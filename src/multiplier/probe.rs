@@ -1,0 +1,448 @@
+//! Sub2API 与 New API 的倍率探针（§11.2）。
+//!
+//! 两个探针都遵守 §23.3 对后台请求的约束：独立超时、响应体上限、Content-Type
+//! 检查，以及发起前的 DNS Rebinding 复查。任何一项校验不过就返回错误，绝不
+//! "猜一个 x1 顶上"——猜错的方向恰好是亏钱的方向。
+
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use crate::domain::Multiplier;
+use crate::security::url_guard;
+use crate::upstream::UpstreamClient;
+
+/// 探针独立超时，不受请求总超时影响。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 响应体上限。倍率信息只有几百字节，超过这个量级说明拿错了东西。
+const MAX_BODY: usize = 64 * 1024;
+
+/// 一次成功探测的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    /// 上游声明的当前有效倍率，尚未乘账号校准系数。
+    pub multiplier: Multiplier,
+    /// 上游声明的观察时间（Unix 秒）。与 Akhub 自己的拉取时间不是一回事。
+    pub observed_at: Option<i64>,
+    /// 峰值时段。存在时由 Akhub 本地换算当前倍率，不必等下一轮刷新（§11.3）。
+    pub peak: Option<PeakSchedule>,
+}
+
+impl Reading {
+    /// 结合峰值时段算出此刻应当使用的倍率。
+    pub fn current(&self, now_unix: i64) -> Multiplier {
+        match &self.peak {
+            Some(peak) if peak.covers(now_unix) => peak.multiplier,
+            _ => self.multiplier,
+        }
+    }
+}
+
+/// 峰值时段与峰值倍率。
+///
+/// 时段一律按 UTC 解释：上游不会附带时区，而按 Akhub 所在机器的本地时区解释
+/// 会让同一份配置在不同机器上算出不同倍率。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeakSchedule {
+    pub multiplier: Multiplier,
+    /// 每段的 `[起, 止)` 秒偏移（UTC 当日 0 点起算）。跨零点的段已被拆开。
+    windows: Vec<(u32, u32)>,
+}
+
+const DAY_SECONDS: u32 = 24 * 60 * 60;
+
+impl PeakSchedule {
+    /// 从 `"HH:MM"` 形式的时段构造，跨零点的段拆成两段。
+    fn new(multiplier: Multiplier, raw: &[RawWindow]) -> Result<Self> {
+        let mut windows = Vec::with_capacity(raw.len());
+        for window in raw {
+            let start = parse_clock(&window.start)?;
+            let end = parse_clock(&window.end)?;
+            if start == end {
+                bail!("峰值时段的起止时间相同：{}", window.start);
+            }
+            if start < end {
+                windows.push((start, end));
+            } else {
+                windows.push((start, DAY_SECONDS));
+                windows.push((0, end));
+            }
+        }
+        Ok(Self {
+            multiplier,
+            windows,
+        })
+    }
+
+    /// 给定 Unix 秒是否落在峰值时段内。
+    pub fn covers(&self, now_unix: i64) -> bool {
+        let seconds = now_unix.rem_euclid(i64::from(DAY_SECONDS)) as u32;
+        self.windows
+            .iter()
+            .any(|(start, end)| seconds >= *start && seconds < *end)
+    }
+}
+
+fn parse_clock(raw: &str) -> Result<u32> {
+    let (hours, minutes) = raw
+        .split_once(':')
+        .with_context(|| format!("峰值时段格式必须是 HH:MM：{raw}"))?;
+    let hours: u32 = hours
+        .parse()
+        .with_context(|| format!("峰值时段的小时非法：{raw}"))?;
+    let minutes: u32 = minutes
+        .parse()
+        .with_context(|| format!("峰值时段的分钟非法：{raw}"))?;
+    if hours > 23 || minutes > 59 {
+        bail!("峰值时段超出合法范围：{raw}");
+    }
+    Ok(hours * 3600 + minutes * 60)
+}
+
+// ------------------------------------------------------------------ Sub2API
+
+/// Sub2API 的 Key 级计费响应。
+///
+/// 字段名取自 §11.2 要求校验的六项：对象类型、版本、计费范围、有效倍率、
+/// 观察时间与峰值倍率。接入真实站点前应当先用 `--probe` 之外的手段核对一次
+/// 实际字段名；校验失败时探针宁可报错也不会退回默认值。
+#[derive(Debug, Deserialize)]
+struct Sub2ApiBilling {
+    object: String,
+    version: u32,
+    scope: String,
+    effective_multiplier: serde_json::Value,
+    observed_at: Option<i64>,
+    peak_multiplier: Option<serde_json::Value>,
+    #[serde(default)]
+    peak_windows: Vec<RawWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWindow {
+    start: String,
+    end: String,
+}
+
+/// Sub2API 目前唯一被支持的响应版本。
+const SUB2API_VERSION: u32 = 1;
+
+/// 调用 Key 级 `/v1/sub2api/billing`。一把 API Key 即可，不需要额外凭据。
+pub async fn sub2api(
+    client: &UpstreamClient,
+    base_url: &str,
+    api_key: &str,
+    allow_private: bool,
+) -> Result<Reading> {
+    let url = join(base_url, "v1/sub2api/billing")?;
+    url_guard::assert_resolvable(&url, allow_private).await?;
+
+    let response = client
+        .http()
+        .get(url)
+        .bearer_auth(api_key)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .context("Sub2API 计费接口请求失败")?;
+    let body = read_json_body(response).await?;
+    let billing: Sub2ApiBilling =
+        serde_json::from_slice(&body).context("Sub2API 计费响应结构不符合预期")?;
+
+    if billing.object != "billing" {
+        bail!("Sub2API 计费响应的对象类型非法：{}", billing.object);
+    }
+    if billing.version != SUB2API_VERSION {
+        bail!(
+            "Sub2API 计费响应版本 {} 不受支持，只支持 {SUB2API_VERSION}",
+            billing.version
+        );
+    }
+    // 只接受 Key 级计费：站点级或用户级的数字回答不了"我这把 Key 多少倍"。
+    if billing.scope != "key" {
+        bail!("Sub2API 计费范围不是 Key 级：{}", billing.scope);
+    }
+
+    let multiplier =
+        to_multiplier(&billing.effective_multiplier).context("Sub2API 计费响应中的有效倍率非法")?;
+    let peak = match billing.peak_multiplier {
+        Some(raw) if !billing.peak_windows.is_empty() => {
+            let value = to_multiplier(&raw).context("Sub2API 计费响应中的峰值倍率非法")?;
+            Some(PeakSchedule::new(value, &billing.peak_windows)?)
+        }
+        _ => None,
+    };
+
+    Ok(Reading {
+        multiplier,
+        observed_at: billing.observed_at,
+        peak,
+    })
+}
+
+// ------------------------------------------------------------------ New API
+
+/// New API 的分组倍率响应。
+#[derive(Debug, Deserialize)]
+struct NewApiGroups {
+    success: bool,
+    #[serde(default)]
+    message: String,
+    data: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// 调用 `GET /api/user/self/groups`。
+///
+/// 必须用这个接口而不是 `/api/pricing` 或 `/api/ratio_config`：后两者返回的是
+/// 全站倍率表，回答不了"我这把 Key 属于哪一档"（§11.2）。
+///
+/// `group` 为空时取可用分组中的**最高**倍率——不知道自己在哪一档时，把成本
+/// 估高才是安全方向。
+pub async fn new_api(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    group: Option<&str>,
+    allow_private: bool,
+) -> Result<Reading> {
+    let url = join(base_url, "api/user/self/groups")?;
+    url_guard::assert_resolvable(&url, allow_private).await?;
+
+    let response = client
+        .http()
+        .get(url)
+        // New API 的访问令牌直接放在 Authorization 里，不带 Bearer 前缀。
+        .header(reqwest::header::AUTHORIZATION, access_token)
+        .header("New-Api-User", user_id)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .context("New API 分组接口请求失败")?;
+    let body = read_json_body(response).await?;
+    let groups: NewApiGroups =
+        serde_json::from_slice(&body).context("New API 分组响应结构不符合预期")?;
+
+    if !groups.success {
+        bail!(
+            "New API 分组接口返回失败：{}",
+            if groups.message.is_empty() {
+                "未提供原因（通常是访问令牌过期或用户 ID 不匹配）"
+            } else {
+                &groups.message
+            }
+        );
+    }
+    let data = groups
+        .data
+        .filter(|data| !data.is_empty())
+        .context("New API 分组接口没有返回任何可用分组")?;
+
+    let multiplier = match group {
+        Some(name) => {
+            let raw = data
+                .get(name)
+                .with_context(|| format!("New API 上不存在分组「{name}」，或这把 Key 无权使用"))?;
+            group_ratio(raw).with_context(|| format!("New API 分组「{name}」的倍率非法"))?
+        }
+        None => data
+            .values()
+            .filter_map(|raw| group_ratio(raw).ok())
+            .max()
+            .context("New API 返回的分组中没有一个带合法倍率")?,
+    };
+
+    Ok(Reading {
+        multiplier,
+        observed_at: None,
+        peak: None,
+    })
+}
+
+/// 分组条目既可能是 `{"ratio": 0.5, "desc": "..."}`，也可能直接是数字。
+fn group_ratio(raw: &serde_json::Value) -> Result<Multiplier> {
+    match raw.get("ratio") {
+        Some(value) => to_multiplier(value),
+        None => to_multiplier(raw),
+    }
+}
+
+// ---------------------------------------------------------------- 公共辅助
+
+/// 把 JSON 数值或字符串转成定点倍率，绝不经过浮点比较（§20.3）。
+fn to_multiplier(raw: &serde_json::Value) -> Result<Multiplier> {
+    let text = match raw {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        other => bail!("倍率必须是数字或字符串，实际是 {other}"),
+    };
+    // JSON 的浮点字面量可能带指数或超过 6 位小数，先按十进制文本裁剪。
+    let normalized = normalize_decimal(&text)?;
+    Multiplier::parse(&normalized).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// 把任意十进制文本收敛成 `Multiplier::parse` 能接受的形式。
+fn normalize_decimal(text: &str) -> Result<String> {
+    if text.contains(['e', 'E']) {
+        // 指数形式先落到 f64 再定点化。倍率的量级只有 0.01–100，精度足够。
+        let value: f64 = text.parse().context("倍率不是合法的十进制数")?;
+        if !value.is_finite() || value < 0.0 {
+            bail!("倍率必须是非负有限数：{text}");
+        }
+        return Ok(format!("{value:.6}"));
+    }
+    match text.split_once('.') {
+        Some((int_part, frac)) if frac.len() > 6 => Ok(format!("{int_part}.{}", &frac[..6])),
+        _ => Ok(text.to_string()),
+    }
+}
+
+fn join(base_url: &str, path: &str) -> Result<reqwest::Url> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let mut url = reqwest::Url::parse(trimmed).context("账号 Base URL 非法")?;
+    let base_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&format!("{base_path}/{path}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+/// 读取响应体，校验状态码与 Content-Type，并施加大小上限（§23.3）。
+async fn read_json_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if !status.is_success() {
+        bail!("探针返回 HTTP {}", status.as_u16());
+    }
+    if !content_type.contains("json") {
+        bail!("探针响应的 Content-Type 不是 JSON：{content_type}");
+    }
+
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("读取探针响应失败")? {
+        if body.len() + chunk.len() > MAX_BODY {
+            bail!("探针响应超过 {MAX_BODY} 字节上限");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn multiplier(raw: &str) -> Multiplier {
+        Multiplier::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn numbers_and_strings_both_become_fixed_point() {
+        assert_eq!(to_multiplier(&json!(0.5)).unwrap(), multiplier("0.5"));
+        assert_eq!(to_multiplier(&json!("0.35")).unwrap(), multiplier("0.35"));
+        assert_eq!(to_multiplier(&json!(1)).unwrap(), Multiplier::ONE);
+        // 超过 6 位小数按定点精度截断，而不是整体拒绝。
+        assert_eq!(
+            to_multiplier(&json!("0.1234567")).unwrap(),
+            multiplier("0.123456")
+        );
+        assert_eq!(to_multiplier(&json!(5e-1)).unwrap(), multiplier("0.5"));
+    }
+
+    #[test]
+    fn malformed_multipliers_are_rejected_rather_than_defaulted() {
+        // 猜一个默认值的方向恰好是亏钱的方向，所以只能报错。
+        for raw in [json!("免费"), json!(-1), json!(null), json!({})] {
+            assert!(to_multiplier(&raw).is_err(), "{raw} 应当被拒绝");
+        }
+    }
+
+    #[test]
+    fn a_new_api_group_entry_may_be_an_object_or_a_bare_number() {
+        assert_eq!(
+            group_ratio(&json!({"ratio": 0.5, "desc": "VIP"})).unwrap(),
+            multiplier("0.5")
+        );
+        assert_eq!(group_ratio(&json!(0.25)).unwrap(), multiplier("0.25"));
+    }
+
+    #[test]
+    fn peak_windows_wrap_around_midnight() {
+        let peak = PeakSchedule::new(
+            multiplier("1.5"),
+            &[RawWindow {
+                start: "22:00".into(),
+                end: "08:00".into(),
+            }],
+        )
+        .unwrap();
+
+        // 23:00 UTC 与 03:00 UTC 都在峰值内，12:00 UTC 不在。
+        assert!(peak.covers(23 * 3600));
+        assert!(peak.covers(3 * 3600));
+        assert!(!peak.covers(12 * 3600));
+    }
+
+    #[test]
+    fn a_reading_switches_to_the_peak_multiplier_locally() {
+        let reading = Reading {
+            multiplier: multiplier("0.5"),
+            observed_at: Some(0),
+            peak: Some(
+                PeakSchedule::new(
+                    multiplier("1.5"),
+                    &[RawWindow {
+                        start: "22:00".into(),
+                        end: "23:00".into(),
+                    }],
+                )
+                .unwrap(),
+            ),
+        };
+        // 峰值时段内不必等下一轮刷新就切换（§11.3）。
+        assert_eq!(reading.current(22 * 3600 + 60), multiplier("1.5"));
+        assert_eq!(reading.current(21 * 3600), multiplier("0.5"));
+    }
+
+    #[test]
+    fn malformed_peak_windows_are_rejected() {
+        for (start, end) in [("25:00", "08:00"), ("22:70", "08:00"), ("2200", "0800")] {
+            assert!(
+                PeakSchedule::new(
+                    Multiplier::ONE,
+                    &[RawWindow {
+                        start: start.into(),
+                        end: end.into()
+                    }]
+                )
+                .is_err(),
+                "{start}-{end} 应当被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_urls_respect_an_existing_base_path() {
+        assert_eq!(
+            join("https://host/proxy/", "v1/sub2api/billing")
+                .unwrap()
+                .as_str(),
+            "https://host/proxy/v1/sub2api/billing"
+        );
+        assert_eq!(
+            join("https://host", "api/user/self/groups")
+                .unwrap()
+                .as_str(),
+            "https://host/api/user/self/groups"
+        );
+    }
+}

@@ -1,0 +1,25 @@
+# 最小可用部署示例（§25.1）。
+services:
+  akhub:
+    image: akhub:latest
+    build: .
+    container_name: akhub
+    restart: unless-stopped
+    ports:
+      # 默认只绑定环回地址；生产环境请由 Caddy / Nginx 终止 HTTPS 后反代过来。
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # 唯一持久卷：SQLite、主密钥与临时目录。
+      - ./data:/data
+    environment:
+      AKHUB_LISTEN: 0.0.0.0:8080
+      AKHUB_DATA_DIR: /data
+      RUST_LOG: akhub=info,warn
+      # 想让主密钥脱离数据目录管理时，取消下面一行的注释并填入 32 字节 hex：
+      # AKHUB_MASTER_KEY: ""
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/akhub", "--healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

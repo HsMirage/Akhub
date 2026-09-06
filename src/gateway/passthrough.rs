@@ -1,0 +1,1837 @@
+//! 请求转发：端点选择、跨协议转换、故障切换与流式边界。
+//!
+//! 同协议时只改鉴权头、Base URL 和模型名，其余字节按原样送达，未知字段因此
+//! 天然保留。上游没有匹配端点时才进入 [`crate::protocol`] 的中间格式转换，
+//! 转换中丢弃的白名单能力会写进 `X-Akhub-Degraded` 与请求记录（§14.8）。
+//!
+//! 调度侧的三件事：按严格阶梯与层内评分排出尝试顺序、粘性命中时直接复用已
+//! 绑定目标、以及**流式切换边界**——在只收到 HTTP 头、空白、注释、ping 或协议
+//! 开始标记时仍可切换，一旦发出有语义的增量就禁止拼接第二个上游。
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use futures::StreamExt as _;
+
+use crate::app::SharedState;
+use crate::capability;
+use crate::config::{GroupView, TargetView};
+use crate::domain::{Multiplier, Protocol};
+use crate::gateway::error::{ErrorCode, GatewayError};
+use crate::gateway::{responses, stream, translate};
+use crate::health;
+use crate::multiplier;
+use crate::protocol::degrade;
+use crate::protocol::translate::Translation;
+use crate::routing::{self, queue, score, sticky};
+use crate::storage::store::RequestRecord;
+use crate::upstream::endpoints::{self, Choice};
+use crate::upstream::{self, Endpoint};
+
+/// 允许从上游回传给下游的响应头。其余一律丢弃，避免泄漏上游身份（§14.7）。
+const FORWARDED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-tokens-remaining",
+];
+
+/// 没有 tokenizer 时的保守 Token 估算：按字节数除以这个系数。
+///
+/// 英文大约 4 字节一个 token，中文 UTF-8 下大约 1.5。取 3 是偏保守的中间值：
+/// 宁可高估把自己挡在限流外，也不要低估越过上游的 TPM（§17.2）。
+const BYTES_PER_TOKEN: usize = 3;
+
+/// 等待 RPM / TPM 窗口释放时的轮询间隔。
+///
+/// 并发名额有信号量可等，限流窗口只随时间推移释放，没有可等的信号。
+const RATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 按上游的 `Retry-After` 等待时额外多等的余量，避免卡在冷却结束的临界点上。
+const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
+
+/// 一次转发请求的全部输入。
+pub struct Forward<'a> {
+    pub state: &'a SharedState,
+    pub group: &'a Arc<GroupView>,
+    pub endpoint: Endpoint,
+    pub request_id: &'a str,
+    pub downstream_headers: &'a HeaderMap,
+    /// 已解析的请求体。模型名会被逐目标改写。
+    pub body: serde_json::Value,
+    pub logical_model: String,
+    pub request_bytes: usize,
+    pub started_at: Instant,
+    /// 请求进入网关时的 Unix 秒，用于请求记录按真实开始时间归档。
+    pub started_unix: i64,
+    /// Responses 状态链处理计划。所有入口都携带；非 Responses 入口它只是
+    /// 没有引用与固定候选的空计划。
+    pub chain: responses::ChainPlan,
+}
+
+/// 单次尝试的失败原因，决定是否继续尝试下一个目标（§13.2、§13.3）。
+#[derive(Debug)]
+enum AttemptFailure {
+    /// 廉价失败：上游未开始生成，可以切换（§13.1）。
+    Switchable {
+        code: ErrorCode,
+        message: String,
+        upstream_status: Option<StatusCode>,
+        /// 上游给出的恢复时间。粘性请求据此决定等待还是换号（§10.3）。
+        retry_after: Option<Duration>,
+    },
+    /// 明确属于下游请求本身的问题，切换到别的目标也是同样结果。
+    /// 装箱是因为 `Response` 比其余变体大一个数量级，而这是**失败**分支：
+    /// 让成功路径为它多搬 128 字节不划算。
+    Terminal(Box<Response>),
+    /// 这条路由不存在。换个端点再试**同一个**目标，不算这个目标失败——
+    /// 账号首选 Chat 但上游也有 Messages 时，正是靠这一步学会走哪条路
+    /// （§14.2、§16.7）。
+    MissingEndpoint,
+}
+
+impl AttemptFailure {
+    fn switchable(code: ErrorCode, message: String) -> Self {
+        Self::Switchable {
+            code,
+            message,
+            upstream_status: None,
+            retry_after: None,
+        }
+    }
+
+    fn with_status(self, status: StatusCode) -> Self {
+        match self {
+            Self::Switchable {
+                code,
+                message,
+                retry_after,
+                ..
+            } => Self::Switchable {
+                code,
+                message,
+                upstream_status: Some(status),
+                retry_after,
+            },
+            terminal => terminal,
+        }
+    }
+}
+
+/// 一次请求的可观测统计，最终写进请求记录。
+#[derive(Default)]
+struct Telemetry {
+    attempts: i64,
+    queued: Duration,
+    sticky_hit: bool,
+    cheapest: Option<Multiplier>,
+    dearest: Option<Multiplier>,
+    effective: Option<Multiplier>,
+    /// 实际使用的上游端点。
+    endpoint: Option<Endpoint>,
+    /// 本次为了完成请求丢弃的白名单能力（§14.8）。
+    degraded: Vec<String>,
+}
+
+/// 一次请求在候选之间游走时的全部可变状态。
+struct Walk<'a> {
+    forward: &'a Forward<'a>,
+    /// 三个协议的转换缓存。同协议目标不碰它（§14.1）。
+    translation: &'a Translation<'a>,
+    telemetry: Telemetry,
+    streaming: bool,
+    estimated_tokens: u64,
+    deadline: Instant,
+    now_unix: i64,
+    /// 已经真正发过请求的目标。每个目标最多尝试一次（§13.1）。
+    attempted: Vec<String>,
+    /// 最后一次可切换失败，用来在候选耗尽时决定错误码。
+    last: Option<(ErrorCode, String)>,
+    /// 最后一次失败附带的 `Retry-After`，粘性路径据此决定是否原地等待（§10.3）。
+    last_retry_after: Option<Duration>,
+}
+
+/// 一次尝试要发出的东西：端点、已改写模型名的请求体与降级记录。
+struct Prepared {
+    endpoint: Endpoint,
+    body: serde_json::Value,
+    degraded: Vec<String>,
+}
+
+fn admission_limits(candidate: &routing::Candidate) -> health::AdmissionLimits {
+    health::AdmissionLimits {
+        account: candidate.target.account.limits,
+        target: candidate.target.target.limits,
+    }
+}
+
+/// 一段游走的结果。
+enum Flow {
+    /// 已经拿到可以直接返回的响应（成功、终止性错误或网关错误）。
+    Done(Response),
+    /// 这一段没有结果，继续下一段。
+    Continue,
+    /// 等待预算耗尽。粘性路径据此降级，层路径据此报 `queue_timeout`。
+    Exhausted,
+    /// 分组排队总容量已满。
+    QueueFull,
+}
+
+/// 按严格阶梯依次尝试候选目标，返回第一个成功的上游响应。
+pub async fn forward(forward: Forward<'_>) -> Response {
+    let streaming = forward
+        .body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let now_unix = crate::storage::now_unix();
+    let multipliers = forward.state.runtime.multipliers.view();
+
+    // 状态链带可重放正文时，资格过滤与转换都按**合并体**算：引用不在里面，
+    // 跨协议目标因此保持合格（§15.2）。合并体不存在时按原始请求体。
+    let multipliers_ref = &multipliers;
+    forward_inner(forward, streaming, now_unix, multipliers_ref).await
+}
+
+async fn forward_inner<'a>(
+    forward: Forward<'a>,
+    streaming: bool,
+    now_unix: i64,
+    multipliers: &'a multiplier::View,
+) -> Response {
+    // 中间格式最多解析一次、每个目标协议最多发射一次（§19.4）。
+    let translation = Translation::new(
+        forward.endpoint.protocol(),
+        forward.chain.body_for_translation(&forward.body),
+    );
+    let context = routing::Context {
+        health: &forward.state.runtime.health,
+        perf: &forward.state.runtime.perf,
+        multipliers,
+        evidence: &forward.state.runtime.evidence,
+        capabilities: &forward.state.runtime.capabilities,
+        translation: &translation,
+        endpoint: forward.endpoint,
+        allow_degrade: forward.group.group.allow_degrade,
+        protocol: forward.endpoint.protocol(),
+        streaming,
+        now_unix,
+        now: Instant::now(),
+    };
+
+    let mut walk = Walk {
+        forward: &forward,
+        translation: &translation,
+        telemetry: Telemetry::default(),
+        streaming,
+        estimated_tokens: estimate_tokens(forward.request_bytes, &forward.body),
+        deadline: forward.started_at + forward.state.settings.request_timeout,
+        now_unix,
+        attempted: Vec::new(),
+        last: None,
+        last_retry_after: None,
+    };
+
+    let plan = match routing::plan(
+        forward.group,
+        &forward.logical_model,
+        &context,
+        &mut score::random_unit,
+    ) {
+        Ok(plan) => plan,
+        Err(failure) => return walk.fail(failure.code, failure.message),
+    };
+    walk.telemetry.cheapest = plan.cheapest;
+    walk.telemetry.dearest = plan.dearest;
+
+    // 粘性命中的请求不参与抽签，直接走已绑定目标（§9.5）。
+    let sticky_key = sticky::derive(
+        &forward.state.key_digest,
+        &forward.group.group.id,
+        &forward.logical_model,
+        forward.downstream_headers,
+        &forward.body,
+    );
+    let bound = sticky_key.as_ref().and_then(|(key, _)| {
+        let binding = forward.state.runtime.sticky.get(key, now_unix)?;
+        // 普通粘性只能在当前最高合格层内生效；低层绑定不能绕过已恢复的高层。
+        let candidate = plan
+            .first_layer()
+            .iter()
+            .find(|candidate| candidate.target.target.id == binding.target_id)?;
+        routing::sticky_still_valid(forward.group, &candidate.target, &context)
+            .then_some((candidate, binding))
+    });
+    if bound.is_none()
+        && let Some((key, _)) = &sticky_key
+    {
+        // 绑定还在但目标已经不合格：清除，重新抽签（§10.2）。
+        forward.state.runtime.sticky.clear(key);
+    }
+
+    // 第一步：粘性命中时先按等待预算争取原目标（§10.3）。
+    if let Some((candidate, binding)) = bound {
+        walk.telemetry.sticky_hit = true;
+        let budget = sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at);
+        match walk
+            .wait_and_run(&[candidate], budget, &sticky_key, true)
+            .await
+        {
+            Flow::Done(response) => return response,
+            Flow::QueueFull => return walk.queue_full(),
+            // 预算耗尽或原目标失败：降级为无粘性请求重新走层内选择，并重绑
+            // 粘性（§10.3）。这也让"高并发时同一前缀自然分散到几个号"成为
+            // 免费行为。
+            Flow::Continue | Flow::Exhausted => {}
+        }
+    }
+
+    // 第二步：逐层游走。层内先耗尽，再降层；层内全忙则在本层排队（§13.6）。
+    for layer in &plan.layers {
+        if walk.attempted.len() >= routing::MAX_TARGET_ATTEMPTS {
+            break;
+        }
+        match walk.walk_layer(&layer.candidates, &sticky_key).await {
+            Flow::Done(response) => return response,
+            Flow::QueueFull => return walk.queue_full(),
+            Flow::Exhausted => {
+                return walk.fail(ErrorCode::QueueTimeout, "等待可用目标超时".into());
+            }
+            Flow::Continue => {}
+        }
+    }
+
+    // 候选全部用尽。用最后一次失败的性质决定错误码，让客户端的重试行为正确。
+    let (code, message) = walk.last.take().unwrap_or((
+        ErrorCode::NoEligibleTarget,
+        format!("逻辑模型 {} 当前没有可用的调度目标", forward.logical_model),
+    ));
+    walk.fail(code, message)
+}
+
+impl Walk<'_> {
+    /// 在一层内游走：有空位的立即用，全部失败就降层，全忙则在本层排队。
+    ///
+    /// "忙"不会导致降层——你设 `A=100 B=50`，B 永远拿不到流量，除非 A 真的
+    /// 不合格；并发满不是不合格（§9.2、§13.6）。
+    async fn walk_layer(
+        &mut self,
+        candidates: &[routing::Candidate],
+        sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+    ) -> Flow {
+        let (lossless, degraded): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .partition(|candidate| candidate.is_lossless());
+
+        // 先完整耗尽无损候选。无损候选只是忙并不算失败，此时不能绕过它们
+        // 直接使用降级候选，否则“降级只在故障切换时生效”会被并发高峰打破。
+        let busy = match self.try_candidates(lossless, sticky_key).await {
+            Ok(busy) => busy,
+            Err(flow) => return flow,
+        };
+        if !busy.is_empty() {
+            let budget = self.deadline.saturating_duration_since(Instant::now());
+            match self.wait_and_run(&busy, budget, sticky_key, false).await {
+                Flow::Continue => {}
+                other => return other,
+            }
+        }
+
+        // 只有无损候选都失败后，才尝试白名单降级候选。
+        let busy = match self.try_candidates(degraded, sticky_key).await {
+            Ok(busy) => busy,
+            Err(flow) => return flow,
+        };
+        if busy.is_empty() {
+            return Flow::Continue;
+        }
+        let budget = self.deadline.saturating_duration_since(Instant::now());
+        match self.wait_and_run(&busy, budget, sticky_key, false).await {
+            Flow::Continue => Flow::Exhausted,
+            other => other,
+        }
+    }
+
+    /// 尝试一组同类候选，返回暂时忙的目标供本阶段排队。
+    async fn try_candidates<'a>(
+        &mut self,
+        candidates: Vec<&'a routing::Candidate>,
+        sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+    ) -> Result<Vec<&'a routing::Candidate>, Flow> {
+        let mut busy: Vec<&'a routing::Candidate> = Vec::new();
+        for candidate in candidates {
+            if self.attempted.len() >= routing::MAX_TARGET_ATTEMPTS {
+                break;
+            }
+            if self.already_tried(candidate) {
+                continue;
+            }
+            if Instant::now() >= self.deadline {
+                return Err(Flow::Done(
+                    self.fail(ErrorCode::UpstreamTimeout, "请求已达到总超时".into()),
+                ));
+            }
+            match self.try_admit(candidate) {
+                Ok(admission) => match self.run(candidate, admission, sticky_key).await {
+                    Flow::Continue => {}
+                    other => return Err(other),
+                },
+                Err(reason) if reason.is_queueable() => busy.push(candidate),
+                Err(reason) => self.note_unavailable(candidate, reason),
+            }
+        }
+        Ok(busy)
+    }
+
+    /// 在一组候选上等待名额；等到就带着名额做终检并发出请求。
+    ///
+    /// `budget` 是愿意等待的上限，同时受请求总超时约束。返回 `Continue`
+    /// 表示候选都试过且都失败了，`Exhausted` 表示还在忙但预算已耗尽。
+    ///
+    /// `sticky` 打开时额外执行 §10.3 的 429 规则：上游给出的 `Retry-After`
+    /// 不超过剩余预算就原地等待并重试同一个目标，而不是立刻换号——换号的
+    /// 代价是整份前缀缓存重建。
+    async fn wait_and_run(
+        &mut self,
+        candidates: &[&routing::Candidate],
+        budget: Duration,
+        sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+        sticky: bool,
+    ) -> Flow {
+        let mut pending: Vec<&routing::Candidate> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| !self.already_tried(candidate))
+            .collect();
+        let started = Instant::now();
+        // 只有真的要等，才占用分组的排队名额；一次等待只占一个。
+        let mut ticket: Option<queue::QueueTicket> = None;
+        // 429 后的原地重试每个目标只给一次，否则一个一直 429 的上游能把整个
+        // 预算耗光。
+        let mut retried_after_429 = false;
+
+        loop {
+            // 先试一次不排队的准入：任一目标有空位就立即使用，根本不排队。
+            let mut index = 0;
+            while index < pending.len() {
+                let candidate = pending[index];
+                match self.try_admit(candidate) {
+                    Ok(admission) => {
+                        pending.remove(index);
+                        match self.run(candidate, admission, sticky_key).await {
+                            Flow::Continue => {
+                                if sticky
+                                    && !retried_after_429
+                                    && let Some(wait) = self.retry_after_within(budget, started)
+                                {
+                                    // 原地等待也是排队，同样占用分组的总容量。
+                                    if ticket.is_none() {
+                                        match self.enter_queue() {
+                                            Some(entered) => ticket = Some(entered),
+                                            None => return Flow::QueueFull,
+                                        }
+                                    }
+                                    retried_after_429 = true;
+                                    self.wait_out_retry_after(wait).await;
+                                    self.forget_attempt(candidate);
+                                    pending.insert(index, candidate);
+                                }
+                            }
+                            other => return other,
+                        }
+                    }
+                    Err(reason) if reason.is_queueable() => index += 1,
+                    Err(reason) => {
+                        self.note_unavailable(candidate, reason);
+                        pending.remove(index);
+                    }
+                }
+            }
+            if pending.is_empty() {
+                return Flow::Continue;
+            }
+
+            let remaining = routing::clamp_wait(
+                budget.saturating_sub(started.elapsed()),
+                self.deadline.saturating_duration_since(Instant::now()),
+            );
+            if remaining.is_zero() {
+                return Flow::Exhausted;
+            }
+            if ticket.is_none() {
+                match self.enter_queue() {
+                    Some(entered) => ticket = Some(entered),
+                    None => return Flow::QueueFull,
+                }
+            }
+
+            // 并发名额靠信号量唤醒；RPM / TPM 窗口只会随时间推移释放，没有可
+            // 等的信号，只能按短间隔轮询。
+            let rate_limited = pending.iter().any(|candidate| {
+                matches!(self.check(candidate), Err(health::Unavailable::RateLimited))
+            });
+            let slice = if rate_limited {
+                remaining.min(RATE_POLL_INTERVAL)
+            } else {
+                remaining
+            };
+            let capacities: Vec<_> = pending
+                .iter()
+                .map(|candidate| {
+                    self.forward
+                        .state
+                        .runtime
+                        .health
+                        .capacity(&candidate.target.account.id, &candidate.target.target.id)
+                })
+                .collect();
+
+            let waited = Instant::now();
+            let outcome = queue::wait_for_any_capacity(capacities, slice).await;
+            self.telemetry.queued += waited.elapsed();
+
+            if let queue::CapacityWaitOutcome::Ready(index, permit) = outcome {
+                let candidate = pending[index];
+                // 被唤醒后重新做完整终检：等待期间倍率或配置可能已经变了（§13.6）。
+                match self.admit_with_permit(candidate, permit) {
+                    Ok(admission) => {
+                        pending.remove(index);
+                        match self.run(candidate, admission, sticky_key).await {
+                            Flow::Continue => {}
+                            other => return other,
+                        }
+                    }
+                    Err(reason) if reason.is_queueable() => {}
+                    Err(reason) => {
+                        self.note_unavailable(candidate, reason);
+                        pending.remove(index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 发起一次尝试并把结果同时喂给健康状态与性能统计。
+    ///
+    /// 只有 `Continue` 表示"可以换下一个"；其余情况都已经有了最终响应。
+    async fn run(
+        &mut self,
+        candidate: &routing::Candidate,
+        admission: health::Admission,
+        sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+    ) -> Flow {
+        if let Err((code, message)) = self.recheck_multiplier(candidate) {
+            // 倍率终检发生在准入之后；终检失败时本次请求从未发给上游，
+            // 预扣的 RPM/TPM 必须完整退回，且不能留下半开试运行占用。
+            admission.cancel_before_upstream();
+            self.last = Some((code, message));
+            return Flow::Continue;
+        }
+
+        self.attempted.push(candidate.target.target.id.clone());
+        self.telemetry.attempts += 1;
+        self.telemetry.effective = Some(candidate.multiplier);
+
+        let started = Instant::now();
+        let result = self.walk_endpoints(candidate).await;
+
+        let dimension = score::Dimension {
+            protocol: self.forward.endpoint.protocol(),
+            streaming: self.streaming,
+        };
+        match result {
+            Ok(success) => {
+                let response = if self.streaming {
+                    // 流式响应在首个语义块后仍会占用上游连接；把准入凭据
+                    // 绑定到 Body，避免释放并发名额后继续超出上限。
+                    hold_stream_admission(success.response, admission)
+                } else {
+                    admission.settle(health::Outcome::Success, success.usage_tokens);
+                    success.response
+                };
+                self.forward.state.runtime.perf.observe(
+                    &candidate.target.target.id,
+                    dimension,
+                    &score::Sample {
+                        success: true,
+                        first_token: success.first_token,
+                        total: started.elapsed(),
+                        output_tokens: success.output_tokens,
+                    },
+                );
+                if let Some((key, _)) = sticky_key {
+                    self.forward.state.runtime.sticky.bind(
+                        key.clone(),
+                        &self.forward.group.group.id,
+                        &self.forward.logical_model,
+                        &candidate.target.target.id,
+                        self.now_unix,
+                    );
+                }
+                Flow::Done(self.finish(
+                    Some(candidate),
+                    success.status,
+                    None,
+                    Some(success.status),
+                    response,
+                ))
+            }
+            Err(AttemptFailure::Terminal(response)) => {
+                admission.settle(health::Outcome::Neutral, None);
+                let status = response.status();
+                Flow::Done(self.finish(Some(candidate), status, None, None, *response))
+            }
+            // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
+            Err(AttemptFailure::MissingEndpoint) => {
+                admission.settle(health::Outcome::Neutral, None);
+                Flow::Continue
+            }
+            Err(AttemptFailure::Switchable {
+                code,
+                message,
+                upstream_status,
+                retry_after,
+            }) => {
+                let outcome = classify_outcome(code, upstream_status, retry_after);
+                admission.settle(outcome, None);
+                self.last_retry_after = retry_after;
+                // 慢到超时不熔断，但可靠性得分必须反映它（§12.1）。
+                let counts_for_perf = !matches!(outcome, health::Outcome::Neutral)
+                    || code == ErrorCode::UpstreamTimeout;
+                if counts_for_perf {
+                    self.forward.state.runtime.perf.observe(
+                        &candidate.target.target.id,
+                        dimension,
+                        &score::Sample {
+                            success: false,
+                            first_token: None,
+                            total: started.elapsed(),
+                            output_tokens: None,
+                        },
+                    );
+                }
+                tracing::warn!(
+                    request_id = self.forward.request_id,
+                    target = candidate.target.target.id,
+                    account = candidate.target.account.name,
+                    upstream_status = upstream_status.map(|s| s.as_u16()),
+                    error_code = code.as_str(),
+                    "目标尝试失败，切换到下一个候选"
+                );
+                self.last = Some((code, message));
+                Flow::Continue
+            }
+        }
+    }
+
+    /// 按 §14.3 的顺序试这个目标的端点。
+    ///
+    /// 路由不存在只是"走错了门"，不是这个目标坏了：记下证据，重新排一次端点
+    /// 顺序继续试同一个账号。全部端点都不存在时才把它当作这个目标的失败。
+    async fn walk_endpoints(
+        &mut self,
+        candidate: &routing::Candidate,
+    ) -> Result<Success, AttemptFailure> {
+        let mut plan = candidate.endpoints.clone();
+
+        for _ in 0..endpoints::MAX_ENDPOINTS_PER_TARGET {
+            let Some(choice) = plan.first().cloned() else {
+                break;
+            };
+            let prepared = self.prepare(candidate, &choice).await?;
+            let timeout = self.deadline.saturating_duration_since(Instant::now());
+            self.telemetry.endpoint = Some(prepared.endpoint);
+            self.telemetry.degraded = prepared.degraded.clone();
+
+            match attempt(
+                self.forward,
+                &candidate.target,
+                &prepared,
+                self.streaming,
+                timeout,
+            )
+            .await
+            {
+                Err(AttemptFailure::MissingEndpoint) => {
+                    self.forward.state.runtime.evidence.note_unsupported(
+                        &candidate.target.account.id,
+                        prepared.endpoint,
+                        Instant::now(),
+                    );
+                    tracing::info!(
+                        account = candidate.target.account.name,
+                        endpoint = prepared.endpoint.as_str(),
+                        "上游没有这个端点，改走转换后的端点"
+                    );
+                    // 证据变了，端点顺序要重排：刚证实缺失的那个会被排除掉。
+                    plan = self.endpoint_plan(candidate).unwrap_or_default();
+                }
+                other => return other,
+            }
+            if Instant::now() >= self.deadline {
+                break;
+            }
+        }
+
+        Err(AttemptFailure::switchable(
+            ErrorCode::UpstreamExhausted,
+            format!(
+                "账号「{}」没有可用于本次请求的端点",
+                candidate.target.account.name
+            ),
+        ))
+    }
+
+    /// 用最新的能力证据重排这个目标的端点顺序。
+    fn endpoint_plan(&self, candidate: &routing::Candidate) -> Option<Vec<Choice>> {
+        endpoints::choices(
+            &candidate.target.account,
+            self.forward.endpoint,
+            self.translation,
+            &self.forward.state.runtime.evidence,
+            self.forward.group.group.allow_degrade,
+            Instant::now(),
+        )
+        .ok()
+    }
+
+    /// 为一次尝试准备请求体：状态链收尾 + 跨协议转换 + 模型名改写。
+    ///
+    /// 原生续链（回到原账号的原生 Responses 端点）把引用改写成上游 ID；
+    /// 其余候选走可重放的合并体。既续不了链又没有合并体，说明这次引用
+    /// 无法被该候选满足——换下一个（§15.2）。
+    async fn prepare(
+        &self,
+        candidate: &routing::Candidate,
+        choice: &Choice,
+    ) -> Result<Prepared, AttemptFailure> {
+        let target_protocol = choice.endpoint.protocol();
+        let downstream = self.forward.endpoint.protocol();
+        let chain = &self.forward.chain;
+
+        let native_continuation = matches!(&chain.pinned, Some(pinned)
+            if pinned.account_id == candidate.target.account.id
+                && downstream == target_protocol);
+        let mut degraded: Vec<String> = Vec::new();
+        let expired = || {
+            AttemptFailure::switchable(
+                ErrorCode::ResponseStateExpired,
+                format!(
+                    "响应状态 {} 不存在或已过期，无法继续会话",
+                    chain.reference.as_deref().unwrap_or("")
+                ),
+            )
+        };
+
+        let mut body = if native_continuation {
+            let pinned = chain.pinned.as_ref().expect("native_continuation 已判定");
+            let mut body = self.forward.body.clone();
+            responses::rewrite_reference(&mut body, &pinned.upstream_id);
+            body
+        } else if chain.reference.is_some() && chain.merged.is_none() {
+            // 带着引用却既不能原生续链也没有正文：不能装作新对话。
+            return Err(expired());
+        } else {
+            let emitted = self.translation.emit(target_protocol).map_err(|reason| {
+                // 资格过滤已经排除过这种情况；真走到这里说明请求本身表达不了。
+                AttemptFailure::Terminal(Box::new(
+                    GatewayError::new(ErrorCode::UnsupportedParameter, reason.to_string())
+                        .with_protocol(self.forward.endpoint.protocol())
+                        .with_request_id(self.forward.request_id)
+                        .into_response(),
+                ))
+            })?;
+            degraded = emitted.degraded.clone();
+            emitted.body.clone()
+        };
+        rewrite_model(&mut body, &candidate.target.target.upstream_model);
+        Ok(Prepared {
+            endpoint: choice.endpoint,
+            body,
+            degraded,
+        })
+    }
+
+    /// 占一个分组排队名额；容量已满时返回 `None`（§13.6）。
+    fn enter_queue(&self) -> Option<queue::QueueTicket> {
+        let group = &self.forward.group.group;
+        self.forward
+            .state
+            .runtime
+            .queues
+            .enter(&group.id, group.queue_capacity)
+    }
+
+    /// 最后一次失败若是带 `Retry-After` 的 429，且等得起，就返回要等多久。
+    fn retry_after_within(&mut self, budget: Duration, started: Instant) -> Option<Duration> {
+        let wait = self.last_retry_after.take()?;
+        let remaining = routing::clamp_wait(
+            budget.saturating_sub(started.elapsed()),
+            self.deadline.saturating_duration_since(Instant::now()),
+        );
+        (wait.saturating_add(RETRY_AFTER_MARGIN) <= remaining).then_some(wait)
+    }
+
+    /// 原地等过上游要求的恢复时间；多等一点点，保证冷却确实已经结束。
+    async fn wait_out_retry_after(&mut self, wait: Duration) {
+        let waited = Instant::now();
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let sleep_for = wait.saturating_add(RETRY_AFTER_MARGIN).min(remaining);
+        tokio::time::sleep(sleep_for).await;
+        self.telemetry.queued += waited.elapsed();
+    }
+
+    /// 允许一个目标被再试一次。只用于 §10.3 的粘性 429 重试。
+    fn forget_attempt(&mut self, candidate: &routing::Candidate) {
+        self.attempted
+            .retain(|id| *id != candidate.target.target.id);
+    }
+
+    fn already_tried(&self, candidate: &routing::Candidate) -> bool {
+        self.attempted
+            .iter()
+            .any(|id| *id == candidate.target.target.id)
+    }
+
+    fn try_admit(
+        &self,
+        candidate: &routing::Candidate,
+    ) -> Result<health::Admission, health::Unavailable> {
+        self.forward.state.runtime.health.try_admit(
+            &candidate.target.account.id,
+            &candidate.target.target.id,
+            admission_limits(candidate),
+            self.estimated_tokens,
+        )
+    }
+
+    fn admit_with_permit(
+        &self,
+        candidate: &routing::Candidate,
+        permit: health::CapacityPermit,
+    ) -> Result<health::Admission, health::Unavailable> {
+        self.forward.state.runtime.health.admit_with_permit(
+            &candidate.target.account.id,
+            &candidate.target.target.id,
+            admission_limits(candidate),
+            self.estimated_tokens,
+            permit,
+        )
+    }
+
+    fn check(&self, candidate: &routing::Candidate) -> Result<(), health::Unavailable> {
+        self.forward.state.runtime.health.check(
+            &candidate.target.account.id,
+            &candidate.target.target.id,
+            admission_limits(candidate),
+        )
+    }
+
+    fn note_unavailable(&mut self, candidate: &routing::Candidate, reason: health::Unavailable) {
+        self.last = Some((
+            unavailable_code(reason),
+            format!(
+                "账号「{}」当前不可用：{}",
+                candidate.target.account.name,
+                reason.as_str()
+            ),
+        ));
+    }
+
+    /// 真正发出请求前的倍率终检（§11.5、§13.1）。
+    fn recheck_multiplier(
+        &self,
+        candidate: &routing::Candidate,
+    ) -> Result<(), (ErrorCode, String)> {
+        let limit = self.forward.group.group.multiplier_limit;
+        let effective = self.forward.state.runtime.multipliers.view().effective(
+            &candidate.target.account,
+            limit,
+            crate::storage::now_unix(),
+        );
+        if !effective.status.is_usable() {
+            return Err((
+                ErrorCode::MultiplierUnknown,
+                format!(
+                    "账号「{}」的倍率已超过宽限期",
+                    candidate.target.account.name
+                ),
+            ));
+        }
+        if effective.value > limit {
+            return Err((
+                ErrorCode::MultiplierExceeded,
+                format!(
+                    "账号「{}」的有效倍率已超过分组上限",
+                    candidate.target.account.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn queue_full(&self) -> Response {
+        self.fail(
+            ErrorCode::QueueFull,
+            format!("分组「{}」的排队总容量已满", self.forward.group.group.name),
+        )
+    }
+
+    /// 生成网关错误响应并记录元数据。
+    fn fail(&self, code: ErrorCode, message: String) -> Response {
+        let error = GatewayError::new(code, message)
+            .with_protocol(self.forward.endpoint.protocol())
+            .with_request_id(self.forward.request_id);
+        let status = error.code.status();
+        self.finish(None, status, Some(code), None, error.into_response())
+    }
+
+    /// 统一出口：写一条请求元数据后返回响应。
+    fn finish(
+        &self,
+        candidate: Option<&routing::Candidate>,
+        status: StatusCode,
+        error_code: Option<ErrorCode>,
+        upstream_status: Option<StatusCode>,
+        response: Response,
+    ) -> Response {
+        let forward = self.forward;
+        let target = candidate.map(|c| &c.target);
+        forward.state.recorder.record(RequestRecord {
+            request_id: forward.request_id.to_string(),
+            started_at: forward.started_unix,
+            duration_ms: forward.started_at.elapsed().as_millis() as i64,
+            protocol: forward.endpoint.protocol(),
+            streaming: self.streaming,
+            group_id: Some(forward.group.group.id.clone()),
+            logical_model: Some(forward.logical_model.clone()),
+            target_id: target.map(|t| t.target.id.clone()),
+            account_id: target.map(|t| t.account.id.clone()),
+            upstream_model: target.map(|t| t.target.upstream_model.clone()),
+            request_bytes: forward.request_bytes as i64,
+            upstream_status: upstream_status.map(|s| s.as_u16() as i64),
+            http_status: status.as_u16() as i64,
+            error_code: error_code.map(|c| c.as_str().to_string()),
+            endpoint: self.telemetry.endpoint.map(|e| e.as_str().to_string()),
+            degraded: (!self.telemetry.degraded.is_empty())
+                .then(|| degrade::header_value(&self.telemetry.degraded)),
+            effective_multiplier: candidate.map(|c| c.multiplier).or(self.telemetry.effective),
+            cheapest_multiplier: self.telemetry.cheapest,
+            dearest_multiplier: self.telemetry.dearest,
+            attempts: self.telemetry.attempts,
+            queued_ms: self.telemetry.queued.as_millis() as i64,
+            sticky_hit: self.telemetry.sticky_hit,
+        });
+        response
+    }
+}
+
+/// 一次成功尝试的产物。
+struct Success {
+    status: StatusCode,
+    response: Response,
+    first_token: Option<Duration>,
+    output_tokens: Option<u64>,
+    usage_tokens: Option<u64>,
+}
+
+/// 将健康准入绑定到流式响应的完整生命周期。
+fn hold_stream_admission(response: Response, admission: health::Admission) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let mut body = body.into_data_stream();
+        while let Some(item) = body.next().await {
+            if item.is_err() {
+                admission.settle(health::Outcome::Fault, None);
+                yield item;
+                return;
+            }
+            yield item;
+        }
+        admission.settle(health::Outcome::Success, None);
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// 把网关错误码与上游状态码翻译成健康状态机的事件（§12.3）。
+fn classify_outcome(
+    code: ErrorCode,
+    upstream: Option<StatusCode>,
+    retry_after: Option<Duration>,
+) -> health::Outcome {
+    match upstream {
+        Some(StatusCode::UNAUTHORIZED) | Some(StatusCode::FORBIDDEN) => health::Outcome::KeyInvalid,
+        Some(StatusCode::PAYMENT_REQUIRED) => health::Outcome::QuotaExhausted { retry_after },
+        Some(StatusCode::TOO_MANY_REQUESTS) => health::Outcome::RateLimited { retry_after },
+        // 上游 408 / 504 是它自己承认的超时，按故障计；没有状态码的超时则是
+        // 我们等不下去了——"单纯变慢"只降评分，不熔断（§12.1）。
+        Some(_) => health::Outcome::Fault,
+        None => match code {
+            ErrorCode::UpstreamTimeout => health::Outcome::Neutral,
+            // 目标本身不可用（熔断、限流）不该再算一次故障：状态机刚刚才因为
+            // 它拒绝过这次请求，重复计数只会让冷却无谓地翻倍。
+            ErrorCode::RateLimited | ErrorCode::MultiplierExceeded => health::Outcome::Neutral,
+            _ => health::Outcome::Fault,
+        },
+    }
+}
+
+fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
+    match reason {
+        health::Unavailable::RateLimited | health::Unavailable::ConcurrencyFull => {
+            ErrorCode::RateLimited
+        }
+        _ => ErrorCode::UpstreamExhausted,
+    }
+}
+
+/// 向单个目标的一个端点发起一次尝试。
+async fn attempt(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    prepared: &Prepared,
+    streaming: bool,
+    timeout: Duration,
+) -> Result<Success, AttemptFailure> {
+    let account = &target.account;
+    if timeout.is_zero() {
+        return Err(AttemptFailure::switchable(
+            ErrorCode::UpstreamTimeout,
+            "请求已达到总超时".into(),
+        ));
+    }
+
+    let url = upstream::build_url(&account.base_url, prepared.endpoint).map_err(|error| {
+        AttemptFailure::switchable(
+            ErrorCode::InternalError,
+            format!("账号「{}」的 Base URL 无法构造端点：{error}", account.name),
+        )
+    })?;
+
+    // DNS Rebinding 防护：每次请求前复查解析结果（§23.3）。
+    crate::security::url_guard::assert_resolvable(&url, account.allow_private_network)
+        .await
+        .map_err(|error| {
+            AttemptFailure::switchable(
+                ErrorCode::InternalError,
+                format!("账号「{}」的目标地址被拒绝：{error}", account.name),
+            )
+        })?;
+
+    let api_key = load_api_key(forward.state, &account.id)
+        .await
+        .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?;
+    // 请求头按**上游端点**的协议构造，与下游用哪个协议进来无关（§14.7）。
+    let headers = upstream::build_headers(prepared.endpoint, &api_key, forward.downstream_headers)
+        .map_err(|error| {
+            AttemptFailure::switchable(
+                ErrorCode::InternalError,
+                format!("账号「{}」的请求头构造失败：{error}", account.name),
+            )
+        })?;
+
+    let payload = serde_json::to_vec(&prepared.body).map_err(|error| {
+        AttemptFailure::switchable(
+            ErrorCode::InternalError,
+            format!("序列化上游请求体失败：{error}"),
+        )
+    })?;
+
+    let response = forward
+        .state
+        .upstream
+        .http()
+        .post(url)
+        .headers(headers)
+        .body(payload)
+        .timeout(timeout)
+        .send()
+        .await;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            // 连接失败、TLS 失败与超时都属于廉价失败，允许换目标（§13.1）。
+            // 连不上是"坏"，连上了但慢是"慢"：前者计入熔断，后者只降评分
+            // （§12.1）。连接阶段的超时归入前者。
+            let code = if error.is_timeout() && !error.is_connect() {
+                ErrorCode::UpstreamTimeout
+            } else {
+                ErrorCode::UpstreamExhausted
+            };
+            return Err(AttemptFailure::switchable(
+                code,
+                format!(
+                    "账号「{}」的上游请求失败：{}",
+                    account.name,
+                    safe_reason(&error)
+                ),
+            ));
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        // 推测端点上的 404 / 405 证明这条路由不存在：换个端点，不算目标失败。
+        if endpoints::proves_missing_endpoint(account, prepared.endpoint, status.as_u16()) {
+            return Err(AttemptFailure::MissingEndpoint);
+        }
+        return classify_upstream_error(forward, target, prepared, response, status).await;
+    }
+    if streaming {
+        commit_stream(forward, target, prepared, response, status).await
+    } else {
+        commit_body(forward, target, prepared, response, status).await
+    }
+}
+
+/// 流式响应：在第一个**有语义**的事件之前仍可切换（§13.4）。
+///
+/// 同协议时字节原样转发，一次都不重新编码；跨协议时交给
+/// [`translate::commit_stream`]，判据从"上游的字节"换成"中间事件"。
+async fn commit_stream(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    prepared: &Prepared,
+    response: reqwest::Response,
+    status: StatusCode,
+) -> Result<Success, AttemptFailure> {
+    let downstream = forward.endpoint.protocol();
+    let upstream_protocol = prepared.endpoint.protocol();
+    let headers = response.headers().clone();
+
+    if upstream_protocol != downstream {
+        let include_usage = forward
+            .body
+            .get("stream_options")
+            .and_then(|options| options.get("include_usage"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(downstream != Protocol::OpenAiChat);
+        return match translate::commit_stream(
+            upstream_protocol,
+            downstream,
+            include_usage,
+            &target.account.name,
+            response,
+        )
+        .await
+        {
+            Ok(committed) => Ok(Success {
+                status,
+                response: build_response(forward, status, &headers, prepared, committed.body),
+                first_token: Some(committed.first_token),
+                output_tokens: None,
+                usage_tokens: None,
+            }),
+            Err(failure) => {
+                Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
+            }
+        };
+    }
+
+    // Responses 入口的流式响应：网关 ID 必须在第一个字节下发前就定下来，
+    // `response.created` 里的 id 就是客户端此后引用的地址（§15.1）。上游 ID
+    // 从已缓冲的前缀里取出来登记，之后的字节流里把它替换成网关 ID。
+    if downstream == Protocol::OpenAiResponses {
+        let started = Instant::now();
+        let mut response = response;
+        let mut sniffer = stream::Sniffer::new(downstream);
+        let mut upstream_id: Option<String> = None;
+        let gateway;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if upstream_id.is_none() {
+                        upstream_id = stream::first_response_id(&chunk);
+                    }
+                    match sniffer.push(&chunk) {
+                        stream::Verdict::Pending => continue,
+                        stream::Verdict::Semantic => {
+                            let prefix = sniffer.take_buffer();
+                            if upstream_id.is_none() {
+                                upstream_id = stream::first_response_id(&prefix);
+                            }
+                            gateway = responses::gateway_id();
+                            // 流式输出项逐帧出现，保存不了完整输出；正文以
+                            // 入口请求体为准记录（重建时以输入为骨架）。
+                            record_response_state(
+                                forward,
+                                target,
+                                prepared,
+                                &gateway,
+                                upstream_id
+                                    .as_deref()
+                                    .map(|id| serde_json::json!({"id": id}))
+                                    .as_ref()
+                                    .unwrap_or(&serde_json::Value::Null),
+                                upstream_protocol,
+                            )
+                            .await;
+                            let body =
+                                translate::passthrough_responses_stream(prefix, response, &gateway);
+                            return Ok(Success {
+                                status,
+                                response: build_response(forward, status, &headers, prepared, body),
+                                first_token: Some(started.elapsed()),
+                                output_tokens: None,
+                                usage_tokens: None,
+                            });
+                        }
+                        stream::Verdict::Error(message) => {
+                            return Err(AttemptFailure::switchable(
+                                ErrorCode::UpstreamProtocolError,
+                                format!("账号「{}」的流式响应报错：{message}", target.account.name),
+                            )
+                            .with_status(status));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err(AttemptFailure::switchable(
+                        ErrorCode::UpstreamProtocolError,
+                        format!(
+                            "账号「{}」的流式响应在产生内容前就结束",
+                            target.account.name
+                        ),
+                    )
+                    .with_status(status));
+                }
+                Err(error) => {
+                    return Err(AttemptFailure::switchable(
+                        if error.is_timeout() {
+                            ErrorCode::UpstreamTimeout
+                        } else {
+                            ErrorCode::UpstreamExhausted
+                        },
+                        format!(
+                            "账号「{}」的流式响应中断：{}",
+                            target.account.name,
+                            safe_reason(&error)
+                        ),
+                    )
+                    .with_status(status));
+                }
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let mut response = response;
+    let mut sniffer = stream::Sniffer::new(downstream);
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => match sniffer.push(&chunk) {
+                stream::Verdict::Pending => continue,
+                stream::Verdict::Semantic => {
+                    let prefix = sniffer.take_buffer();
+                    let body = translate::passthrough_stream(prefix, response, downstream);
+                    return Ok(Success {
+                        status,
+                        response: build_response(forward, status, &headers, prepared, body),
+                        first_token: Some(started.elapsed()),
+                        output_tokens: None,
+                        usage_tokens: None,
+                    });
+                }
+                // 语义内容出现前的明确错误事件：还没花钱，可以换号。
+                stream::Verdict::Error(message) => {
+                    return Err(AttemptFailure::switchable(
+                        ErrorCode::UpstreamProtocolError,
+                        format!("账号「{}」的流式响应报错：{message}", target.account.name),
+                    )
+                    .with_status(status));
+                }
+            },
+            Ok(None) => {
+                // 流在产生任何语义内容前就结束：这是损坏响应（§13.2）。
+                return Err(AttemptFailure::switchable(
+                    ErrorCode::UpstreamProtocolError,
+                    format!(
+                        "账号「{}」的流式响应在产生内容前就结束",
+                        target.account.name
+                    ),
+                )
+                .with_status(status));
+            }
+            Err(error) => {
+                return Err(AttemptFailure::switchable(
+                    if error.is_timeout() {
+                        ErrorCode::UpstreamTimeout
+                    } else {
+                        ErrorCode::UpstreamExhausted
+                    },
+                    format!(
+                        "账号「{}」的流式响应中断：{}",
+                        target.account.name,
+                        safe_reason(&error)
+                    ),
+                )
+                .with_status(status));
+            }
+        }
+    }
+}
+
+/// 非流式响应整体缓冲。
+///
+/// 非流式响应本来就是一个 JSON 对象，逐块转发没有意义；整体读回来反而能识别
+/// "违反所选协议的损坏响应"（§13.2），并取出 `usage` 用于 TPM 归还与输出速度
+/// 统计。跨协议时在这里把响应体翻译回下游协议。
+async fn commit_body(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    prepared: &Prepared,
+    response: reqwest::Response,
+    status: StatusCode,
+) -> Result<Success, AttemptFailure> {
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.map_err(|error| {
+        AttemptFailure::switchable(
+            ErrorCode::UpstreamExhausted,
+            format!(
+                "账号「{}」的响应读取失败：{}",
+                target.account.name,
+                safe_reason(&error)
+            ),
+        )
+        .with_status(status)
+    })?;
+
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        AttemptFailure::switchable(
+            ErrorCode::UpstreamProtocolError,
+            format!("账号「{}」返回了无法解析的响应体", target.account.name),
+        )
+        .with_status(status)
+    })?;
+
+    let downstream = forward.endpoint.protocol();
+    let upstream_protocol = prepared.endpoint.protocol();
+    let body = if upstream_protocol == downstream {
+        // Responses 入口：把上游的响应 ID 换成网关 ID，客户端从此只见到
+        // `resp_akh_*`（§15.1）。其余协议的 ID 没有续链语义，原样透传。
+        if downstream == Protocol::OpenAiResponses {
+            let mut value = parsed.clone();
+            let gateway = responses::gateway_id();
+            record_response_state(
+                forward,
+                target,
+                prepared,
+                &gateway,
+                &value,
+                upstream_protocol,
+            )
+            .await;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("id".into(), serde_json::json!(gateway));
+            }
+            Body::from(value.to_string())
+        } else {
+            Body::from(bytes)
+        }
+    } else {
+        // 转换失败说明上游的响应不符合它自己声明的协议：损坏响应（§13.2）。
+        let converted = crate::protocol::convert_response(upstream_protocol, downstream, &parsed)
+            .map_err(|reason| {
+            AttemptFailure::switchable(
+                ErrorCode::UpstreamProtocolError,
+                format!(
+                    "账号「{}」的响应无法转换回下游协议：{reason}",
+                    target.account.name
+                ),
+            )
+            .with_status(status)
+        })?;
+        if downstream == Protocol::OpenAiResponses {
+            let mut value = converted;
+            let gateway = responses::gateway_id();
+            record_response_state(
+                forward,
+                target,
+                prepared,
+                &gateway,
+                &parsed,
+                upstream_protocol,
+            )
+            .await;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("id".into(), serde_json::json!(gateway));
+            }
+            Body::from(value.to_string())
+        } else {
+            Body::from(converted.to_string())
+        }
+    };
+
+    Ok(Success {
+        status,
+        response: build_response(forward, status, &headers, prepared, body),
+        first_token: None,
+        output_tokens: stream::output_tokens(&parsed),
+        usage_tokens: stream::usage_tokens(&parsed),
+    })
+}
+
+/// 保存一次 Responses 响应的状态链记录（§15.2）。
+///
+/// `upstream_body` 是上游的原始响应：定位映射取它的 ID，可重放正文取入口
+/// 请求体加输出项。**在返回响应之前同步落库**：客户端拿到响应 ID 后可能
+/// 立刻引用它，晚一步写入就会出现竞态。写失败只记日志——状态链是增强
+/// 能力，不能让它影响主流程。
+async fn record_response_state(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    prepared: &Prepared,
+    gateway_id: &str,
+    upstream_body: &serde_json::Value,
+    upstream_protocol: Protocol,
+) {
+    // 只有上游本身是 Responses 时才有可续链的上游 ID；跨协议转来的响应
+    // 没有原生 Responses ID，续链只能靠保存的正文。
+    let upstream_id = (upstream_protocol == Protocol::OpenAiResponses)
+        .then(|| {
+            upstream_body
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
+    let output_items = responses::output_items_of(upstream_body);
+    // 保存正文用入口请求体的形状：跨协议进入时按入口协议解析重建。
+    let entry_body = forward.body.clone();
+    let entry_protocol = forward.endpoint.protocol();
+    let state = forward.state.clone();
+    let chain = forward.chain.clone();
+    let gateway = gateway_id.to_string();
+    let account_id = target.account.id.clone();
+    let target_id = target.target.id.clone();
+    let endpoint = prepared.endpoint.as_str().to_string();
+    responses::record_state(
+        &state,
+        &chain,
+        responses::PendingState {
+            gateway_id: gateway,
+            upstream_id,
+            account_id: Some(account_id),
+            target_id: Some(target_id),
+            endpoint: Some(endpoint),
+        },
+        &entry_body,
+        entry_protocol,
+        output_items.as_ref(),
+        state.settings.response_state_days,
+    )
+    .await;
+}
+
+/// 把上游的非 2xx 响应分成"可切换"与"必须直接返回下游"两类。
+async fn classify_upstream_error(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    prepared: &Prepared,
+    response: reqwest::Response,
+    status: StatusCode,
+) -> Result<Success, AttemptFailure> {
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    if is_switchable_status(status) {
+        let code = match status {
+            StatusCode::TOO_MANY_REQUESTS => ErrorCode::RateLimited,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => ErrorCode::UpstreamTimeout,
+            _ => ErrorCode::UpstreamExhausted,
+        };
+        return Err(AttemptFailure::Switchable {
+            code,
+            message: format!(
+                "账号「{}」返回 {}{}",
+                target.account.name,
+                status.as_u16(),
+                retry_after
+                    .map(|s| format!("，建议 {s} 秒后重试"))
+                    .unwrap_or_default()
+            ),
+            upstream_status: Some(status),
+            retry_after: retry_after.map(Duration::from_secs),
+        });
+    }
+
+    // 400、413、422 这类错误换个目标结果一样，直接把上游的判断转达给客户端
+    // （§13.3）。同协议时原样透传上游的错误体，它本身是有用的诊断信息；跨
+    // 协议时上游的错误体是另一套形状，改用网关自己的错误对象，客户端的 SDK
+    // 才解析得了（§18.2）。
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.unwrap_or_default();
+    learn_capability_limitation(forward, target, status, &bytes);
+    if prepared.endpoint.protocol() == forward.endpoint.protocol() {
+        return Err(AttemptFailure::Terminal(Box::new(build_response(
+            forward,
+            status,
+            &headers,
+            prepared,
+            Body::from(bytes),
+        ))));
+    }
+
+    let message =
+        upstream_error_message(&bytes).unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
+    let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, message)
+        .with_protocol(forward.endpoint.protocol())
+        .with_request_id(forward.request_id);
+    if let Some(seconds) = retry_after {
+        error = error.with_retry_after(seconds);
+    }
+    let mut response = error.into_response();
+    *response.status_mut() = status;
+    Err(AttemptFailure::Terminal(Box::new(response)))
+}
+
+/// 从上游错误体里取出可以安全转达的文本。绝不返回完整 URL、Key 或堆栈。
+pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let message = parsed
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .or_else(|| parsed.get("message"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(
+        crate::security::redact::text(message)
+            .chars()
+            .take(400)
+            .collect(),
+    )
+}
+
+/// 能力学习（§16.7）：上游明确拒绝某能力时记入限制缓存。
+///
+/// 只认 `error_proves_unsupported` 判定过的错误形状；普通 400、5xx、超时和
+/// 网络错误绝不进入缓存。同一能力的第二次请求会因此改选其它目标，而不是
+/// 再撞一次同一堵墙。
+fn learn_capability_limitation(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    status: StatusCode,
+    bytes: &[u8],
+) {
+    let parsed: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let Some(capability) = capability::unsupported_from_error(status.as_u16(), &parsed) else {
+        return;
+    };
+    forward.state.runtime.capabilities.note_unsupported(
+        &target.account.id,
+        &target.target.upstream_model,
+        capability,
+        Instant::now(),
+    );
+    tracing::info!(
+        account = target.account.name,
+        model = target.target.upstream_model,
+        capability,
+        "上游明确拒绝该能力，24 小时内调度避开这个组合"
+    );
+}
+
+/// 该上游状态码是否意味着"换个目标可能就成了"（§13.2）。
+fn is_switchable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::PAYMENT_REQUIRED
+    ) || status.is_server_error()
+}
+
+fn build_response(
+    forward: &Forward<'_>,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    prepared: &Prepared,
+    body: Body,
+) -> Response {
+    let mut builder = Response::builder().status(status);
+    copy_response_headers(headers, &mut builder);
+    // 发生降级时显式标记，绝不修改响应体去掩盖它（§14.7、§14.8）。
+    if !prepared.degraded.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&degrade::header_value(&prepared.degraded))
+    {
+        builder
+            .headers_mut()
+            .map(|headers| headers.insert("x-akhub-degraded", value));
+    }
+    builder
+        .header("x-akhub-request-id", forward.request_id)
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+fn copy_response_headers(
+    from: &reqwest::header::HeaderMap,
+    to: &mut axum::http::response::Builder,
+) {
+    for name in FORWARDED_RESPONSE_HEADERS {
+        if let Some(value) = from.get(*name)
+            && let (Ok(name), Ok(value)) = (
+                HeaderName::try_from(*name),
+                HeaderValue::from_bytes(value.as_bytes()),
+            )
+        {
+            to.headers_mut().map(|headers| headers.insert(name, value));
+        }
+    }
+}
+
+/// 把请求体中的逻辑模型名替换为该目标的真实上游模型名。
+///
+/// 只改这一个字段，其余字节保持原样——下游看到的永远是逻辑模型名，上游
+/// 看到的永远是它自己的模型名（§2.1）。
+fn rewrite_model(body: &mut serde_json::Value, upstream_model: &str) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".into(),
+            serde_json::Value::String(upstream_model.to_string()),
+        );
+    }
+}
+
+/// 没有 tokenizer 时的保守 Token 估算（§17.2）。
+fn estimate_tokens(request_bytes: usize, body: &serde_json::Value) -> u64 {
+    let input = (request_bytes / BYTES_PER_TOKEN) as u64;
+    let output = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    input.saturating_add(output)
+}
+
+/// 解密账号凭据。错误信息里不能出现任何密钥材料。
+async fn load_api_key(state: &SharedState, account_id: &str) -> Result<String, String> {
+    let sealed = state
+        .store
+        .account_sealed_key(account_id)
+        .await
+        .map_err(|error| format!("读取账号凭据失败：{error}"))?
+        .ok_or_else(|| "账号缺少凭据记录".to_string())?;
+    let plaintext = state
+        .cipher
+        .open(&sealed)
+        .map_err(|error| format!("解密账号凭据失败：{error}"))?;
+    String::from_utf8(plaintext.to_vec()).map_err(|_| "账号凭据不是合法的 UTF-8 文本".to_string())
+}
+
+/// 从 reqwest 错误中提取安全描述，绝不包含完整 URL 或凭据。
+fn safe_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "上游超时"
+    } else if error.is_connect() {
+        "连接建立失败"
+    } else if error.is_body() || error.is_decode() {
+        "响应无法解析"
+    } else {
+        "网络错误"
+    }
+}
+
+/// 从请求体中取出下游声明的逻辑模型名。
+pub fn extract_model(body: &serde_json::Value, protocol: Protocol) -> Result<String, GatewayError> {
+    body.get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GatewayError::new(ErrorCode::UnsupportedParameter, "请求体缺少 model 字段")
+                .with_protocol(protocol)
+        })
+}
+
+/// 读取并解析请求体，同时施加大小上限（§17.3）。
+pub async fn read_body(
+    body: Body,
+    max_bytes: usize,
+    protocol: Protocol,
+) -> Result<(serde_json::Value, usize), GatewayError> {
+    let bytes: Bytes = axum::body::to_bytes(body, max_bytes).await.map_err(|_| {
+        GatewayError::new(
+            ErrorCode::RequestTooLarge,
+            format!("请求体超过上限 {max_bytes} 字节，或读取中断"),
+        )
+        .with_protocol(protocol)
+    })?;
+    let size = bytes.len();
+    let value = serde_json::from_slice(&bytes).map_err(|error| {
+        // 下游 JSON 非法不切换目标，直接快速失败（§13.3）。
+        GatewayError::new(
+            ErrorCode::UnsupportedParameter,
+            format!("请求体不是合法 JSON：{error}"),
+        )
+        .with_protocol(protocol)
+    })?;
+    Ok((value, size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_rewrite_touches_only_the_model_field() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "厂商扩展": {"保留": true}
+        });
+        let mut rewritten = body.clone();
+        rewrite_model(&mut rewritten, "claude-sonnet-4-5-20250929");
+
+        assert_eq!(rewritten["model"], "claude-sonnet-4-5-20250929");
+        assert_eq!(rewritten["stream"], true);
+        assert_eq!(rewritten["messages"], body["messages"]);
+        assert_eq!(rewritten["厂商扩展"]["保留"], true, "未知字段必须原样保留");
+    }
+
+    #[test]
+    fn switchable_statuses_match_the_failover_rules() {
+        // §13.2 可以切换
+        for code in [401, 402, 403, 404, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                is_switchable_status(StatusCode::from_u16(code).unwrap()),
+                "{code} 应当允许切换"
+            );
+        }
+        // §13.3 不切换：这些是下游请求本身的问题
+        for code in [400, 413, 422] {
+            assert!(
+                !is_switchable_status(StatusCode::from_u16(code).unwrap()),
+                "{code} 不应当切换"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_statuses_map_onto_the_health_state_machine() {
+        // 401/403 是"Key 坏了"，影响整个账号；429 只影响账号 + 模型（§12.1）。
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::UpstreamExhausted,
+                Some(StatusCode::UNAUTHORIZED),
+                None
+            ),
+            health::Outcome::KeyInvalid
+        ));
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::RateLimited,
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                None
+            ),
+            health::Outcome::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::UpstreamExhausted,
+                Some(StatusCode::INTERNAL_SERVER_ERROR),
+                None
+            ),
+            health::Outcome::Fault
+        ));
+        // 没能发出去的请求不该算目标的故障。
+        assert!(matches!(
+            classify_outcome(ErrorCode::RateLimited, None, None),
+            health::Outcome::Neutral
+        ));
+        // 慢到我们等不下去只是"慢"，不是"坏"（§12.1）；上游自己报 504 才是坏。
+        assert!(matches!(
+            classify_outcome(ErrorCode::UpstreamTimeout, None, None),
+            health::Outcome::Neutral
+        ));
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::UpstreamTimeout,
+                Some(StatusCode::GATEWAY_TIMEOUT),
+                None
+            ),
+            health::Outcome::Fault
+        ));
+    }
+
+    #[test]
+    fn token_estimates_stay_on_the_conservative_side() {
+        // 宁可高估把自己挡在限流外，也不要低估越过上游的 TPM。
+        let body = json!({"max_tokens": 4096});
+        let estimate = estimate_tokens(30_000, &body);
+        assert_eq!(estimate, 10_000 + 4096);
+        // 没声明最大输出时只算输入。
+        assert_eq!(estimate_tokens(3_000, &json!({})), 1_000);
+    }
+
+    #[test]
+    fn model_extraction_rejects_missing_and_blank_names() {
+        let body = json!({"model": "glm-4.6"});
+        assert_eq!(
+            extract_model(&body, Protocol::OpenAiChat).unwrap(),
+            "glm-4.6"
+        );
+
+        for body in [
+            json!({}),
+            json!({"model": ""}),
+            json!({"model": "  "}),
+            json!({"model": 7}),
+        ] {
+            let error = extract_model(&body, Protocol::OpenAiChat).unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedParameter);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_rejected_with_413() {
+        let body = Body::from(vec![b'x'; 4096]);
+        let error = read_body(body, 1024, Protocol::OpenAiChat)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestTooLarge);
+        assert_eq!(error.code.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_fails_fast_without_failover() {
+        let error = read_body(Body::from("{不是 JSON"), 1024, Protocol::AnthropicMessages)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedParameter);
+        assert!(!error.code.is_retryable(), "下游请求本身非法，重试没有意义");
+    }
+
+    #[tokio::test]
+    async fn body_size_is_reported_for_the_stickiness_budget() {
+        let payload = json!({"model": "glm-4.6"});
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let expected = raw.len();
+        let (value, size) = read_body(Body::from(raw), 1024, Protocol::OpenAiChat)
+            .await
+            .unwrap();
+        assert_eq!(size, expected);
+        assert_eq!(value["model"], "glm-4.6");
+    }
+}

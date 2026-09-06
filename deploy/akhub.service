@@ -1,0 +1,37 @@
+# Linux 原生部署示例（§25.2）。
+# 安装：
+#   sudo install -m755 akhub /usr/local/bin/akhub
+#   sudo useradd --system --home-dir /var/lib/akhub --create-home akhub
+#   sudo install -m644 deploy/akhub.service /etc/systemd/system/akhub.service
+#   sudo systemctl enable --now akhub
+
+[Unit]
+Description=Akhub AI 协议网关
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=akhub
+Group=akhub
+Environment=AKHUB_DATA_DIR=/var/lib/akhub
+Environment=AKHUB_LISTEN=127.0.0.1:8080
+Environment=RUST_LOG=akhub=info,warn
+ExecStart=/usr/local/bin/akhub
+Restart=always
+RestartSec=2
+
+# 优雅关闭：给在途的长流式请求留出完成时间，必须大于 AKHUB_SHUTDOWN_GRACE_SECS。
+KillSignal=SIGTERM
+TimeoutStopSec=200
+
+# 加固：只允许写入自己的数据目录。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=akhub
+ReadWritePaths=/var/lib/akhub
+
+[Install]
+WantedBy=multi-user.target

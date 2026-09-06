@@ -1,0 +1,12 @@
+/target
+/web/dist/
+/web/tsconfig.tsbuildinfo
+/.playwright-mcp/
+
+# 运行时数据目录：SQLite、主密钥与临时文件
+/data/
+
+# Playwright MCP 的临时快照
+/.playwright-mcp/
+web/node_modules/
+web/dist/

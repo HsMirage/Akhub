@@ -1,0 +1,44 @@
+[package]
+name = "akhub"
+version = "1.0.0"
+edition = "2024"
+license-file = "LICENSE"
+description = "AI 协议网关与组内负载均衡工具：同协议透传、跨协议互转、严格优先级调度"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+arc-swap = "1.9.2"
+argon2 = "0.6.0"
+async-stream = "0.3.6"
+axum = { version = "0.8.9", features = ["macros", "http2"] }
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+futures = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+hmac = "0.13.0"
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["charset", "http2", "json", "rustls", "stream"] }
+rust-embed = { version = "8.12.0", features = ["interpolate-folder-path"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["json", "macros", "migrate", "runtime-tokio", "sqlite", "time"] }
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["fs", "trace", "limit", "cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ulid = "3.0.0"
+zeroize = "1.9.0"
+
+[dev-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "cookies", "charset"] }
+tempfile = "3.27.0"
+# 冷却、宽限期与限流窗口都以分钟计，测试必须能直接推进时钟而不是真的睡过去。
+tokio = { version = "1.53.1", features = ["test-util"] }

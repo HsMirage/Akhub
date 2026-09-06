@@ -1,0 +1,190 @@
+/*
+ * Akhub 设计系统
+ *
+ * 取向：开发者控制台。深色优先、高对比、1px 细边框、克制的强调色，
+ * 技术性数据（ID、Key、模型名）一律用等宽字体承载。所有颜色都走变量，
+ * 亮色主题只覆盖变量值，不复写任何组件规则。
+ */
+
+:root {
+  /* 间距与圆角：4px 基准，保证纵向节奏一致 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-full: 999px;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --transition: 140ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  --sidebar-width: 236px;
+  --content-max: 1240px;
+}
+
+/* 深色：默认主题 */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #08080a;
+  --bg-elevated: #0e0e11;
+  --surface: #131317;
+  --surface-hover: #191920;
+  --surface-active: #1f1f27;
+
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+  --border-focus: rgba(124, 108, 255, 0.55);
+
+  --text: #ececf2;
+  --text-dim: #9d9dab;
+  --text-faint: #64646f;
+
+  --accent: #7c6cff;
+  --accent-hover: #8f81ff;
+  --accent-soft: rgba(124, 108, 255, 0.14);
+  --accent-contrast: #ffffff;
+
+  --success: #3ddc97;
+  --success-soft: rgba(61, 220, 151, 0.13);
+  --warn: #f5c451;
+  --warn-soft: rgba(245, 196, 81, 0.13);
+  --danger: #ff6b6b;
+  --danger-soft: rgba(255, 107, 107, 0.13);
+  --info: #58a6ff;
+  --info-soft: rgba(88, 166, 255, 0.13);
+
+  --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.65);
+}
+
+/* 亮色：只覆盖变量 */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f7f7f9;
+  --bg-elevated: #ffffff;
+  --surface: #ffffff;
+  --surface-hover: #f4f4f7;
+  --surface-active: #ebebf0;
+
+  --border: rgba(0, 0, 0, 0.09);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --border-focus: rgba(93, 76, 240, 0.5);
+
+  --text: #17171c;
+  --text-dim: #5f5f6d;
+  --text-faint: #8e8e9c;
+
+  --accent: #5d4cf0;
+  --accent-hover: #4d3ce0;
+  --accent-soft: rgba(93, 76, 240, 0.1);
+  --accent-contrast: #ffffff;
+
+  --success: #0f9d63;
+  --success-soft: rgba(15, 157, 99, 0.11);
+  --warn: #b7791f;
+  --warn-soft: rgba(183, 121, 31, 0.11);
+  --danger: #d93b3b;
+  --danger-soft: rgba(217, 59, 59, 0.1);
+  --info: #1f6feb;
+  --info-soft: rgba(31, 111, 235, 0.1);
+
+  --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 24px 56px rgba(0, 0, 0, 0.14);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 数字一律等宽，避免表格里的数值跳动 */
+table,
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 620;
+  letter-spacing: -0.018em;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* 滚动条：细、无按钮、悬停才显眼 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--radius-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
