@@ -119,6 +119,19 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
                     )}
                   </td>
                 </tr>
+                <tr>
+                  <td className="text-faint">源码仓库</td>
+                  <td>
+                    <a
+                      className="external-link"
+                      href="https://github.com/HsMirage/Akhub"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      github.com/HsMirage/Akhub ↗
+                    </a>
+                  </td>
+                </tr>
               </tbody>
             </table>
           </div>

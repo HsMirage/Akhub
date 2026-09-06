@@ -111,6 +111,43 @@
   gap: var(--space-1);
 }
 
+.repo-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: 12px;
+  text-decoration: none;
+  transition: background var(--transition), color var(--transition);
+}
+
+.repo-link:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.repo-link-mark {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.external-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.external-link:hover {
+  text-decoration: underline;
+}
+
 .main {
   display: flex;
   flex-direction: column;

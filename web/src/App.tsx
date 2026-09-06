@@ -159,6 +159,15 @@ function Console({
         </nav>
 
         <div className="sidebar-footer">
+          <a
+            className="repo-link"
+            href="https://github.com/HsMirage/Akhub"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span className="repo-link-mark" aria-hidden="true">↗</span>
+            GitHub 仓库
+          </a>
           <button className="nav-item" onClick={toggle}>
             {mode === "dark" ? <IconSun /> : <IconMoon />}
             {mode === "dark" ? "浅色主题" : "深色主题"}
