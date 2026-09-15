@@ -950,18 +950,27 @@ struct OpenItem {
 }
 
 impl StreamEmitter {
-    pub fn new() -> Self {
-        Self::default()
+    /// `preset_id` 是网关自己的 `resp_akh_*` ID：跨协议进入 Responses 时，
+    /// 客户端从第一个事件起引用的必须是网关 ID，而不是临时生成的上游形状 ID。
+    pub fn new(preset_id: Option<String>) -> Self {
+        Self {
+            id: preset_id.unwrap_or_default(),
+            ..Self::default()
+        }
     }
 
     pub fn push(&mut self, event: &Event) -> Vec<(String, Value)> {
         match event {
             Event::Start { id, model } => {
-                self.id = if id.is_empty() {
-                    format!("resp_{}", ulid::Ulid::generate())
-                } else {
-                    id.clone()
-                };
+                // 预设的网关 ID 永远优先：上游 Chat/Messages 的 id 绝不能
+                // 泄漏给 Responses 客户端。
+                if self.id.is_empty() {
+                    self.id = if id.is_empty() {
+                        format!("resp_{}", ulid::Ulid::generate())
+                    } else {
+                        id.clone()
+                    };
+                }
                 self.model = model.clone();
                 vec![
                     self.frame(
@@ -1305,7 +1314,7 @@ mod tests {
             }]
         );
 
-        let mut emitter = StreamEmitter::new();
+        let mut emitter = StreamEmitter::new(None);
         emitter.push(&Event::Start {
             id: "resp_1".into(),
             model: "m".into(),
@@ -1335,7 +1344,7 @@ mod tests {
 
     #[test]
     fn sequence_numbers_are_monotonic() {
-        let mut emitter = StreamEmitter::new();
+        let mut emitter = StreamEmitter::new(None);
         let mut frames = emitter.push(&Event::Start {
             id: "r".into(),
             model: "m".into(),

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
@@ -21,7 +21,7 @@ use crate::capability;
 use crate::config::{GroupView, TargetView};
 use crate::domain::{Multiplier, Protocol};
 use crate::gateway::error::{ErrorCode, GatewayError};
-use crate::gateway::{responses, stream, translate};
+use crate::gateway::{responses, settle, stream, translate};
 use crate::health;
 use crate::multiplier;
 use crate::protocol::degrade;
@@ -550,24 +550,6 @@ impl Walk<'_> {
         };
         match result {
             Ok(success) => {
-                let response = if self.streaming {
-                    // 流式响应在首个语义块后仍会占用上游连接；把准入凭据
-                    // 绑定到 Body，避免释放并发名额后继续超出上限。
-                    hold_stream_admission(success.response, admission)
-                } else {
-                    admission.settle(health::Outcome::Success, success.usage_tokens);
-                    success.response
-                };
-                self.forward.state.runtime.perf.observe(
-                    &candidate.target.target.id,
-                    dimension,
-                    &score::Sample {
-                        success: true,
-                        first_token: success.first_token,
-                        total: started.elapsed(),
-                        output_tokens: success.output_tokens,
-                    },
-                );
                 if let Some((key, _)) = sticky_key {
                     self.forward.state.runtime.sticky.bind(
                         key.clone(),
@@ -577,13 +559,67 @@ impl Walk<'_> {
                         self.now_unix,
                     );
                 }
-                Flow::Done(self.finish(
-                    Some(candidate),
-                    success.status,
-                    None,
-                    Some(success.status),
-                    response,
-                ))
+                if self.streaming {
+                    // 流式：TPM 回补、性能 EWMA、熔断结果、请求记录与 Responses
+                    // 状态链全都等流真正结束再结算（§26.3）。提交时记的那份
+                    // 只是"首字延迟"，用它冒充总耗时会系统性高估吞吐。
+                    let record = self.record_for(
+                        Some(candidate),
+                        success.status,
+                        None,
+                        Some(success.status),
+                    );
+                    let responses = success
+                        .stream_state
+                        .map(|seed| settle::ResponsesCompletion {
+                            state: self.forward.state.clone(),
+                            chain: self.forward.chain.clone(),
+                            pending: responses::PendingState {
+                                gateway_id: seed.gateway_id,
+                                upstream_id: seed.upstream_id,
+                                account_id: Some(candidate.target.account.id.clone()),
+                                target_id: Some(candidate.target.target.id.clone()),
+                                endpoint: Some(seed.endpoint),
+                            },
+                            entry_body: self.forward.body.clone(),
+                            entry_protocol: self.forward.endpoint.protocol(),
+                            retention_days: self.forward.state.settings.response_state_days,
+                        });
+                    Flow::Done(settle::settle_stream(
+                        success.response,
+                        settle::StreamSettlement {
+                            state: self.forward.state.clone(),
+                            protocol: self.forward.endpoint.protocol(),
+                            target_id: candidate.target.target.id.clone(),
+                            dimension,
+                            started,
+                            request_started: self.forward.started_at,
+                            first_token: success.first_token.unwrap_or_default(),
+                            record,
+                            admission: Some(admission),
+                            responses,
+                        },
+                    ))
+                } else {
+                    admission.settle(health::Outcome::Success, success.usage_tokens);
+                    self.forward.state.runtime.perf.observe(
+                        &candidate.target.target.id,
+                        dimension,
+                        &score::Sample {
+                            success: true,
+                            first_token: success.first_token,
+                            total: started.elapsed(),
+                            output_tokens: success.output_tokens,
+                        },
+                    );
+                    Flow::Done(self.finish(
+                        Some(candidate),
+                        success.status,
+                        None,
+                        Some(success.status),
+                        success.response,
+                    ))
+                }
             }
             Err(AttemptFailure::Terminal(response)) => {
                 admission.settle(health::Outcome::Neutral, None);
@@ -672,6 +708,24 @@ impl Walk<'_> {
                         endpoint = prepared.endpoint.as_str(),
                         "上游没有这个端点，改走转换后的端点"
                     );
+                    // 辅助端点（count_tokens / compact / input_tokens）没有
+                    // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
+                    // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
+                    if self.forward.endpoint.is_native_only() {
+                        return Err(AttemptFailure::Terminal(Box::new(
+                            GatewayError::new(
+                                ErrorCode::UnsupportedParameter,
+                                format!(
+                                    "账号「{}」没有 /{} 端点",
+                                    candidate.target.account.name,
+                                    self.forward.endpoint.path()
+                                ),
+                            )
+                            .with_protocol(self.forward.endpoint.protocol())
+                            .with_request_id(self.forward.request_id)
+                            .into_response(),
+                        )));
+                    }
                     // 证据变了，端点顺序要重排：刚证实缺失的那个会被排除掉。
                     plan = self.endpoint_plan(candidate).unwrap_or_default();
                 }
@@ -904,9 +958,27 @@ impl Walk<'_> {
         upstream_status: Option<StatusCode>,
         response: Response,
     ) -> Response {
+        self.forward.state.recorder.record(self.record_for(
+            candidate,
+            status,
+            error_code,
+            upstream_status,
+        ));
+        response
+    }
+
+    /// 组装一条请求记录。流式请求由 [`settle::StreamSettlement`] 在流结束后
+    /// 调用同一个构造函数，再补上真实耗时与流内错误码。
+    fn record_for(
+        &self,
+        candidate: Option<&routing::Candidate>,
+        status: StatusCode,
+        error_code: Option<ErrorCode>,
+        upstream_status: Option<StatusCode>,
+    ) -> RequestRecord {
         let forward = self.forward;
         let target = candidate.map(|c| &c.target);
-        forward.state.recorder.record(RequestRecord {
+        RequestRecord {
             request_id: forward.request_id.to_string(),
             started_at: forward.started_unix,
             duration_ms: forward.started_at.elapsed().as_millis() as i64,
@@ -930,8 +1002,7 @@ impl Walk<'_> {
             attempts: self.telemetry.attempts,
             queued_ms: self.telemetry.queued.as_millis() as i64,
             sticky_hit: self.telemetry.sticky_hit,
-        });
-        response
+        }
     }
 }
 
@@ -942,26 +1013,18 @@ struct Success {
     first_token: Option<Duration>,
     output_tokens: Option<u64>,
     usage_tokens: Option<u64>,
+    /// 流式 Responses：提交时先落骨架状态，流结束后据此补写完整历史。
+    stream_state: Option<StreamStateSeed>,
+}
+
+/// 流式 Responses 在提交时留下的状态种子。
+struct StreamStateSeed {
+    gateway_id: String,
+    upstream_id: Option<String>,
+    endpoint: String,
 }
 
 /// 将健康准入绑定到流式响应的完整生命周期。
-fn hold_stream_admission(response: Response, admission: health::Admission) -> Response {
-    let (parts, body) = response.into_parts();
-    let stream = async_stream::stream! {
-        let mut body = body.into_data_stream();
-        while let Some(item) = body.next().await {
-            if item.is_err() {
-                admission.settle(health::Outcome::Fault, None);
-                yield item;
-                return;
-            }
-            yield item;
-        }
-        admission.settle(health::Outcome::Success, None);
-    };
-    Response::from_parts(parts, Body::from_stream(stream))
-}
-
 /// 把网关错误码与上游状态码翻译成健康状态机的事件（§12.3）。
 fn classify_outcome(
     code: ErrorCode,
@@ -1049,7 +1112,7 @@ async fn attempt(
     let response = forward
         .state
         .upstream
-        .http()
+        .http_for(account.allow_private_network)
         .post(url)
         .headers(headers)
         .body(payload)
@@ -1116,12 +1179,36 @@ async fn commit_stream(
             .and_then(|options| options.get("include_usage"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(downstream != Protocol::OpenAiChat);
+        // 跨协议进入 Responses 时，客户端引用的 ID 同样必须是网关 ID：
+        // 上游是 Chat/Messages，根本没有可复用的 Responses ID（§15.1）。
+        let stream_state = if downstream == Protocol::OpenAiResponses {
+            let gateway = responses::gateway_id();
+            record_response_state(
+                forward,
+                target,
+                prepared,
+                &gateway,
+                &serde_json::Value::Null,
+                None,
+                upstream_protocol,
+            )
+            .await;
+            Some(StreamStateSeed {
+                gateway_id: gateway,
+                upstream_id: None,
+                endpoint: prepared.endpoint.as_str().to_string(),
+            })
+        } else {
+            None
+        };
+        let responses_id = stream_state.as_ref().map(|seed| seed.gateway_id.clone());
         return match translate::commit_stream(
             upstream_protocol,
             downstream,
             include_usage,
             &target.account.name,
             response,
+            responses_id,
         )
         .await
         {
@@ -1131,6 +1218,7 @@ async fn commit_stream(
                 first_token: Some(committed.first_token),
                 output_tokens: None,
                 usage_tokens: None,
+                stream_state,
             }),
             Err(failure) => {
                 Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
@@ -1173,6 +1261,7 @@ async fn commit_stream(
                                     .map(|id| serde_json::json!({"id": id}))
                                     .as_ref()
                                     .unwrap_or(&serde_json::Value::Null),
+                                None,
                                 upstream_protocol,
                             )
                             .await;
@@ -1184,6 +1273,11 @@ async fn commit_stream(
                                 first_token: Some(started.elapsed()),
                                 output_tokens: None,
                                 usage_tokens: None,
+                                stream_state: Some(StreamStateSeed {
+                                    gateway_id: gateway.clone(),
+                                    upstream_id: upstream_id.clone(),
+                                    endpoint: prepared.endpoint.as_str().to_string(),
+                                }),
                             });
                         }
                         stream::Verdict::Error(message) => {
@@ -1241,6 +1335,7 @@ async fn commit_stream(
                         first_token: Some(started.elapsed()),
                         output_tokens: None,
                         usage_tokens: None,
+                        stream_state: None,
                     });
                 }
                 // 语义内容出现前的明确错误事件：还没花钱，可以换号。
@@ -1295,17 +1390,15 @@ async fn commit_body(
     status: StatusCode,
 ) -> Result<Success, AttemptFailure> {
     let headers = response.headers().clone();
-    let bytes = response.bytes().await.map_err(|error| {
-        AttemptFailure::switchable(
-            ErrorCode::UpstreamExhausted,
-            format!(
-                "账号「{}」的响应读取失败：{}",
-                target.account.name,
-                safe_reason(&error)
-            ),
-        )
-        .with_status(status)
-    })?;
+    let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .map_err(|reason| {
+            AttemptFailure::switchable(
+                ErrorCode::UpstreamExhausted,
+                format!("账号「{}」的响应读取失败：{reason}", target.account.name),
+            )
+            .with_status(status)
+        })?;
 
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
         AttemptFailure::switchable(
@@ -1323,18 +1416,21 @@ async fn commit_body(
         if downstream == Protocol::OpenAiResponses {
             let mut value = parsed.clone();
             let gateway = responses::gateway_id();
+            // 先换成网关 ID 再落库：密封正文里不出现上游 ID，查询接口也能
+            // 直接把这份真实响应对象回放给客户端（§15.1）。
+            if let Some(object) = value.as_object_mut() {
+                object.insert("id".into(), serde_json::json!(gateway));
+            }
             record_response_state(
                 forward,
                 target,
                 prepared,
                 &gateway,
-                &value,
+                &parsed,
+                Some(&value),
                 upstream_protocol,
             )
             .await;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("id".into(), serde_json::json!(gateway));
-            }
             Body::from(value.to_string())
         } else {
             Body::from(bytes)
@@ -1355,18 +1451,21 @@ async fn commit_body(
         if downstream == Protocol::OpenAiResponses {
             let mut value = converted;
             let gateway = responses::gateway_id();
+            // 落库的是**转换后**的下游响应对象：查询回放才不会把上游
+            // Chat/Messages 的形状原样端出去（§15）。
+            if let Some(object) = value.as_object_mut() {
+                object.insert("id".into(), serde_json::json!(gateway));
+            }
             record_response_state(
                 forward,
                 target,
                 prepared,
                 &gateway,
-                &parsed,
+                &value,
+                Some(&value),
                 upstream_protocol,
             )
             .await;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("id".into(), serde_json::json!(gateway));
-            }
             Body::from(value.to_string())
         } else {
             Body::from(converted.to_string())
@@ -1379,6 +1478,7 @@ async fn commit_body(
         first_token: None,
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
+        stream_state: None,
     })
 }
 
@@ -1394,6 +1494,7 @@ async fn record_response_state(
     prepared: &Prepared,
     gateway_id: &str,
     upstream_body: &serde_json::Value,
+    final_response: Option<&serde_json::Value>,
     upstream_protocol: Protocol,
 ) {
     // 只有上游本身是 Responses 时才有可续链的上游 ID；跨协议转来的响应
@@ -1429,6 +1530,7 @@ async fn record_response_state(
         &entry_body,
         entry_protocol,
         output_items.as_ref(),
+        final_response,
         state.settings.response_state_days,
     )
     .await;
@@ -1474,7 +1576,13 @@ async fn classify_upstream_error(
     // 协议时上游的错误体是另一套形状，改用网关自己的错误对象，客户端的 SDK
     // 才解析得了（§18.2）。
     let headers = response.headers().clone();
-    let bytes = response.bytes().await.unwrap_or_default();
+    // 错误体同样有上限：异常上游不能靠一个超大错误体把网关拖垮。
+    let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .unwrap_or_else(|reason| {
+            tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
+            axum::body::Bytes::new()
+        });
     learn_capability_limitation(forward, target, status, &bytes);
     if prepared.endpoint.protocol() == forward.endpoint.protocol() {
         return Err(AttemptFailure::Terminal(Box::new(build_response(
@@ -1663,21 +1771,77 @@ pub fn extract_model(body: &serde_json::Value, protocol: Protocol) -> Result<Str
         })
 }
 
+/// 请求体在内存里的上限；超过后落临时文件（§17.3、§19.4）。
+pub const IN_MEMORY_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// 非流式上游响应体的硬上限（§17.3）。正常推理响应远小于这个数；设置上限
+/// 是为了让异常或恶意上游不能把网关内存撑爆。
+pub const MAX_UPSTREAM_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// 读取并解析请求体，同时施加大小上限（§17.3）。
+///
+/// 8 MiB 以内直接在内存里解析；超过后先把原始字节写进数据目录下的临时
+/// 文件，再用 `serde_json::from_reader` 流式解析——避免同时持有一份完整的
+/// 原始字节和解析后的 `Value`。临时文件随 `NamedTempFile` 在本函数返回或
+/// 出错时自动删除（§1291）。
 pub async fn read_body(
     body: Body,
     max_bytes: usize,
     protocol: Protocol,
+    temp_dir: &std::path::Path,
 ) -> Result<(serde_json::Value, usize), GatewayError> {
-    let bytes: Bytes = axum::body::to_bytes(body, max_bytes).await.map_err(|_| {
+    use std::io::{Seek as _, Write as _};
+
+    let too_large = || {
         GatewayError::new(
             ErrorCode::RequestTooLarge,
             format!("请求体超过上限 {max_bytes} 字节，或读取中断"),
         )
         .with_protocol(protocol)
-    })?;
-    let size = bytes.len();
-    let value = serde_json::from_slice(&bytes).map_err(|error| {
+    };
+    let disk_error = |error: std::io::Error| {
+        tracing::warn!(%error, "临时请求体读写失败");
+        GatewayError::new(ErrorCode::InternalError, "内部错误，详见服务端日志")
+            .with_protocol(protocol)
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut memory: Vec<u8> = Vec::new();
+    let mut file: Option<tempfile::NamedTempFile> = None;
+    let mut size = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| too_large())?;
+        size = size.saturating_add(chunk.len());
+        if size > max_bytes {
+            return Err(too_large());
+        }
+        if file.is_none() && memory.len() + chunk.len() > IN_MEMORY_BODY_LIMIT {
+            let mut created = tempfile::Builder::new()
+                .prefix("body-")
+                .tempfile_in(temp_dir)
+                .map_err(disk_error)?;
+            created
+                .write_all(&memory)
+                .and_then(|()| created.flush())
+                .map_err(disk_error)?;
+            memory = Vec::new();
+            file = Some(created);
+        }
+        match &mut file {
+            Some(file) => file.write_all(&chunk).map_err(disk_error)?,
+            None => memory.extend_from_slice(&chunk),
+        }
+    }
+
+    let parsed = match &mut file {
+        Some(file) => {
+            file.flush().map_err(disk_error)?;
+            file.as_file_mut().rewind().map_err(disk_error)?;
+            serde_json::from_reader(std::io::BufReader::new(file.as_file_mut()))
+        }
+        None => serde_json::from_slice(&memory),
+    };
+    let value = parsed.map_err(|error| {
         // 下游 JSON 非法不切换目标，直接快速失败（§13.3）。
         GatewayError::new(
             ErrorCode::UnsupportedParameter,
@@ -1685,7 +1849,31 @@ pub async fn read_body(
         )
         .with_protocol(protocol)
     })?;
+    // `file` 在这里析构，临时文件随之删除。
     Ok((value, size))
+}
+
+/// 读取非流式上游响应体，并施加硬上限（§17.3）。
+pub async fn read_upstream_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<axum::body::Bytes, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "读取上游响应失败".to_string())?;
+        append_capped(&mut buffer, &chunk, max_bytes)?;
+    }
+    Ok(axum::body::Bytes::from(buffer))
+}
+
+/// 追加一块响应字节；超限时整块拒绝，不写半块。
+fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<(), String> {
+    if buffer.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(format!("上游响应体超过 {max_bytes} 字节上限"));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1806,32 +1994,81 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_bodies_are_rejected_with_413() {
+        let dir = tempfile::tempdir().unwrap();
         let body = Body::from(vec![b'x'; 4096]);
-        let error = read_body(body, 1024, Protocol::OpenAiChat)
+        let error = read_body(body, 1024, Protocol::OpenAiChat, dir.path())
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::RequestTooLarge);
         assert_eq!(error.code.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "失败路径也不能留下临时文件"
+        );
     }
 
     #[tokio::test]
     async fn malformed_json_fails_fast_without_failover() {
-        let error = read_body(Body::from("{不是 JSON"), 1024, Protocol::AnthropicMessages)
-            .await
-            .unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let error = read_body(
+            Body::from("{不是 JSON"),
+            1024,
+            Protocol::AnthropicMessages,
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedParameter);
         assert!(!error.code.is_retryable(), "下游请求本身非法，重试没有意义");
     }
 
     #[tokio::test]
     async fn body_size_is_reported_for_the_stickiness_budget() {
+        let dir = tempfile::tempdir().unwrap();
         let payload = json!({"model": "glm-4.6"});
         let raw = serde_json::to_vec(&payload).unwrap();
         let expected = raw.len();
-        let (value, size) = read_body(Body::from(raw), 1024, Protocol::OpenAiChat)
+        let (value, size) = read_body(Body::from(raw), 1024, Protocol::OpenAiChat, dir.path())
             .await
             .unwrap();
         assert_eq!(size, expected);
         assert_eq!(value["model"], "glm-4.6");
+    }
+
+    /// 超过 8 MiB 的请求体必须落临时文件解析，且返回前把文件清理掉（§1291）。
+    #[tokio::test]
+    async fn large_bodies_are_spooled_to_disk_and_still_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = "x".repeat(9 * 1024 * 1024);
+        let raw = serde_json::to_vec(&json!({"model": "m", "blob": blob})).unwrap();
+        let expected = raw.len();
+        let (value, size) = read_body(
+            Body::from(raw),
+            64 * 1024 * 1024,
+            Protocol::OpenAiChat,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(size > IN_MEMORY_BODY_LIMIT, "必须走落盘路径");
+        assert_eq!(size, expected);
+        assert_eq!(value["blob"].as_str().unwrap().len(), 9 * 1024 * 1024);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "临时文件必须随请求结束删除"
+        );
+    }
+
+    /// 上游响应体上限必须真的生效（§17.3）。
+    #[test]
+    fn upstream_bodies_stop_at_the_cap() {
+        let mut buffer = Vec::new();
+        assert!(append_capped(&mut buffer, &[0u8; 1024], 2048).is_ok());
+        assert_eq!(buffer.len(), 1024);
+        let error = append_capped(&mut buffer, &[0u8; 2048], 2048).unwrap_err();
+        assert!(error.contains("上限"), "{error}");
+        assert_eq!(buffer.len(), 1024, "超限的块不得部分写入");
     }
 }

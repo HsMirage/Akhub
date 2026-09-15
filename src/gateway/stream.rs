@@ -282,6 +282,182 @@ pub fn first_response_id(chunk: &[u8]) -> Option<String> {
     None
 }
 
+/// 流式响应的完成态与用量收集器（§26.3）。
+///
+/// 同协议透传不重编码字节，但结算仍然需要知道"这条流最终成功了没有、实际
+/// 用了多少 Token、Responses 的最终响应对象是什么"。这里只对**完整 SSE 帧**
+/// 做浅解析，并且只在帧里出现 usage、错误或结束事件时才真正解析 JSON；任何
+/// 解析失败都直接忽略——统计绝不能影响转发本身。
+pub struct StreamAccounting {
+    protocol: Protocol,
+    reader: crate::protocol::sse::FrameReader,
+    error: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    finished: Option<serde_json::Value>,
+}
+
+impl StreamAccounting {
+    pub fn new(protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            reader: crate::protocol::sse::FrameReader::new(),
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            finished: None,
+        }
+    }
+
+    /// 喂入一块**下游**字节；必须在同一块交给客户端之前调用。
+    pub fn push(&mut self, chunk: &[u8]) {
+        for frame in self.reader.push(chunk) {
+            self.observe(&frame);
+        }
+    }
+
+    /// 流结束时处理残留的半帧。
+    pub fn finish(&mut self) {
+        if let Some(frame) = self.reader.finish() {
+            self.observe(&frame);
+        }
+    }
+
+    /// 流内错误事件：这条流在语义上已经失败，即使 HTTP 头早就发出去了。
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// TPM 结算用的完整用量；上游没有给足字段时返回 `None`，绝不估算。
+    pub fn usage_tokens(&self) -> Option<u64> {
+        self.total_tokens.or_else(|| {
+            self.input_tokens
+                .zip(self.output_tokens)
+                .map(|(input, output)| input.saturating_add(output))
+        })
+    }
+
+    /// 输出 Token，供吞吐评分使用。
+    pub fn output_tokens(&self) -> Option<u64> {
+        self.output_tokens
+    }
+
+    /// Responses：`response.completed` / `incomplete` / `failed` 里的最终对象。
+    pub fn finished_response(&self) -> Option<&serde_json::Value> {
+        self.finished.as_ref()
+    }
+
+    fn observe(&mut self, frame: &crate::protocol::sse::Frame) {
+        if frame.is_done_marker() || frame.data.is_empty() {
+            return;
+        }
+        let raw = frame.data.as_bytes();
+        let event = frame.event.as_deref();
+        let interesting = event
+            .is_some_and(|name| name.starts_with("response.") || name == "error")
+            || has(raw, b"usage")
+            || has(raw, b"\"error\"")
+            || has(raw, b"response.completed")
+            || has(raw, b"response.incomplete")
+            || has(raw, b"response.failed");
+        if !interesting {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame.data) else {
+            return;
+        };
+        let kind = event.or_else(|| value.get("type").and_then(serde_json::Value::as_str));
+        if kind == Some("error") || value.get("error").is_some() {
+            let message = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("上游返回了错误事件");
+            self.error = Some(message.chars().take(200).collect());
+            return;
+        }
+        match self.protocol {
+            Protocol::OpenAiChat => self.absorb_usage(&value),
+            Protocol::AnthropicMessages => {
+                // Anthropic 的输入用量在 `message_start.message.usage`，输出用量
+                // 在收尾的 `message_delta.usage`。
+                let usage = match kind {
+                    Some("message_start") => value
+                        .get("message")
+                        .and_then(|message| message.get("usage"))
+                        .or_else(|| value.get("usage")),
+                    _ => value.get("usage"),
+                };
+                if let Some(usage) = usage {
+                    self.absorb_anthropic_usage(usage);
+                }
+            }
+            Protocol::OpenAiResponses => {
+                let response = value.get("response").unwrap_or(&value);
+                if matches!(
+                    kind,
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                ) {
+                    self.finished = Some(response.clone());
+                }
+                if let Some(usage) = response.get("usage") {
+                    self.absorb_usage(usage);
+                }
+            }
+        }
+    }
+
+    /// OpenAI 形状的 usage（Chat 收尾块与 Responses 共用字段名）。
+    fn absorb_usage(&mut self, container: &serde_json::Value) {
+        let usage = container.get("usage").unwrap_or(container);
+        if let Some(total) = usage
+            .get("total_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.total_tokens = Some(total);
+        }
+        if let Some(input) = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.input_tokens = Some(input);
+        }
+        if let Some(output) = usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.output_tokens = Some(output);
+        }
+    }
+
+    /// Anthropic 的 `usage`：缓存读写单独上报，必须并入输入侧。
+    fn absorb_anthropic_usage(&mut self, usage: &serde_json::Value) {
+        let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
+        if let Some(input) = field("input_tokens") {
+            let cache = field("cache_creation_input_tokens").unwrap_or(0)
+                + field("cache_read_input_tokens").unwrap_or(0);
+            self.input_tokens = Some(input.saturating_add(cache));
+        }
+        if let Some(output) = field("output_tokens") {
+            self.output_tokens = Some(output);
+        }
+        if let Some(total) = field("total_tokens") {
+            self.total_tokens = Some(total);
+        }
+    }
+}
+
+/// 不分配字符串的字节子串查找。
+fn has(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +685,80 @@ mod tests {
             Some(64)
         );
         assert_eq!(output_tokens(&serde_json::json!({})), None);
+    }
+
+    fn feed_all(accounting: &mut StreamAccounting, chunks: &[&str]) {
+        for chunk in chunks {
+            accounting.push(chunk.as_bytes());
+        }
+        accounting.finish();
+    }
+
+    #[test]
+    fn chat_usage_is_settled_from_the_final_chunk() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiChat);
+        feed_all(
+            &mut accounting,
+            &[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":10,\"total_tokens\":910}}\n\n",
+                "data: [DONE]\n\n",
+            ],
+        );
+        assert_eq!(accounting.usage_tokens(), Some(910));
+        assert_eq!(accounting.output_tokens(), Some(10));
+        assert_eq!(accounting.error(), None);
+    }
+
+    #[test]
+    fn anthropic_usage_merges_start_and_delta_frames() {
+        let mut accounting = StreamAccounting::new(Protocol::AnthropicMessages);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.usage_tokens(), Some(127));
+        assert_eq!(accounting.output_tokens(), Some(7));
+    }
+
+    #[test]
+    fn responses_completion_keeps_the_final_object_and_usage() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":6,\"total_tokens\":11}}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.usage_tokens(), Some(11));
+        assert_eq!(accounting.output_tokens(), Some(6));
+        let finished = accounting.finished_response().expect("最终响应对象");
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["output"][0]["type"], "message");
+    }
+
+    #[test]
+    fn frames_split_across_network_chunks_are_still_settled() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiChat);
+        accounting.push(b"data: {\"choices\":[],\"usage\":{\"prompt_tok");
+        accounting.push(b"ens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n");
+        accounting.finish();
+        assert_eq!(accounting.usage_tokens(), Some(7));
+    }
+
+    #[test]
+    fn a_stream_error_event_marks_the_stream_failed() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &["event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n"],
+        );
+        assert_eq!(accounting.error(), Some("boom"));
+        assert_eq!(accounting.usage_tokens(), None, "失败流不编造用量");
     }
 }

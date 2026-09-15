@@ -277,3 +277,57 @@ async fn a_database_written_by_a_newer_binary_refuses_to_open() {
     let message = format!("{:#}", result.err().unwrap());
     assert!(message.contains("升级"), "错误信息要提示升级：{message}");
 }
+
+/// 第三方声明里的版本必须与 Cargo.lock 一致。
+///
+/// 阶段 6 包含"许可证与第三方声明审查"；声明漂移过一次（base64、getrandom、
+/// sha2、tower-http 都停留在旧版本），所以用测试把它钉住。
+#[test]
+fn third_party_notices_match_the_lockfile() {
+    let lock = std::fs::read_to_string("Cargo.lock").expect("Cargo.lock");
+    let notices = std::fs::read_to_string("NOTICES.md").expect("NOTICES.md");
+
+    // 解析 Cargo.lock 的 name/version 对。
+    let mut versions = std::collections::HashMap::new();
+    let mut current: Option<String> = None;
+    for line in lock.lines() {
+        if let Some(name) = line.strip_prefix("name = \"") {
+            current = Some(name.trim_end_matches('"').to_string());
+        } else if let Some(version) = line.strip_prefix("version = \"")
+            && let Some(name) = current.take()
+        {
+            versions.insert(name, version.trim_end_matches('"').to_string());
+        }
+    }
+
+    let mut checked = 0usize;
+    for line in notices.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() < 4 {
+            continue;
+        }
+        let names: Vec<&str> = cells[1].split('/').map(str::trim).collect();
+        let pinned: Vec<&str> = cells[2].split('/').map(str::trim).collect();
+        if names.len() != pinned.len() || names.len() > 2 {
+            continue;
+        }
+        // 只处理"每个版本都形如数字.数字"的表格行。
+        if !pinned
+            .iter()
+            .all(|version| version.split('.').all(|part| part.parse::<u32>().is_ok()))
+        {
+            continue;
+        }
+        for (name, version) in names.iter().zip(pinned.iter()) {
+            let Some(locked) = versions.get(*name) else {
+                continue;
+            };
+            assert_eq!(
+                locked, version,
+                "NOTICES.md 里 {name} 声明 {version}，Cargo.lock 是 {locked}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 15, "至少应该核对到主要直接依赖，实际 {checked}");
+}

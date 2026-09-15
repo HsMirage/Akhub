@@ -1,0 +1,330 @@
+//! 流式结算与 Responses 流式状态链验收（§15.2、§26.3）。
+//!
+//! 这组用例专门覆盖"HTTP 头已经发出、但流还没结束"的时段：
+//!
+//! - TPM 必须按流里真实上报的 usage 回补，而不是把预留占满整个窗口；
+//! - 上游没上报 usage 时必须保持保守预留（宁可少发也不超限），不估算；
+//! - Responses 流结束后必须把输出项补进状态链，跨上游重建才无损；
+//! - 跨协议进入 Responses 时，客户端引用的一定是网关 ID。
+
+mod common;
+
+use akhub::domain::{Limits, Protocol};
+use axum::Router;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use common::{TargetSpec, client, spawn_akhub, spawn_akhub_with, wire_target};
+use serde_json::{Value, json};
+
+/// 假上游返回的流式脚本。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    /// Chat 流，收尾块带 usage（正常 `include_usage` 上游）。
+    ChatWithUsage,
+    /// Chat 流，完全不提 usage（客户端没要、上游也没给）。
+    ChatWithoutUsage,
+    /// Responses 流：开始标记 → 输出项 → 带 output 与 usage 的 completed。
+    Responses,
+}
+
+fn chat_stream(with_usage: bool) -> String {
+    let mut frames = vec![
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n".to_string(),
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n".to_string(),
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+    ];
+    if with_usage {
+        frames.push(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":10,\"total_tokens\":12}}\n\n"
+                .to_string(),
+        );
+    }
+    frames.push("data: [DONE]\n\n".to_string());
+    frames.concat()
+}
+
+fn responses_stream() -> String {
+    [
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n",
+    ]
+    .concat()
+}
+
+async fn spawn_upstream(script: Script) -> String {
+    async fn handler(
+        axum::extract::State(script): axum::extract::State<Script>,
+        body: String,
+    ) -> axum::response::Response {
+        let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        if request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let payload = match script {
+                Script::ChatWithUsage => chat_stream(true),
+                Script::ChatWithoutUsage => chat_stream(false),
+                Script::Responses => responses_stream(),
+            };
+            return ([("content-type", "text/event-stream")], payload).into_response();
+        }
+        axum::Json(json!({"id": "resp_up", "output": [], "usage": {}})).into_response()
+    }
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/v1/responses", post(handler))
+        .with_state(script);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+fn chat_request() -> Value {
+    json!({
+        "model": "claude-sonnet-4-5",
+        "stream": true,
+        "max_tokens": 400,
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+}
+
+/// 一次带 usage 的 Chat 流结束后，TPM 必须按真实用量回补。
+///
+/// 预估预留约 `请求字节/4 + max_tokens(400)`，上限 500；上游实际只用了
+/// 12。若结算发生在首段提交（旧行为），第二个请求会因窗口仍被预留占满
+/// 而被限流；按流结束的真实 usage 回补后，第二个请求必须放行。
+#[tokio::test]
+async fn a_chat_stream_refunds_the_tpm_reservation_with_reported_usage() {
+    let upstream = spawn_upstream(Script::ChatWithUsage).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiChat,
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5",
+            50,
+        )
+        .limits(Limits {
+            tpm: Some(500),
+            ..Limits::default()
+        }),
+    )
+    .await;
+
+    for round in 0..2 {
+        let response = client()
+            .post(format!("{}/v1/chat/completions", akhub.base_url))
+            .bearer_auth(&akhub.key)
+            .json(&chat_request())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "第 {} 次请求应被放行", round + 1);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("你好"), "{text}");
+    }
+}
+
+/// 上游没有上报 usage 时，预留必须保持到窗口过期（保守方向）。
+///
+/// 用一个很短的请求总超时把"继续等"变成"等不到"：第二个请求只能被限流
+/// 拒绝（429），而不是被放行——这正是"预留没有被退还"的证据。
+#[tokio::test]
+async fn a_stream_without_usage_keeps_the_conservative_reservation() {
+    let upstream = spawn_upstream(Script::ChatWithoutUsage).await;
+    let akhub = spawn_akhub_with(
+        akhub::app::Settings {
+            request_timeout: std::time::Duration::from_millis(500),
+            ..akhub::app::Settings::default()
+        },
+        |_| {},
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiChat,
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5",
+            50,
+        )
+        .limits(Limits {
+            tpm: Some(500),
+            ..Limits::default()
+        }),
+    )
+    .await;
+
+    let first = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let _ = first.text().await.unwrap();
+
+    let second = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        429,
+        "没有 usage 就不能猜，预留必须继续占着直到窗口释放"
+    );
+}
+
+/// 流式 Responses 结束后，输出项必须补进状态链（§15.2）。
+#[tokio::test]
+async fn a_streamed_responses_turn_stores_its_output_items() {
+    let upstream = spawn_upstream(Script::Responses).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("response.completed"), "{text}");
+
+    let gateway_id = text
+        .lines()
+        .find_map(|line| {
+            let data = line.strip_prefix("data: ")?;
+            let value: Value = serde_json::from_str(data).ok()?;
+            let id = value
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)?;
+            id.starts_with("resp_akh_").then(|| id.to_string())
+        })
+        .expect("客户端必须看到网关 ID");
+    assert!(!text.contains("resp_up"), "上游 ID 不得泄漏：{text}");
+
+    // 状态补写在流结束后异步落库，轮询等待。
+    let mut stored = None;
+    for _ in 0..50 {
+        let row = akhub
+            .state
+            .store
+            .response_state(&gateway_id, &akhub.group_id)
+            .await
+            .unwrap();
+        if let Some(row) = row
+            && let Some(sealed) = row.sealed_body.as_ref()
+            && let Ok(plaintext) = akhub.state.cipher.open(sealed)
+            && let Ok(body) = serde_json::from_slice::<Value>(&plaintext)
+        {
+            let has_output = body
+                .get("input")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.to_string().contains("你好")
+                            && item.get("role").and_then(Value::as_str) == Some("assistant")
+                    })
+                });
+            if has_output {
+                stored = Some(body);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let stored = stored.expect("流式输出项必须补进状态链");
+    assert!(
+        stored.to_string().contains("你好"),
+        "保存的历史必须包含助手输出：{stored}"
+    );
+}
+
+/// 跨协议进入 Responses 时，客户端引用的是网关 ID，状态链也要登记（§15.1）。
+#[tokio::test]
+async fn a_cross_protocol_stream_into_responses_uses_a_gateway_id() {
+    let upstream = spawn_upstream(Script::ChatWithUsage).await;
+    let akhub = spawn_akhub().await;
+    // 账号只有 Chat 端点，客户端说的是 Responses：必须走跨协议转换。
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiChat,
+            "gpt-5",
+            "claude-sonnet-4-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("response.created"), "{text}");
+    let gateway_id = text
+        .lines()
+        .find_map(|line| {
+            let data = line.strip_prefix("data: ")?;
+            let value: Value = serde_json::from_str(data).ok()?;
+            let id = value
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)?;
+            id.starts_with("resp_akh_").then(|| id.to_string())
+        })
+        .expect("跨协议进入 Responses 也必须用网关 ID");
+
+    // 状态行必须存在，且没有上游 ID（跨协议没有可复用的 Responses ID）。
+    let mut found = None;
+    for _ in 0..50 {
+        found = akhub
+            .state
+            .store
+            .response_state(&gateway_id, &akhub.group_id)
+            .await
+            .unwrap();
+        if found.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let row = found.expect("跨协议流也必须登记状态链");
+    assert!(row.upstream_id.is_none(), "跨协议没有原生上游 ID");
+}

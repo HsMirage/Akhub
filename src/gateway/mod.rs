@@ -4,6 +4,7 @@ pub mod error;
 pub mod models;
 pub mod passthrough;
 pub mod responses;
+pub mod settle;
 pub mod stream;
 pub mod translate;
 
@@ -33,6 +34,14 @@ pub fn router() -> Router<SharedState> {
             get(responses::retrieve).delete(responses::destroy),
         )
         .route("/v1/responses/{id}/cancel", post(responses::cancel))
+        .route(
+            "/v1/responses/{id}/input_items",
+            get(responses::input_items),
+        )
+        // 静态段优先于参数段，所以这两个不会被 `{id}` 吃掉。两者都只能原生
+        // 转发（§15.4）：走完整调度链路，拿不到原生上游就明确返回不支持。
+        .route("/v1/responses/compact", post(responses_compact))
+        .route("/v1/responses/input_tokens", post(responses_input_tokens))
         .route("/v1/models", get(models::list))
         .route("/v1/models/{model}", get(models::get))
 }
@@ -51,6 +60,20 @@ async fn count_tokens(state: State<SharedState>, headers: HeaderMap, body: Body)
 
 async fn responses_create(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
     handle(state, headers, body, Endpoint::Responses).await
+}
+
+/// `POST /v1/responses/compact`：只能原生转发，没有等价适配器（§15.4）。
+async fn responses_compact(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::ResponsesCompact).await
+}
+
+/// `POST /v1/responses/input_tokens`：只能原生转发（§15.4）。
+async fn responses_input_tokens(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    handle(state, headers, body, Endpoint::ResponsesInputTokens).await
 }
 
 /// §8 中描述的请求处理流程（第一期部分）。
@@ -88,11 +111,17 @@ async fn handle(
         }
     };
 
-    let (body, request_bytes) =
-        match passthrough::read_body(body, state.settings.max_request_bytes, protocol).await {
-            Ok(parsed) => parsed,
-            Err(error) => return error.with_request_id(request_id).into_response(),
-        };
+    let (body, request_bytes) = match passthrough::read_body(
+        body,
+        state.settings.max_request_bytes,
+        protocol,
+        &state.data_dir.join(crate::app::TEMP_DIR_NAME),
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(error) => return error.with_request_id(request_id).into_response(),
+    };
 
     let logical_model = match passthrough::extract_model(&body, protocol) {
         Ok(model) => model,

@@ -58,11 +58,12 @@ pub async fn commit_stream(
     include_usage: bool,
     account: &str,
     mut response: reqwest::Response,
+    responses_id: Option<String>,
 ) -> Result<Committed, Failure> {
     let started = Instant::now();
     let mut reader = sse::FrameReader::new();
     let mut parser = protocol::StreamParser::new(upstream);
-    let mut emitter = protocol::StreamEmitter::new(downstream, include_usage);
+    let mut emitter = protocol::StreamEmitter::new(downstream, include_usage, responses_id);
     let mut prefix: Vec<Bytes> = Vec::new();
     let mut buffered = 0usize;
 
@@ -411,6 +412,7 @@ mod tests {
             true,
             "账号A",
             response,
+            None,
         )
         .await
         .unwrap();
@@ -435,6 +437,7 @@ mod tests {
             false,
             "账号A",
             response,
+            None,
         )
         .await
         .err()
@@ -453,6 +456,7 @@ mod tests {
             false,
             "账号A",
             response,
+            None,
         )
         .await
         .err()
@@ -476,6 +480,7 @@ mod tests {
             false,
             "账号A",
             response,
+            None,
         )
         .await
         .unwrap();

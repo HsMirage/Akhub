@@ -223,10 +223,12 @@ pub enum StreamEmitter {
 }
 
 impl StreamEmitter {
-    pub fn new(protocol: Protocol, include_usage: bool) -> Self {
+    pub fn new(protocol: Protocol, include_usage: bool, responses_id: Option<String>) -> Self {
         match protocol {
             Protocol::OpenAiChat => Self::Chat(openai_chat::StreamEmitter::new(include_usage)),
-            Protocol::OpenAiResponses => Self::Responses(openai_responses::StreamEmitter::new()),
+            Protocol::OpenAiResponses => {
+                Self::Responses(openai_responses::StreamEmitter::new(responses_id))
+            }
             Protocol::AnthropicMessages => Self::Anthropic(anthropic::StreamEmitter::new()),
         }
     }
@@ -578,7 +580,7 @@ mod tests {
     /// 把一段 SSE 喂进"解析 + 发射"管道，返回下游看到的完整字节。
     fn pipe(from: Protocol, to: Protocol, raw: &str) -> String {
         let mut parser = StreamParser::new(from);
-        let mut emitter = StreamEmitter::new(to, true);
+        let mut emitter = StreamEmitter::new(to, true, None);
         let mut reader = sse::FrameReader::new();
         let mut out = Vec::new();
         for frame in reader.push(raw.as_bytes()) {
@@ -703,7 +705,7 @@ mod tests {
     #[test]
     fn a_stream_error_uses_the_downstream_protocol_shape() {
         for protocol in ALL {
-            let emitter = StreamEmitter::new(protocol, false);
+            let emitter = StreamEmitter::new(protocol, false, None);
             let bytes = emitter.error("上游中断");
             let text = String::from_utf8_lossy(&bytes);
             assert!(text.contains("上游中断"));

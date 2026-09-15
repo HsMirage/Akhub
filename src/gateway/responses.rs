@@ -119,13 +119,16 @@ pub fn rebuild_body(
     target_protocol: Protocol,
     model: &str,
 ) -> Result<Value, String> {
+    // 查询回放用的最终响应对象绝不是请求的一部分，重建时必须先剥掉。
+    let mut stored = stored.clone();
+    strip_replay_object(&mut stored);
     let mut request: Request =
-        crate::protocol::parse_request(entry_protocol, stored).map_err(|e| e.to_string())?;
+        crate::protocol::parse_request(entry_protocol, &stored).map_err(|e| e.to_string())?;
     // 历史属于旧请求；模型、流式开关与参数以本次请求为准的部分在调用方合并。
     request.model = model.to_string();
 
     if entry_protocol == target_protocol {
-        let mut body = stored.clone();
+        let mut body = stored;
         if let Some(object) = body.as_object_mut() {
             object.insert("model".into(), json!(model));
         }
@@ -137,15 +140,34 @@ pub fn rebuild_body(
     Ok(emitted.body)
 }
 
+/// 查询回放用的最终响应对象在密封正文里的保留键（§15.1、§15.3）。
+///
+/// 它只服务于 `GET /v1/responses/{id}`：让查询返回真实的输出项、usage 与状态，
+/// 而不是从请求体拼一个"看起来像响应"的对象。续链重建前必须剥掉。
+pub const REPLAY_RESPONSE_KEY: &str = "__akhub_response";
+
+fn strip_replay_object(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove(REPLAY_RESPONSE_KEY);
+    }
+}
+
 /// 把一次响应的输入与输出项合并成可重放正文。
 ///
 /// 正文保存**入口协议的原始请求体**（去掉引用、去掉 store 字段），这是唯一
 /// 无损的形状：换成保存"中间格式"会丢掉未知字段，换成保存"输出项"则丢掉
 /// 采样参数。重建时再按目标协议重新解析与发射。
-pub fn stored_body(entry_body: &Value, output_items: Option<&Value>) -> Value {
+pub fn stored_body(
+    entry_body: &Value,
+    output_items: Option<&Value>,
+    final_response: Option<&Value>,
+) -> Value {
     let mut body = entry_body.clone();
     strip_reference(&mut body);
-    if let Some(object) = body.as_object_mut() {
+    let needs_messages_append = {
+        let Some(object) = body.as_object_mut() else {
+            return body;
+        };
         object.remove("store");
         // 流式与否不影响历史形状，统一按非流式保存。
         object.remove("stream");
@@ -163,12 +185,15 @@ pub fn stored_body(entry_body: &Value, output_items: Option<&Value>) -> Value {
         if let (Some(items), Some(Value::Array(input))) = (output_items, object.get_mut("input")) {
             input.extend(items.as_array().cloned().unwrap_or_default());
         }
-        // Chat / Messages 的历史在 messages / 顶层，输出项作为助手轮次追加。
-        if !object.contains_key("input")
-            && let Some(items) = output_items
-        {
-            append_output_to_messages(&mut body, items);
-        }
+        !object.contains_key("input") && output_items.is_some()
+    };
+    // Chat / Messages 的历史在 messages / 顶层，输出项作为助手轮次追加。
+    if needs_messages_append && let Some(items) = output_items {
+        append_output_to_messages(&mut body, items);
+    }
+    if let (Some(object), Some(response)) = (body.as_object_mut(), final_response) {
+        // 最终响应对象留一份给查询接口；续链重建前会被剥掉。
+        object.insert(REPLAY_RESPONSE_KEY.into(), response.clone());
     }
     body
 }
@@ -209,6 +234,157 @@ impl From<AdminInternal> for GatewayError {
     }
 }
 
+// -------------------------------------------------------- 原生上游生命周期代理
+
+/// 状态链记录指向的原生 Responses 上游（§15.3）。
+struct NativeTarget {
+    account: crate::domain::Account,
+    api_key: String,
+    upstream_id: String,
+}
+
+/// 记录里有原生 Responses 映射时解析出目标；否则返回 `None`。
+///
+/// 判定依据是记录里的端点证据：只有真正把请求发到了上游 `/v1/responses`
+/// 的记录才谈得上原生查询与取消。跨协议转出来的响应没有原生生命周期。
+async fn native_target(
+    state: &crate::app::SharedState,
+    record: &ResponseStateRow,
+) -> Option<NativeTarget> {
+    if record.endpoint.as_deref() != Some(crate::upstream::Endpoint::Responses.as_str()) {
+        return None;
+    }
+    let upstream_id = record.upstream_id.clone()?;
+    let account_id = record.account_id.clone()?;
+    let account = state
+        .store
+        .list_accounts()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|account| account.id == account_id)?;
+    let sealed = state.store.account_sealed_key(&account.id).await.ok()??;
+    let plaintext = state.cipher.open(&sealed).ok()?;
+    let api_key = String::from_utf8(plaintext.to_vec()).ok()?;
+    Some(NativeTarget {
+        account,
+        api_key,
+        upstream_id,
+    })
+}
+
+/// 一次需要转发的原生生命周期动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Retrieve,
+    InputItems,
+    Cancel,
+    Delete,
+}
+
+/// 把生命周期调用转发到原账号。
+///
+/// 与推理路径使用同一个 HTTP 客户端与同一套地址校验；失败时返回明确错误，
+/// 绝不把本地状态冒充成上游的真实状态。
+async fn proxy_lifecycle(
+    state: &crate::app::SharedState,
+    target: &NativeTarget,
+    action: Lifecycle,
+    gateway_id: &str,
+) -> Result<Value, GatewayError> {
+    let protocol = Protocol::OpenAiResponses;
+    let internal = || {
+        GatewayError::new(ErrorCode::InternalError, "内部错误，详见服务端日志")
+            .with_protocol(protocol)
+    };
+    let mut url = crate::upstream::build_url(
+        &target.account.base_url,
+        crate::upstream::Endpoint::Responses,
+    )
+    .map_err(|error| {
+        tracing::warn!(%error, "构造上游生命周期 URL 失败");
+        internal()
+    })?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| internal())?;
+        segments.push(&target.upstream_id);
+        match action {
+            Lifecycle::InputItems => {
+                segments.push("input_items");
+            }
+            Lifecycle::Cancel => {
+                segments.push("cancel");
+            }
+            Lifecycle::Retrieve | Lifecycle::Delete => {}
+        }
+    }
+
+    crate::security::url_guard::assert_resolvable(&url, target.account.allow_private_network)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "生命周期调用的目标地址被拒绝");
+            GatewayError::new(ErrorCode::UpstreamExhausted, "上游地址不可用")
+                .with_protocol(protocol)
+        })?;
+
+    let mut headers =
+        crate::upstream::headers_for_protocol(Protocol::OpenAiResponses, &target.api_key).map_err(
+            |error| {
+                tracing::warn!(%error, "构造上游生命周期请求头失败");
+                internal()
+            },
+        )?;
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let client = state
+        .upstream
+        .http_for(target.account.allow_private_network);
+    let request = match action {
+        Lifecycle::Retrieve | Lifecycle::InputItems => client.get(url),
+        Lifecycle::Cancel => client.post(url),
+        Lifecycle::Delete => client.delete(url),
+    };
+    let response = request
+        .headers(headers)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "上游生命周期调用失败");
+            GatewayError::new(ErrorCode::UpstreamExhausted, "上游查询失败，请稍后重试")
+                .with_protocol(protocol)
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let (code, message) = match status.as_u16() {
+            404 => (ErrorCode::ResponseStateExpired, "上游已经不存在该响应"),
+            400 | 409 => (
+                ErrorCode::UnsupportedParameter,
+                "上游表示该响应不支持这个操作（例如不是后台任务）",
+            ),
+            _ => (ErrorCode::UpstreamExhausted, "上游生命周期调用失败"),
+        };
+        return Err(GatewayError::new(code, message).with_protocol(protocol));
+    }
+
+    let mut value: Value = response.json().await.map_err(|error| {
+        tracing::warn!(%error, "上游生命周期响应不是合法 JSON");
+        GatewayError::new(ErrorCode::UpstreamProtocolError, "上游返回了无法解析的响应")
+            .with_protocol(protocol)
+    })?;
+    // 对外只暴露网关 ID（§15.1）；列表类响应的项 ID 不是响应身份，保持原样。
+    if let Some(object) = value.as_object_mut()
+        && object.contains_key("id")
+    {
+        object.insert("id".into(), json!(gateway_id));
+    }
+    Ok(value)
+}
+
 // ------------------------------------------------------------------ 管理路由
 
 /// `GET /v1/responses/{id}`：把保存的响应回放给客户端。
@@ -228,6 +404,25 @@ pub async fn retrieve(
         Ok(record) => record,
         Err(error) => return error.into_response(),
     };
+    // 原生 Responses 映射存在时优先问原账号：查询结果、状态与运行中的后台
+    // 任务状态才是真的（§15.3）。上游不支持查询（404/405 或网络故障）时，
+    // 只要本地保存了真实响应对象就回放它——那仍然是上游给出的事实。
+    if let Some(target) = native_target(&state, &record).await {
+        match proxy_lifecycle(&state, &target, Lifecycle::Retrieve, &id).await {
+            Ok(value) => return axum::Json(value).into_response(),
+            Err(error) => {
+                if record.sealed_body.is_none() {
+                    return error.into_response();
+                }
+                tracing::debug!(
+                    code = error.code.as_str(),
+                    "上游查询不可用，回放本地保存的响应对象"
+                );
+            }
+        }
+    }
+    // 没有原生映射（跨协议或 store:false）：用保存的历史重建一个**诚实的**
+    // 对象——只承诺我们真的保存了的东西。新版记录里带的是上游最终响应对象。
     let Some(sealed) = record.sealed_body else {
         return expired_error(protocol, &id).into_response();
     };
@@ -251,7 +446,40 @@ pub async fn retrieve(
     axum::Json(replay_response(&body, &id)).into_response()
 }
 
-/// `DELETE /v1/responses/{id}`：删除本地状态；上游侧是否可删不在第一期承诺内。
+/// `GET /v1/responses/{id}/input_items`：输入项列表（§15）。
+///
+/// 没有经过等价性验证的本地实现，所以只代理原生上游；拿不到原生映射时返回
+/// 明确错误，不拿别的数组冒充输入项。
+pub async fn input_items(
+    State(state): State<crate::app::SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let protocol = Protocol::OpenAiResponses;
+    let Some(group) = authenticate(&state, &headers) else {
+        return auth_error(protocol);
+    };
+    let record = match lookup(&state, &group, &id, protocol).await {
+        Ok(record) => record,
+        Err(error) => return error.into_response(),
+    };
+    let Some(target) = native_target(&state, &record).await else {
+        return GatewayError::new(
+            ErrorCode::UnsupportedParameter,
+            "该响应没有可查询的原生输入项（跨协议或 store:false）",
+        )
+        .with_protocol(protocol)
+        .into_response();
+    };
+    match proxy_lifecycle(&state, &target, Lifecycle::InputItems, &id).await {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `DELETE /v1/responses/{id}`：删除上游（若支持）与本地状态。
+///
+/// 上游删除是尽力而为：不支持删除的上游不该阻塞本地清理（§15.2）。
 pub async fn destroy(
     State(state): State<crate::app::SharedState>,
     headers: HeaderMap,
@@ -261,6 +489,20 @@ pub async fn destroy(
     let Some(group) = authenticate(&state, &headers) else {
         return auth_error(protocol);
     };
+    let record = match lookup(&state, &group, &id, protocol).await {
+        Ok(record) => record,
+        Err(error) => return error.into_response(),
+    };
+    if let Some(target) = native_target(&state, &record).await
+        && let Err(error) = proxy_lifecycle(&state, &target, Lifecycle::Delete, &id).await
+    {
+        // 删除失败不影响本地清理，但必须留下可诊断的日志。
+        tracing::warn!(
+            code = error.code.as_str(),
+            message = %error.message,
+            "上游删除响应失败，继续清理本地状态"
+        );
+    }
     match state.store.delete_response_state(&id, &group).await {
         Ok(_) => {
             axum::Json(json!({"id": id, "object": "response", "deleted": true})).into_response()
@@ -272,7 +514,8 @@ pub async fn destroy(
 /// `POST /v1/responses/{id}/cancel`。
 ///
 /// 只有原生 Responses 上游才真的有"取消"语义；其他上游从来没有开始过这个
-/// 任务，冒充取消就是伪造（§15.3）。这里对已保存的响应按"立即终结"处理。
+/// 任务，冒充取消就是伪造（§15.3）。没有原生映射时返回明确的错误，绝不
+/// 把本地记录改个状态就说取消成功。
 pub async fn cancel(
     State(state): State<crate::app::SharedState>,
     headers: HeaderMap,
@@ -286,22 +529,18 @@ pub async fn cancel(
         Ok(record) => record,
         Err(error) => return error.into_response(),
     };
-    let body = record
-        .sealed_body
-        .as_ref()
-        .and_then(|sealed| state.cipher.open(sealed).ok())
-        .and_then(|plaintext| serde_json::from_slice::<Value>(&plaintext).ok());
-    axum::Json(match body {
-        Some(saved) => {
-            let mut replay = replay_response(&saved, &id);
-            if let Some(object) = replay.as_object_mut() {
-                object.insert("status".into(), json!("cancelled"));
-            }
-            replay
-        }
-        None => json!({"id": id, "object": "response", "status": "cancelled"}),
-    })
-    .into_response()
+    let Some(target) = native_target(&state, &record).await else {
+        return GatewayError::new(
+            ErrorCode::UnsupportedParameter,
+            "该响应不是原生后台任务，Akhub 不会伪报取消成功（§15.3）",
+        )
+        .with_protocol(protocol)
+        .into_response();
+    };
+    match proxy_lifecycle(&state, &target, Lifecycle::Cancel, &id).await {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 fn authenticate(state: &crate::app::SharedState, headers: &HeaderMap) -> Option<String> {
@@ -318,21 +557,28 @@ fn auth_error(protocol: Protocol) -> Response {
         .into_response()
 }
 
-/// 把保存的入口请求体回放成响应对象。
+/// 把保存的状态回放成响应对象。
 ///
-/// 正文是请求形状而不是响应形状；查询接口的意义是"给客户端一个能继续引用
-/// 的对象"，状态与 ID 由网关补齐。
-fn replay_response(saved_request: &Value, gateway_id: &str) -> Value {
-    let model = saved_request
-        .get("model")
-        .cloned()
-        .unwrap_or(json!(Value::Null));
+/// 首选我们真的保存过的最终响应对象（`__akhub_response`）：输出项、usage 与
+/// 状态都来自上游，不是拼出来的。只有早期记录或没有最终对象时，才退回
+/// "历史 + 网关补齐状态"的重建，并且明确不编造输出与 usage。
+fn replay_response(saved: &Value, gateway_id: &str) -> Value {
+    if let Some(mut response) = saved.get(REPLAY_RESPONSE_KEY).cloned() {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("id".into(), json!(gateway_id));
+            object.entry("object").or_insert_with(|| json!("response"));
+            object.entry("status").or_insert_with(|| json!("completed"));
+        }
+        return response;
+    }
+    let model = saved.get("model").cloned().unwrap_or(json!(Value::Null));
     json!({
         "id": gateway_id,
         "object": "response",
         "model": model,
         "status": "completed",
-        "input": saved_request.get("input").or_else(|| saved_request.get("messages")).cloned().unwrap_or(Value::Null),
+        "input": saved.get("input").or_else(|| saved.get("messages")).cloned().unwrap_or(Value::Null),
+        "output": [],
     })
 }
 
@@ -511,6 +757,7 @@ pub struct PendingState {
 }
 
 /// 把一次成功完成的 Responses 请求写入状态链（§15.2）。
+#[allow(clippy::too_many_arguments)]
 pub async fn record_state(
     state: &crate::app::SharedState,
     chain: &ChainPlan,
@@ -518,11 +765,12 @@ pub async fn record_state(
     entry_body: &Value,
     entry_protocol: Protocol,
     output_items: Option<&Value>,
+    final_response: Option<&Value>,
     retention_days: u32,
 ) {
     let stored = should_store(entry_body, retention_days);
     let sealed_body = stored.then(|| {
-        let body = stored_body(entry_body, output_items);
+        let body = stored_body(entry_body, output_items, final_response);
         state.cipher.seal(body.to_string().as_bytes())
     });
     let now = crate::storage::now_unix();
@@ -616,7 +864,7 @@ mod tests {
             "store": true,
             "temperature": 0.7,
         });
-        let stored = stored_body(&body, None);
+        let stored = stored_body(&body, None, None);
         assert!(stored.get("previous_response_id").is_none());
         assert!(stored.get("store").is_none());
         assert!(stored.get("stream").is_none());
@@ -634,7 +882,7 @@ mod tests {
             {"type": "message", "role": "assistant",
              "content": [{"type": "output_text", "text": "你好"}]}
         ]);
-        let stored = stored_body(&body, Some(&output));
+        let stored = stored_body(&body, Some(&output), None);
         let input = stored["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["role"], "assistant");

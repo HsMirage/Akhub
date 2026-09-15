@@ -443,7 +443,7 @@ async fn retrieve_and_delete_work_through_gateway_ids() {
     let gateway_id = first["id"].as_str().unwrap().to_string();
     let http = client();
 
-    // 查询：返回保存的正文形状，ID 是网关 ID。
+    // 查询：返回上游真实响应对象（输出项与 usage 都在），ID 换成网关 ID。
     let got = http
         .get(format!("{}/v1/responses/{gateway_id}", akhub.base_url))
         .bearer_auth(&akhub.key)
@@ -453,7 +453,12 @@ async fn retrieve_and_delete_work_through_gateway_ids() {
     assert_eq!(got.status(), 200);
     let body: Value = got.json().await.unwrap();
     assert_eq!(body["id"].as_str(), Some(gateway_id.as_str()));
-    assert!(body["input"].as_array().is_some(), "{body}");
+    assert!(body["output"].as_array().is_some(), "{body}");
+    assert!(body["usage"].is_object(), "{body}");
+    assert!(
+        !body.to_string().contains("resp_1"),
+        "上游 ID 不得泄漏：{body}"
+    );
 
     // 删除：本地状态随之消失，之后的引用按过期处理。
     let deleted = http
