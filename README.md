@@ -77,10 +77,8 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
 
 | 能力 | 计划阶段 |
 |---|---|
-| 官方 SDK 黑盒验收（§26.2） | 阶段 6 |
-| Docker 构建、多架构镜像与 Linux 工件（本机 Docker daemon 未运行，未验证） | 阶段 6 |
-| 真实上游接入，以及 Sub2API / New API 探针现场字段形状 | 阶段 6 |
-| §26.9 性能验收（无 `benches/`，未测吞吐、长连接与内存上限） | 阶段 6 |
+| Docker 构建、多架构镜像与 Linux 工件（当前只有原生 systemd 部署） | 阶段 6 |
+| §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、长连接与内存上限） | 阶段 6 |
 | 关闭信号到达时"取消排队请求并返回可重试错误"（§25.3 第 2 步；当前靠宽限期兜底） | 阶段 6 |
 
 已补齐（本轮）：
@@ -96,6 +94,12 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
   后原生转发给 Responses 上游；上游没有该路由时返回明确的不支持（不重试、不估算）。
 - 图片接口 `POST /v1/images/generations` 与 `POST /v1/images/edits`：仅原生转发到
   OpenAI 兼容上游，不做跨协议转换与 provider 适配；edits 保留 multipart 文件字节。
+- 官方 SDK 黑盒验收（§26.2）：已用官方 `openai` / `anthropic` SDK 对真实上游
+  跑通 14/14（Chat/Responses/Messages 的流式与非流式、工具往返、查询与续链、
+  错误对象、401），并完成真实生图与图生图；脚本在 `tests/sdk/acceptance.py`。
+- 真实上游接入与探针现场字段：Sub2API 计费探针已兼容现场 `sub2api.key_billing`
+  形状（自动识别 effective 倍率），newapi 走 OpenAI 兼容 + Anthropic 端点；
+  过程记录见 `review/2026-09-15-真实上游验收.md`。
 - 请求体超过 8 MiB 落数据目录临时文件（自动清理 + 启动清理），非流式上游
   响应体施加 64 MiB 硬上限。
 - SSRF 校验移入 DNS 解析器：连接使用的地址就是校验过的地址，消除 DNS
