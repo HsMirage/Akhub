@@ -71,6 +71,23 @@ pub fn choices(
                     || account.preferred_protocol == Protocol::OpenAiResponses,
                 "该账号没有 /v1/responses/input_tokens 端点，Token 计数无法跨协议表达",
             ),
+            Endpoint::ImagesGenerations | Endpoint::ImagesEdits => {
+                let plausible = matches!(
+                    account.preferred_protocol,
+                    Protocol::OpenAiChat | Protocol::OpenAiResponses
+                ) || account.adaptive_protocol;
+                let missing = format!(
+                    "该账号没有 /{} 端点（图片接口仅支持 OpenAI 兼容上游原生转发）",
+                    downstream.path()
+                );
+                if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
+                    return Err(Unsupported::new(missing));
+                }
+                return Ok(vec![Choice {
+                    endpoint: downstream,
+                    fidelity: Fidelity::Lossless,
+                }]);
+            }
             _ => unreachable!("is_native_only 只覆盖辅助端点"),
         };
         if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
@@ -363,6 +380,51 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn image_endpoints_require_a_plausible_openai_account_and_route_evidence() {
+        let body = json!({"model": "m"});
+        let translation = Translation::new(Protocol::OpenAiChat, &body);
+        let now = Instant::now();
+
+        for endpoint in [Endpoint::ImagesGenerations, Endpoint::ImagesEdits] {
+            let refused = choices(
+                &account(Protocol::AnthropicMessages, false),
+                endpoint,
+                &translation,
+                &Evidence::new(),
+                true,
+                now,
+            )
+            .unwrap_err();
+            assert!(refused.to_string().contains(endpoint.path()));
+
+            let picked = choices(
+                &account(Protocol::OpenAiResponses, false),
+                endpoint,
+                &translation,
+                &Evidence::new(),
+                true,
+                now,
+            )
+            .unwrap();
+            assert_eq!(picked[0].endpoint, endpoint);
+
+            let evidence = Evidence::new();
+            evidence.note_unsupported("acc", endpoint, now);
+            assert!(
+                choices(
+                    &account(Protocol::OpenAiResponses, false),
+                    endpoint,
+                    &translation,
+                    &evidence,
+                    true,
+                    now,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

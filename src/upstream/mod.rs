@@ -130,11 +130,15 @@ pub enum Endpoint {
     ResponsesCompact,
     /// `POST /v1/responses/input_tokens`（§15.4）：同上。
     ResponsesInputTokens,
+    /// `POST /v1/images/generations`：只能原生转发，没有跨协议等价物。
+    ImagesGenerations,
+    /// `POST /v1/images/edits`：只能原生转发，没有跨协议等价物。
+    ImagesEdits,
 }
 
 impl Endpoint {
-    /// 三个推理端点。辅助端点（`CountTokens`、`ResponsesCompact`、
-    /// `ResponsesInputTokens`）不在其中：它们没有跨协议等价物（§15.4、§15.5）。
+    /// 三个推理端点。辅助端点（计数、Responses 辅助操作与图片接口）不在其中：
+    /// 它们没有跨协议等价物（§15.4、§15.5）。
     pub const INFERENCE: [Endpoint; 3] = [Self::ChatCompletions, Self::Responses, Self::Messages];
 
     /// 某个协议的原生推理端点。
@@ -150,7 +154,11 @@ impl Endpoint {
     pub fn is_native_only(self) -> bool {
         matches!(
             self,
-            Self::CountTokens | Self::ResponsesCompact | Self::ResponsesInputTokens
+            Self::CountTokens
+                | Self::ResponsesCompact
+                | Self::ResponsesInputTokens
+                | Self::ImagesGenerations
+                | Self::ImagesEdits
         )
     }
 
@@ -162,6 +170,7 @@ impl Endpoint {
                 Protocol::OpenAiResponses
             }
             Self::Messages | Self::CountTokens => Protocol::AnthropicMessages,
+            Self::ImagesGenerations | Self::ImagesEdits => Protocol::OpenAiChat,
         }
     }
 
@@ -174,6 +183,8 @@ impl Endpoint {
             Self::CountTokens => "v1/messages/count_tokens",
             Self::ResponsesCompact => "v1/responses/compact",
             Self::ResponsesInputTokens => "v1/responses/input_tokens",
+            Self::ImagesGenerations => "v1/images/generations",
+            Self::ImagesEdits => "v1/images/edits",
         }
     }
 
@@ -186,6 +197,8 @@ impl Endpoint {
             Self::CountTokens => "count_tokens",
             Self::ResponsesCompact => "responses_compact",
             Self::ResponsesInputTokens => "responses_input_tokens",
+            Self::ImagesGenerations => "images_generations",
+            Self::ImagesEdits => "images_edits",
         }
     }
 }
@@ -305,11 +318,26 @@ pub fn build_headers(
     api_key: &str,
     downstream: &HeaderMap,
 ) -> Result<HeaderMap, UpstreamError> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
+    build_headers_with_content_type(
+        endpoint,
+        api_key,
+        downstream,
         HeaderValue::from_static("application/json"),
-    );
+    )
+}
+
+/// 构造发往上游的协议鉴权头，并使用调用方指定的正文类型。
+///
+/// multipart 请求必须把客户端的 boundary 一并保留下来；因此原始正文路径
+/// 使用这个变体，而普通 JSON 请求继续通过 [`build_headers`] 走固定类型。
+pub fn build_headers_with_content_type(
+    endpoint: Endpoint,
+    api_key: &str,
+    downstream: &HeaderMap,
+    content_type: HeaderValue,
+) -> Result<HeaderMap, UpstreamError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, content_type);
 
     match endpoint.protocol() {
         Protocol::AnthropicMessages => {
@@ -441,6 +469,20 @@ mod tests {
             build_headers(Endpoint::ChatCompletions, "sk-abc", &HeaderMap::new()).unwrap();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-abc");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn raw_content_type_is_kept_for_multipart_requests() {
+        let content_type = HeaderValue::from_static("multipart/form-data; boundary=abc");
+        let headers = build_headers_with_content_type(
+            Endpoint::ImagesEdits,
+            "sk-abc",
+            &HeaderMap::new(),
+            content_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(headers.get("content-type"), Some(&content_type));
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-abc");
     }
 
     #[test]

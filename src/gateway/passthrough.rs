@@ -8,6 +8,7 @@
 //! 绑定目标、以及**流式切换边界**——在只收到 HTTP 头、空白、注释、ping 或协议
 //! 开始标记时仍可切换，一旦发出有语义的增量就禁止拼接第二个上游。
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,14 @@ const RATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 按上游的 `Retry-After` 等待时额外多等的余量，避免卡在冷却结束的临界点上。
 const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
 
+/// 需要原样发送的请求正文。`content_type` 保留客户端提供的 multipart
+/// boundary，不能被统一 JSON 头覆盖。
+#[derive(Debug, Clone)]
+pub struct RawBody {
+    pub bytes: Vec<u8>,
+    pub content_type: HeaderValue,
+}
+
 /// 一次转发请求的全部输入。
 pub struct Forward<'a> {
     pub state: &'a SharedState,
@@ -68,6 +77,8 @@ pub struct Forward<'a> {
     pub downstream_headers: &'a HeaderMap,
     /// 已解析的请求体。模型名会被逐目标改写。
     pub body: serde_json::Value,
+    /// 可选的原始请求体（目前用于 multipart 图片编辑）。
+    pub raw: Option<RawBody>,
     pub logical_model: String,
     pub request_bytes: usize,
     pub started_at: Instant,
@@ -164,6 +175,8 @@ struct Walk<'a> {
 struct Prepared {
     endpoint: Endpoint,
     body: serde_json::Value,
+    /// 原始请求体经过当前目标模型名替换后的字节；存在时不做 JSON 发射。
+    raw: Option<Vec<u8>>,
     degraded: Vec<String>,
 }
 
@@ -772,6 +785,33 @@ impl Walk<'_> {
         let downstream = self.forward.endpoint.protocol();
         let chain = &self.forward.chain;
 
+        // multipart 请求没有可用的 JSON 转换路径：只替换当前目标的 model
+        // part，其余 boundary、文件头与文件字节全部保持不动。
+        if let Some(raw) = self.forward.raw.as_ref() {
+            let rewritten =
+                rewrite_multipart_model(&raw.bytes, &candidate.target.target.upstream_model)
+                    .map_err(|error| {
+                        let message = match error {
+                            MultipartModelError::Missing => "multipart 请求体缺少 model 字段",
+                            MultipartModelError::UnsafeReplacement => {
+                                "上游模型名包含 multipart 不安全字符"
+                            }
+                        };
+                        AttemptFailure::Terminal(Box::new(
+                            GatewayError::new(ErrorCode::UnsupportedParameter, message)
+                                .with_protocol(self.forward.endpoint.protocol())
+                                .with_request_id(self.forward.request_id)
+                                .into_response(),
+                        ))
+                    })?;
+            return Ok(Prepared {
+                endpoint: choice.endpoint,
+                body: self.forward.body.clone(),
+                raw: Some(rewritten),
+                degraded: Vec::new(),
+            });
+        }
+
         let native_continuation = matches!(&chain.pinned, Some(pinned)
             if pinned.account_id == candidate.target.account.id
                 && downstream == target_protocol);
@@ -811,6 +851,7 @@ impl Walk<'_> {
         Ok(Prepared {
             endpoint: choice.endpoint,
             body,
+            raw: None,
             degraded,
         })
     }
@@ -1094,20 +1135,46 @@ async fn attempt(
         .await
         .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?;
     // 请求头按**上游端点**的协议构造，与下游用哪个协议进来无关（§14.7）。
-    let headers = upstream::build_headers(prepared.endpoint, &api_key, forward.downstream_headers)
-        .map_err(|error| {
-            AttemptFailure::switchable(
-                ErrorCode::InternalError,
-                format!("账号「{}」的请求头构造失败：{error}", account.name),
-            )
-        })?;
-
-    let payload = serde_json::to_vec(&prepared.body).map_err(|error| {
+    // 原始 multipart 路径必须保留客户端的 Content-Type（尤其是 boundary），
+    // 不能让普通 JSON 头覆盖它。
+    let headers = if let Some(raw) = forward.raw.as_ref() {
+        upstream::build_headers_with_content_type(
+            prepared.endpoint,
+            &api_key,
+            forward.downstream_headers,
+            raw.content_type.clone(),
+        )
+    } else {
+        upstream::build_headers(prepared.endpoint, &api_key, forward.downstream_headers)
+    }
+    .map_err(|error| {
         AttemptFailure::switchable(
             ErrorCode::InternalError,
-            format!("序列化上游请求体失败：{error}"),
+            format!("账号「{}」的请求头构造失败：{error}", account.name),
         )
     })?;
+
+    let payload = match (forward.raw.as_ref(), prepared.raw.as_ref()) {
+        (Some(_), Some(raw)) => raw.clone(),
+        (Some(_), None) => {
+            return Err(AttemptFailure::switchable(
+                ErrorCode::InternalError,
+                "原始请求体准备结果缺失".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(AttemptFailure::switchable(
+                ErrorCode::InternalError,
+                "原始请求体状态不一致".into(),
+            ));
+        }
+        (None, None) => serde_json::to_vec(&prepared.body).map_err(|error| {
+            AttemptFailure::switchable(
+                ErrorCode::InternalError,
+                format!("序列化上游请求体失败：{error}"),
+            )
+        })?,
+    };
 
     let response = forward
         .state
@@ -1771,6 +1838,186 @@ pub fn extract_model(body: &serde_json::Value, protocol: Protocol) -> Result<Str
         })
 }
 
+/// multipart `model` part 的解析错误。图片编辑只需要识别这个字段，
+/// 不试图实现完整 multipart 语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartModelError {
+    Missing,
+    UnsafeReplacement,
+}
+
+/// 从完整 multipart 正文中提取 `Content-Disposition` 的 `name="model"` 字段。
+///
+/// 解析按 boundary 行与 CRLF/LF 分隔进行，调用方已经把请求体完整读入内存，
+/// 因而不会受网络分块边界影响。返回值会去掉字段值两端的空白。
+pub fn extract_multipart_model(body: &[u8]) -> Result<String, MultipartModelError> {
+    let range = multipart_model_range(body)?;
+    let value = std::str::from_utf8(&body[range])
+        .map_err(|_| MultipartModelError::Missing)?
+        .trim();
+    if value.is_empty() {
+        return Err(MultipartModelError::Missing);
+    }
+    Ok(value.to_string())
+}
+
+/// 只替换 multipart `model` part 的内容，保留其它字节与 boundary 原样。
+///
+/// 上游模型名若含控制字符会改变 multipart 的结构（例如注入换行或新的
+/// boundary），因此直接拒绝，而不是把不安全字节写进正文。
+pub fn rewrite_multipart_model(
+    body: &[u8],
+    upstream_model: &str,
+) -> Result<Vec<u8>, MultipartModelError> {
+    if upstream_model.is_empty() || upstream_model.chars().any(char::is_control) {
+        return Err(MultipartModelError::UnsafeReplacement);
+    }
+    let range = multipart_model_range(body)?;
+    let mut rewritten = Vec::with_capacity(
+        body.len()
+            .saturating_sub(range.end.saturating_sub(range.start))
+            .saturating_add(upstream_model.len()),
+    );
+    rewritten.extend_from_slice(&body[..range.start]);
+    rewritten.extend_from_slice(upstream_model.as_bytes());
+    rewritten.extend_from_slice(&body[range.end..]);
+    Ok(rewritten)
+}
+
+/// 找到 `model` part 的值范围（不包含值前后的 multipart 分隔换行）。
+fn multipart_model_range(body: &[u8]) -> Result<Range<usize>, MultipartModelError> {
+    let (boundary, mut cursor) = multipart_first_boundary(body)?;
+
+    loop {
+        if cursor >= body.len() || !body[cursor..].starts_with(&boundary) {
+            return Err(MultipartModelError::Missing);
+        }
+        let after_boundary = cursor + boundary.len();
+        if body[after_boundary..].starts_with(b"--") {
+            return Err(MultipartModelError::Missing);
+        }
+
+        // 当前 boundary 行后面必须紧跟换行，之后才是 part headers。
+        let (_, headers_start) =
+            multipart_line(body, cursor).ok_or(MultipartModelError::Missing)?;
+        let mut line_start = headers_start;
+        let mut is_model = false;
+        let value_start = loop {
+            let (line_end, next) =
+                multipart_line(body, line_start).ok_or(MultipartModelError::Missing)?;
+            if line_end == line_start {
+                break next;
+            }
+            if multipart_is_model_disposition(&body[line_start..line_end]) {
+                is_model = true;
+            }
+            line_start = next;
+        };
+
+        let next_boundary = multipart_find_boundary(body, value_start, &boundary)
+            .ok_or(MultipartModelError::Missing)?;
+        let value_end = multipart_trim_delimiter_newline(body, value_start, next_boundary);
+        if is_model {
+            return Ok(value_start..value_end);
+        }
+        cursor = next_boundary;
+    }
+}
+
+/// 读取一行，返回不含换行的结束位置与下一行起点。兼容 CRLF 与 LF。
+fn multipart_line(body: &[u8], start: usize) -> Option<(usize, usize)> {
+    let newline = body[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| start + offset)?;
+    let end = if newline > start && body[newline - 1] == b'\r' {
+        newline - 1
+    } else {
+        newline
+    };
+    Some((end, newline + 1))
+}
+
+/// 取出正文首行 boundary 与首个 part 的起点。
+fn multipart_first_boundary(body: &[u8]) -> Result<(Vec<u8>, usize), MultipartModelError> {
+    if !body.starts_with(b"--") {
+        return Err(MultipartModelError::Missing);
+    }
+    let (line_end, _) = multipart_line(body, 0).ok_or(MultipartModelError::Missing)?;
+    if line_end <= 2 {
+        return Err(MultipartModelError::Missing);
+    }
+    // 从首个 delimiter 行开始处理；循环会从该行读取 headers 起点。
+    Ok((body[..line_end].to_vec(), 0))
+}
+
+/// 在行首查找下一个 boundary delimiter。
+fn multipart_find_boundary(body: &[u8], start: usize, boundary: &[u8]) -> Option<usize> {
+    let mut search = start;
+    while search <= body.len() {
+        let relative = body[search..]
+            .windows(boundary.len())
+            .position(|window| window == boundary)?;
+        let position = search + relative;
+        let at_line_start = position == 0 || body[position - 1] == b'\n';
+        let after = position + boundary.len();
+        let valid_suffix = after == body.len() || matches!(body[after], b'-' | b'\r' | b'\n');
+        if at_line_start && valid_suffix {
+            return Some(position);
+        }
+        search = position.saturating_add(1);
+    }
+    None
+}
+
+/// 去掉 boundary 前用于分隔 part 的最后一个 CRLF/LF。
+fn multipart_trim_delimiter_newline(body: &[u8], start: usize, boundary: usize) -> usize {
+    let mut end = boundary;
+    if end > start && body[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && body[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    end
+}
+
+/// 判断一个 header 行是否声明了 `name="model"` part。
+fn multipart_is_model_disposition(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    if !trim_ascii(&line[..colon]).eq_ignore_ascii_case(b"content-disposition") {
+        return false;
+    }
+    for segment in line[colon + 1..].split(|byte| *byte == b';') {
+        let Some(equal) = segment.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        if !trim_ascii(&segment[..equal]).eq_ignore_ascii_case(b"name") {
+            continue;
+        }
+        let mut value = trim_ascii(&segment[equal + 1..]);
+        if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
+            value = &value[1..value.len() - 1];
+        }
+        return value == b"model";
+    }
+    false
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |position| position + 1);
+    &bytes[start..end]
+}
+
 /// 请求体在内存里的上限；超过后落临时文件（§17.3、§19.4）。
 pub const IN_MEMORY_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -1851,6 +2098,35 @@ pub async fn read_body(
     })?;
     // `file` 在这里析构，临时文件随之删除。
     Ok((value, size))
+}
+
+/// 读取原始请求体并施加大小上限。multipart 需要保留完整字节以便只改写
+/// `model` part，因此不走 JSON 解析或临时文件路径。
+pub async fn read_raw_body(
+    body: Body,
+    max_bytes: usize,
+    protocol: Protocol,
+) -> Result<(Vec<u8>, usize), GatewayError> {
+    let too_large = || {
+        GatewayError::new(
+            ErrorCode::RequestTooLarge,
+            format!("请求体超过上限 {max_bytes} 字节，或读取中断"),
+        )
+        .with_protocol(protocol)
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    let mut size = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| too_large())?;
+        size = size.saturating_add(chunk.len());
+        if size > max_bytes {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, size))
 }
 
 /// 读取非流式上游响应体，并施加硬上限（§17.3）。
@@ -2036,6 +2312,22 @@ mod tests {
         assert_eq!(value["model"], "glm-4.6");
     }
 
+    #[tokio::test]
+    async fn raw_bodies_keep_bytes_and_share_the_request_size_error() {
+        let raw = b"--b\r\nmodel\r\n--b--\r\n".to_vec();
+        let (read, size) = read_raw_body(Body::from(raw.clone()), 1024, Protocol::OpenAiChat)
+            .await
+            .unwrap();
+        assert_eq!(read, raw);
+        assert_eq!(size, read.len());
+
+        let error = read_raw_body(Body::from(vec![0_u8; 4096]), 1024, Protocol::OpenAiChat)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestTooLarge);
+        assert_eq!(error.code.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     /// 超过 8 MiB 的请求体必须落临时文件解析，且返回前把文件清理掉（§1291）。
     #[tokio::test]
     async fn large_bodies_are_spooled_to_disk_and_still_parse() {
@@ -2070,5 +2362,48 @@ mod tests {
         let error = append_capped(&mut buffer, &[0u8; 2048], 2048).unwrap_err();
         assert!(error.contains("上限"), "{error}");
         assert_eq!(buffer.len(), 1024, "超限的块不得部分写入");
+    }
+
+    #[test]
+    fn multipart_model_is_found_and_only_its_value_is_rewritten() {
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"model\"\r\n\
+\r\n\
+logical-model\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"image\"; filename=\"a.bin\"\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+\x00\x01same-bytes\r\n\
+--boundary--\r\n";
+        assert_eq!(extract_multipart_model(body).unwrap(), "logical-model");
+        let rewritten = rewrite_multipart_model(body, "upstream-model").unwrap();
+        assert!(rewritten.starts_with(b"--boundary\r\n"));
+        assert!(
+            rewritten
+                .windows(b"upstream-model".len())
+                .any(|window| { window == b"upstream-model" })
+        );
+        assert!(rewritten.ends_with(b"\x00\x01same-bytes\r\n--boundary--\r\n"));
+    }
+
+    #[test]
+    fn multipart_parser_accepts_lf_and_rejects_missing_model() {
+        let body = b"--b\nContent-Disposition: form-data; name=\"image\"\n\nbytes\n--b--\n";
+        assert_eq!(
+            extract_multipart_model(body),
+            Err(MultipartModelError::Missing)
+        );
+        let body = b"--b\nContent-Disposition: form-data; name=\"model\"\n\n m \n--b--\n";
+        assert_eq!(extract_multipart_model(body).unwrap(), "m");
+    }
+
+    #[test]
+    fn multipart_rewrite_rejects_control_characters_in_upstream_model() {
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--b--\r\n";
+        assert_eq!(
+            rewrite_multipart_model(body, "bad\r\nvalue"),
+            Err(MultipartModelError::UnsafeReplacement)
+        );
     }
 }

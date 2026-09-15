@@ -27,6 +27,7 @@ Responses 状态链与模型发现（选择集、别名、自动同步、能力�
   - `POST /v1/messages`
   - `POST /v1/messages/count_tokens`
   - `POST /v1/responses`
+  - `POST /v1/images/generations` 与 `POST /v1/images/edits`（仅原生 OpenAI 兼容上游）
 - `GET /v1/models` 与 `/v1/models/{model}`，响应形状按鉴权头双形态切换。
 - 请求 ID、稳定错误码、§18.3 的 HTTP 状态码映射、上游凭据加密与日志脱敏。
 - **严格优先级阶梯**：优先级数字相同的目标构成一层，高层只要还有合格目标就
@@ -93,6 +94,8 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
   对象，取消则明确拒绝，绝不伪报成功。
 - `POST /v1/responses/compact` 与 `/v1/responses/input_tokens` 接入完整调度链路
   后原生转发给 Responses 上游；上游没有该路由时返回明确的不支持（不重试、不估算）。
+- 图片接口 `POST /v1/images/generations` 与 `POST /v1/images/edits`：仅原生转发到
+  OpenAI 兼容上游，不做跨协议转换与 provider 适配；edits 保留 multipart 文件字节。
 - 请求体超过 8 MiB 落数据目录临时文件（自动清理 + 启动清理），非流式上游
   响应体施加 64 MiB 硬上限。
 - SSRF 校验移入 DNS 解析器：连接使用的地址就是校验过的地址，消除 DNS

@@ -19,6 +19,7 @@ use axum::routing::{get, post};
 
 use crate::app::SharedState;
 use crate::auth;
+use crate::gateway::error::GatewayError;
 use crate::upstream::Endpoint;
 
 /// 组装 `/v1` 下的全部公开接口。
@@ -28,6 +29,8 @@ pub fn router() -> Router<SharedState> {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/responses", post(responses_create))
+        .route("/v1/images/generations", post(images_generations))
+        .route("/v1/images/edits", post(images_edits))
         // Responses 的查询、删除与取消（§15.1、§15.2）。全部走网关 ID。
         .route(
             "/v1/responses/{id}",
@@ -60,6 +63,16 @@ async fn count_tokens(state: State<SharedState>, headers: HeaderMap, body: Body)
 
 async fn responses_create(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
     handle(state, headers, body, Endpoint::Responses).await
+}
+
+/// `POST /v1/images/generations`：只能原生转发到 OpenAI 兼容上游。
+async fn images_generations(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::ImagesGenerations).await
+}
+
+/// `POST /v1/images/edits`：JSON 以外也允许原样携带 multipart 正文。
+async fn images_edits(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::ImagesEdits).await
 }
 
 /// `POST /v1/responses/compact`：只能原生转发，没有等价适配器（§15.4）。
@@ -111,17 +124,76 @@ async fn handle(
         }
     };
 
-    let (body, request_bytes) = match passthrough::read_body(
-        body,
-        state.settings.max_request_bytes,
-        protocol,
-        &state.data_dir.join(crate::app::TEMP_DIR_NAME),
-    )
-    .await
-    {
-        Ok(parsed) => parsed,
-        Err(error) => return error.with_request_id(request_id).into_response(),
-    };
+    // 图片 edits 使用 multipart 时必须保留完整原始正文与 boundary；其它请求
+    // 继续走既有 JSON 读取与解析路径。
+    let is_multipart = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .as_bytes()
+                .get(..b"multipart/form-data".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"multipart/form-data"))
+        });
+    let (body, request_bytes, raw) =
+        if is_multipart {
+            // 原始正文只有图片编辑需要；其它入口收到 multipart 说明客户端
+            // 用错了接口，明确 400，而不是把它转发成一条形状错误的请求。
+            if endpoint != Endpoint::ImagesEdits {
+                return GatewayError::new(
+                    crate::gateway::error::ErrorCode::UnsupportedParameter,
+                    "multipart 请求体只支持 /v1/images/edits",
+                )
+                .with_protocol(protocol)
+                .with_request_id(request_id)
+                .into_response();
+            }
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .cloned()
+                .expect("multipart 判定成立时必须有 Content-Type");
+            let (bytes, request_bytes) =
+                match passthrough::read_raw_body(body, state.settings.max_request_bytes, protocol)
+                    .await
+                {
+                    Ok(raw) => raw,
+                    Err(error) => return error.with_request_id(request_id).into_response(),
+                };
+            let model = match passthrough::extract_multipart_model(&bytes) {
+                Ok(model) if !model.trim().is_empty() => model,
+                Ok(_) | Err(_) => {
+                    return GatewayError::new(
+                        crate::gateway::error::ErrorCode::UnsupportedParameter,
+                        "multipart 请求体缺少 model 字段",
+                    )
+                    .with_protocol(protocol)
+                    .with_request_id(request_id)
+                    .into_response();
+                }
+            };
+            (
+                serde_json::json!({"model": model}),
+                request_bytes,
+                Some(passthrough::RawBody {
+                    bytes,
+                    content_type,
+                }),
+            )
+        } else {
+            let (body, request_bytes) = match passthrough::read_body(
+                body,
+                state.settings.max_request_bytes,
+                protocol,
+                &state.data_dir.join(crate::app::TEMP_DIR_NAME),
+            )
+            .await
+            {
+                Ok(parsed) => parsed,
+                Err(error) => return error.with_request_id(request_id).into_response(),
+            };
+            (body, request_bytes, None)
+        };
 
     let logical_model = match passthrough::extract_model(&body, protocol) {
         Ok(model) => model,
@@ -144,6 +216,7 @@ async fn handle(
         request_id: &request_id,
         downstream_headers: &headers,
         body,
+        raw,
         logical_model,
         request_bytes,
         started_at,
