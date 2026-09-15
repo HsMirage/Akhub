@@ -370,8 +370,13 @@ def main() -> int:
         model = args.image_model
 
         def image_generate():
+            # 真实生图往往要 1–3 分钟，用 SDK 的 per-request 超时放宽到 300 秒。
             result = openai_client.images.generate(
-                model=model, prompt="a tiny red dot on a white background", n=1, size="1024x1024"
+                model=model,
+                prompt="a tiny red dot on a white background",
+                n=1,
+                size="1024x1024",
+                timeout=300,
             )
             assert result.data, "没有图片数据"
             item = result.data[0]

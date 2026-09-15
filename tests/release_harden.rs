@@ -89,6 +89,73 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
     );
 }
 
+/// 回归：宽限期必须从**收到停止信号之后**才开始计时。
+///
+/// 早期实现用 `timeout(grace, serve)` 包住整个服务，导致进程每 180 秒自杀一次
+/// （线上表现为 systemd 反复重启、管理会话丢失）。这里用 150ms 的宽限期，
+/// 先验证没有信号时服务在几倍宽限期之后仍然活着，再发信号验证它会退出。
+#[tokio::test]
+async fn the_grace_period_only_starts_after_the_stop_signal() {
+    let akhub = spawn_akhub_with(
+        Settings {
+            shutdown_grace: Duration::from_millis(150),
+            ..Settings::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener); // 端口留给 serve_with_shutdown 绑定。
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let state = std::sync::Arc::clone(&akhub.state);
+    let serving = tokio::spawn(async move {
+        akhub::server::serve_with_shutdown(state, addr, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+
+    let http = client();
+    let mut alive = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if http
+            .get(format!("http://{addr}/health/live"))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            alive = true;
+            break;
+        }
+    }
+    assert!(alive, "服务没有起来");
+
+    // 超过宽限期数倍仍未收到信号：绝不能自行退出。
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        !serving.is_finished(),
+        "没有停止信号就不该退出——宽限期不能从启动时开始计时"
+    );
+    let response = http
+        .get(format!("http://{addr}/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "服务必须仍然可用");
+
+    // 发信号后正常收口。
+    tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("收到信号后必须退出")
+        .unwrap();
+    assert!(result.is_ok());
+}
+
 #[tokio::test]
 async fn a_corrupt_database_fails_loudly_instead_of_being_silently_recreated() {
     // §26.8：主库文件损坏时启动必须失败，绝不能"当作新库"继续跑。

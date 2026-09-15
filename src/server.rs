@@ -100,11 +100,28 @@ pub async fn serve_with_shutdown(
     crate::app::tasks::spawn(&state);
     tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin");
     let grace = state.settings.shutdown_grace;
+
+    // 宽限期必须从**收到停止信号之后**开始算。早期实现直接用
+    // `timeout(grace, serve)` 包住整个服务，结果进程每 180 秒就自行退出一次
+    // （systemd 会一直重启）。这里用两个通道把两件事分开：先等信号，再计时。
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async move {
+        shutdown.await;
+        let _ = stopping_tx.send(());
+    };
     let serving = axum::serve(listener, router(state.clone()).into_make_service())
-        .with_graceful_shutdown(shutdown);
-    let result = match tokio::time::timeout(grace, serving).await {
-        Ok(result) => result.context("HTTP 服务异常退出"),
-        Err(_) => {
+        .with_graceful_shutdown(graceful);
+    let hard_stop = async move {
+        if stopping_rx.await.is_err() {
+            // 信号发送端消失表示服务已经结束，这里永远等下去。
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(grace).await;
+    };
+
+    let result = tokio::select! {
+        result = serving => result.context("HTTP 服务异常退出"),
+        _ = hard_stop => {
             // 宽限期到点：`main` 随本函数返回，运行时析构会中止剩余任务。
             // systemd 的 `TimeoutStopSec` 与容器的 `stop_grace_period` 是更外层
             // 的兜底，这里自己先收口，不让 180 秒的承诺落空。

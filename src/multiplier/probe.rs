@@ -102,21 +102,62 @@ fn parse_clock(raw: &str) -> Result<u32> {
 
 // ------------------------------------------------------------------ Sub2API
 
-/// Sub2API 的 Key 级计费响应。
+/// Sub2API 的 Key 级计费响应（兼容两代现场形状）。
 ///
-/// 字段名取自 §11.2 要求校验的六项：对象类型、版本、计费范围、有效倍率、
-/// 观察时间与峰值倍率。接入真实站点前应当先用 `--probe` 之外的手段核对一次
-/// 实际字段名；校验失败时探针宁可报错也不会退回默认值。
+/// 现场（2026-09，`sub2api:latest`）返回 `sub2api.key_billing`：
+/// `schema_version` / `billing_scope` / `effective_rate_multiplier`，观察时间是
+/// RFC3339 字符串。早期文档形状是 `billing` / `version` / `scope` /
+/// `effective_multiplier`，观察时间是 Unix 秒。两种都接受；字段缺失或取值非法
+/// 时报错，绝不退回默认倍率。
 #[derive(Debug, Deserialize)]
 struct Sub2ApiBilling {
     object: String,
+    #[serde(alias = "schema_version")]
     version: u32,
+    #[serde(alias = "billing_scope")]
     scope: String,
-    effective_multiplier: serde_json::Value,
-    observed_at: Option<i64>,
+    /// 早期形状：有效倍率。
+    #[serde(default)]
+    effective_multiplier: Option<serde_json::Value>,
+    /// 现场形状：有效倍率。
+    #[serde(default)]
+    effective_rate_multiplier: Option<serde_json::Value>,
+    /// 现场形状的备用来源：站点解析后的倍率。
+    #[serde(default)]
+    resolved_rate_multiplier: Option<serde_json::Value>,
+    #[serde(default)]
+    observed_at: Option<serde_json::Value>,
+    #[serde(default)]
     peak_multiplier: Option<serde_json::Value>,
     #[serde(default)]
     peak_windows: Vec<RawWindow>,
+}
+
+impl Sub2ApiBilling {
+    /// 有效倍率的取值优先级：早期字段 → 现场字段 → 解析后的倍率。
+    fn effective(&self) -> Option<&serde_json::Value> {
+        self.effective_multiplier
+            .as_ref()
+            .or(self.effective_rate_multiplier.as_ref())
+            .or(self.resolved_rate_multiplier.as_ref())
+    }
+
+    /// 观察时间归一成 Unix 秒（两种现场形状都接受）。
+    fn observed_unix(&self) -> Result<Option<i64>> {
+        let Some(raw) = self.observed_at.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(seconds) = raw.as_i64() {
+            return Ok(Some(seconds));
+        }
+        if let Some(text) = raw.as_str() {
+            let parsed =
+                time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                    .with_context(|| format!("Sub2API 计费响应的观察时间无法解析：{text}"))?;
+            return Ok(Some(parsed.unix_timestamp()));
+        }
+        bail!("Sub2API 计费响应的观察时间既不是 Unix 秒也不是 RFC3339 字符串")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +191,7 @@ pub async fn sub2api(
     let billing: Sub2ApiBilling =
         serde_json::from_slice(&body).context("Sub2API 计费响应结构不符合预期")?;
 
-    if billing.object != "billing" {
+    if billing.object != "billing" && billing.object != "sub2api.key_billing" {
         bail!("Sub2API 计费响应的对象类型非法：{}", billing.object);
     }
     if billing.version != SUB2API_VERSION {
@@ -160,12 +201,16 @@ pub async fn sub2api(
         );
     }
     // 只接受 Key 级计费：站点级或用户级的数字回答不了"我这把 Key 多少倍"。
-    if billing.scope != "key" {
+    // 现场把 Key 级写成 `token`，与早期 `key` 是同一层级。
+    if billing.scope != "key" && billing.scope != "token" {
         bail!("Sub2API 计费范围不是 Key 级：{}", billing.scope);
     }
 
-    let multiplier =
-        to_multiplier(&billing.effective_multiplier).context("Sub2API 计费响应中的有效倍率非法")?;
+    let raw_multiplier = billing
+        .effective()
+        .context("Sub2API 计费响应缺少有效倍率字段")?;
+    let multiplier = to_multiplier(raw_multiplier).context("Sub2API 计费响应中的有效倍率非法")?;
+    let observed_at = billing.observed_unix()?;
     let peak = match billing.peak_multiplier {
         Some(raw) if !billing.peak_windows.is_empty() => {
             let value = to_multiplier(&raw).context("Sub2API 计费响应中的峰值倍率非法")?;
@@ -176,7 +221,7 @@ pub async fn sub2api(
 
     Ok(Reading {
         multiplier,
-        observed_at: billing.observed_at,
+        observed_at,
         peak,
     })
 }
@@ -343,6 +388,60 @@ mod tests {
 
     fn multiplier(raw: &str) -> Multiplier {
         Multiplier::parse(raw).unwrap()
+    }
+
+    /// 现场形状（sub2api:latest）：`sub2api.key_billing` + RFC3339 时间。
+    #[test]
+    fn the_live_sub2api_billing_shape_is_accepted() {
+        let billing: Sub2ApiBilling = serde_json::from_value(json!({
+            "object": "sub2api.key_billing",
+            "schema_version": 1,
+            "billing_scope": "token",
+            "group_rate_multiplier": 0.16,
+            "resolved_rate_multiplier": 0.16,
+            "peak_rate_enabled": false,
+            "effective_rate_multiplier": 0.16,
+            "observed_at": "2026-09-15T17:24:50.924429747Z"
+        }))
+        .unwrap();
+        assert_eq!(billing.version, 1);
+        assert_eq!(billing.scope, "token");
+        assert_eq!(
+            to_multiplier(billing.effective().expect("现场形状的有效倍率")).unwrap(),
+            multiplier("0.16")
+        );
+        let observed = billing.observed_unix().unwrap().expect("观察时间");
+        assert_eq!(observed, 1_789_493_090, "RFC3339 必须归一成 Unix 秒");
+    }
+
+    /// 早期文档形状继续可用（向后兼容）。
+    #[test]
+    fn the_legacy_sub2api_billing_shape_still_works() {
+        let billing: Sub2ApiBilling = serde_json::from_value(json!({
+            "object": "billing",
+            "version": 1,
+            "scope": "key",
+            "effective_multiplier": "0.5",
+            "observed_at": 1_700_000_000
+        }))
+        .unwrap();
+        assert_eq!(
+            to_multiplier(billing.effective().unwrap()).unwrap(),
+            multiplier("0.5")
+        );
+        assert_eq!(billing.observed_unix().unwrap(), Some(1_700_000_000));
+    }
+
+    /// 缺字段时不能悄悄退回默认倍率。
+    #[test]
+    fn a_billing_response_without_a_multiplier_is_rejected() {
+        let billing: Sub2ApiBilling = serde_json::from_value(json!({
+            "object": "sub2api.key_billing",
+            "schema_version": 1,
+            "billing_scope": "token"
+        }))
+        .unwrap();
+        assert!(billing.effective().is_none());
     }
 
     #[test]
