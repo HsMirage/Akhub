@@ -226,13 +226,15 @@ async fn streaming_responses_hold_the_concurrency_slot_until_upstream_finishes()
 #[tokio::test]
 async fn cheap_failures_do_not_count_against_any_attempt_limit() {
     // §26.3：第 1 层 5 个目标，3 个连接失败，第 4 个仍被尝试且成功。
-    let mut dead = Vec::new();
-    for _ in 0..3 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        dead.push(format!("http://{addr}"));
-    }
+    //
+    // "必然拒绝连接"用固定特权端口：早期实现是 bind(:0) 后立刻 drop，赌端口
+    // 不会被别人占用；CI 上并行跑用例时这个赌注会输——另一个用例的假上游
+    // 正好绑到同一个临时端口，于是"死目标"活了过来，请求落到别人的上游上，
+    // 同进程并行跑的 queue_timeout 用例也会被串扰。特权端口非 root 绑不了，
+    // 连接必然 ECONNREFUSED，结果稳定。
+    let dead: Vec<String> = (1..=3)
+        .map(|port| format!("http://127.0.0.1:{port}"))
+        .collect();
     let healthy = [FakeUpstream::spawn().await, FakeUpstream::spawn().await];
 
     let akhub = spawn_akhub().await;
