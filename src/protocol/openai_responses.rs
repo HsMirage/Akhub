@@ -274,11 +274,9 @@ fn parse_content_part(part: &Value) -> Option<Part> {
             part.get("text").and_then(Value::as_str).unwrap_or_default(),
         )),
         "input_image" => {
-            let source = match part.get("image_url").and_then(Value::as_str) {
-                Some(url) => MediaSource::from_url(url),
-                // `file_id` 引用的是上游自己的文件资源，跨协议无法表达。
-                None => return None,
-            };
+            // `file_id` 引用的是上游自己的文件资源，跨协议无法表达。
+            let url = part.get("image_url").and_then(Value::as_str)?;
+            let source = MediaSource::from_url(url);
             Some(Part::Image {
                 source,
                 detail: part

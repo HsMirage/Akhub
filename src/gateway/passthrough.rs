@@ -375,6 +375,10 @@ impl Walk<'_> {
     }
 
     /// 尝试一组同类候选，返回暂时忙的目标供本阶段排队。
+    ///
+    /// `Err` 里带的是给客户端的完整响应，故意不装箱：这条路径每次请求只走
+    /// 一次，装箱反而多一次分配；clippy 的体积告警在这里按已知代价放行。
+    #[allow(clippy::result_large_err)]
     async fn try_candidates<'a>(
         &mut self,
         candidates: Vec<&'a routing::Candidate>,
