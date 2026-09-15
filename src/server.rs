@@ -22,7 +22,30 @@ pub fn router(state: SharedState) -> Router {
         .route("/", get(|| async { Redirect::temporary("/admin") }))
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// 给所有响应补上最小安全响应头（§23.2）。
+///
+/// 不设 CSP：管理后台是内嵌单页应用，贸然上严格 CSP 会把它打坏；这里只做
+/// 无副作用的加固。
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers
+        .entry(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(axum::http::HeaderValue::from_static("nosniff"));
+    headers
+        .entry(axum::http::header::X_FRAME_OPTIONS)
+        .or_insert(axum::http::HeaderValue::from_static("DENY"));
+    headers
+        .entry(axum::http::header::REFERRER_POLICY)
+        .or_insert(axum::http::HeaderValue::from_static("no-referrer"));
+    response
 }
 
 /// 进程存活。不触碰数据库，永远立即返回。
@@ -62,7 +85,9 @@ pub async fn serve(state: SharedState, addr: SocketAddr) -> Result<()> {
 
 /// 用外部注入的停止信号启动服务；`serve` 的可测试形态。
 ///
-/// 信号触发后停止接收新请求，等待在途请求完成后刷最后一笔快照。
+/// 信号触发后停止接收新请求，等待在途请求完成；超过
+/// `AKHUB_SHUTDOWN_GRACE_SECS`（默认 180 秒）仍未收尾就强制结束，避免长流式
+/// 请求把关闭流程拖到监督进程来杀（§25.3 第 3、5 步）。
 pub async fn serve_with_shutdown(
     state: SharedState,
     addr: SocketAddr,
@@ -74,10 +99,22 @@ pub async fn serve_with_shutdown(
 
     crate::app::tasks::spawn(&state);
     tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin");
-    let result = axum::serve(listener, router(state.clone()).into_make_service())
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("HTTP 服务异常退出");
+    let grace = state.settings.shutdown_grace;
+    let serving = axum::serve(listener, router(state.clone()).into_make_service())
+        .with_graceful_shutdown(shutdown);
+    let result = match tokio::time::timeout(grace, serving).await {
+        Ok(result) => result.context("HTTP 服务异常退出"),
+        Err(_) => {
+            // 宽限期到点：`main` 随本函数返回，运行时析构会中止剩余任务。
+            // systemd 的 `TimeoutStopSec` 与容器的 `stop_grace_period` 是更外层
+            // 的兜底，这里自己先收口，不让 180 秒的承诺落空。
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "优雅关闭超过宽限期，强制结束剩余在途请求"
+            );
+            Ok(())
+        }
+    };
 
     // 关闭前把最后一分钟的粘性与性能数据刷完，否则重启会白丢一分钟（§22）。
     crate::app::tasks::flush_snapshots(&state).await;

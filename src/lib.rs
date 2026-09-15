@@ -18,4 +18,5 @@ pub mod routing;
 pub mod security;
 pub mod server;
 pub mod storage;
+pub mod sync;
 pub mod upstream;

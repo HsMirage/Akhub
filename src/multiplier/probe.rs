@@ -139,7 +139,7 @@ pub async fn sub2api(
     url_guard::assert_resolvable(&url, allow_private).await?;
 
     let response = client
-        .http()
+        .http_for(allow_private)
         .get(url)
         .bearer_auth(api_key)
         .timeout(PROBE_TIMEOUT)
@@ -211,7 +211,7 @@ pub async fn new_api(
     url_guard::assert_resolvable(&url, allow_private).await?;
 
     let response = client
-        .http()
+        .http_for(allow_private)
         .get(url)
         // New API 的访问令牌直接放在 Authorization 里，不带 Bearer 前缀。
         .header(reqwest::header::AUTHORIZATION, access_token)

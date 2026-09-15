@@ -112,7 +112,12 @@ pub struct AppState {
     pub refresh: tasks::RefreshHandle,
     /// 主密钥来自环境变量，供后台展示密钥状态。
     pub master_key_from_env: bool,
+    /// 数据目录：大请求体的临时文件落在这里（§17.3、§19.4）。
+    pub data_dir: std::path::PathBuf,
 }
+
+/// 大请求体的临时目录名（§1291、§1292）。
+pub const TEMP_DIR_NAME: &str = "tmp";
 
 pub type SharedState = Arc<AppState>;
 
@@ -130,6 +135,14 @@ impl AppState {
         let runtime = Runtime::default();
         restore(&store, &runtime).await?;
 
+        // 上次异常退出遗留的临时请求体：启动时清掉（§1291、§1292）。
+        let temp_dir = data_dir.join(TEMP_DIR_NAME);
+        if let Err(error) = std::fs::create_dir_all(&temp_dir) {
+            tracing::warn!(%error, path = %temp_dir.display(), "创建临时目录失败");
+        } else {
+            sweep_stale_temp_files(&temp_dir);
+        }
+
         let state = Arc::new(AppState {
             cipher: master_key.cipher(),
             key_digest: master_key.key_digest(),
@@ -142,6 +155,7 @@ impl AppState {
             recorder,
             runtime,
             refresh: tasks::RefreshHandle::default(),
+            data_dir: data_dir.to_path_buf(),
         });
         Ok(state)
     }
@@ -187,4 +201,61 @@ async fn restore(store: &Store, runtime: &Runtime) -> Result<()> {
         "已从快照恢复粘性绑定与性能统计"
     );
     Ok(())
+}
+
+/// 清理上次异常退出遗留的临时请求体（§1292）。
+///
+/// 正常路径下 `NamedTempFile` 会在请求结束、客户端断开或任务被丢弃时自动
+/// 删除；只有进程崩溃会留下文件。安全时间取 6 小时，避免误删仍在途的长请求。
+fn sweep_stale_temp_files(dir: &std::path::Path) {
+    const HORIZON: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > HORIZON);
+        if stale {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "清理临时请求体失败");
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "已清理上次异常退出遗留的临时请求体");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只有超过安全时间的遗留文件才会被清掉，新文件必须保留。
+    #[test]
+    fn stale_temp_files_are_swept_but_fresh_ones_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh");
+        let stale = dir.path().join("stale");
+        std::fs::write(&fresh, b"x").unwrap();
+        std::fs::write(&stale, b"x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
+        let file = std::fs::File::options().write(true).open(&stale).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+
+        sweep_stale_temp_files(dir.path());
+
+        assert!(fresh.exists(), "新鲜文件不能被删");
+        assert!(!stale.exists(), "超过安全时间的遗留文件必须清掉");
+    }
 }

@@ -64,7 +64,7 @@ pub async fn refresh_catalog(state: &SharedState, account: &Account) -> Result<V
     let key = state.cipher.open(&sealed)?;
     let api_key = String::from_utf8_lossy(&key).into_owned();
     let upstream_names = crate::upstream::fetch_model_list(
-        state.upstream.http(),
+        state.upstream.http_for(account.allow_private_network),
         &account.base_url,
         account.preferred_protocol,
         &api_key,

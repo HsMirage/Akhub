@@ -70,7 +70,7 @@ impl SessionStore {
 
     /// 该用户当前是否处于登录锁定中。
     pub fn is_locked(&self, username: &str) -> bool {
-        let mut failures = self.failures.lock().expect("会话锁未被跨 await 持有");
+        let mut failures = crate::sync::lock(&self.failures);
         match failures.get(username).and_then(|f| f.locked_until) {
             Some(until) if until > Instant::now() => true,
             Some(_) => {
@@ -84,7 +84,7 @@ impl SessionStore {
 
     /// 记录一次登录失败，必要时触发锁定。
     pub fn record_failure(&self, username: &str) {
-        let mut failures = self.failures.lock().expect("会话锁未被跨 await 持有");
+        let mut failures = crate::sync::lock(&self.failures);
         let entry = failures.entry(username.to_string()).or_default();
         entry.count += 1;
         if entry.count >= MAX_FAILURES {
@@ -95,27 +95,21 @@ impl SessionStore {
 
     /// 登录成功：清空失败计数并签发会话令牌。
     pub fn create(&self, username: &str) -> Result<String> {
-        self.failures
-            .lock()
-            .expect("会话锁未被跨 await 持有")
-            .remove(username);
+        crate::sync::lock(&self.failures).remove(username);
         let token = URL_SAFE_NO_PAD.encode(&*crate::security::random_bytes(32)?);
-        self.sessions
-            .lock()
-            .expect("会话锁未被跨 await 持有")
-            .insert(
-                token.clone(),
-                Session {
-                    username: username.to_string(),
-                    expires_at: Instant::now() + SESSION_TTL,
-                },
-            );
+        crate::sync::lock(&self.sessions).insert(
+            token.clone(),
+            Session {
+                username: username.to_string(),
+                expires_at: Instant::now() + SESSION_TTL,
+            },
+        );
         Ok(token)
     }
 
     /// 校验令牌并返回用户名；过期会话在此顺带清除。
     pub fn resolve(&self, token: &str) -> Option<String> {
-        let mut sessions = self.sessions.lock().expect("会话锁未被跨 await 持有");
+        let mut sessions = crate::sync::lock(&self.sessions);
         match sessions.get(token) {
             Some(session) if session.expires_at > Instant::now() => Some(session.username.clone()),
             Some(_) => {
@@ -127,10 +121,7 @@ impl SessionStore {
     }
 
     pub fn revoke(&self, token: &str) {
-        self.sessions
-            .lock()
-            .expect("会话锁未被跨 await 持有")
-            .remove(token);
+        crate::sync::lock(&self.sessions).remove(token);
     }
 }
 

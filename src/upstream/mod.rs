@@ -36,27 +36,86 @@ pub enum UpstreamError {
 /// 共享的上游 HTTP 客户端。
 ///
 /// `reqwest::Client` 内部按 Origin 维护连接池且克隆开销极低，所以整个进程
-/// 共用一个实例即可满足"每个 Origin 复用长期连接"的要求，不需要自建池。
+/// 只需要两个实例：默认拒绝环回/内网/云元数据网段，账号显式开启
+/// `allow_private_network` 时使用另一个。
+///
+/// 关键在于 SSRF 校验发生在**解析器内部**：连接实际使用的地址与校验过的
+/// 地址是同一批，中间没有第二次 DNS 解析，因此不存在 DNS Rebinding 的窗口
+/// （§23.3、§26.8）。字面量 IP 不经过解析器，由保存时与发请求前的地址检查
+/// 覆盖。
 #[derive(Clone)]
 pub struct UpstreamClient {
-    inner: reqwest::Client,
+    deny_private: reqwest::Client,
+    allow_private: reqwest::Client,
 }
 
 impl UpstreamClient {
-    /// 构造客户端。禁止重定向——带 Key 的请求跟随重定向会把凭据泄漏到
+    /// 构造两个客户端。禁止重定向——带 Key 的请求跟随重定向会把凭据泄漏到
     /// 另一个 Origin（§23.3）。
     pub fn new() -> reqwest::Result<Self> {
-        let inner = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("akhub/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        Ok(Self { inner })
+        Ok(Self {
+            deny_private: build_client(GuardedResolver {
+                allow_private: false,
+            })?,
+            allow_private: build_client(GuardedResolver {
+                allow_private: true,
+            })?,
+        })
     }
 
+    /// 按账号配置选择客户端。
+    pub fn http_for(&self, allow_private: bool) -> &reqwest::Client {
+        if allow_private {
+            &self.allow_private
+        } else {
+            &self.deny_private
+        }
+    }
+
+    /// 默认客户端：用于探针等不带账号语义、必须禁内网的调用。
     pub fn http(&self) -> &reqwest::Client {
-        &self.inner
+        &self.deny_private
+    }
+}
+
+/// 带统一配置的客户端构造。
+fn build_client(resolver: GuardedResolver) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("akhub/", env!("CARGO_PKG_VERSION")))
+        .dns_resolver(resolver)
+        .build()
+}
+
+/// 解析阶段即完成地址校验的 DNS 解析器（§23.3）。
+struct GuardedResolver {
+    allow_private: bool,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let allow_private = self.allow_private;
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+            let mut addresses = Vec::new();
+            for address in resolved {
+                if !allow_private && crate::security::url_guard::is_blocked(address.ip()) {
+                    return Err(
+                        format!("目标地址 {} 属于环回、内网或云元数据网段", address.ip()).into(),
+                    );
+                }
+                addresses.push(address);
+            }
+            if addresses.is_empty() {
+                return Err("主机没有解析出任何地址".into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -67,10 +126,15 @@ pub enum Endpoint {
     Responses,
     Messages,
     CountTokens,
+    /// `POST /v1/responses/compact`（§15.4）：只能原生转发，没有跨协议等价物。
+    ResponsesCompact,
+    /// `POST /v1/responses/input_tokens`（§15.4）：同上。
+    ResponsesInputTokens,
 }
 
 impl Endpoint {
-    /// 三个推理端点。`CountTokens` 不在其中：它没有跨协议等价物（§15.5）。
+    /// 三个推理端点。辅助端点（`CountTokens`、`ResponsesCompact`、
+    /// `ResponsesInputTokens`）不在其中：它们没有跨协议等价物（§15.4、§15.5）。
     pub const INFERENCE: [Endpoint; 3] = [Self::ChatCompletions, Self::Responses, Self::Messages];
 
     /// 某个协议的原生推理端点。
@@ -82,11 +146,21 @@ impl Endpoint {
         }
     }
 
+    /// 只能原生转发、没有跨协议等价物的辅助端点。
+    pub fn is_native_only(self) -> bool {
+        matches!(
+            self,
+            Self::CountTokens | Self::ResponsesCompact | Self::ResponsesInputTokens
+        )
+    }
+
     /// 该端点所属的协议。
     pub fn protocol(self) -> Protocol {
         match self {
             Self::ChatCompletions => Protocol::OpenAiChat,
-            Self::Responses => Protocol::OpenAiResponses,
+            Self::Responses | Self::ResponsesCompact | Self::ResponsesInputTokens => {
+                Protocol::OpenAiResponses
+            }
             Self::Messages | Self::CountTokens => Protocol::AnthropicMessages,
         }
     }
@@ -98,6 +172,8 @@ impl Endpoint {
             Self::Responses => "v1/responses",
             Self::Messages => "v1/messages",
             Self::CountTokens => "v1/messages/count_tokens",
+            Self::ResponsesCompact => "v1/responses/compact",
+            Self::ResponsesInputTokens => "v1/responses/input_tokens",
         }
     }
 
@@ -108,6 +184,8 @@ impl Endpoint {
             Self::Responses => "responses",
             Self::Messages => "messages",
             Self::CountTokens => "count_tokens",
+            Self::ResponsesCompact => "responses_compact",
+            Self::ResponsesInputTokens => "responses_input_tokens",
         }
     }
 }
@@ -404,5 +482,33 @@ mod tests {
         assert_eq!(url.as_str(), "https://host/v1/models");
         let url = models_url("https://host").unwrap();
         assert_eq!(url.as_str(), "https://host/v1/models");
+    }
+
+    use reqwest::dns::Resolve as _;
+
+    /// 解析器必须在解析阶段就把内网地址拦下：连接用的地址只能是校验过的
+    /// 那一批，不能等 assert_resolvable 之后再解析第二次（§23.3、§26.8）。
+    #[tokio::test]
+    async fn the_guarded_resolver_blocks_private_addresses_unless_allowed() {
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+
+        let denied = GuardedResolver {
+            allow_private: false,
+        };
+        let error = denied
+            .resolve(name)
+            .await
+            .err()
+            .expect("默认必须拒绝解析到环回地址的主机");
+        assert!(error.to_string().contains("环回"), "{error}");
+
+        let name: reqwest::dns::Name = "localhost".parse().unwrap();
+        let allowed = GuardedResolver {
+            allow_private: true,
+        };
+        assert!(
+            allowed.resolve(name).await.is_ok(),
+            "显式开启内网访问的账号必须能解析"
+        );
     }
 }

@@ -1571,7 +1571,7 @@ pub async fn test_account(
     let started = std::time::Instant::now();
     let outcome = state
         .upstream
-        .http()
+        .http_for(account.allow_private_network)
         .post(url)
         .headers(headers)
         .timeout(std::time::Duration::from_secs(20))

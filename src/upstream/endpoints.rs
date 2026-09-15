@@ -51,15 +51,30 @@ pub fn choices(
     allow_degrade: bool,
     now: Instant,
 ) -> Result<Vec<Choice>, Unsupported> {
-    // `count_tokens` 只能原生转发：Chat 与 Responses 没有等价端点，本地精确
-    // 计数也不可行，按 §15.5 直接返回不支持而不是估算一个数字冒充精确值。
-    if downstream == Endpoint::CountTokens {
-        let plausible =
-            account.adaptive_protocol || account.preferred_protocol == Protocol::AnthropicMessages;
-        if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
-            return Err(Unsupported::new(
+    // `count_tokens`、`compact` 与 `input_tokens` 只能原生转发：没有跨协议
+    // 等价物，本地精确计数也不可行，按 §15.4、§15.5 直接返回不支持，而不是
+    // 估算一个数字或替换一种语义来冒充。
+    if downstream.is_native_only() {
+        let (plausible, missing) = match downstream {
+            Endpoint::CountTokens => (
+                account.adaptive_protocol
+                    || account.preferred_protocol == Protocol::AnthropicMessages,
                 "该账号没有 /v1/messages/count_tokens 端点，Token 计数无法跨协议表达",
-            ));
+            ),
+            Endpoint::ResponsesCompact => (
+                account.adaptive_protocol
+                    || account.preferred_protocol == Protocol::OpenAiResponses,
+                "该账号没有 /v1/responses/compact 端点，压缩无法跨协议表达",
+            ),
+            Endpoint::ResponsesInputTokens => (
+                account.adaptive_protocol
+                    || account.preferred_protocol == Protocol::OpenAiResponses,
+                "该账号没有 /v1/responses/input_tokens 端点，Token 计数无法跨协议表达",
+            ),
+            _ => unreachable!("is_native_only 只覆盖辅助端点"),
+        };
+        if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
+            return Err(Unsupported::new(missing));
         }
         return Ok(vec![Choice {
             endpoint: downstream,

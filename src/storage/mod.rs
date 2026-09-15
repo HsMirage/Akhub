@@ -23,6 +23,8 @@ const SCHEMA_VERSION: i64 = 1;
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("创建数据目录失败：{}", data_dir.display()))?;
+    // 目录里除了数据库还有 WAL/SHM 与主密钥，整目录只给属主访问（§23.2）。
+    restrict_dir_to_owner(data_dir);
     let db_path = data_dir.join("akhub.sqlite");
 
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
@@ -40,7 +42,41 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
 
     apply_schema(&pool).await?;
     check_schema_version(&pool).await?;
+    // 库里有加密后的上游凭据与请求元数据，文件本身只给属主读写（§23.2）。
+    restrict_to_owner(&db_path);
     Ok(pool)
+}
+
+/// 把数据库文件权限收紧到 0600（非 Unix 平台静默跳过）。
+fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(%error, path = %path.display(), "收紧数据库文件权限失败");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// 把数据目录权限收紧到 0700（非 Unix 平台静默跳过）。
+///
+/// 这样即使 WAL/SHM 由 SQLite 按默认 umask 创建，也不会被同机其他用户读到。
+fn restrict_dir_to_owner(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(error) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(%error, path = %dir.display(), "收紧数据目录权限失败");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 /// 升级检查（§27）：数据库的结构版本不得高于当前二进制。

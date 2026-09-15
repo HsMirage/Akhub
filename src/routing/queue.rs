@@ -73,7 +73,7 @@ impl GroupQueues {
         {
             return Arc::clone(found);
         }
-        let mut guard = self.inner.write().expect("分组队列表被毒化");
+        let mut guard = crate::sync::write(&self.inner);
         Arc::clone(
             guard
                 .entry(group_id.to_string())

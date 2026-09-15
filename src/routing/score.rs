@@ -135,14 +135,14 @@ impl Registry {
     /// 记录一次真实请求的采样。
     pub fn observe(&self, target_id: &str, dimension: Dimension, sample: &Sample) {
         let entry = self.entry(target_id);
-        let mut stats = entry.lock().expect("性能统计被毒化");
+        let mut stats = crate::sync::lock(&entry);
         stats.entry(dimension).or_default().observe(sample);
     }
 
     /// 读取一个目标在某个维度上的当前统计。
     pub fn stats(&self, target_id: &str, dimension: Dimension) -> Stats {
         let entry = self.entry(target_id);
-        let stats = entry.lock().expect("性能统计被毒化");
+        let stats = crate::sync::lock(&entry);
         stats.get(&dimension).copied().unwrap_or_default()
     }
 
@@ -152,16 +152,16 @@ impl Registry {
         {
             return Arc::clone(found);
         }
-        let mut guard = self.inner.write().expect("性能统计表被毒化");
+        let mut guard = crate::sync::write(&self.inner);
         Arc::clone(guard.entry(target_id.to_string()).or_default())
     }
 
     /// 导出全部统计，供 60 秒快照任务落盘。
     pub fn export(&self, now: i64) -> Vec<PerfSnapshotRow> {
-        let guard = self.inner.read().expect("性能统计表被毒化");
+        let guard = crate::sync::read(&self.inner);
         let mut rows = Vec::new();
         for (target_id, entry) in guard.iter() {
-            let stats = entry.lock().expect("性能统计被毒化");
+            let stats = crate::sync::lock(entry);
             for (dimension, value) in stats.iter() {
                 rows.push(PerfSnapshotRow {
                     target_id: target_id.clone(),
@@ -181,10 +181,10 @@ impl Registry {
 
     /// 启动时从快照恢复，让评分不从零开始（§20.1）。
     pub fn restore(&self, rows: &[PerfSnapshotRow]) {
-        let mut guard = self.inner.write().expect("性能统计表被毒化");
+        let mut guard = crate::sync::write(&self.inner);
         for row in rows {
             let entry = guard.entry(row.target_id.clone()).or_default();
-            let mut stats = entry.lock().expect("性能统计被毒化");
+            let mut stats = crate::sync::lock(entry);
             stats.insert(
                 Dimension {
                     protocol: row.protocol,

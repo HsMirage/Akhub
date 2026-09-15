@@ -229,7 +229,7 @@ fn get_or_insert<T>(
     {
         return Arc::clone(found);
     }
-    let mut guard = map.write().expect("动态状态表被毒化");
+    let mut guard = crate::sync::write(map);
     Arc::clone(
         guard
             .entry(key.to_string())
@@ -258,7 +258,7 @@ impl AccountState {
         if self.key_invalid.load(Ordering::Acquire) {
             return Err(Unavailable::KeyInvalid);
         }
-        match self.quota.lock().expect("额度状态被毒化").phase(now) {
+        match crate::sync::lock(&self.quota).phase(now) {
             Phase::Cooling | Phase::HalfOpenTaken => Err(Unavailable::QuotaExhausted),
             Phase::Closed | Phase::HalfOpenAvailable => Ok(()),
         }
@@ -269,9 +269,7 @@ impl AccountState {
         if self.key_invalid.load(Ordering::Acquire) {
             return Err(Unavailable::KeyInvalid);
         }
-        self.quota
-            .lock()
-            .expect("额度状态被毒化")
+        crate::sync::lock(&self.quota)
             .try_enter(now)
             .map_err(|_| Unavailable::QuotaExhausted)
     }
@@ -313,15 +311,10 @@ impl TargetState {
             return TargetStatus::KeyInvalid;
         }
         let now = Instant::now();
-        if account
-            .quota
-            .lock()
-            .expect("额度状态被毒化")
-            .is_cooling(now)
-        {
+        if crate::sync::lock(&account.quota).is_cooling(now) {
             return TargetStatus::QuotaExhausted;
         }
-        let circuit = self.circuit.lock().expect("熔断状态被毒化");
+        let circuit = crate::sync::lock(&self.circuit);
         match circuit.phase(now) {
             Phase::Closed => TargetStatus::Active,
             Phase::Cooling => TargetStatus::Cooldown,
@@ -331,10 +324,7 @@ impl TargetState {
 
     /// 冷却剩余秒数，供后台展示与 `Retry-After`。
     pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
-        self.circuit
-            .lock()
-            .expect("熔断状态被毒化")
-            .cooldown_remaining(now)
+        crate::sync::lock(&self.circuit).cooldown_remaining(now)
     }
 
     /// 不消耗任何额度的资格检查，用于 §9.1 的硬性过滤。
@@ -345,7 +335,7 @@ impl TargetState {
         now: Instant,
     ) -> Result<(), Unavailable> {
         account.check(now)?;
-        match self.circuit.lock().expect("熔断状态被毒化").phase(now) {
+        match crate::sync::lock(&self.circuit).phase(now) {
             Phase::Cooling | Phase::HalfOpenTaken => return Err(Unavailable::Cooling),
             Phase::Closed | Phase::HalfOpenAvailable => {}
         }
@@ -368,12 +358,12 @@ impl Budget {
 
     fn check(&self, limits: Limits, now: Instant) -> Result<(), Unavailable> {
         if let Some(rpm) = limits.rpm
-            && self.rpm.lock().expect("RPM 窗口被毒化").estimate(now) >= f64::from(rpm)
+            && crate::sync::lock(&self.rpm).estimate(now) >= f64::from(rpm)
         {
             return Err(Unavailable::RateLimited);
         }
         if let Some(tpm) = limits.tpm
-            && self.tpm.lock().expect("TPM 窗口被毒化").estimate(now) >= f64::from(tpm)
+            && crate::sync::lock(&self.tpm).estimate(now) >= f64::from(tpm)
         {
             return Err(Unavailable::RateLimited);
         }
@@ -389,7 +379,7 @@ impl Budget {
     /// 这样永远不会超过旧上限，也总会收敛到新上限。
     fn reconcile_capacity(&self, limits: Limits) {
         let wanted = limits.max_concurrency.unwrap_or(UNLIMITED).max(1);
-        let _guard = self.capacity_lock.lock().expect("并发容量状态被毒化");
+        let _guard = crate::sync::lock(&self.capacity_lock);
         let current = self.capacity.load(Ordering::Acquire);
         if wanted == current {
             return;
@@ -406,22 +396,16 @@ impl Budget {
 
     fn cancel(&self, reservation: RateReservation, now: Instant) {
         if reservation.rpm {
-            self.rpm
-                .lock()
-                .expect("RPM 窗口被毒化")
-                .refund_at(1, reservation.at, now);
+            crate::sync::lock(&self.rpm).refund_at(1, reservation.at, now);
         }
         if let Some(tokens) = reservation.tokens {
-            self.tpm
-                .lock()
-                .expect("TPM 窗口被毒化")
-                .refund_at(tokens, reservation.at, now);
+            crate::sync::lock(&self.tpm).refund_at(tokens, reservation.at, now);
         }
     }
 
     fn settle(&self, reservation: RateReservation, actual: Option<u64>, now: Instant) {
         if let (Some(reserved), Some(actual)) = (reservation.tokens, actual) {
-            let mut tpm = self.tpm.lock().expect("TPM 窗口被毒化");
+            let mut tpm = crate::sync::lock(&self.tpm);
             if actual < reserved {
                 tpm.refund_at(reserved - actual, reservation.at, now);
             } else {
@@ -461,11 +445,7 @@ impl Admission {
 
     fn release_account_half_open(&self) {
         if self.account_half_open {
-            self.account
-                .quota
-                .lock()
-                .expect("额度状态被毒化")
-                .release_half_open();
+            crate::sync::lock(&self.account.quota).release_half_open();
         }
     }
 
@@ -476,11 +456,7 @@ impl Admission {
         self.account.budget.cancel(self.account_rate, now);
         self.target.budget.cancel(self.target_rate, now);
         self.release_account_half_open();
-        self.target
-            .circuit
-            .lock()
-            .expect("熔断状态被毒化")
-            .undo_half_open(self.half_open);
+        crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
     }
 
     /// 上报结果并释放半开名额。
@@ -501,49 +477,25 @@ impl Admission {
         match outcome {
             Outcome::Neutral => {
                 self.release_account_half_open();
-                self.target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .release_half_open();
+                crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::Success => {
                 self.account.key_invalid.store(false, Ordering::Release);
-                self.account
-                    .quota
-                    .lock()
-                    .expect("额度状态被毒化")
-                    .on_success(now);
-                self.target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .on_success(now);
+                crate::sync::lock(&self.account.quota).on_success(now);
+                crate::sync::lock(&self.target.circuit).on_success(now);
             }
             Outcome::KeyInvalid => {
                 self.account.key_invalid.store(true, Ordering::Release);
                 self.release_account_half_open();
-                self.target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .release_half_open();
+                crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::QuotaExhausted { retry_after } => {
-                self.account
-                    .quota
-                    .lock()
-                    .expect("额度状态被毒化")
-                    .trip(now, retry_after);
-                self.target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .release_half_open();
+                crate::sync::lock(&self.account.quota).trip(now, retry_after);
+                crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::RateLimited { retry_after } => {
                 self.release_account_half_open();
-                let mut circuit = self.target.circuit.lock().expect("熔断状态被毒化");
+                let mut circuit = crate::sync::lock(&self.target.circuit);
                 match retry_after {
                     // 上游明确说了多久，就照做，不叠加自己的指数退避。
                     Some(wait) => circuit.trip(now, Some(wait)),
@@ -553,11 +505,7 @@ impl Admission {
             }
             Outcome::Fault => {
                 self.release_account_half_open();
-                self.target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .on_fault(now);
+                crate::sync::lock(&self.target.circuit).on_fault(now);
             }
         }
     }
@@ -571,11 +519,7 @@ impl Drop for Admission {
             // 客户端断开或任务被取消：半开名额必须还回去，否则这个目标会
             // 一直卡在"有人正在试运行"而永远无法恢复。
             self.release_account_half_open();
-            self.target
-                .circuit
-                .lock()
-                .expect("熔断状态被毒化")
-                .undo_half_open(self.half_open);
+            crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
         }
     }
 }
@@ -645,17 +589,10 @@ impl Registry {
         // 先看"坏不坏"再看"忙不忙"：一个既熔断又满载的目标必须报熔断，否则
         // 调用方会把它当成"忙"去排队等一个永远不会好的目标。
         let account_half_open = account.try_enter(now)?;
-        let half_open = target
-            .circuit
-            .lock()
-            .expect("熔断状态被毒化")
+        let half_open = crate::sync::lock(&target.circuit)
             .try_enter(now)
             .map_err(|()| {
-                account
-                    .quota
-                    .lock()
-                    .expect("额度状态被毒化")
-                    .undo_half_open(account_half_open);
+                crate::sync::lock(&account.quota).undo_half_open(account_half_open);
                 Unavailable::Cooling
             })?;
 
@@ -665,16 +602,8 @@ impl Registry {
             None => match self.capacity(account_id, target_id).try_acquire() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    target
-                        .circuit
-                        .lock()
-                        .expect("熔断状态被毒化")
-                        .undo_half_open(half_open);
-                    account
-                        .quota
-                        .lock()
-                        .expect("额度状态被毒化")
-                        .undo_half_open(account_half_open);
+                    crate::sync::lock(&target.circuit).undo_half_open(half_open);
+                    crate::sync::lock(&account.quota).undo_half_open(account_half_open);
                     return Err(Unavailable::ConcurrencyFull);
                 }
             },
@@ -694,16 +623,8 @@ impl Registry {
         let (account_rate, target_rate) = match reservations {
             Ok(reservations) => reservations,
             Err(reason) => {
-                target
-                    .circuit
-                    .lock()
-                    .expect("熔断状态被毒化")
-                    .undo_half_open(half_open);
-                account
-                    .quota
-                    .lock()
-                    .expect("额度状态被毒化")
-                    .undo_half_open(account_half_open);
+                crate::sync::lock(&target.circuit).undo_half_open(half_open);
+                crate::sync::lock(&account.quota).undo_half_open(account_half_open);
                 return Err(reason);
             }
         };
@@ -739,24 +660,16 @@ fn consume_rate(
     now: Instant,
 ) -> Result<RateReservation, Unavailable> {
     if let Some(rpm) = limits.rpm
-        && !target
-            .rpm
-            .lock()
-            .expect("RPM 窗口被毒化")
-            .try_consume(1, f64::from(rpm), now)
+        && !crate::sync::lock(&target.rpm).try_consume(1, f64::from(rpm), now)
     {
         return Err(Unavailable::RateLimited);
     }
     // TPM 未配置时完全跳过 Token 估算，避免无意义开销（§17.2）。
     if let Some(tpm) = limits.tpm
-        && !target.tpm.lock().expect("TPM 窗口被毒化").try_consume(
-            estimated_tokens,
-            f64::from(tpm),
-            now,
-        )
+        && !crate::sync::lock(&target.tpm).try_consume(estimated_tokens, f64::from(tpm), now)
     {
         if limits.rpm.is_some() {
-            target.rpm.lock().expect("RPM 窗口被毒化").refund(1, now);
+            crate::sync::lock(&target.rpm).refund(1, now);
         }
         return Err(Unavailable::RateLimited);
     }

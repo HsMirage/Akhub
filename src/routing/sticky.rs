@@ -238,7 +238,7 @@ impl Bindings {
 
     /// 建立或改写绑定。
     pub fn bind(&self, key: Key, group_id: &str, logical_model: &str, target_id: &str, now: i64) {
-        let mut guard = self.inner.write().expect("粘性绑定表被毒化");
+        let mut guard = crate::sync::write(&self.inner);
         guard.insert(
             key,
             Arc::new(BindingEntry {
@@ -262,7 +262,7 @@ impl Bindings {
 
     /// 导出全部绑定，供 60 秒快照任务落盘。
     pub fn export(&self) -> Vec<StickyBindingRow> {
-        let guard = self.inner.read().expect("粘性绑定表被毒化");
+        let guard = crate::sync::read(&self.inner);
         guard
             .iter()
             .filter_map(|(key, entry)| {
@@ -281,7 +281,7 @@ impl Bindings {
 
     /// 启动时从快照恢复，让前缀缓存不因重启而丢失（§20.1）。
     pub fn restore(&self, rows: &[StickyBindingRow]) {
-        let mut guard = self.inner.write().expect("粘性绑定表被毒化");
+        let mut guard = crate::sync::write(&self.inner);
         for row in rows {
             guard.insert(
                 Key(row.sticky_key.clone()),
