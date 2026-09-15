@@ -1,0 +1,88 @@
+# 公开发版：推 v* tag 时产出 Linux 双架构二进制与多架构 Docker 镜像。
+#
+# 二进制走 GitHub Release，镜像推送到 GHCR（ghcr.io/<owner>/<repo>）。
+# 管理后台必须在 cargo 之前构建：rust-embed 在编译期把它嵌进二进制。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    name: Linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建管理后台
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: 交叉编译
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--release --locked"
+
+      - name: 打包
+        run: |
+          tar -czf "akhub-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" akhub
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: akhub-${{ matrix.target }}.tar.gz
+
+  docker:
+    name: Docker 多架构镜像
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
