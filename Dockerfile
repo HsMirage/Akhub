@@ -49,6 +49,9 @@ ENV AKHUB_DATA_DIR=/data \
     AKHUB_LISTEN=0.0.0.0:8080 \
     RUST_LOG=akhub=info,warn
 EXPOSE 8080
+# 显式声明停止信号；容器侧必须配 stop_grace_period，否则 Docker 默认 10 秒
+# 就会 SIGKILL 掉在途的长流式请求（§25.3）。
+STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/akhub", "--healthcheck"]

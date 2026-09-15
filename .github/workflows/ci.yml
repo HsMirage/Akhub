@@ -1,0 +1,40 @@
+# 公开仓库的质量门：格式、静态检查、全量测试与前端构建。
+# 前端产物必须在 `cargo` 之前构建：管理后台由 rust-embed 在编译期嵌入。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建管理后台
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --check
+
+      - name: 静态检查
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 全量测试
+        run: cargo test --all --no-fail-fast

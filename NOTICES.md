@@ -13,10 +13,10 @@ Akhub 直接依赖的第三方库及其许可证。运行 `cargo generate-lockfi
 | argon2 | 0.6.0 | MIT OR Apache-2.0 |
 | async-stream | 0.3.6 | MIT |
 | axum | 0.8.9 | MIT |
-| base64 | 0.22.1 | MIT OR Apache-2.0 |
+| base64 | 0.23.1 | MIT OR Apache-2.0 |
 | chacha20poly1305 | 0.11.0 | MIT OR Apache-2.0 |
 | futures | 0.3.34 | MIT OR Apache-2.0 |
-| getrandom | 0.2.17 | MIT OR Apache-2.0 |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | hex | 0.4.3 | MIT OR Apache-2.0 |
 | hmac | 0.13.0 | MIT OR Apache-2.0 |
 | rand | 0.10.2 | MIT OR Apache-2.0 |
@@ -24,13 +24,13 @@ Akhub 直接依赖的第三方库及其许可证。运行 `cargo generate-lockfi
 | rust-embed | 8.12.0 | MIT |
 | secrecy | 0.10.3 | MIT OR Apache-2.0 |
 | serde / serde_json | 1.0.229 / 1.0.151 | MIT OR Apache-2.0 |
-| sha2 | 0.10.9 | MIT OR Apache-2.0 |
+| sha2 | 0.11.0 | MIT OR Apache-2.0 |
 | sqlx | 0.9.0 | MIT OR Apache-2.0 |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | time | 0.3.55 | MIT OR Apache-2.0 |
 | tokio | 1.53.1 | MIT |
-| tower / tower-http | 0.5.3 / 0.6.11 | MIT |
+| tower / tower-http | 0.5.3 / 0.7.1 | MIT |
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | MIT |
 | ulid | 3.0.0 | MIT |
 | zeroize | 1.9.0 | MIT OR Apache-2.0 |

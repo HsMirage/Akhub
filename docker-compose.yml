@@ -5,6 +5,10 @@ services:
     build: .
     container_name: akhub
     restart: unless-stopped
+    # Docker 默认只给 10 秒停止宽限，会 SIGKILL 掉在途的长流式请求。
+    # 这里必须大于等于 AKHUB_SHUTDOWN_GRACE_SECS（默认 180 秒，§25.3）。
+    stop_signal: SIGTERM
+    stop_grace_period: 200s
     ports:
       # 默认只绑定环回地址；生产环境请由 Caddy / Nginx 终止 HTTPS 后反代过来。
       - "127.0.0.1:8080:8080"
