@@ -59,7 +59,6 @@ impl Default for Settings {
 ///
 /// 与 [`crate::config::RuntimeConfig`] 并列而不是嵌进去：倍率、熔断、并发和
 /// 额度不等待配置版本，每次真正发请求前都要读最新值（§21）。
-#[derive(Default)]
 pub struct Runtime {
     /// 熔断、冷却、半开、并发与限流。
     pub health: health::Registry,
@@ -75,6 +74,40 @@ pub struct Runtime {
     pub evidence: Evidence,
     /// 模型能力限制：已证实不支持某能力的账号模型（§16.7）。
     pub capabilities: capability::Capabilities,
+    /// 关闭信号：置位后排队中的请求立即取消并返回可重试错误（§25.3 第 2 步）。
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            health: Default::default(),
+            perf: Default::default(),
+            sticky: Default::default(),
+            multipliers: Default::default(),
+            queues: Default::default(),
+            evidence: Default::default(),
+            capabilities: Default::default(),
+            shutdown: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+impl Runtime {
+    /// 收到停止信号：置位关闭标志，唤醒所有排队中的请求。
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// 是否已经进入关闭流程。
+    pub fn is_shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// 订阅关闭信号；等待容量时与它一起 `select`。
+    pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
 }
 
 impl Runtime {

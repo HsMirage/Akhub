@@ -105,8 +105,12 @@ pub async fn serve_with_shutdown(
     // `timeout(grace, serve)` 包住整个服务，结果进程每 180 秒就自行退出一次
     // （systemd 会一直重启）。这里用两个通道把两件事分开：先等信号，再计时。
     let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_state = std::sync::Arc::clone(&state);
     let graceful = async move {
         shutdown.await;
+        // 先置位关闭标志：排队中的请求立刻拿到可重试错误，而不是干等到
+        // 宽限期结束被强制切断（§25.3 第 2 步）。
+        shutdown_state.runtime.begin_shutdown();
         let _ = stopping_tx.send(());
     };
     let serving = axum::serve(listener, router(state.clone()).into_make_service())

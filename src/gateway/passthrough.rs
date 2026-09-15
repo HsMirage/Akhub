@@ -431,8 +431,16 @@ impl Walk<'_> {
         // 429 后的原地重试每个目标只给一次，否则一个一直 429 的上游能把整个
         // 预算耗光。
         let mut retried_after_429 = false;
+        // 关闭信号：置位后排队中的请求不再干等，立刻返回可重试错误（§25.3）。
+        let mut shutdown = self.forward.state.runtime.subscribe_shutdown();
 
         loop {
+            if self.forward.state.runtime.is_shutting_down() {
+                return Flow::Done(self.fail(
+                    ErrorCode::QueueTimeout,
+                    "服务正在关闭，排队中的请求已取消，请稍后重试".into(),
+                ));
+            }
             // 先试一次不排队的准入：任一目标有空位就立即使用，根本不排队。
             let mut index = 0;
             while index < pending.len() {
@@ -509,9 +517,15 @@ impl Walk<'_> {
                 .collect();
 
             let waited = Instant::now();
-            let outcome = queue::wait_for_any_capacity(capacities, slice).await;
+            let outcome = queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await;
             self.telemetry.queued += waited.elapsed();
 
+            if let queue::CapacityWaitOutcome::ShuttingDown = outcome {
+                return Flow::Done(self.fail(
+                    ErrorCode::QueueTimeout,
+                    "服务正在关闭，排队中的请求已取消，请稍后重试".into(),
+                ));
+            }
             if let queue::CapacityWaitOutcome::Ready(index, permit) = outcome {
                 let candidate = pending[index];
                 // 被唤醒后重新做完整终检：等待期间倍率或配置可能已经变了（§13.6）。

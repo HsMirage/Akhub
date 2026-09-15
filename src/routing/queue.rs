@@ -124,19 +124,32 @@ pub async fn wait_for_any(permits: Vec<Arc<Semaphore>>, budget: Duration) -> Wai
 }
 
 /// 等待一个候选的账号共享容量与目标局部容量同时可用。
+///
+/// `shutdown` 置位时立即返回 `ShuttingDown`：关闭流程不该被排队请求拖住
+/// （§25.3 第 2 步）。
 pub async fn wait_for_any_capacity(
     capacities: Vec<Capacity>,
     budget: Duration,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> CapacityWaitOutcome {
     if capacities.is_empty() || budget.is_zero() {
         return CapacityWaitOutcome::TimedOut;
     }
+    // 信号可能在订阅之前就置位；先查一次，避免 select 永远等不到变化。
+    if *shutdown.borrow() {
+        return CapacityWaitOutcome::ShuttingDown;
+    }
     let acquisitions = capacities.into_iter().enumerate().map(|(index, capacity)| {
         Box::pin(async move { capacity.acquire().await.map(|permit| (index, permit)) })
     });
-    match tokio::time::timeout(budget, futures::future::select_all(acquisitions)).await {
-        Ok((Some((index, permit)), _, _)) => CapacityWaitOutcome::Ready(index, permit),
-        _ => CapacityWaitOutcome::TimedOut,
+    tokio::select! {
+        result = tokio::time::timeout(budget, futures::future::select_all(acquisitions)) => {
+            match result {
+                Ok((Some((index, permit)), _, _)) => CapacityWaitOutcome::Ready(index, permit),
+                _ => CapacityWaitOutcome::TimedOut,
+            }
+        }
+        _ = shutdown.changed() => CapacityWaitOutcome::ShuttingDown,
     }
 }
 
@@ -144,6 +157,8 @@ pub async fn wait_for_any_capacity(
 pub enum CapacityWaitOutcome {
     Ready(usize, CapacityPermit),
     TimedOut,
+    /// 服务正在关闭：排队中的请求立即取消，而不是等到宽限期结束。
+    ShuttingDown,
 }
 
 #[cfg(test)]
@@ -240,5 +255,54 @@ mod tests {
             assert!(queues.enter("g1", 1).is_none());
         }
         assert!(queues.enter("g1", 1).is_some());
+    }
+
+    /// 关闭信号必须打断"等容量"，而不是让排队请求干等到宽限期结束。
+    #[tokio::test]
+    async fn the_shutdown_signal_cancels_a_capacity_wait() {
+        use crate::health::Capacity;
+
+        // 容量被占满：两个信号量都没有空闲名额。
+        let account = Arc::new(tokio::sync::Semaphore::new(1));
+        let target = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held_account = account.clone().try_acquire_owned().unwrap();
+        let _held_target = target.clone().try_acquire_owned().unwrap();
+        let capacity = Capacity { account, target };
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let waiting = tokio::spawn(async move {
+            wait_for_any_capacity(vec![capacity], Duration::from_secs(600), &mut shutdown_rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("关闭信号必须唤醒等待")
+            .unwrap();
+        assert!(
+            matches!(outcome, CapacityWaitOutcome::ShuttingDown),
+            "关闭时必须返回 ShuttingDown"
+        );
+    }
+
+    /// 信号在订阅之前就已置位时也不能漏判。
+    #[tokio::test]
+    async fn an_already_shutting_down_signal_is_not_missed() {
+        use crate::health::Capacity;
+
+        let account = Arc::new(tokio::sync::Semaphore::new(0));
+        let target = Arc::new(tokio::sync::Semaphore::new(0));
+        let capacity = Capacity { account, target };
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_any_capacity(vec![capacity], Duration::from_secs(600), &mut shutdown_rx),
+        )
+        .await
+        .expect("不能卡住");
+        assert!(matches!(outcome, CapacityWaitOutcome::ShuttingDown));
     }
 }
