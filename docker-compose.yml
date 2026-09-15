@@ -14,7 +14,12 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       # 唯一持久卷：SQLite、主密钥与临时目录。
-      - ./data:/data
+      #
+      # 必须用命名卷：Docker 会把镜像里 /data 的属主（uid 10001）带到卷上，
+      # 容器内的非 root 用户才能写主密钥与数据库。若改成 bind mount
+      #（例如 `./data:/data`），宿主目录必须先 `chown 10001:10001`，
+      # 否则启动会以「创建主密钥文件失败：Permission denied」退出。
+      - akhub-data:/data
     environment:
       AKHUB_LISTEN: 0.0.0.0:8080
       AKHUB_DATA_DIR: /data
@@ -27,3 +32,7 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  # Docker 首次创建时继承镜像里 /data 的属主，开箱即用。
+  akhub-data:

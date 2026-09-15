@@ -10,3 +10,6 @@
 /.playwright-mcp/
 web/node_modules/
 web/dist/
+
+# 发布工件（scripts/release.sh 输出）
+/dist/
