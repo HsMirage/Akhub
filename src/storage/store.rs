@@ -841,18 +841,111 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RequestRecord>> {
-        // 同一秒内的记录按写入顺序倒序：写入顺序即完成顺序，后完成的在前。
-        let rows = sqlx::query(
-            "SELECT * FROM request_records ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?",
-        )
-        .bind(limit.clamp(1, 500))
-        .bind(offset.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        Ok(self
+            .list_request_records_filtered(&RequestFilter::default(), limit, offset)
+            .await?
+            .0)
+    }
+
+    /// 带筛选的分页查询，返回（本页记录, 命中总数）（§6.6）。
+    pub async fn list_request_records_filtered(
+        &self,
+        filter: &RequestFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<RequestRecord>, i64)> {
+        let mut query = sqlx::QueryBuilder::new("SELECT * FROM request_records");
+        push_request_filter(&mut query, filter);
+        query
+            .push(" ORDER BY started_at DESC, rowid DESC LIMIT ")
+            .push_bind(limit.clamp(1, 500))
+            .push(" OFFSET ")
+            .push_bind(offset.max(0));
+        let rows = query.build().fetch_all(&self.pool).await?;
         let mut records: Vec<RequestRecord> =
             rows.iter().map(row_to_record).collect::<Result<_>>()?;
         self.attach_attempts(&mut records).await?;
-        Ok(records)
+
+        let mut counter = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM request_records");
+        push_request_filter(&mut counter, filter);
+        let total: i64 = counter.build_query_scalar().fetch_one(&self.pool).await?;
+        Ok((records, total))
+    }
+
+    /// 概览统计（§6.2）：窗口内的请求数、成功数、队列超时数与耗时样本。
+    pub async fn request_stats(&self, since: i64, samples: i64) -> Result<RequestStats> {
+        let (total, success, queue_timeouts): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN error_code = 'queue_timeout' THEN 1 ELSE 0 END)
+             FROM request_records WHERE started_at >= ?",
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        let durations: Vec<i64> = sqlx::query_scalar(
+            "SELECT duration_ms FROM request_records
+             WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(since)
+        .bind(samples.clamp(1, 5000))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(RequestStats {
+            total,
+            success,
+            queue_timeouts,
+            durations,
+        })
+    }
+
+    /// 最近错误（§6.2）：窗口内非 2xx 或带错误码的记录。
+    pub async fn recent_errors(&self, since: i64, limit: i64) -> Result<Vec<RecentError>> {
+        let rows = sqlx::query(
+            "SELECT request_id, started_at, logical_model, target_id, http_status, error_code
+             FROM request_records
+             WHERE started_at >= ?
+               AND (http_status < 200 OR http_status >= 300 OR error_code IS NOT NULL)
+             ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(since)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RecentError {
+                    request_id: row.try_get("request_id")?,
+                    started_at: row.try_get("started_at")?,
+                    logical_model: row.try_get("logical_model")?,
+                    target_id: row.try_get("target_id")?,
+                    http_status: row.try_get("http_status")?,
+                    error_code: row.try_get("error_code")?,
+                })
+            })
+            .collect()
+    }
+
+    /// 最近配置变化（§6.2）：来源是管理员审计日志。
+    pub async fn recent_audit(&self, limit: i64) -> Result<Vec<AuditEntry>> {
+        let rows = sqlx::query(
+            "SELECT occurred_at, actor, action, object, result
+             FROM admin_audit_log ORDER BY occurred_at DESC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(AuditEntry {
+                    occurred_at: row.try_get("occurred_at")?,
+                    actor: row.try_get("actor")?,
+                    action: row.try_get("action")?,
+                    object: row.try_get("object")?,
+                    result: row.try_get("result")?,
+                })
+            })
+            .collect()
     }
 
     /// 把这一页请求的尝试明细一次性查出来并挂回去（避免逐行 N+1 查询）。
@@ -1656,6 +1749,111 @@ pub struct AttemptRecord {
     pub error_code: Option<String>,
     /// 这次失败是否计入尝试预算：廉价的连接失败不计（§13.1）。
     pub counts_against_budget: bool,
+}
+
+/// 请求记录筛选条件（§6.6）。全部字段可选，空表示不限。
+#[derive(Debug, Clone, Default)]
+pub struct RequestFilter {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub request_id: Option<String>,
+    pub group_id: Option<String>,
+    pub logical_model: Option<String>,
+    pub target_id: Option<String>,
+    pub account_id: Option<String>,
+    /// `ok` 只保留 2xx；`error` 只保留非 2xx 或带错误码的记录。
+    pub status: Option<String>,
+    pub error_code: Option<String>,
+}
+
+/// 把筛选条件拼进 QueryBuilder；值全部走 bind，SQL 片段是常量。
+fn push_request_filter(builder: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestFilter) {
+    let mut first = true;
+    fn clause(builder: &mut sqlx::QueryBuilder<sqlx::Sqlite>, first: &mut bool, text: &str) {
+        if *first {
+            builder.push(" WHERE ");
+            *first = false;
+        } else {
+            builder.push(" AND ");
+        }
+        builder.push(text);
+    }
+    if let Some(since) = filter.since {
+        clause(builder, &mut first, "started_at >= ");
+        builder.push_bind(since);
+    }
+    if let Some(until) = filter.until {
+        clause(builder, &mut first, "started_at <= ");
+        builder.push_bind(until);
+    }
+    if let Some(value) = filter.request_id.as_deref() {
+        clause(builder, &mut first, "request_id = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = filter.group_id.as_deref() {
+        clause(builder, &mut first, "group_id = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = filter.logical_model.as_deref() {
+        clause(builder, &mut first, "logical_model = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = filter.target_id.as_deref() {
+        clause(builder, &mut first, "target_id = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = filter.account_id.as_deref() {
+        clause(builder, &mut first, "account_id = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = filter.error_code.as_deref() {
+        clause(builder, &mut first, "error_code = ");
+        builder.push_bind(value);
+    }
+    match filter.status.as_deref() {
+        Some("ok") => clause(
+            builder,
+            &mut first,
+            "(http_status >= 200 AND http_status < 300)",
+        ),
+        Some("error") => clause(
+            builder,
+            &mut first,
+            "(http_status < 200 OR http_status >= 300)",
+        ),
+        _ => {}
+    }
+}
+
+/// 概览统计（§6.2）。
+#[derive(Debug, Clone, Default)]
+pub struct RequestStats {
+    pub total: i64,
+    pub success: i64,
+    pub queue_timeouts: i64,
+    /// 最近的耗时样本（毫秒），用于算均值与高位延迟。
+    pub durations: Vec<i64>,
+}
+
+/// 最近一条错误（§6.2）。
+#[derive(Debug, Clone)]
+pub struct RecentError {
+    pub request_id: String,
+    pub started_at: i64,
+    pub logical_model: Option<String>,
+    pub target_id: Option<String>,
+    pub http_status: i64,
+    pub error_code: Option<String>,
+}
+
+/// 最近一条配置变化（§6.2）。
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub occurred_at: i64,
+    pub actor: String,
+    pub action: String,
+    pub object: String,
+    pub result: String,
 }
 
 /// 成本页的一行流量聚合：某分组某逻辑模型在某账号上的成功请求数（§6.8）。

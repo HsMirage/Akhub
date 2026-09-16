@@ -11,7 +11,8 @@ import type {
   Limits,
   LogicalModel,
   Overview,
-  RequestRecord,
+  RequestFilters,
+  RequestPage,
   SelectionWarning,
   Settings,
   SettingsPatch,
@@ -252,8 +253,30 @@ export const api = {
     patch<DispatchTarget>(`/targets/${id}`, input),
   deleteTarget: (id: string) => del(`/targets/${id}`),
 
-  requests: (limit = 60, offset = 0) =>
-    request<{ data: RequestRecord[] }>(`/requests?limit=${limit}&offset=${offset}`),
+  requests: (filters: RequestFilters = {}) => {
+    const params = new URLSearchParams();
+    const setNumber = (key: string, value: number | undefined) => {
+      if (value !== undefined) params.set(key, String(value));
+    };
+    const setString = (key: string, value: string | undefined) => {
+      if (value !== undefined) params.set(key, value);
+    };
+
+    setNumber("limit", filters.limit);
+    setNumber("offset", filters.offset);
+    setNumber("since", filters.since);
+    setNumber("until", filters.until);
+    setString("request_id", filters.request_id);
+    setString("group_id", filters.group_id);
+    setString("logical_model", filters.logical_model);
+    setString("target_id", filters.target_id);
+    setString("account_id", filters.account_id);
+    setString("status", filters.status);
+    setString("error_code", filters.error_code);
+
+    const query = params.toString();
+    return request<RequestPage>(`/requests${query ? `?${query}` : ""}`);
+  },
 
   /** 只提交发生变化的系统设置；后端会立即热生效。 */
   updateSettings: (values: SettingsPatch) => patch<Settings>("/settings", values),

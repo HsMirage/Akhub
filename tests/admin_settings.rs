@@ -280,3 +280,197 @@ async fn a_site_credential_lets_accounts_skip_their_own_token() {
     .unwrap();
     assert_eq!(refreshed["effective_multiplier"], "0.1", "{refreshed}");
 }
+
+/// 造一条请求记录，用来验证筛选与概览聚合。
+#[allow(clippy::too_many_arguments)]
+async fn insert_record(
+    akhub: &common::Akhub,
+    request_id: &str,
+    logical_model: &str,
+    target_id: Option<&str>,
+    http_status: i64,
+    error_code: Option<&str>,
+    duration_ms: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) {
+    akhub
+        .state
+        .store
+        .insert_request_records(&[akhub::storage::store::RequestRecord {
+            request_id: request_id.to_string(),
+            started_at: akhub::storage::now_unix(),
+            duration_ms,
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+            group_id: Some(akhub.group_id.clone()),
+            logical_model: Some(logical_model.to_string()),
+            target_id: target_id.map(str::to_string),
+            account_id: None,
+            upstream_model: None,
+            request_bytes: 100,
+            upstream_status: Some(http_status),
+            http_status,
+            error_code: error_code.map(str::to_string),
+            endpoint: Some("chat_completions".to_string()),
+            degraded: None,
+            effective_multiplier: Some(Multiplier::ONE),
+            cheapest_multiplier: None,
+            dearest_multiplier: None,
+            attempts: 1,
+            queued_ms: 0,
+            sticky_hit: false,
+            first_token_ms: Some(10),
+            input_tokens,
+            output_tokens,
+            config_version: Some(1),
+            attempts_detail: Vec::new(),
+        }])
+        .await
+        .unwrap();
+}
+
+/// 请求记录支持按模型/状态/错误码筛选，并返回命中总数（§6.6）。
+#[tokio::test]
+async fn request_records_support_filters_and_total() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    insert_record(
+        &akhub,
+        "req-a1",
+        "m-a",
+        Some("t-1"),
+        200,
+        None,
+        12,
+        Some(5),
+        Some(7),
+    )
+    .await;
+    insert_record(
+        &akhub,
+        "req-a2",
+        "m-a",
+        Some("t-1"),
+        502,
+        Some("upstream_exhausted"),
+        30,
+        None,
+        None,
+    )
+    .await;
+    insert_record(
+        &akhub,
+        "req-b1",
+        "m-b",
+        Some("t-2"),
+        200,
+        None,
+        40,
+        Some(1),
+        Some(1),
+    )
+    .await;
+
+    let http = client();
+    let get = |query: &str| {
+        http.get(format!("{}/admin/api/requests?{query}", akhub.base_url))
+            .header("cookie", &cookie)
+            .send()
+    };
+
+    // 按模型筛选。
+    let body: Value = get("logical_model=m-a")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 2, "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+
+    // 只看失败。
+    let body: Value = get("status=error").await.unwrap().json().await.unwrap();
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["data"][0]["request_id"], "req-a2");
+
+    // 按错误码 + 目标筛选。
+    let body: Value = get("error_code=upstream_exhausted&target_id=t-1")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 1, "{body}");
+
+    // 按请求 ID 精确命中。
+    let body: Value = get("request_id=req-b1")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["data"][0]["logical_model"], "m-b");
+}
+
+/// 概览返回运行指标：请求量、成功率、延迟分位、队列超时、最近错误与配置变化（§6.2）。
+#[tokio::test]
+async fn overview_reports_runtime_metrics() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    for (index, duration) in [10_i64, 20, 30, 40].iter().enumerate() {
+        insert_record(
+            &akhub,
+            &format!("req-ok-{index}"),
+            "m-a",
+            None,
+            200,
+            None,
+            *duration,
+            Some(1),
+            Some(1),
+        )
+        .await;
+    }
+    insert_record(
+        &akhub,
+        "req-timeout",
+        "m-a",
+        None,
+        429,
+        Some("queue_timeout"),
+        500,
+        None,
+        None,
+    )
+    .await;
+
+    let overview: Value = client()
+        .get(format!("{}/admin/api/overview", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(overview["window_secs"], 86400, "{overview}");
+    assert_eq!(overview["requests"], 5, "{overview}");
+    assert_eq!(overview["queue_timeouts"], 1, "{overview}");
+    assert_eq!(overview["in_flight"], 0, "{overview}");
+    let rate = overview["success_rate"].as_f64().unwrap();
+    assert!((rate - 0.8).abs() < 0.001, "成功率应为 4/5：{rate}");
+    assert!(overview["p50_latency_ms"].as_i64().unwrap() >= 10);
+    assert!(overview["p95_latency_ms"].as_i64().unwrap() >= 500);
+    assert_eq!(
+        overview["recent_errors"].as_array().unwrap().len(),
+        1,
+        "{overview}"
+    );
+    assert!(
+        overview["recent_changes"].as_array().is_some(),
+        "配置变化列表必须存在"
+    );
+}

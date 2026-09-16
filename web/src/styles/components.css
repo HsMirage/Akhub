@@ -607,6 +607,71 @@ tr:hover .cell-actions,
   gap: var(--space-3);
 }
 
+/* 数据表筛选：和表头同一条对齐线，宽屏保持紧凑，窄屏自动换行。 */
+.table-filters {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.table-filter-fields {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.request-filters .table-filter-fields {
+  grid-template-columns: repeat(6, minmax(112px, 1fr));
+}
+
+.account-filters .table-filter-fields {
+  flex: 0 1 560px;
+  grid-template-columns: repeat(3, minmax(140px, 1fr));
+}
+
+.table-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: 1px;
+}
+
+.table-filter-summary {
+  margin-left: auto;
+  padding-bottom: 9px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: 54px;
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.table-empty {
+  padding: var(--space-6) var(--space-5);
+  color: var(--text-faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+table.data td.table-empty-cell {
+  padding: var(--space-6) var(--space-5);
+  color: var(--text-faint);
+  text-align: center;
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -979,6 +1044,29 @@ tr:hover .cell-actions,
 .callout-info {
   background: var(--info-soft);
   color: var(--info);
+}
+
+.overview-list-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-5);
+}
+
+.overview-list-grid > .card {
+  min-width: 0;
+}
+
+@media (min-width: 861px) and (max-width: 1220px) {
+  .request-filters {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .request-filters .table-filter-fields {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .request-filters .table-filter-actions {
+    justify-content: flex-end;
+  }
 }
 
 /* ------------------------------------------------------------ 登录页面 */
@@ -1377,12 +1465,44 @@ tr:hover .cell-actions,
   .settings-grid {
     grid-template-columns: 1fr;
   }
+  .table-filters {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .request-filters .table-filter-fields,
+  .account-filters .table-filter-fields {
+    flex-basis: auto;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .table-filter-summary {
+    margin-left: 0;
+    padding-bottom: 0;
+  }
+  .overview-list-grid {
+    grid-template-columns: 1fr;
+  }
   .cost-model-main {
     grid-template-columns: 1fr;
   }
 }
 
 @media (max-width: 560px) {
+  .request-filters .table-filter-fields,
+  .account-filters .table-filter-fields {
+    grid-template-columns: 1fr;
+  }
+  .table-filter-actions .btn {
+    flex: 1;
+  }
+  .table-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .table-pagination .row,
+  .table-pagination .btn {
+    flex: 1;
+  }
   .cost-overview {
     grid-template-columns: 1fr;
     padding: var(--space-3);

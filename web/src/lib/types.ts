@@ -185,6 +185,29 @@ export interface RequestRecord {
   attempts_detail: AttemptRecord[];
 }
 
+export type RequestStatus = "ok" | "error";
+
+/** 请求记录查询条件。未提供的字段不会出现在查询串中。 */
+export interface RequestFilters {
+  limit?: number;
+  offset?: number;
+  since?: number;
+  until?: number;
+  request_id?: string;
+  group_id?: string;
+  logical_model?: string;
+  target_id?: string;
+  account_id?: string;
+  status?: RequestStatus;
+  error_code?: string;
+}
+
+export interface RequestPage {
+  data: RequestRecord[];
+  /** 符合查询条件的总数，不只是当前页条数。 */
+  total: number;
+}
+
 /** 一次上游尝试的明细（§6.6）。 */
 export interface AttemptRecord {
   seq: number;
@@ -207,6 +230,23 @@ export interface MultiplierAlert {
   stale_for?: number | null;
 }
 
+export interface RecentError {
+  request_id: string;
+  started_at: number;
+  logical_model: string | null;
+  target_id: string | null;
+  http_status: number;
+  error_code: string | null;
+}
+
+export interface RecentChange {
+  occurred_at: number;
+  actor: string;
+  action: string;
+  object: string;
+  result: string;
+}
+
 export interface Overview {
   config_version: number;
   groups: number;
@@ -223,6 +263,18 @@ export interface Overview {
   missing_endpoints: number;
   dropped_request_records: number;
   master_key_from_env: boolean;
+  /** 运行指标的统计窗口，当前固定为 24 小时。 */
+  window_secs: number;
+  requests: number;
+  success_rate: number | null;
+  avg_latency_ms: number | null;
+  p50_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  in_flight: number;
+  queued: number;
+  queue_timeouts: number;
+  recent_errors: RecentError[];
+  recent_changes: RecentChange[];
 }
 
 export interface Settings {

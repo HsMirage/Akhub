@@ -84,6 +84,39 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
             .or_insert(0usize) += 1;
     }
 
+    // 运行指标（§6.2）：窗口内的请求量/成功率/延迟分位、队列超时、最近错误
+    // 与最近配置变化。窗口固定 24 小时，响应里带上窗口长度供前端标注。
+    let window_secs: i64 = 24 * 3600;
+    let stats = state
+        .store
+        .request_stats(now - window_secs, 2000)
+        .await
+        .map_err(AdminError::internal)?;
+    let recent_errors = state
+        .store
+        .recent_errors(now - window_secs, 5)
+        .await
+        .map_err(AdminError::internal)?;
+    let recent_changes = state
+        .store
+        .recent_audit(5)
+        .await
+        .map_err(AdminError::internal)?;
+    let in_flight = state.runtime.in_flight();
+    let queued: u32 = config
+        .groups
+        .iter()
+        .map(|group| {
+            state
+                .runtime
+                .queues
+                .waiting(&group.group.id, group.group.queue_capacity)
+        })
+        .sum();
+    let mut durations = stats.durations.clone();
+    durations.sort_unstable();
+    let success_rate = (stats.total > 0).then(|| stats.success as f64 / stats.total as f64);
+
     Ok(Json(json!({
         "config_version": config.version,
         "groups": group_count,
@@ -100,7 +133,41 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         "missing_endpoints": state.runtime.evidence.len(std::time::Instant::now()),
         "dropped_request_records": state.recorder.dropped(),
         "master_key_from_env": state.master_key_from_env,
+        // 运行指标（§6.2）。
+        "window_secs": window_secs,
+        "requests": stats.total,
+        "success_rate": success_rate,
+        "avg_latency_ms": (stats.total > 0).then(|| stats.durations.iter().sum::<i64>() / stats.total),
+        "p50_latency_ms": percentile(&durations, 0.50),
+        "p95_latency_ms": percentile(&durations, 0.95),
+        "in_flight": in_flight,
+        "queued": queued,
+        "queue_timeouts": stats.queue_timeouts,
+        "recent_errors": recent_errors.iter().map(|error| json!({
+            "request_id": error.request_id,
+            "started_at": error.started_at,
+            "logical_model": error.logical_model,
+            "target_id": error.target_id,
+            "http_status": error.http_status,
+            "error_code": error.error_code,
+        })).collect::<Vec<_>>(),
+        "recent_changes": recent_changes.iter().map(|entry| json!({
+            "occurred_at": entry.occurred_at,
+            "actor": entry.actor,
+            "action": entry.action,
+            "object": entry.object,
+            "result": entry.result,
+        })).collect::<Vec<_>>(),
     })))
+}
+
+/// 取已排序样本的百分位（最近邻，样本为空返回 None）。
+fn percentile(sorted: &[i64], quantile: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
+    sorted.get(index).copied()
 }
 
 /// 系统设置的可改范围；前端用它做输入校验，后端保存时再校验一次。
@@ -2423,15 +2490,54 @@ pub struct Pagination {
     pub offset: Option<i64>,
 }
 
-/// 请求元数据分页查询（§6.6）。永远不包含正文。
+/// 请求记录的筛选参数（§6.6）。全部可选，空表示不限。
+#[derive(Deserialize)]
+pub struct RequestQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    /// 起始时间（unix 秒，含）。
+    pub since: Option<i64>,
+    /// 结束时间（unix 秒，含）。
+    pub until: Option<i64>,
+    pub request_id: Option<String>,
+    pub group_id: Option<String>,
+    pub logical_model: Option<String>,
+    pub target_id: Option<String>,
+    pub account_id: Option<String>,
+    /// `ok` 只看 2xx；`error` 只看失败。
+    pub status: Option<String>,
+    pub error_code: Option<String>,
+}
+
+fn trimmed_opt(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// 请求元数据分页查询（§6.6）。永远不包含正文；支持按时间/ID/分组/模型/
+/// 目标/账号/状态/错误码筛选，并返回命中总数供翻页。
 pub async fn list_requests(
     State(state): State<SharedState>,
     _: Admin,
-    Query(page): Query<Pagination>,
+    Query(query): Query<RequestQuery>,
 ) -> AdminResult<Json<Value>> {
-    let records = state
+    let filter = crate::storage::store::RequestFilter {
+        since: query.since,
+        until: query.until,
+        request_id: trimmed_opt(&query.request_id).map(str::to_string),
+        group_id: trimmed_opt(&query.group_id).map(str::to_string),
+        logical_model: trimmed_opt(&query.logical_model).map(str::to_string),
+        target_id: trimmed_opt(&query.target_id).map(str::to_string),
+        account_id: trimmed_opt(&query.account_id).map(str::to_string),
+        status: trimmed_opt(&query.status).map(str::to_string),
+        error_code: trimmed_opt(&query.error_code).map(str::to_string),
+    };
+    let (records, total) = state
         .store
-        .list_request_records(page.limit.unwrap_or(50), page.offset.unwrap_or(0))
+        .list_request_records_filtered(
+            &filter,
+            query.limit.unwrap_or(50),
+            query.offset.unwrap_or(0),
+        )
         .await
         .map_err(AdminError::internal)?;
 
@@ -2482,7 +2588,7 @@ pub async fn list_requests(
             })
         })
         .collect();
-    Ok(Json(json!({ "data": items })))
+    Ok(Json(json!({ "data": items, "total": total })))
 }
 
 // ---------------------------------------------------------------- 辅助

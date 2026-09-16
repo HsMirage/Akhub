@@ -1,5 +1,5 @@
 /** 上游账号：凭据、连接、倍率来源与限制。 */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, type AccountInput } from "../lib/api";
 import type {
   Account,
@@ -37,6 +37,9 @@ import { ModelSelectionDialog } from "../components/ModelSelectionDialog";
 import { CalibrationDialog } from "../components/CalibrationDialog";
 import { IconPlus, IconRefresh, IconServer, IconTrash } from "../components/Icons";
 
+type AccountStatusFilter = "all" | "enabled" | "disabled";
+type AccountUpstreamFilter = "all" | UpstreamType;
+
 export function Accounts({
   data,
   refresh,
@@ -51,6 +54,30 @@ export function Accounts({
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [refreshingMultiplierId, setRefreshingMultiplierId] = useState<string | null>(null);
+  const [groupFilter, setGroupFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
+  const [upstreamFilter, setUpstreamFilter] = useState<AccountUpstreamFilter>("all");
+
+  const upstreamTypes = useMemo(
+    () =>
+      Array.from(new Set(data.accounts.map((account) => account.upstream_type))).sort(
+        (left, right) =>
+          UPSTREAM_LABELS[left].localeCompare(UPSTREAM_LABELS[right], "zh-CN"),
+      ),
+    [data.accounts],
+  );
+
+  const filteredAccounts = useMemo(
+    () =>
+      data.accounts.filter((account) => {
+        if (groupFilter !== "all" && account.group_id !== groupFilter) return false;
+        if (statusFilter === "enabled" && !account.enabled) return false;
+        if (statusFilter === "disabled" && account.enabled) return false;
+        if (upstreamFilter !== "all" && account.upstream_type !== upstreamFilter) return false;
+        return true;
+      }),
+    [data.accounts, groupFilter, statusFilter, upstreamFilter],
+  );
 
   const groupName = (id: string) =>
     data.groups.find((group) => group.id === id)?.name ?? id;
@@ -152,108 +179,177 @@ export function Accounts({
             }
           />
         ) : (
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>账号</th>
-                  <th>分组</th>
-                  <th>Base URL</th>
-                  <th>优先级</th>
-                  <th>有效倍率</th>
-                  <th>限制</th>
-                  <th>状态</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {data.accounts.map((account) => (
-                  <tr key={account.id}>
-                    <td>
-                      <div className="cell-strong">{account.name}</div>
-                      <div className="text-faint" style={{ fontSize: 12 }}>
-                        {UPSTREAM_LABELS[account.upstream_type]} ·{" "}
-                        {PROTOCOL_LABELS[account.preferred_protocol]}
-                      </div>
-                    </td>
-                    <td className="cell-dim">{groupName(account.group_id)}</td>
-                    <td>
-                      <div
-                        className="mono cell-dim cell-truncate"
-                        style={{ maxWidth: 180, fontSize: 12 }}
-                        title={account.base_url}
-                      >
-                        {account.base_url}
-                      </div>
-                      {account.allow_private_network && <Badge tone="warn">内网</Badge>}
-                    </td>
-                    <td className="mono">{account.default_priority}</td>
-                    <td>
-                      <MultiplierCell
-                        account={account}
-                        onRefresh={refreshMultiplier}
-                        refreshing={refreshingMultiplierId === account.id}
-                      />
-                    </td>
-                    <td className="cell-dim" style={{ fontSize: 12 }}>
-                      {formatLimits(account.limits)}
-                    </td>
-                    <td>
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => void toggle(account)}
-                        title={account.enabled ? "点击停用" : "点击启用"}
-                      >
-                        <Badge tone={account.enabled ? "success" : "neutral"} dot>
-                          {account.enabled ? "启用" : "停用"}
-                        </Badge>
-                      </button>
-                    </td>
-                    <td>
-                      <div className="cell-actions">
-                        <Button size="sm" onClick={() => setSelecting(account)}>
-                          模型
-                        </Button>
-                        <Button
-                          size="sm"
-                          onClick={() => setCalibrating(account)}
-                          title="按单模型对账反算校准系数"
-                        >
-                          校准
-                        </Button>
-                        <Button size="sm" onClick={() => setEditing(account)}>
-                          编辑
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busyId === account.id}
-                          title="一键独立复制（停用状态）"
-                          onClick={() => void copy(account)}
-                        >
-                          复制
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busyId === account.id}
-                          title="发送一次真实 hi 测试连接"
-                          onClick={() => void test(account)}
-                        >
-                          测试
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          icon={<IconTrash size={13} />}
-                          title="删除账号"
-                          onClick={() => setConfirm(account)}
-                        />
-                      </div>
-                    </td>
+          <>
+            <div className="table-filters account-filters">
+              <div className="table-filter-fields">
+                <Field label="分组">
+                  {(id) => (
+                    <select
+                      id={id}
+                      className="select"
+                      value={groupFilter}
+                      onChange={(event) => setGroupFilter(event.target.value)}
+                    >
+                      <option value="all">全部分组</option>
+                      {data.groups.map((group) => (
+                        <option key={group.id} value={group.id}>
+                          {group.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </Field>
+                <Field label="状态">
+                  {(id) => (
+                    <select
+                      id={id}
+                      className="select"
+                      value={statusFilter}
+                      onChange={(event) =>
+                        setStatusFilter(event.target.value as AccountStatusFilter)
+                      }
+                    >
+                      <option value="all">全部</option>
+                      <option value="enabled">已启用</option>
+                      <option value="disabled">已停用</option>
+                    </select>
+                  )}
+                </Field>
+                <Field label="上游类型">
+                  {(id) => (
+                    <select
+                      id={id}
+                      className="select"
+                      value={upstreamFilter}
+                      onChange={(event) =>
+                        setUpstreamFilter(event.target.value as AccountUpstreamFilter)
+                      }
+                    >
+                      <option value="all">全部类型</option>
+                      {upstreamTypes.map((upstreamType) => (
+                        <option key={upstreamType} value={upstreamType}>
+                          {UPSTREAM_LABELS[upstreamType]}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </Field>
+              </div>
+              <div className="table-filter-summary tabular">
+                共 {data.accounts.length} 个账号（筛选后 {filteredAccounts.length} 个）
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>分组</th>
+                    <th>Base URL</th>
+                    <th>优先级</th>
+                    <th>有效倍率</th>
+                    <th>限制</th>
+                    <th>状态</th>
+                    <th />
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {filteredAccounts.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="table-empty-cell">
+                        没有符合条件的账号
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredAccounts.map((account) => (
+                      <tr key={account.id}>
+                        <td>
+                          <div className="cell-strong">{account.name}</div>
+                          <div className="text-faint" style={{ fontSize: 12 }}>
+                            {UPSTREAM_LABELS[account.upstream_type]} ·{" "}
+                            {PROTOCOL_LABELS[account.preferred_protocol]}
+                          </div>
+                        </td>
+                        <td className="cell-dim">{groupName(account.group_id)}</td>
+                        <td>
+                          <div
+                            className="mono cell-dim cell-truncate"
+                            style={{ maxWidth: 180, fontSize: 12 }}
+                            title={account.base_url}
+                          >
+                            {account.base_url}
+                          </div>
+                          {account.allow_private_network && <Badge tone="warn">内网</Badge>}
+                        </td>
+                        <td className="mono">{account.default_priority}</td>
+                        <td>
+                          <MultiplierCell
+                            account={account}
+                            onRefresh={refreshMultiplier}
+                            refreshing={refreshingMultiplierId === account.id}
+                          />
+                        </td>
+                        <td className="cell-dim" style={{ fontSize: 12 }}>
+                          {formatLimits(account.limits)}
+                        </td>
+                        <td>
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => void toggle(account)}
+                            title={account.enabled ? "点击停用" : "点击启用"}
+                          >
+                            <Badge tone={account.enabled ? "success" : "neutral"} dot>
+                              {account.enabled ? "启用" : "停用"}
+                            </Badge>
+                          </button>
+                        </td>
+                        <td>
+                          <div className="cell-actions">
+                            <Button size="sm" onClick={() => setSelecting(account)}>
+                              模型
+                            </Button>
+                            <Button
+                              size="sm"
+                              onClick={() => setCalibrating(account)}
+                              title="按单模型对账反算校准系数"
+                            >
+                              校准
+                            </Button>
+                            <Button size="sm" onClick={() => setEditing(account)}>
+                              编辑
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={busyId === account.id}
+                              title="一键独立复制（停用状态）"
+                              onClick={() => void copy(account)}
+                            >
+                              复制
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={busyId === account.id}
+                              title="发送一次真实 hi 测试连接"
+                              onClick={() => void test(account)}
+                            >
+                              测试
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="danger"
+                              icon={<IconTrash size={13} />}
+                              title="删除账号"
+                              onClick={() => setConfirm(account)}
+                            />
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </Card>
 

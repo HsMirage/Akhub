@@ -211,7 +211,7 @@ async fn handle(
         return error.with_request_id(request_id).into_response();
     }
 
-    passthrough::forward(passthrough::Forward {
+    let response = passthrough::forward(passthrough::Forward {
         state: &state,
         group: &group,
         endpoint,
@@ -225,5 +225,7 @@ async fn handle(
         started_unix,
         chain,
     })
-    .await
+    .await;
+    // 在途计数绑定到响应体：流式请求要等连接结束才算完成（§6.2）。
+    state.runtime.track_response(response)
 }

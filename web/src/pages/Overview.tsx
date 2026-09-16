@@ -13,12 +13,19 @@ import {
   IconArrowRight,
   IconCheck,
   IconCube,
+  IconGauge,
   IconInbox,
   IconKey,
   IconRoute,
   IconServer,
 } from "../components/Icons";
-import { formatRelative, formatDuration, formatStaleFor, statusTone } from "../lib/format";
+import {
+  formatDuration,
+  formatRelative,
+  formatStaleFor,
+  formatTime,
+  statusTone,
+} from "../lib/format";
 import { TARGET_STATUS_LABELS } from "../lib/types";
 import type { TargetStatus } from "../lib/types";
 
@@ -59,12 +66,7 @@ export function Overview({
   ];
   const currentStep = steps.findIndex((step) => !step.done);
   const ready = currentStep === -1;
-
-  const failures = requests.filter((r) => r.http_status >= 400).length;
-  const successRate =
-    requests.length > 0
-      ? Math.round(((requests.length - failures) / requests.length) * 100)
-      : null;
+  const windowLabel = formatWindow(overview.window_secs);
 
   const unhealthy = (Object.entries(overview.target_status) as [TargetStatus, number][]).filter(
     ([status, count]) => status !== "active" && count > 0,
@@ -109,13 +111,45 @@ export function Overview({
         />
         <Stat
           icon={<IconInbox size={13} />}
-          label="近期成功率"
-          value={successRate === null ? "—" : `${successRate}%`}
-          hint={
-            requests.length === 0
-              ? "尚无请求"
-              : `最近 ${requests.length} 次请求中 ${failures} 次失败`
-          }
+          label="窗口内请求数"
+          value={formatMetricNumber(overview.requests)}
+          hint={`${windowLabel}窗口 · 按开始时间统计`}
+        />
+        <Stat
+          icon={<IconCheck size={13} />}
+          label="成功率"
+          value={formatSuccessRate(overview.success_rate)}
+          hint={`${windowLabel}窗口`}
+        />
+        <Stat
+          icon={<IconGauge size={13} />}
+          label="平均延迟"
+          value={formatMetricDuration(overview.avg_latency_ms)}
+          hint={`P50 ${formatMetricDuration(overview.p50_latency_ms)}`}
+        />
+        <Stat
+          icon={<IconGauge size={13} />}
+          label="P95 延迟"
+          value={formatMetricDuration(overview.p95_latency_ms)}
+          hint={`${windowLabel}窗口`}
+        />
+        <Stat
+          icon={<IconRoute size={13} />}
+          label="当前在途"
+          value={formatMetricNumber(overview.in_flight)}
+          hint="流式请求在连接结束后扣除"
+        />
+        <Stat
+          icon={<IconInbox size={13} />}
+          label="当前排队"
+          value={formatMetricNumber(overview.queued)}
+          hint="正在等待调度的请求"
+        />
+        <Stat
+          icon={<IconAlert size={13} />}
+          label="队列超时数"
+          value={formatMetricNumber(overview.queue_timeouts)}
+          hint={`${windowLabel}窗口`}
         />
       </div>
 
@@ -156,6 +190,99 @@ export function Overview({
       )}
 
       {ready && <ReadyPanel data={data} />}
+
+      <div className="overview-list-grid">
+        <Card
+          title="最近错误"
+          description={`${windowLabel}窗口内最近 5 条失败请求。`}
+        >
+          {overview.recent_errors.length === 0 ? (
+            <div className="table-empty">窗口内没有失败请求</div>
+          ) : (
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>请求 ID</th>
+                    <th>模型</th>
+                    <th>状态码</th>
+                    <th>错误码</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {overview.recent_errors.slice(0, 5).map((error) => (
+                    <tr key={error.request_id}>
+                      <td className="cell-dim">{formatTime(error.started_at)}</td>
+                      <td>
+                        <div
+                          className="mono cell-dim cell-truncate"
+                          style={{ maxWidth: 150 }}
+                          title={error.request_id}
+                        >
+                          {error.request_id}
+                        </div>
+                      </td>
+                      <td className="mono">{error.logical_model ?? "—"}</td>
+                      <td>
+                        <Badge tone={statusTone(error.http_status)}>
+                          {error.http_status}
+                        </Badge>
+                      </td>
+                      <td className="mono text-faint">{error.error_code ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <Card
+          title="最近配置变化"
+          description={`最近 5 条管理操作，时间范围为 ${windowLabel}。`}
+        >
+          {overview.recent_changes.length === 0 ? (
+            <div className="table-empty">窗口内没有配置变化</div>
+          ) : (
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>动作</th>
+                    <th>对象</th>
+                    <th>结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {overview.recent_changes.slice(0, 5).map((change, index) => (
+                    <tr key={`${change.occurred_at}-${change.action}-${index}`}>
+                      <td className="cell-dim">{formatTime(change.occurred_at)}</td>
+                      <td>
+                        <div>{change.action}</div>
+                        <div className="text-faint" style={{ fontSize: 11 }}>
+                          {change.actor}
+                        </div>
+                      </td>
+                      <td>
+                        <div
+                          className="mono cell-dim cell-truncate"
+                          style={{ maxWidth: 180 }}
+                          title={change.object}
+                        >
+                          {change.object}
+                        </div>
+                      </td>
+                      <td className="mono cell-dim">{change.result}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </div>
 
       <Card
         title="最近请求"
@@ -359,3 +486,28 @@ function Stat({
 }
 
 export const OverviewIcon = IconServer;
+
+function formatMetricNumber(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value)
+    ? "—"
+    : value.toLocaleString();
+}
+
+function formatMetricDuration(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value)
+    ? "—"
+    : formatDuration(Math.round(value));
+}
+
+function formatSuccessRate(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatWindow(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) {
+    return "当前";
+  }
+  if (seconds % 3_600 === 0) return `${seconds / 3_600} 小时`;
+  return `${seconds.toLocaleString()} 秒`;
+}

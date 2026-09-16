@@ -201,6 +201,18 @@ pub struct Runtime {
     pub capabilities: capability::Capabilities,
     /// 关闭信号：置位后排队中的请求立即取消并返回可重试错误（§25.3 第 2 步）。
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// 当前在途请求数（§6.2 概览指标）。计数绑定在响应体上，流式请求直到
+    /// 连接结束才算完成。
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// 在途计数守卫：随响应体一起析构，客户端断开也会准确 -1。
+struct InFlightGuard(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Default for Runtime {
@@ -214,6 +226,7 @@ impl Default for Runtime {
             evidence: Default::default(),
             capabilities: Default::default(),
             shutdown: tokio::sync::watch::channel(false).0,
+            in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -232,6 +245,32 @@ impl Runtime {
     /// 订阅关闭信号；等待容量时与它一起 `select`。
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shutdown.subscribe()
+    }
+
+    /// 当前在途请求数。
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 把在途计数绑到响应体的生命周期上（§6.2）。
+    ///
+    /// 流式请求从进入网关一直算到连接结束；客户端中途断开时守卫随流一起析构，
+    /// 计数不会泄漏。
+    pub fn track_response(&self, response: axum::response::Response) -> axum::response::Response {
+        use futures::StreamExt as _;
+
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let guard = InFlightGuard(Arc::clone(&self.in_flight));
+        let (parts, body) = response.into_parts();
+        let stream = async_stream::stream! {
+            let _guard = guard;
+            let mut body = body.into_data_stream();
+            while let Some(item) = body.next().await {
+                yield item;
+            }
+        };
+        axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
     }
 }
 

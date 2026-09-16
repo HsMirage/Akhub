@@ -1,19 +1,65 @@
 /** 请求记录：只有元数据，没有正文。 */
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { api } from "../lib/api";
 import type { Data } from "../lib/store";
-import { ENDPOINT_LABELS, PROTOCOL_LABELS, type AttemptRecord } from "../lib/types";
+import {
+  ENDPOINT_LABELS,
+  PROTOCOL_LABELS,
+  type AttemptRecord,
+  type RequestFilters,
+  type RequestStatus,
+} from "../lib/types";
 import {
   formatBytes,
   formatDuration,
   formatTime,
   statusTone,
 } from "../lib/format";
-import { Badge, Button, Card, EmptyState } from "../components/ui";
+import { Badge, Button, Card, EmptyState, Field, useToast } from "../components/ui";
 import { IconInbox } from "../components/Icons";
 
-type Filter = "all" | "failed" | "streaming" | "degraded";
+type TimeRange = "1h" | "24h" | "7d" | "all";
+
+interface RequestFilterForm {
+  timeRange: TimeRange;
+  groupId: string;
+  logicalModel: string;
+  status: "" | RequestStatus;
+  errorCode: string;
+  requestId: string;
+}
+
+const PAGE_SIZE = 50;
+const EMPTY_FILTERS: RequestFilterForm = {
+  timeRange: "all",
+  groupId: "",
+  logicalModel: "",
+  status: "",
+  errorCode: "",
+  requestId: "",
+};
+const RANGE_SECONDS: Record<Exclude<TimeRange, "all">, number> = {
+  "1h": 60 * 60,
+  "24h": 24 * 60 * 60,
+  "7d": 7 * 24 * 60 * 60,
+};
 
 const REQUEST_COLUMN_COUNT = 10;
+
+function toRequestFilters(form: RequestFilterForm): RequestFilters {
+  const filters: RequestFilters = {};
+  if (form.timeRange !== "all") {
+    const until = Math.floor(Date.now() / 1000);
+    filters.since = until - RANGE_SECONDS[form.timeRange];
+    filters.until = until;
+  }
+  if (form.groupId) filters.group_id = form.groupId;
+  if (form.logicalModel) filters.logical_model = form.logicalModel;
+  if (form.status) filters.status = form.status;
+  if (form.errorCode.trim()) filters.error_code = form.errorCode.trim();
+  if (form.requestId.trim()) filters.request_id = form.requestId.trim();
+  return filters;
+}
 
 function formatTokenPair(input: number | null, output: number | null): string {
   if (input === null || output === null) return "—";
@@ -54,24 +100,78 @@ function sameProtocol(protocol: string, endpoint: string): boolean {
   return of[endpoint] === protocol;
 }
 
-export function Requests({ data, refresh }: { data: Data; refresh: () => Promise<void> }) {
-  const [filter, setFilter] = useState<Filter>("all");
+export function Requests({ data }: { data: Data; refresh: () => Promise<void> }) {
+  const toast = useToast();
+  const [filters, setFilters] = useState<RequestFilterForm>(() => ({ ...EMPTY_FILTERS }));
+  const [appliedFilters, setAppliedFilters] = useState<RequestFilters>({});
+  const [records, setRecords] = useState(data.requests);
+  const [total, setTotal] = useState(data.requests.length);
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(true);
   const [expandedRequestIds, setExpandedRequestIds] = useState<Set<string>>(
     () => new Set(),
   );
 
-  const records = useMemo(() => {
-    switch (filter) {
-      case "failed":
-        return data.requests.filter((record) => record.http_status >= 400);
-      case "streaming":
-        return data.requests.filter((record) => record.streaming);
-      case "degraded":
-        return data.requests.filter((record) => record.degraded !== null);
-      default:
-        return data.requests;
-    }
-  }, [data.requests, filter]);
+  const logicalModels = useMemo(
+    () =>
+      Array.from(new Set(data.models.map((model) => model.name))).sort((left, right) =>
+        left.localeCompare(right),
+      ),
+    [data.models],
+  );
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    void api
+      .requests({
+        ...appliedFilters,
+        limit: PAGE_SIZE,
+        offset: (page - 1) * PAGE_SIZE,
+      })
+      .then((result) => {
+        if (!active) return;
+        const lastPage = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
+        setTotal(result.total);
+        if (page > lastPage) {
+          setPage(lastPage);
+          return;
+        }
+        setRecords(result.data);
+        setExpandedRequestIds(new Set());
+      })
+      .catch((cause: unknown) => {
+        if (!active) return;
+        toast.error(cause instanceof Error ? cause.message : "查询请求记录失败");
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [appliedFilters, data.requests, page, toast]);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const hasFilters = Object.keys(appliedFilters).length > 0;
+
+  const updateFilter = <K extends keyof RequestFilterForm>(
+    key: K,
+    value: RequestFilterForm[K],
+  ) => {
+    setFilters((current) => ({ ...current, [key]: value }));
+  };
+
+  const query = () => {
+    setPage(1);
+    setAppliedFilters(toRequestFilters(filters));
+  };
+
+  const reset = () => {
+    setFilters({ ...EMPTY_FILTERS });
+    setPage(1);
+    setAppliedFilters({});
+  };
 
   const accountName = (id: string | null) =>
     id ? (data.accounts.find((account) => account.id === id)?.name ?? id) : "—";
@@ -92,43 +192,125 @@ export function Requests({ data, refresh }: { data: Data; refresh: () => Promise
     <Card
       title="请求记录"
       description="默认保留 30 天。不保存消息正文、图片、工具参数或思考内容。"
-      actions={
-        <>
-          <div className="row" style={{ gap: 2 }}>
-            {(
-              [
-                ["all", "全部"],
-                ["failed", "仅失败"],
-                ["streaming", "仅流式"],
-                ["degraded", "仅降级"],
-              ] as const
-            ).map(([value, label]) => (
-              <Button
-                key={value}
-                size="sm"
-                variant={filter === value ? "secondary" : "ghost"}
-                onClick={() => setFilter(value)}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-          <Button size="sm" onClick={() => void refresh()}>
-            刷新
-          </Button>
-        </>
-      }
     >
+      <form
+        className="table-filters request-filters"
+        onSubmit={(event) => {
+          event.preventDefault();
+          query();
+        }}
+      >
+        <div className="table-filter-fields">
+          <Field label="时间范围">
+            {(id) => (
+              <select
+                id={id}
+                className="select"
+                value={filters.timeRange}
+                onChange={(event) =>
+                  updateFilter("timeRange", event.target.value as TimeRange)
+                }
+              >
+                <option value="1h">近 1 小时</option>
+                <option value="24h">近 24 小时</option>
+                <option value="7d">近 7 天</option>
+                <option value="all">全部</option>
+              </select>
+            )}
+          </Field>
+          <Field label="分组">
+            {(id) => (
+              <select
+                id={id}
+                className="select"
+                value={filters.groupId}
+                onChange={(event) => updateFilter("groupId", event.target.value)}
+              >
+                <option value="">全部分组</option>
+                {data.groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <Field label="逻辑模型">
+            {(id) => (
+              <select
+                id={id}
+                className="select"
+                value={filters.logicalModel}
+                onChange={(event) => updateFilter("logicalModel", event.target.value)}
+              >
+                <option value="">全部模型</option>
+                {logicalModels.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <Field label="状态">
+            {(id) => (
+              <select
+                id={id}
+                className="select"
+                value={filters.status}
+                onChange={(event) =>
+                  updateFilter("status", event.target.value as RequestFilterForm["status"])
+                }
+              >
+                <option value="">全部</option>
+                <option value="ok">只有成功</option>
+                <option value="error">只有失败</option>
+              </select>
+            )}
+          </Field>
+          <Field label="错误码">
+            {(id) => (
+              <input
+                id={id}
+                className="input mono"
+                value={filters.errorCode}
+                placeholder="如 upstream_timeout"
+                onChange={(event) => updateFilter("errorCode", event.target.value)}
+              />
+            )}
+          </Field>
+          <Field label="请求 ID">
+            {(id) => (
+              <input
+                id={id}
+                className="input mono"
+                value={filters.requestId}
+                placeholder="完整请求 ID"
+                onChange={(event) => updateFilter("requestId", event.target.value)}
+              />
+            )}
+          </Field>
+        </div>
+        <div className="table-filter-actions">
+          <Button type="submit" variant="primary" disabled={loading}>
+            查询
+          </Button>
+          <Button type="button" onClick={reset} disabled={loading && !hasFilters}>
+            重置
+          </Button>
+        </div>
+      </form>
+
       {records.length === 0 ? (
         <EmptyState
           icon={<IconInbox size={19} />}
-          title={filter === "all" ? "还没有请求记录" : "没有符合条件的记录"}
+          title={loading ? "正在查询请求记录" : hasFilters ? "没有符合条件的记录" : "还没有请求记录"}
           description={
-            filter === "all"
+            loading
+              ? "正在从后台读取当前页。"
+              : !hasFilters
               ? "用分组 Key 向 /v1/messages 或 /v1/chat/completions 发一次请求就会出现。元数据由后台任务批量落盘，热路径不等待写入。"
-              : filter === "degraded"
-                ? "没有请求发生过能力降级。工具、图片与结构化输出永远不会被丢弃；只有 thinking 与协议独有采样参数会，而且只在故障切换时。"
-                : "换一个筛选条件试试。"
+              : "调整筛选条件后重新查询。"
           }
         />
       ) : (
@@ -317,6 +499,27 @@ export function Requests({ data, refresh }: { data: Data; refresh: () => Promise
           </table>
         </div>
       )}
+      <div className="table-pagination" aria-live="polite">
+        <span className="text-dim tabular">
+          第 {page} / {totalPages} 页，共 {total.toLocaleString()} 条
+        </span>
+        <div className="row">
+          <Button
+            size="sm"
+            disabled={loading || page <= 1}
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            上一页
+          </Button>
+          <Button
+            size="sm"
+            disabled={loading || page * PAGE_SIZE >= total}
+            onClick={() => setPage((current) => current + 1)}
+          >
+            下一页
+          </Button>
+        </div>
+      </div>
     </Card>
   );
 }
