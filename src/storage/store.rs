@@ -95,6 +95,44 @@ impl Store {
         )
     }
 
+    /// 覆盖管理员的密码哈希。返回是否真的改到了一行。
+    pub async fn update_admin_password(&self, username: &str, password_hash: &str) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE username = ?",
+        )
+        .bind(password_hash)
+        .bind(now_unix())
+        .bind(username)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    /// 读取一条应用级设置（后台可改的系统参数）。
+    pub async fn app_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 写入一条应用级设置。
+    pub async fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ 分组
 
     pub async fn insert_group(&self, group: &Group) -> Result<()> {

@@ -79,7 +79,7 @@ async fn not_found() -> Response {
 
 /// 启动 HTTP 服务并阻塞到收到停止信号。
 pub async fn serve(state: SharedState, addr: SocketAddr) -> Result<()> {
-    let grace = state.settings.shutdown_grace;
+    let grace = state.settings.get().shutdown_grace;
     serve_with_shutdown(state, addr, shutdown_signal(grace)).await
 }
 
@@ -99,7 +99,7 @@ pub async fn serve_with_shutdown(
 
     crate::app::tasks::spawn(&state);
     tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin");
-    let grace = state.settings.shutdown_grace;
+    let grace = state.settings.get().shutdown_grace;
 
     // 宽限期必须从**收到停止信号之后**开始算。早期实现直接用
     // `timeout(grace, serve)` 包住整个服务，结果进程每 180 秒就自行退出一次

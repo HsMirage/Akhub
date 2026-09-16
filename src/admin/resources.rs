@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 
 use super::{Admin, AdminError, AdminResult};
 use crate::app::SharedState;
+use crate::auth::session;
 use crate::discovery;
 use crate::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
@@ -102,20 +103,113 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
     })))
 }
 
-/// 只读的系统设置视图（§6.7）。第一期设置项由启动参数决定，不在后台修改。
-pub async fn get_settings(State(state): State<SharedState>, _: Admin) -> AdminResult<Json<Value>> {
-    Ok(Json(json!({
-        "request_timeout_secs": state.settings.request_timeout.as_secs(),
-        "max_request_bytes": state.settings.max_request_bytes,
-        "retention_days": state.settings.retention_days,
-        "response_state_days": state.settings.response_state_days,
-        "shutdown_grace_secs": state.settings.shutdown_grace.as_secs(),
-        "multiplier_refresh_secs": state.settings.multiplier_refresh.as_secs(),
-        "model_sync_secs": state.settings.model_sync.as_secs(),
+/// 系统设置的可改范围；前端用它做输入校验，后端保存时再校验一次。
+const SETTINGS_LIMITS: &str = r#"{
+    "request_timeout_secs": {"min": 5, "max": 86400},
+    "max_request_bytes": {"min": 1024, "max": 268435456},
+    "retention_days": {"min": 0, "max": 3650},
+    "response_state_days": {"min": 0, "max": 3650},
+    "shutdown_grace_secs": {"min": 5, "max": 3600},
+    "multiplier_refresh_secs": {"min": 30, "max": 86400},
+    "model_sync_secs": {"min": 60, "max": 86400}
+}"#;
+
+fn settings_json(settings: &crate::app::Settings) -> Value {
+    json!({
+        "request_timeout_secs": settings.request_timeout.as_secs(),
+        "max_request_bytes": settings.max_request_bytes,
+        "retention_days": settings.retention_days,
+        "response_state_days": settings.response_state_days,
+        "shutdown_grace_secs": settings.shutdown_grace.as_secs(),
+        "multiplier_refresh_secs": settings.multiplier_refresh.as_secs(),
+        "model_sync_secs": settings.model_sync.as_secs(),
         // 内置能力目录的版本（§6.7：当前版本、模型目录版本和适配器版本）。
         "capability_catalog_revision": crate::capability::builtin().revision().to_string(),
         "version": env!("CARGO_PKG_VERSION"),
-    })))
+        // 这些字段在进程启动时读取一次，保存后要等下次重启才生效。
+        "restart_required": ["shutdown_grace_secs"],
+        "limits": serde_json::from_str::<Value>(SETTINGS_LIMITS).unwrap_or(Value::Null),
+    })
+}
+
+/// 系统设置（§6.7）：读当前值、可改范围与"下次重启生效"的字段。
+pub async fn get_settings(State(state): State<SharedState>, _: Admin) -> AdminResult<Json<Value>> {
+    Ok(Json(settings_json(&state.settings.get())))
+}
+
+/// 保存系统设置：校验 → 持久化 → 立即热生效。
+///
+/// `shutdown_grace_secs` 例外：关闭宽限期在进程启动时读取，保存后等下次
+/// 重启生效，响应里的 `restart_required` 会把它标出来。
+pub async fn update_settings(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Json(payload): Json<crate::app::PersistedSettings>,
+) -> AdminResult<Json<Value>> {
+    payload
+        .validate()
+        .map_err(|error| AdminError::bad_request(error.to_string()))?;
+    let next = payload.apply_to((*state.settings.get()).clone());
+    let stored = serde_json::to_string(&crate::app::PersistedSettings::from_settings(&next))
+        .map_err(AdminError::internal)?;
+    state
+        .store
+        .set_app_setting(crate::app::SETTINGS_KEY, &stored)
+        .await
+        .map_err(AdminError::internal)?;
+    let applied = state.settings.replace(next);
+    audit(&state, &admin, "update_settings", "system").await;
+    Ok(Json(settings_json(&applied)))
+}
+
+/// 修改管理员密码（§23.2）。改完吊销全部会话，并给当前浏览器发一张新的。
+pub async fn change_password(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Json(payload): Json<PasswordChange>,
+) -> AdminResult<Response> {
+    let hash = state
+        .store
+        .admin_password_hash(&admin.username)
+        .await
+        .map_err(AdminError::internal)?
+        .ok_or_else(|| AdminError::unauthorized("管理员账号不存在"))?;
+    if !session::verify_password(&payload.current_password, &hash) {
+        return Err(AdminError::unauthorized("当前密码不正确"));
+    }
+    if payload.new_password.chars().count() < 12 {
+        return Err(AdminError::bad_request("新密码至少 12 个字符"));
+    }
+    if payload.new_password == payload.current_password {
+        return Err(AdminError::bad_request("新密码不能与当前密码相同"));
+    }
+    let new_hash = session::hash_password(&payload.new_password).map_err(AdminError::internal)?;
+    if !state
+        .store
+        .update_admin_password(&admin.username, &new_hash)
+        .await
+        .map_err(AdminError::internal)?
+    {
+        return Err(AdminError::unauthorized("管理员账号不存在"));
+    }
+    // 其他设备上的旧会话立即失效；当前浏览器换一张新会话，避免改完被踢下线。
+    state.sessions.revoke_all();
+    let token = state
+        .sessions
+        .create(&admin.username)
+        .map_err(AdminError::internal)?;
+    audit(&state, &admin, "change_password", &admin.username).await;
+    Ok((
+        [(header::SET_COOKIE, super::session_cookie_header(&token))],
+        Json(json!({"username": admin.username})),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct PasswordChange {
+    pub current_password: String,
+    pub new_password: String,
 }
 
 // ------------------------------------------------------------------ 分组
@@ -627,6 +721,8 @@ pub async fn update_account(
 }
 
 /// 立即刷新一个账号的自动倍率（§11.3 的账号级刷新按钮）。
+///
+/// 同步等待探针结果：成功返回新的有效倍率，失败把探测错误以 502 带回前端。
 pub async fn refresh_account_multiplier(
     State(state): State<SharedState>,
     admin: Admin,
@@ -638,11 +734,25 @@ pub async fn refresh_account_multiplier(
             "手动倍率不需要刷新，直接修改数值即可",
         ));
     }
-    state.refresh.force(&account.id);
+    // 与后台定时任务共用同一条探测与落库路径，但同步等待结果：按钮点下去
+    // 就是一次真实探测，而不是"排进下一轮"。
+    let reading = crate::multiplier::refresh::refresh_account_now(&state, &account)
+        .await
+        .map_err(|error| {
+            AdminError::new(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "倍率探测失败：{}",
+                    crate::security::redact::text(&error.to_string())
+                ),
+            )
+        })?;
     audit(&state, &admin, "refresh_multiplier", &account.id).await;
     Ok(Json(json!({
-        "queued": true,
-        "notice": "已排入下一轮刷新",
+        "refreshed": true,
+        "effective_multiplier": reading.multiplier,
+        "observed_at": reading.observed_at,
+        "notice": format!("已重新探测：当前有效倍率 {}", reading.multiplier),
     })))
 }
 

@@ -50,6 +50,7 @@ export function Accounts({
   const [selecting, setSelecting] = useState<Account | null>(null);
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [refreshingMultiplierId, setRefreshingMultiplierId] = useState<string | null>(null);
 
   const groupName = (id: string) =>
     data.groups.find((group) => group.id === id)?.name ?? id;
@@ -75,11 +76,16 @@ export function Accounts({
   };
 
   const refreshMultiplier = async (account: Account) => {
+    if (refreshingMultiplierId === account.id) return;
+    setRefreshingMultiplierId(account.id);
     try {
-      await api.refreshMultiplier(account.id);
-      toast.success(`「${account.name}」已排入下一轮倍率刷新`);
+      const result = await api.refreshMultiplier(account.id);
+      await refresh();
+      toast.success(result.notice);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "操作失败");
+    } finally {
+      setRefreshingMultiplierId(null);
     }
   };
 
@@ -183,7 +189,11 @@ export function Accounts({
                     </td>
                     <td className="mono">{account.default_priority}</td>
                     <td>
-                      <MultiplierCell account={account} onRefresh={refreshMultiplier} />
+                      <MultiplierCell
+                        account={account}
+                        onRefresh={refreshMultiplier}
+                        refreshing={refreshingMultiplierId === account.id}
+                      />
                     </td>
                     <td className="cell-dim" style={{ fontSize: 12 }}>
                       {formatLimits(account.limits)}
@@ -302,9 +312,11 @@ export function Accounts({
 function MultiplierCell({
   account,
   onRefresh,
+  refreshing,
 }: {
   account: Account;
   onRefresh: (account: Account) => Promise<void>;
+  refreshing: boolean;
 }) {
   const automatic = account.multiplier_mode !== "manual";
   return (
@@ -332,9 +344,15 @@ function MultiplierCell({
             className="btn btn-ghost btn-sm"
             style={{ padding: "0 4px", height: 18 }}
             title={account.multiplier_error ?? "立即刷新倍率"}
+            aria-label={`刷新「${account.name}」倍率`}
+            disabled={refreshing}
             onClick={() => void onRefresh(account)}
           >
-            <IconRefresh size={12} />
+            {refreshing ? (
+              <span className="spinner spinner-sm" aria-hidden="true" />
+            ) : (
+              <IconRefresh size={12} />
+            )}
           </button>
         )}
       </div>

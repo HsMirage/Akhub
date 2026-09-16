@@ -55,6 +55,131 @@ impl Default for Settings {
     }
 }
 
+/// 设置持久化用的 JSON 形状：只保存"后台能改"的字段，全部可选。
+///
+/// 启动时以环境变量/默认值为底，再把数据库里的覆盖项盖上去；这样以后新增
+/// 设置项时，旧的持久化文件不会因为缺字段而失效。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PersistedSettings {
+    pub request_timeout_secs: Option<u64>,
+    pub max_request_bytes: Option<usize>,
+    pub retention_days: Option<u32>,
+    pub response_state_days: Option<u32>,
+    pub shutdown_grace_secs: Option<u64>,
+    pub multiplier_refresh_secs: Option<u64>,
+    pub model_sync_secs: Option<u64>,
+}
+
+impl PersistedSettings {
+    /// 用持久化值覆盖底值。
+    pub fn apply_to(&self, base: Settings) -> Settings {
+        Settings {
+            request_timeout: self
+                .request_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.request_timeout),
+            max_request_bytes: self.max_request_bytes.unwrap_or(base.max_request_bytes),
+            retention_days: self.retention_days.unwrap_or(base.retention_days),
+            response_state_days: self.response_state_days.unwrap_or(base.response_state_days),
+            shutdown_grace: self
+                .shutdown_grace_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.shutdown_grace),
+            multiplier_refresh: self
+                .multiplier_refresh_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.multiplier_refresh),
+            model_sync: self
+                .model_sync_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.model_sync),
+        }
+    }
+
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            request_timeout_secs: Some(settings.request_timeout.as_secs()),
+            max_request_bytes: Some(settings.max_request_bytes),
+            retention_days: Some(settings.retention_days),
+            response_state_days: Some(settings.response_state_days),
+            shutdown_grace_secs: Some(settings.shutdown_grace.as_secs()),
+            multiplier_refresh_secs: Some(settings.multiplier_refresh.as_secs()),
+            model_sync_secs: Some(settings.model_sync.as_secs()),
+        }
+    }
+
+    /// 逐字段校验；越界时报出字段名与允许范围。
+    pub fn validate(&self) -> Result<()> {
+        let range = |name: &str, value: Option<u64>, low: u64, high: u64| -> Result<()> {
+            match value {
+                Some(value) if !(low..=high).contains(&value) => {
+                    anyhow::bail!("{name} 必须在 {low}–{high} 之间，收到 {value}")
+                }
+                _ => Ok(()),
+            }
+        };
+        range("请求总超时（秒）", self.request_timeout_secs, 5, 86_400)?;
+        range("关闭宽限期（秒）", self.shutdown_grace_secs, 5, 3600)?;
+        range(
+            "自动倍率刷新间隔（秒）",
+            self.multiplier_refresh_secs,
+            30,
+            86_400,
+        )?;
+        range("模型同步间隔（秒）", self.model_sync_secs, 60, 86_400)?;
+        range(
+            "请求元数据保留（天）",
+            self.retention_days.map(u64::from),
+            0,
+            3650,
+        )?;
+        range(
+            "Responses 状态保留（天）",
+            self.response_state_days.map(u64::from),
+            0,
+            3650,
+        )?;
+        if let Some(bytes) = self.max_request_bytes
+            && !(1024..=256 * 1024 * 1024).contains(&bytes)
+        {
+            anyhow::bail!("请求体上限必须在 1 KiB–256 MiB 之间，收到 {bytes} 字节");
+        }
+        Ok(())
+    }
+}
+
+/// 应用级设置的持久化键。
+pub const SETTINGS_KEY: &str = "settings";
+
+/// 运行时可改的系统设置。
+///
+/// 热路径一次原子指针读取；后台保存后立刻对所有请求生效，不需要重启
+/// （`shutdown_grace` 例外：它在进程启动时读取，下一次重启生效）。
+#[derive(Debug, Clone)]
+pub struct SettingsService {
+    current: std::sync::Arc<arc_swap::ArcSwap<Settings>>,
+}
+
+impl SettingsService {
+    pub fn new(current: Settings) -> Self {
+        Self {
+            current: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(current)),
+        }
+    }
+
+    /// 当前设置快照。调用方应只在一次请求/一轮任务内使用同一份快照。
+    pub fn get(&self) -> Arc<Settings> {
+        self.current.load_full()
+    }
+
+    /// 覆盖设置并返回新快照。
+    pub fn replace(&self, next: Settings) -> Arc<Settings> {
+        let next = Arc::new(next);
+        self.current.store(Arc::clone(&next));
+        next
+    }
+}
+
 /// 全部动态运行状态。
 ///
 /// 与 [`crate::config::RuntimeConfig`] 并列而不是嵌进去：倍率、熔断、并发和
@@ -138,7 +263,8 @@ pub struct AppState {
     pub key_digest: KeyDigest,
     pub upstream: UpstreamClient,
     pub sessions: SessionStore,
-    pub settings: Settings,
+    /// 运行时可改的系统设置（后台保存后热生效）。
+    pub settings: SettingsService,
     pub recorder: RequestRecorder,
     pub runtime: Runtime,
     /// 倍率刷新任务的句柄，供后台的"立即刷新"按钮插队（§11.3）。
@@ -168,6 +294,22 @@ impl AppState {
         let runtime = Runtime::default();
         restore(&store, &runtime).await?;
 
+        // 后台保存过的设置覆盖环境变量/默认值；解析失败只告警，不让进程起不来。
+        let settings = match store.app_setting(SETTINGS_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_str::<PersistedSettings>(&raw) {
+                Ok(persisted) => persisted.apply_to(settings),
+                Err(error) => {
+                    tracing::warn!(%error, "持久化设置无法解析，回退到启动参数");
+                    settings
+                }
+            },
+            Ok(None) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "读取持久化设置失败，回退到启动参数");
+                settings
+            }
+        };
+
         // 上次异常退出遗留的临时请求体：启动时清掉（§1291、§1292）。
         let temp_dir = data_dir.join(TEMP_DIR_NAME);
         if let Err(error) = std::fs::create_dir_all(&temp_dir) {
@@ -184,7 +326,7 @@ impl AppState {
             store,
             upstream: UpstreamClient::new().context("构造上游 HTTP 客户端失败")?,
             sessions: SessionStore::new(),
-            settings,
+            settings: SettingsService::new(settings),
             recorder,
             runtime,
             refresh: tasks::RefreshHandle::default(),

@@ -97,7 +97,7 @@ async fn multiplier_refresh(state: Weak<AppState>, handle: RefreshHandle) {
         return;
     };
     let scheduler = Arc::new(Mutex::new(refresh::Scheduler::new(
-        first.settings.multiplier_refresh,
+        first.settings.get().multiplier_refresh,
     )));
     if let Ok(mut slot) = handle.scheduler.lock() {
         *slot = Some(Arc::clone(&scheduler));
@@ -118,12 +118,15 @@ async fn multiplier_refresh(state: Weak<AppState>, handle: RefreshHandle) {
                 continue;
             }
         };
+        // 后台可能刚改过刷新间隔：每一轮都取最新值，不必重启进程。
+        let interval = state.settings.get().multiplier_refresh;
 
         let now = Instant::now();
         let due: Vec<_> = {
             let Ok(mut scheduler) = scheduler.lock() else {
                 return;
             };
+            scheduler.set_interval(interval);
             scheduler.retain(&accounts);
             scheduler.due(&accounts, now).into_iter().cloned().collect()
         };
@@ -196,7 +199,7 @@ async fn model_sync(state: Weak<AppState>) {
             }
             next_run.insert(
                 account.id.clone(),
-                Instant::now() + jitter(state.settings.model_sync),
+                Instant::now() + jitter(state.settings.get().model_sync),
             );
         }
         // 已删除或已关闭托管的账号不再保留调度项。
@@ -230,8 +233,8 @@ async fn cleanup(state: Weak<AppState>) {
         };
         let now = crate::storage::now_unix();
 
-        if state.settings.retention_days > 0 {
-            let cutoff = now - i64::from(state.settings.retention_days) * 86_400;
+        if state.settings.get().retention_days > 0 {
+            let cutoff = now - i64::from(state.settings.get().retention_days) * 86_400;
             match state.store.prune_request_records(cutoff, PRUNE_BATCH).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(removed, "已清理过期请求记录");

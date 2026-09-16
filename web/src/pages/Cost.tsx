@@ -2,15 +2,14 @@
  * 成本页（§6.8）：以逻辑模型为单位组织，绝不跨模型加总。
  *
  * 倍率是折扣不是价格——跨模型相加会被模型组合严重扭曲。全局区域只显示
- * 不失真的量：请求总数与各账号占比。每个模型块同时给出"全用最便宜目标
- * 还能再省多少"：不中断服务的代价必须看得见。
+ * 不失真的请求总数与账号占比；每个模型卡片再展开该模型内部的倍率口径。
  */
 import { useCallback, useEffect, useState } from "react";
+import type { Data } from "../lib/store";
 import { api } from "../lib/api";
 import type { CostModel, CostView } from "../lib/types";
-import type { Data } from "../lib/store";
-import { Card, EmptyState, Skeleton } from "../components/ui";
-import { IconGauge } from "../components/Icons";
+import { Badge, Button, Card, EmptyState, Skeleton } from "../components/ui";
+import { IconGauge, IconRefresh } from "../components/Icons";
 
 const PERIODS: { value: "day" | "month"; label: string }[] = [
   { value: "day", label: "近 24 小时" },
@@ -35,7 +34,7 @@ export function Cost({ data }: { data: Data }) {
     void load();
   }, [load]);
 
-  const groupName = (id: string) => data.groups.find((g) => g.id === id)?.name ?? id;
+  const groupName = (id: string) => data.groups.find((group) => group.id === id)?.name ?? id;
 
   return (
     <Card
@@ -48,13 +47,21 @@ export function Cost({ data }: { data: Data }) {
               key={option.value}
               className={`btn btn-sm ${period === option.value ? "btn-primary" : "btn-ghost"}`}
               onClick={() => setPeriod(option.value)}
+              disabled={loading && period === option.value}
             >
               {option.label}
             </button>
           ))}
-          <button className="btn btn-ghost btn-sm" onClick={() => void load()} title="刷新">
-            ↻
-          </button>
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={loading ? <span className="spinner spinner-sm" /> : <IconRefresh size={14} />}
+            onClick={() => void load()}
+            disabled={loading}
+            title="刷新成本数据"
+          >
+            刷新
+          </Button>
         </div>
       }
     >
@@ -67,46 +74,41 @@ export function Cost({ data }: { data: Data }) {
           description="成本页只统计成功请求：失败请求没有产生上游消耗。跑一些真实流量后再来看。"
         />
       ) : (
-        <div className="stack" style={{ gap: 16 }}>
-          {/* 全局区域：只显示不失真的量（§6.8）。 */}
-          <div className="card-body" style={{ padding: 0 }}>
-            <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
-              <Stat label="成功请求" value={view.total_requests.toLocaleString()} />
-              <div>
-                <div className="text-faint" style={{ fontSize: 11.5 }}>
-                  各账号请求占比
-                </div>
-                <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 2 }}>
-                  {view.account_shares.map((share) => (
-                    <span key={share.account_id} style={{ fontSize: 12.5 }}>
-                      <b>{share.name}</b>{" "}
-                      <span className="mono text-faint">
-                        {(share.share * 100).toFixed(1)}%
-                      </span>
-                    </span>
-                  ))}
-                </div>
-              </div>
-            </div>
+        <div className="cost-content">
+          <CostOverview view={view} />
+          <div className="cost-model-list">
+            {view.models.map((model) => (
+              <ModelCostCard
+                key={`${model.group_id}/${model.logical_model}`}
+                model={model}
+                groupName={groupName(model.group_id)}
+              />
+            ))}
           </div>
-
-          {view.models.map((model) => (
-            <ModelCostCard key={`${model.group_id}/${model.logical_model}`} model={model} groupName={groupName(model.group_id)} />
-          ))}
         </div>
       )}
     </Card>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function CostOverview({ view }: { view: CostView }) {
   return (
-    <div>
-      <div className="text-faint" style={{ fontSize: 11.5 }}>
-        {label}
+    <div className="cost-overview">
+      <div className="cost-total">
+        <div className="cost-label">成功请求总数</div>
+        <div className="cost-total-value mono">{view.total_requests.toLocaleString()}</div>
       </div>
-      <div className="mono cell-strong" style={{ fontSize: 18 }}>
-        {value}
+      <div className="cost-share-summary">
+        <div className="cost-label">各账号占比</div>
+        <div className="cost-share-chips">
+          {view.account_shares.map((share) => (
+            <span key={share.account_id} className="cost-share-chip">
+              <span>{share.name}</span>
+              <span className="mono">{(share.share * 100).toFixed(1)}%</span>
+              <span className="cost-chip-count mono">{share.requests.toLocaleString()} 次</span>
+            </span>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -119,68 +121,87 @@ function ModelCostCard({
   model: CostModel;
   groupName: string;
 }) {
+  const saving = model.saving_vs_cheapest;
+  const savingValue = saving == null ? "—" : `${(saving * 100).toFixed(1)}%`;
+
   return (
-    <div className="card-body" style={{ border: "1px solid var(--border)", borderRadius: 10 }}>
-      <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-        <span className="mono cell-strong">{model.logical_model}</span>
-        <span className="text-faint" style={{ fontSize: 12 }}>
-          {groupName} · {model.requests.toLocaleString()} 次成功请求
-        </span>
-        {model.single_target && (
-          <span className="badge badge-neutral">只有一个目标，无调度空间</span>
-        )}
+    <article className="cost-model-card">
+      <header className="cost-model-head">
+        <div className="cost-model-heading">
+          <span className="cost-model-name mono">{model.logical_model}</span>
+          <span className="cost-model-group">{groupName}</span>
+          <span className="cost-model-requests mono">{model.requests.toLocaleString()} 次</span>
+          {model.single_target && <Badge tone="neutral">单目标</Badge>}
+        </div>
+      </header>
+
+      <div className="cost-model-main">
+        <div className="cost-metrics">
+          <CostMetric label="加权均倍率" value={model.weighted_avg_multiplier ?? "—"} />
+          <CostMetric
+            label="最便宜 → 最贵"
+            value={`${model.cheapest_multiplier ?? "—"} → ${model.dearest_multiplier ?? "—"}`}
+          />
+          <CostMetric label="可再省比例" value={savingValue} accent={saving != null && saving > 0} />
+        </div>
+
+        <div className="cost-account-list">
+          <div className="cost-label">账号明细</div>
+          {model.accounts.map((account) => (
+            <CostAccountRow key={account.account_id} account={account} />
+          ))}
+        </div>
       </div>
 
-      <div className="table-wrap" style={{ marginTop: 8 }}>
-        <table className="data">
-          <thead>
-            <tr>
-              <th>账号</th>
-              <th>有效倍率</th>
-              <th>流量占比</th>
-              <th>请求数</th>
-            </tr>
-          </thead>
-          <tbody>
-            {model.accounts.map((account) => (
-              <tr key={account.account_id}>
-                <td className="cell-strong">{account.name}</td>
-                <td className="mono">{account.effective_multiplier ?? "—"}</td>
-                <td className="mono">{(account.share * 100).toFixed(1)}%</td>
-                <td className="mono">{account.requests.toLocaleString()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <p className="cost-footnote">
+        口径：加权均倍率按本逻辑模型内的请求占比计算；可再省比例是假设全部请求走最便宜目标，始终不跨模型加总。
+      </p>
+    </article>
+  );
+}
 
+function CostMetric({
+  label,
+  value,
+  accent = false,
+}: {
+  label: string;
+  value: string;
+  accent?: boolean;
+}) {
+  return (
+    <div className="cost-metric">
+      <div className="cost-label">{label}</div>
+      <div className={`cost-metric-value mono${accent ? " cost-metric-accent" : ""}`}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function CostAccountRow({
+  account,
+}: {
+  account: CostModel["accounts"][number];
+}) {
+  const percentage = Math.max(0, Math.min(100, account.share * 100));
+  return (
+    <div className="cost-account-row">
+      <div className="cost-account-name">
+        <span title={account.name}>{account.name}</span>
+        <span className="cost-account-requests mono">{account.requests.toLocaleString()} 次</span>
+      </div>
+      <span className="cost-account-multiplier mono">
+        {account.effective_multiplier ?? "—"}
+      </span>
       <div
-        className="row"
-        style={{ gap: 16, flexWrap: "wrap", marginTop: 10, fontSize: 12.5 }}
+        className="cost-share-bar"
+        role="img"
+        aria-label={`${account.name} 占比 ${percentage.toFixed(1)}%`}
       >
-        {model.weighted_avg_multiplier && (
-          <span>
-            加权均倍率{" "}
-            <b className="mono">{model.weighted_avg_multiplier}</b>
-          </span>
-        )}
-        {model.cheapest_multiplier && (
-          <span>
-            最便宜目标 <b className="mono">{model.cheapest_multiplier}</b>
-            {model.dearest_multiplier && model.dearest_multiplier !== model.cheapest_multiplier && (
-              <>
-                {" · "}
-                最贵 <b className="mono">{model.dearest_multiplier}</b>
-              </>
-            )}
-          </span>
-        )}
-        {model.saving_vs_cheapest != null && model.saving_vs_cheapest > 0.0005 && (
-          <span className="text-faint">
-            只用它会更省 {Math.round(model.saving_vs_cheapest * 100)}%，但没有备份——这是不中断的代价
-          </span>
-        )}
+        <span style={{ width: `${percentage}%` }} />
       </div>
+      <span className="cost-account-percent mono">{percentage.toFixed(1)}%</span>
     </div>
   );
 }

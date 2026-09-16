@@ -119,7 +119,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 ///
 /// 不设 `Secure`：Akhub 第一期建议由反向代理终止 HTTPS，也支持 `127.0.0.1`
 /// 直连，硬加 `Secure` 会让本地部署无法登录。生产环境请置于 HTTPS 之后。
-fn session_cookie_header(token: &str) -> String {
+pub(crate) fn session_cookie_header(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
 }
 
@@ -146,6 +146,7 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/admin/api/setup/status", get(setup_status))
         .route("/admin/api/setup", post(setup))
+        .route("/admin/api/auth/password", post(r::change_password))
         .route("/admin/api/auth/login", post(login))
         .route("/admin/api/auth/logout", post(logout))
         .route("/admin/api/overview", get(r::overview))
@@ -225,7 +226,10 @@ pub fn router() -> Router<SharedState> {
             patch_or_delete(r::update_target, r::delete_target),
         )
         .route("/admin/api/requests", get(r::list_requests))
-        .route("/admin/api/settings", get(r::get_settings))
+        .route(
+            "/admin/api/settings",
+            get(r::get_settings).patch(r::update_settings),
+        )
         // 静态资源必须排在 API 之后：matchit 优先匹配静态段，所以
         // `/admin/api/...` 不会被这里的通配捕获。
         .route("/admin", get(|| ui::serve("/")))

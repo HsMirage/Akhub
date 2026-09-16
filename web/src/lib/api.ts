@@ -14,8 +14,10 @@ import type {
   RequestRecord,
   SelectionWarning,
   Settings,
+  SettingsPatch,
   SetupStatus,
   TestResult,
+  MultiplierRefreshResult,
 } from "./types";
 
 const BASE = "/admin/api";
@@ -148,7 +150,7 @@ export const api = {
     patch<Account>(`/accounts/${id}`, input),
   deleteAccount: (id: string) => del(`/accounts/${id}`),
   refreshMultiplier: (id: string) =>
-    post<{ queued: boolean; notice: string }>(`/accounts/${id}/refresh-multiplier`),
+    post<MultiplierRefreshResult>(`/accounts/${id}/refresh-multiplier`),
   /** 一键独立复制：停用状态的「名称 - 副本」，Key 重新加密（§6.4）。 */
   copyAccount: (id: string) => post<Account>(`/accounts/${id}/copy`),
   /** 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。 */
@@ -247,4 +249,13 @@ export const api = {
 
   requests: (limit = 60, offset = 0) =>
     request<{ data: RequestRecord[] }>(`/requests?limit=${limit}&offset=${offset}`),
+
+  /** 只提交发生变化的系统设置；后端会立即热生效。 */
+  updateSettings: (values: SettingsPatch) => patch<Settings>("/settings", values),
+  /** 修改管理员密码，成功后后端会下发新会话 Cookie。 */
+  changePassword: (current: string, next: string) =>
+    post<{ username: string }>("/auth/password", {
+      current_password: current,
+      new_password: next,
+    }),
 };

@@ -711,8 +711,9 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     let patched: Value = patched.json().await.unwrap();
     assert_eq!(patched["has_new_api_token"], true);
 
-    // 手动刷新按钮：自动来源可以排队，手动来源没有意义。
-    let queued = write(
+    // 手动刷新按钮：自动来源会真的去探测（示例域名探不到就如实报 502），
+    // 手动来源没有意义、直接 400。
+    let probed = write(
         &client,
         reqwest::Method::POST,
         format!("{base}/admin/api/accounts/{id}/refresh-multiplier"),
@@ -720,7 +721,16 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     .send()
     .await
     .unwrap();
-    assert_eq!(queued.status(), 200);
+    assert_ne!(probed.status(), 400, "自动来源不能被当成手动倍率拒绝");
+    assert_eq!(probed.status(), 502, "示例域名探测失败必须如实报错");
+    let probed: Value = probed.json().await.unwrap();
+    assert!(
+        probed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("倍率探测失败"),
+        "错误信息要说明是探测失败：{probed}"
+    );
 
     let manual: Value = write(
         &client,

@@ -211,6 +211,31 @@ export interface Settings {
   /** 内置能力目录版本（§6.7）。 */
   capability_catalog_revision: string;
   version: string;
+  /** 修改后需要下一次重启才能生效的字段。 */
+  restart_required: string[];
+  /** 每个可编辑设置允许的最小/最大值。 */
+  limits: Record<string, { min: number; max: number }>;
+}
+
+/** 设置接口允许通过 PATCH 修改的数字字段。 */
+export type SettingsNumericField =
+  | "request_timeout_secs"
+  | "max_request_bytes"
+  | "retention_days"
+  | "response_state_days"
+  | "shutdown_grace_secs"
+  | "multiplier_refresh_secs"
+  | "model_sync_secs";
+
+export type SettingsPatch = Partial<Pick<Settings, SettingsNumericField>>;
+
+/** 同步执行倍率探测后的结果。 */
+export interface MultiplierRefreshResult {
+  refreshed: boolean;
+  effective_multiplier: string;
+  /** 某些上游不提供观察时间时后端会返回 null。 */
+  observed_at: number | null;
+  notice: string;
 }
 
 /** 成本页的一条账号流量行（§6.8）。 */

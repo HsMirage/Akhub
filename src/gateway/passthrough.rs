@@ -247,7 +247,7 @@ async fn forward_inner<'a>(
         telemetry: Telemetry::default(),
         streaming,
         estimated_tokens: estimate_tokens(forward.request_bytes, &forward.body),
-        deadline: forward.started_at + forward.state.settings.request_timeout,
+        deadline: forward.started_at + forward.state.settings.get().request_timeout,
         now_unix,
         attempted: Vec::new(),
         last: None,
@@ -614,7 +614,7 @@ impl Walk<'_> {
                             },
                             entry_body: self.forward.body.clone(),
                             entry_protocol: self.forward.endpoint.protocol(),
-                            retention_days: self.forward.state.settings.response_state_days,
+                            retention_days: self.forward.state.settings.get().response_state_days,
                         });
                     Flow::Done(settle::settle_stream(
                         success.response,
@@ -1616,7 +1616,7 @@ async fn record_response_state(
         entry_protocol,
         output_items.as_ref(),
         final_response,
-        state.settings.response_state_days,
+        state.settings.get().response_state_days,
     )
     .await;
 }

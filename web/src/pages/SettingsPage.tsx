@@ -1,18 +1,155 @@
-/**
- * 设置页（§6.7）：系统设置只读展示、版本信息与配置备份恢复。
- *
- * 第一期设置项由启动参数决定，不在后台修改；这里把口径展示出来，避免
- * "为什么和我记的不一样"只能去翻启动命令。高级算法参数不进入后台。
- */
-import { useRef, useState } from "react";
+/** 设置页：可编辑系统设置、管理员账号、版本信息与配置备份恢复。 */
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
 import type { Data } from "../lib/store";
+import type { Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
 import { formatBytes } from "../lib/format";
 import { Button, Card, ConfirmDialog, Field, useToast } from "../components/ui";
+
+const SETTING_FIELDS: readonly {
+  key: SettingsNumericField;
+  label: string;
+  unit: string;
+}[] = [
+  { key: "request_timeout_secs", label: "请求总超时", unit: "秒" },
+  { key: "max_request_bytes", label: "请求体上限", unit: "bytes" },
+  { key: "retention_days", label: "请求元数据保留", unit: "天" },
+  { key: "response_state_days", label: "Responses 状态保留", unit: "天" },
+  { key: "shutdown_grace_secs", label: "关闭宽限期", unit: "秒" },
+  { key: "multiplier_refresh_secs", label: "自动倍率刷新间隔", unit: "秒" },
+  { key: "model_sync_secs", label: "模型同步间隔", unit: "秒" },
+];
+
+type SettingsForm = Record<SettingsNumericField, string>;
+
+function settingsToForm(settings: Settings): SettingsForm {
+  return {
+    request_timeout_secs: String(settings.request_timeout_secs),
+    max_request_bytes: String(settings.max_request_bytes),
+    retention_days: String(settings.retention_days),
+    response_state_days: String(settings.response_state_days),
+    shutdown_grace_secs: String(settings.shutdown_grace_secs),
+    multiplier_refresh_secs: String(settings.multiplier_refresh_secs),
+    model_sync_secs: String(settings.model_sync_secs),
+  };
+}
+
+function formatSettingValue(key: SettingsNumericField, value: number): string {
+  if (key === "max_request_bytes") return `${formatBytes(value)}（${value.toLocaleString()} bytes）`;
+  const unit = SETTING_FIELDS.find((field) => field.key === key)?.unit ?? "";
+  return `${value.toLocaleString()} ${unit}`;
+}
+
+function parseSettingNumber(raw: string): number | null {
+  const text = raw.trim();
+  if (!text) return null;
+  const value = Number(text);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function buildSettingsPatch(form: SettingsForm, settings: Settings): SettingsPatch {
+  const values: SettingsPatch = {};
+  for (const field of SETTING_FIELDS) {
+    const value = parseSettingNumber(form[field.key]);
+    if (value !== null && value !== settings[field.key]) values[field.key] = value;
+  }
+  return values;
+}
 
 export function Settings({ data, refresh }: { data: Data; refresh: () => Promise<void> }) {
   const toast = useToast();
   const settings = data.settings;
+
+  const [settingsForm, setSettingsForm] = useState<SettingsForm>(() => settingsToForm(settings));
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [adminUsername, setAdminUsername] = useState("admin");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordSaving, setPasswordSaving] = useState(false);
+
+  // 备份恢复成功后父级会重新拉取 settings；只有服务端值变化时才重置表单。
+  useEffect(() => {
+    setSettingsForm(settingsToForm(settings));
+  }, [settings]);
+
+  const settingValidation = useMemo(() => {
+    const errors: Partial<Record<SettingsNumericField, string>> = {};
+    for (const field of SETTING_FIELDS) {
+      const raw = settingsForm[field.key].trim();
+      const value = parseSettingNumber(raw);
+      const limit = settings.limits[field.key];
+      if (!raw || value === null) {
+        errors[field.key] = "请输入整数";
+      } else if (limit && (value < limit.min || value > limit.max)) {
+        errors[field.key] = `必须在 ${formatSettingValue(field.key, limit.min)} 至 ${formatSettingValue(field.key, limit.max)} 之间`;
+      }
+    }
+    return errors;
+  }, [settings, settingsForm]);
+
+  const settingsPatch = useMemo(
+    () => buildSettingsPatch(settingsForm, settings),
+    [settings, settingsForm],
+  );
+  const hasSettingsChanges = Object.keys(settingsPatch).length > 0;
+  const settingsInvalid = Object.keys(settingValidation).length > 0;
+
+  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (settingsSaving || settingsInvalid || !hasSettingsChanges) return;
+    setSettingsSaving(true);
+    try {
+      const updated = await api.updateSettings(settingsPatch);
+      setSettingsForm(settingsToForm(updated));
+      const changedRequiringRestart = SETTING_FIELDS.filter(
+        (field) =>
+          Object.prototype.hasOwnProperty.call(settingsPatch, field.key) &&
+          updated.restart_required.includes(field.key),
+      ).map((field) => field.label);
+      if (changedRequiringRestart.length > 0) {
+        toast.success(`系统设置已保存；${changedRequiringRestart.join("、")}将在下次重启生效`);
+      } else {
+        toast.success("系统设置已保存并立即生效");
+      }
+      await refresh();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "保存设置失败");
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  const newPasswordError =
+    newPassword.length > 0 && newPassword.length < 12 ? "新密码至少需要 12 个字符" : undefined;
+  const confirmPasswordError =
+    confirmPassword.length > 0 && confirmPassword !== newPassword
+      ? "两次输入的新密码不一致"
+      : undefined;
+  const passwordInvalid =
+    !currentPassword ||
+    !newPassword ||
+    !confirmPassword ||
+    newPassword.length < 12 ||
+    newPassword !== confirmPassword;
+
+  const changePassword = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (passwordSaving || passwordInvalid) return;
+    setPasswordSaving(true);
+    try {
+      const result = await api.changePassword(currentPassword, newPassword);
+      setAdminUsername(result.username || "admin");
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      toast.success("管理员密码已更新");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "修改密码失败");
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
 
   const [exportPassword, setExportPassword] = useState("");
   const [exporting, setExporting] = useState(false);
@@ -67,33 +204,131 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
 
   return (
     <div className="stack" style={{ gap: 16 }}>
-      <Card title="系统设置" description="第一期设置项由启动参数决定，不在后台修改。">
-        <div className="card-body">
-          <div className="table-wrap">
-            <table className="data">
-              <tbody>
-                {(
-                  [
-                    ["请求总超时", `${settings.request_timeout_secs} 秒`],
-                    ["请求体上限", formatBytes(settings.max_request_bytes)],
-                    ["请求元数据保留", settings.retention_days === 0 ? "关闭（只保留内存汇总）" : `${settings.retention_days} 天`],
-                    ["Responses 状态保留", settings.response_state_days === 0 ? "关闭" : `${settings.response_state_days} 天`],
-                    ["自动倍率刷新间隔", `${settings.multiplier_refresh_secs} 秒`],
-                    ["模型自动同步间隔", `${Math.round(settings.model_sync_secs / 60)} 分钟（带抖动）`],
-                    ["优雅关闭宽限", `${settings.shutdown_grace_secs} 秒`],
-                  ] as const
-                ).map(([label, value]) => (
-                  <tr key={label}>
-                    <td className="text-faint" style={{ width: 200 }}>
-                      {label}
-                    </td>
-                    <td className="mono">{value}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <Card
+        title="系统设置"
+        description="修改后立即热生效；关闭宽限期需要下次重启。范围由服务端实时返回。"
+        actions={
+          <Button
+            type="submit"
+            form="settings-form"
+            variant="primary"
+            disabled={settingsSaving || settingsInvalid || !hasSettingsChanges}
+          >
+            {settingsSaving && <span className="spinner" aria-hidden="true" />}
+            {settingsSaving ? "保存中…" : "保存"}
+          </Button>
+        }
+      >
+        <form id="settings-form" className="card-body form-grid" onSubmit={saveSettings}>
+          <div className="settings-grid">
+            {SETTING_FIELDS.map((field) => {
+              const limit = settings.limits[field.key];
+              return (
+                <Field
+                  key={field.key}
+                  label={field.label}
+                  error={settingValidation[field.key]}
+                  hint={
+                    limit
+                      ? `范围：${formatSettingValue(field.key, limit.min)} 至 ${formatSettingValue(field.key, limit.max)}`
+                      : `单位：${field.unit}`
+                  }
+                >
+                  {(id) => (
+                    <div className="input-with-unit">
+                      <input
+                        id={id}
+                        className="input mono"
+                        type="number"
+                        inputMode="numeric"
+                        min={limit?.min}
+                        max={limit?.max}
+                        step={1}
+                        value={settingsForm[field.key]}
+                        onChange={(event) =>
+                          setSettingsForm((current) => ({
+                            ...current,
+                            [field.key]: event.target.value,
+                          }))
+                        }
+                      />
+                      <span className="input-unit">{field.unit}</span>
+                    </div>
+                  )}
+                </Field>
+              );
+            })}
           </div>
-        </div>
+          <p className="settings-note">
+            请求体上限按 bytes 保存；保留天数填 0 表示关闭对应记录保留。只有发生变化的字段会提交。
+          </p>
+        </form>
+      </Card>
+
+      <Card title="管理员账号" description="用户名只读；修改密码成功后当前会话会继续保持有效。">
+        <form className="card-body form-grid" onSubmit={changePassword}>
+          <div className="form-row-2">
+            <Field label="用户名" hint="当前登录账号">
+              {(id) => (
+                <input
+                  id={id}
+                  className="input mono"
+                  value={adminUsername}
+                  readOnly
+                  aria-readonly="true"
+                />
+              )}
+            </Field>
+            <Field label="当前密码">
+              {(id) => (
+                <input
+                  id={id}
+                  className="input"
+                  type="password"
+                  value={currentPassword}
+                  autoComplete="current-password"
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                />
+              )}
+            </Field>
+          </div>
+          <div className="form-row-2">
+            <Field
+              label="新密码"
+              error={newPasswordError}
+              hint="至少 12 个字符，并且不能与当前密码相同。"
+            >
+              {(id) => (
+                <input
+                  id={id}
+                  className="input"
+                  type="password"
+                  value={newPassword}
+                  autoComplete="new-password"
+                  onChange={(event) => setNewPassword(event.target.value)}
+                />
+              )}
+            </Field>
+            <Field label="确认新密码" error={confirmPasswordError}>
+              {(id) => (
+                <input
+                  id={id}
+                  className="input"
+                  type="password"
+                  value={confirmPassword}
+                  autoComplete="new-password"
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                />
+              )}
+            </Field>
+          </div>
+          <div className="row" style={{ justifyContent: "flex-end" }}>
+            <Button type="submit" variant="primary" disabled={passwordSaving || passwordInvalid}>
+              {passwordSaving && <span className="spinner" aria-hidden="true" />}
+              {passwordSaving ? "修改中…" : "修改密码"}
+            </Button>
+          </div>
+        </form>
       </Card>
 
       <Card title="版本信息">

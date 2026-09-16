@@ -123,6 +123,21 @@ impl SessionStore {
     pub fn revoke(&self, token: &str) {
         crate::sync::lock(&self.sessions).remove(token);
     }
+
+    /// 吊销全部会话。改密码之后必须调用：旧浏览器不能继续带着已失效的凭据。
+    pub fn revoke_all(&self) {
+        crate::sync::lock(&self.sessions).clear();
+    }
+
+    /// 当前会话数量，供测试断言。
+    pub fn len(&self) -> usize {
+        crate::sync::lock(&self.sessions).len()
+    }
+
+    /// 没有任何会话时返回 true。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]

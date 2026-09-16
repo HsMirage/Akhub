@@ -54,6 +54,11 @@ impl Scheduler {
         }
     }
 
+    /// 后台改了刷新间隔后热更新，下一轮 tick 生效。
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+    }
+
     /// 挑出这一轮该刷新的自动来源账号。
     ///
     /// 手动来源直接跳过：它的状态永远是"已知"，探它没有任何意义（§11.2）。
@@ -181,7 +186,11 @@ pub async fn run_round(context: &Context, accounts: &[&Account], now_unix: i64) 
 }
 
 /// 刷新单个账号。失败时保留最后已知值并把它标记为过期。
-async fn refresh_one(context: &Context, account: &Account, now_unix: i64) -> Result<()> {
+async fn refresh_one(
+    context: &Context,
+    account: &Account,
+    now_unix: i64,
+) -> Result<probe::Reading> {
     match probe_account(context, account).await {
         Ok(reading) => {
             let entry = Entry {
@@ -191,11 +200,11 @@ async fn refresh_one(context: &Context, account: &Account, now_unix: i64) -> Res
                 refreshed_at: now_unix,
                 stale_since: None,
                 last_error: None,
-                peak: reading.peak,
+                peak: reading.peak.clone(),
             };
             persist(context, account, &entry, Status::Known).await;
             context.registry.put(&account.id, entry);
-            Ok(())
+            Ok(reading)
         }
         Err(error) => {
             let previous = context.registry.get(&account.id);
@@ -222,6 +231,23 @@ async fn refresh_one(context: &Context, account: &Account, now_unix: i64) -> Res
             Err(error)
         }
     }
+}
+
+/// 立即刷新一个账号并把结果写回（后台"刷新"按钮的同步路径）。
+///
+/// 与后台定时任务共用同一套探测、持久化与宽限期语义，区别只是"现在就等
+/// 结果"，而不是排进下一轮。失败时错误照原样报给调用方。
+pub async fn refresh_account_now(
+    state: &crate::app::SharedState,
+    account: &Account,
+) -> Result<probe::Reading> {
+    let context = Context {
+        store: state.store.clone(),
+        cipher: state.cipher.clone(),
+        upstream: state.upstream.clone(),
+        registry: Arc::clone(&state.runtime.multipliers),
+    };
+    refresh_one(&context, account, crate::storage::now_unix()).await
 }
 
 /// 按账号配置的来源发起探测。
