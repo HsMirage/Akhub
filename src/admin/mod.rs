@@ -234,6 +234,12 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/settings",
             get(r::get_settings).patch(r::update_settings),
         )
+        .route(
+            "/admin/api/new-api-sites",
+            get(r::list_new_api_sites)
+                .post(r::save_new_api_site)
+                .delete(r::delete_new_api_site),
+        )
         // 静态资源必须排在 API 之后：matchit 优先匹配静态段，所以
         // `/admin/api/...` 不会被这里的通配捕获。
         .route("/admin", get(|| ui::serve("/")))

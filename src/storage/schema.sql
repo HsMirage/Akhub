@@ -161,11 +161,36 @@ CREATE TABLE IF NOT EXISTS request_records (
     -- 尝试过的目标个数、排队时长与是否命中粘性，用于诊断调度行为。
     attempts         INTEGER NOT NULL,
     queued_ms        INTEGER NOT NULL,
-    sticky_hit       INTEGER NOT NULL
+    sticky_hit       INTEGER NOT NULL,
+    -- 诊断用的用量与时机：首字延迟、输入/输出 token、当时的配置版本（§6.6）。
+    first_token_ms   INTEGER,
+    input_tokens     INTEGER,
+    output_tokens    INTEGER,
+    config_version   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_started ON request_records(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_records_group ON request_records(group_id, started_at DESC);
+
+-- 每次上游尝试的明细（§6.6）：换了几个目标、各自用了哪个端点、耗时多久、
+-- 为什么失败、这次失败是否计入尝试预算。与请求记录按 request_id 关联。
+CREATE TABLE IF NOT EXISTS request_attempts (
+    request_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    target_id   TEXT,
+    account_id  TEXT,
+    upstream_model TEXT,
+    endpoint    TEXT,
+    started_at  INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    -- ok / failed / missing_endpoint；error_code 是网关错误码（失败时）。
+    outcome     TEXT NOT NULL,
+    error_code  TEXT,
+    counts_against_budget INTEGER NOT NULL,
+    PRIMARY KEY (request_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id);
 
 -- Responses 状态链（§15.1、§15.2）。网关 ID → 上游 ID 的定位映射是必存的
 -- 最小集；可重放正文（加密）只在 store 未显式关闭且保留期大于 0 时保存。
@@ -240,3 +265,12 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_time ON admin_audit_log(occurred_at DESC);
+
+-- New API 站点级凭据（§6.4、§11.2）：一个 Base URL 只需配一次访问令牌与
+-- 用户 ID，该站点下的账号自动继承；账号自己的凭据优先。
+CREATE TABLE IF NOT EXISTS new_api_sites (
+    base_url    TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    sealed_token BLOB NOT NULL,
+    updated_at  INTEGER NOT NULL
+);

@@ -332,6 +332,62 @@ impl Store {
         )
     }
 
+    // -------------------------------------------------- New API 站点级凭据
+
+    /// 读取某个 Base URL 的站点级 New API 凭据（§6.4）。返回 (用户 ID, 密封令牌)。
+    pub async fn new_api_site(&self, base_url: &str) -> Result<Option<(String, Vec<u8>)>> {
+        let row = sqlx::query("SELECT user_id, sealed_token FROM new_api_sites WHERE base_url = ?")
+            .bind(normalize_site(base_url))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok((row.try_get("user_id")?, row.try_get("sealed_token")?)))
+            .transpose()
+    }
+
+    /// 站点级凭据列表（不回吐令牌本身）。
+    pub async fn list_new_api_sites(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT base_url, user_id FROM new_api_sites ORDER BY base_url")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("base_url")?, row.try_get("user_id")?)))
+            .collect()
+    }
+
+    /// 覆盖写入站点级凭据。
+    pub async fn upsert_new_api_site(
+        &self,
+        base_url: &str,
+        user_id: &str,
+        sealed_token: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO new_api_sites (base_url, user_id, sealed_token, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(base_url) DO UPDATE SET
+                user_id = excluded.user_id,
+                sealed_token = excluded.sealed_token,
+                updated_at = excluded.updated_at",
+        )
+        .bind(normalize_site(base_url))
+        .bind(user_id)
+        .bind(sealed_token)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除站点级凭据。
+    pub async fn delete_new_api_site(&self, base_url: &str) -> Result<bool> {
+        let affected = sqlx::query("DELETE FROM new_api_sites WHERE base_url = ?")
+            .bind(normalize_site(base_url))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
     // ---------------------------------------------------------- Responses 状态
 
     /// 写入一条 Responses 状态链记录。gateway_id 是主键，重复写入覆盖旧值。
@@ -715,8 +771,9 @@ impl Store {
                     upstream_model, request_bytes, upstream_status, http_status, error_code,
                     endpoint, degraded,
                     effective_multiplier, cheapest_multiplier, dearest_multiplier,
-                    attempts, queued_ms, sticky_hit)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    attempts, queued_ms, sticky_hit,
+                    first_token_ms, input_tokens, output_tokens, config_version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -740,14 +797,45 @@ impl Store {
             .bind(record.attempts)
             .bind(record.queued_ms)
             .bind(record.sticky_hit)
+            .bind(record.first_token_ms)
+            .bind(record.input_tokens)
+            .bind(record.output_tokens)
+            .bind(record.config_version)
             .execute(&mut *tx)
             .await?;
+
+            // 同一请求重复写入时先清掉旧的尝试明细，避免残留。
+            sqlx::query("DELETE FROM request_attempts WHERE request_id = ?")
+                .bind(&record.request_id)
+                .execute(&mut *tx)
+                .await?;
+            for attempt in &record.attempts_detail {
+                sqlx::query(
+                    "INSERT INTO request_attempts (request_id, seq, target_id, account_id,
+                        upstream_model, endpoint, started_at, duration_ms, outcome,
+                        error_code, counts_against_budget)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&record.request_id)
+                .bind(attempt.seq)
+                .bind(&attempt.target_id)
+                .bind(&attempt.account_id)
+                .bind(&attempt.upstream_model)
+                .bind(&attempt.endpoint)
+                .bind(attempt.started_at)
+                .bind(attempt.duration_ms)
+                .bind(&attempt.outcome)
+                .bind(&attempt.error_code)
+                .bind(attempt.counts_against_budget)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
     }
 
-    /// 分页读取请求元数据，按开始时间倒序。
+    /// 分页读取请求元数据，按开始时间倒序；尝试明细一并带出（§6.6）。
     pub async fn list_request_records(
         &self,
         limit: i64,
@@ -761,20 +849,86 @@ impl Store {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_record).collect()
+        let mut records: Vec<RequestRecord> =
+            rows.iter().map(row_to_record).collect::<Result<_>>()?;
+        self.attach_attempts(&mut records).await?;
+        Ok(records)
+    }
+
+    /// 把这一页请求的尝试明细一次性查出来并挂回去（避免逐行 N+1 查询）。
+    async fn attach_attempts(&self, records: &mut [RequestRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", records.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM request_attempts WHERE request_id IN ({placeholders}) ORDER BY request_id, seq"
+        );
+        // 占位符按记录数生成，值全部走 bind；SQL 本身不含用户输入。
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for record in records.iter() {
+            query = query.bind(&record.request_id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut by_request: std::collections::HashMap<String, Vec<AttemptRecord>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let request_id: String = row.try_get("request_id")?;
+            by_request
+                .entry(request_id)
+                .or_default()
+                .push(AttemptRecord {
+                    seq: row.try_get("seq")?,
+                    target_id: row.try_get("target_id")?,
+                    account_id: row.try_get("account_id")?,
+                    upstream_model: row.try_get("upstream_model")?,
+                    endpoint: row.try_get("endpoint")?,
+                    started_at: row.try_get("started_at")?,
+                    duration_ms: row.try_get("duration_ms")?,
+                    outcome: row.try_get("outcome")?,
+                    error_code: row.try_get("error_code")?,
+                    counts_against_budget: row.try_get("counts_against_budget")?,
+                });
+        }
+        for record in records.iter_mut() {
+            record.attempts_detail = by_request.remove(&record.request_id).unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// 删除早于给定时间的请求元数据，分批执行避免长事务（§24.2）。
     pub async fn prune_request_records(&self, older_than: i64, batch: i64) -> Result<u64> {
-        let affected = sqlx::query(
-            "DELETE FROM request_records WHERE request_id IN
-                (SELECT request_id FROM request_records WHERE started_at < ? LIMIT ?)",
+        // 先取一批要删的 ID，主记录与尝试明细一起删，避免明细成为孤儿。
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT request_id FROM request_records WHERE started_at < ? LIMIT ?",
         )
         .bind(older_than)
         .bind(batch)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .fetch_all(&self.pool)
+        .await?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut tx = self.pool.begin().await?;
+        // 占位符按 ID 数生成，值全部走 bind；SQL 本身不含用户输入。
+        let mut delete_attempts = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM request_attempts WHERE request_id IN ({placeholders})"
+        )));
+        let mut delete_records = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM request_records WHERE request_id IN ({placeholders})"
+        )));
+        for id in &ids {
+            delete_attempts = delete_attempts.bind(id);
+            delete_records = delete_records.bind(id);
+        }
+        delete_attempts.execute(&mut *tx).await?;
+        let affected = delete_records.execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
         Ok(affected)
     }
 
@@ -789,7 +943,8 @@ impl Store {
     /// 前端在缺 Token 时退化为按请求数占比展示，绝不虚构 token 数。
     pub async fn cost_usage(&self, since: i64) -> Result<Vec<CostUsageRow>> {
         let rows = sqlx::query(
-            "SELECT group_id, logical_model, account_id, COUNT(*) AS requests
+            "SELECT group_id, logical_model, account_id, COUNT(*) AS requests,
+                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) AS tokens
              FROM request_records
              WHERE started_at >= ? AND http_status >= 200 AND http_status < 300
                AND group_id IS NOT NULL AND logical_model IS NOT NULL
@@ -806,9 +961,9 @@ impl Store {
                     logical_model: row.try_get("logical_model")?,
                     account_id: row.try_get("account_id")?,
                     requests: row.try_get::<i64, _>("requests")?,
-                    // request_records 有意不存 usage（§6.6），这里只能给出
-                    // 请求数口径；前端在缺 Token 时按请求数占比展示。
-                    tokens: 0,
+                    // 上游没上报 usage 的历史记录按 0 计，前端在整段区间都没有
+                    // Token 时退化为请求数口径，绝不虚构 token 数（§6.8）。
+                    tokens: row.try_get::<Option<i64>, _>("tokens")?.unwrap_or(0),
                 })
             })
             .collect()
@@ -1475,6 +1630,32 @@ pub struct RequestRecord {
     pub attempts: i64,
     pub queued_ms: i64,
     pub sticky_hit: bool,
+    /// 首个语义块到达的时间（流式才有），毫秒（§6.6）。
+    pub first_token_ms: Option<i64>,
+    /// 本次请求的输入/输出 Token；上游没上报时为空，绝不估算（§6.8）。
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    /// 产生这条记录时的配置快照版本（§6.6）。
+    pub config_version: Option<i64>,
+    /// 每次上游尝试的明细（§6.6）。写入时与主记录同一事务。
+    pub attempts_detail: Vec<AttemptRecord>,
+}
+
+/// 一次上游尝试的明细（§6.6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub seq: i64,
+    pub target_id: Option<String>,
+    pub account_id: Option<String>,
+    pub upstream_model: Option<String>,
+    pub endpoint: Option<String>,
+    pub started_at: i64,
+    pub duration_ms: i64,
+    /// `ok` / `failed` / `missing_endpoint`。
+    pub outcome: String,
+    pub error_code: Option<String>,
+    /// 这次失败是否计入尝试预算：廉价的连接失败不计（§13.1）。
+    pub counts_against_budget: bool,
 }
 
 /// 成本页的一行流量聚合：某分组某逻辑模型在某账号上的成功请求数（§6.8）。
@@ -1719,6 +1900,11 @@ fn row_to_target(row: &sqlx::sqlite::SqliteRow) -> Result<DispatchTarget> {
     })
 }
 
+/// 站点级凭据的匹配键：去掉首尾空白与结尾斜杠，大小写不敏感由调用方保证。
+fn normalize_site(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
     let protocol: String = row.try_get("protocol")?;
     Ok(RequestRecord {
@@ -1751,6 +1937,12 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         attempts: row.try_get("attempts")?,
         queued_ms: row.try_get("queued_ms")?,
         sticky_hit: row.try_get("sticky_hit")?,
+        first_token_ms: row.try_get("first_token_ms")?,
+        input_tokens: row.try_get("input_tokens")?,
+        output_tokens: row.try_get("output_tokens")?,
+        config_version: row.try_get("config_version")?,
+        // 尝试明细由 `attach_attempts` 单独填充。
+        attempts_detail: Vec::new(),
     })
 }
 
@@ -1986,6 +2178,11 @@ mod tests {
                 cheapest_multiplier: Some(Multiplier::parse("0.5").unwrap()),
                 dearest_multiplier: Some(Multiplier::ONE),
                 attempts: 1,
+                first_token_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                config_version: None,
+                attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
             })

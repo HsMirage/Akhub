@@ -210,3 +210,73 @@ async fn the_refresh_button_returns_a_real_probe_result() {
     let _: OffsetDateTime = OffsetDateTime::now_utc();
     let _ = Multiplier::ONE;
 }
+
+/// 站点级凭据：一个 Base URL 配一次，账号不必再填令牌与用户 ID（§6.4）。
+#[tokio::test]
+async fn a_site_credential_lets_accounts_skip_their_own_token() {
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_groups(Some(json!({
+        "success": true,
+        "data": {"gpt-boom": {"ratio": 0.1, "desc": "特价"}}
+    })));
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    let http = client();
+
+    // 1) 保存站点凭据（令牌只进不回）。
+    let saved = write(
+        http.post(format!("{}/admin/api/new-api-sites", akhub.base_url))
+            .header("cookie", &cookie)
+            .json(&json!({
+                "base_url": upstream.base_url,
+                "user_id": "1",
+                "access_token": "site-token"
+            })),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+
+    // 2) 建账号：不填令牌与用户 ID，也能开自动倍率。
+    let created: Value = write(
+        http.post(format!("{}/admin/api/accounts", akhub.base_url))
+            .header("cookie", &cookie)
+            .json(&json!({
+                "group_id": akhub.group_id,
+                "name": "站点凭据账号",
+                "upstream_type": "openai_compatible",
+                "base_url": upstream.base_url,
+                "api_key": "sk-abc",
+                "preferred_protocol": "openai_chat",
+                "multiplier_mode": "new_api",
+                "new_api_group": "gpt-boom",
+                "allow_private_network": true
+            })),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let id = created["id"].as_str().expect("账号应创建成功").to_string();
+    assert_eq!(created["uses_site_credentials"], true, "{created}");
+    assert_eq!(created["has_new_api_token"], false, "{created}");
+
+    // 3) 刷新走站点凭据，读到 gpt-boom 的 0.1。
+    let refreshed: Value = write(
+        http.post(format!(
+            "{}/admin/api/accounts/{id}/refresh-multiplier",
+            akhub.base_url
+        ))
+        .header("cookie", &cookie),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(refreshed["effective_multiplier"], "0.1", "{refreshed}");
+}

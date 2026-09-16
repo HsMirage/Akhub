@@ -70,6 +70,8 @@ async fn upstream_handler(
         "id": "msg_upstream",
         "model": parsed.get("model").cloned().unwrap_or(Value::Null),
         "content": [{"type": "text", "text": "你好"}],
+        // 上游上报的用量：成本页与请求记录都依赖它（§6.6、§6.8）。
+        "usage": {"input_tokens": 10, "output_tokens": 2},
     }))
     .into_response()
 }
@@ -359,6 +361,32 @@ async fn a_failing_target_falls_over_to_the_next_one() {
         "高优先级目标必须被先尝试"
     );
     assert_eq!(healthy.seen.lock().unwrap().len(), 1);
+
+    // 尝试明细要能解释"换了几个号、各自为什么失败"（§6.6）。
+    let record = wait_for_record(&state).await;
+    assert_eq!(record.attempts_detail.len(), 2, "两次尝试都要留下明细");
+    assert_eq!(record.attempts_detail[0].outcome, "failed");
+    assert_eq!(
+        record.attempts_detail[0].error_code.as_deref(),
+        Some("upstream_exhausted")
+    );
+    assert!(
+        record.attempts_detail[0].counts_against_budget,
+        "上游 500 要计入尝试预算"
+    );
+    assert_eq!(record.attempts_detail[1].outcome, "ok");
+}
+
+/// 等后台批量落盘，取最近一条请求记录。
+async fn wait_for_record(state: &SharedState) -> akhub::storage::store::RequestRecord {
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let records = state.store.list_request_records(10, 0).await.unwrap();
+        if !records.is_empty() {
+            return records[0].clone();
+        }
+    }
+    panic!("请求元数据未落盘");
 }
 
 #[tokio::test]
@@ -552,6 +580,12 @@ async fn request_metadata_is_recorded_without_any_body() {
         record.request_bytes > 0,
         "请求体字节数是粘性等待预算的锚点（§10.3）"
     );
+    // 上游回的 usage 必须进元数据：成本页与请求记录都靠它（§6.6、§6.8）。
+    assert_eq!(record.input_tokens, Some(10), "输入 token 未记录");
+    assert_eq!(record.output_tokens, Some(2), "输出 token 未记录");
+    assert_eq!(record.attempts_detail.len(), 1, "尝试明细未记录");
+    assert_eq!(record.attempts_detail[0].outcome, "ok");
+    assert!(record.config_version.is_some(), "配置版本未记录");
     assert!(
         !format!("{record:?}").contains("机密内容"),
         "正文绝不能进入元数据"

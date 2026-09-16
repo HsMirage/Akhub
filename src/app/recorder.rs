@@ -119,6 +119,11 @@ mod tests {
             cheapest_multiplier: None,
             dearest_multiplier: None,
             attempts: 1,
+            first_token_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            config_version: None,
+            attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,
         }

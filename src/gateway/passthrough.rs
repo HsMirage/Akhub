@@ -28,7 +28,7 @@ use crate::multiplier;
 use crate::protocol::degrade;
 use crate::protocol::translate::Translation;
 use crate::routing::{self, queue, score, sticky};
-use crate::storage::store::RequestRecord;
+use crate::storage::store::{AttemptRecord, RequestRecord};
 use crate::upstream::endpoints::{self, Choice};
 use crate::upstream::{self, Endpoint};
 
@@ -169,6 +169,10 @@ struct Walk<'a> {
     last: Option<(ErrorCode, String)>,
     /// 最后一次失败附带的 `Retry-After`，粘性路径据此决定是否原地等待（§10.3）。
     last_retry_after: Option<Duration>,
+    /// 本次请求最终的 (输入, 输出) Token，成功时写入（§6.6）。
+    usage_parts: (Option<u64>, Option<u64>),
+    /// 每次上游尝试的明细，随请求记录一起落库（§6.6）。
+    attempt_log: Vec<AttemptRecord>,
 }
 
 /// 一次尝试要发出的东西：端点、已改写模型名的请求体与降级记录。
@@ -252,6 +256,8 @@ async fn forward_inner<'a>(
         attempted: Vec::new(),
         last: None,
         last_retry_after: None,
+        usage_parts: (None, None),
+        attempt_log: Vec::new(),
     };
 
     let plan = match routing::plan(
@@ -594,6 +600,7 @@ impl Walk<'_> {
                     // 流式：TPM 回补、性能 EWMA、熔断结果、请求记录与 Responses
                     // 状态链全都等流真正结束再结算（§26.3）。提交时记的那份
                     // 只是"首字延迟"，用它冒充总耗时会系统性高估吞吐。
+                    self.note_attempt(candidate, started, "ok", None, false);
                     let record = self.record_for(
                         Some(candidate),
                         success.status,
@@ -632,6 +639,8 @@ impl Walk<'_> {
                         },
                     ))
                 } else {
+                    self.usage_parts = success.usage_parts;
+                    self.note_attempt(candidate, started, "ok", None, false);
                     admission.settle(health::Outcome::Success, success.usage_tokens);
                     self.forward.state.runtime.perf.observe(
                         &candidate.target.target.id,
@@ -655,11 +664,14 @@ impl Walk<'_> {
             Err(AttemptFailure::Terminal(response)) => {
                 admission.settle(health::Outcome::Neutral, None);
                 let status = response.status();
+                self.note_attempt(candidate, started, "failed", None, true);
                 Flow::Done(self.finish(Some(candidate), status, None, None, *response))
             }
             // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
             Err(AttemptFailure::MissingEndpoint) => {
                 admission.settle(health::Outcome::Neutral, None);
+                // 走错门是廉价失败：不计入尝试预算（§13.1）。
+                self.note_attempt(candidate, started, "missing_endpoint", None, false);
                 Flow::Continue
             }
             Err(AttemptFailure::Switchable {
@@ -671,6 +683,10 @@ impl Walk<'_> {
                 let outcome = classify_outcome(code, upstream_status, retry_after);
                 admission.settle(outcome, None);
                 self.last_retry_after = retry_after;
+                // 连接都没建立、上游没给状态码的 exhausted 属于廉价失败，
+                // 不计入尝试预算（§13.1）。
+                let cheap = upstream_status.is_none() && code == ErrorCode::UpstreamExhausted;
+                self.note_attempt(candidate, started, "failed", Some(code), !cheap);
                 // 慢到超时不熔断，但可靠性得分必须反映它（§12.1）。
                 let counts_for_perf = !matches!(outcome, health::Outcome::Neutral)
                     || code == ErrorCode::UpstreamTimeout;
@@ -1061,7 +1077,35 @@ impl Walk<'_> {
             attempts: self.telemetry.attempts,
             queued_ms: self.telemetry.queued.as_millis() as i64,
             sticky_hit: self.telemetry.sticky_hit,
+            first_token_ms: None,
+            input_tokens: self.usage_parts.0.map(|value| value as i64),
+            output_tokens: self.usage_parts.1.map(|value| value as i64),
+            config_version: Some(forward.state.config.current().version as i64),
+            attempts_detail: self.attempt_log.clone(),
         }
+    }
+
+    /// 记一次上游尝试的明细（§6.6）。`endpoint` 取当前尝试真正用到的端点。
+    fn note_attempt(
+        &mut self,
+        candidate: &routing::Candidate,
+        started: Instant,
+        outcome: &str,
+        error_code: Option<ErrorCode>,
+        counts_against_budget: bool,
+    ) {
+        self.attempt_log.push(AttemptRecord {
+            seq: self.attempt_log.len() as i64 + 1,
+            target_id: Some(candidate.target.target.id.clone()),
+            account_id: Some(candidate.target.account.id.clone()),
+            upstream_model: Some(candidate.target.target.upstream_model.clone()),
+            endpoint: self.telemetry.endpoint.map(|e| e.as_str().to_string()),
+            started_at: crate::storage::now_unix(),
+            duration_ms: started.elapsed().as_millis() as i64,
+            outcome: outcome.to_string(),
+            error_code: error_code.map(|code| code.as_str().to_string()),
+            counts_against_budget,
+        });
     }
 }
 
@@ -1072,6 +1116,8 @@ struct Success {
     first_token: Option<Duration>,
     output_tokens: Option<u64>,
     usage_tokens: Option<u64>,
+    /// (输入, 输出) Token；流式在结算时才拿得到，这里为 None（§6.6）。
+    usage_parts: (Option<u64>, Option<u64>),
     /// 流式 Responses：提交时先落骨架状态，流结束后据此补写完整历史。
     stream_state: Option<StreamStateSeed>,
 }
@@ -1303,6 +1349,7 @@ async fn commit_stream(
                 first_token: Some(committed.first_token),
                 output_tokens: None,
                 usage_tokens: None,
+                usage_parts: (None, None),
                 stream_state,
             }),
             Err(failure) => {
@@ -1358,6 +1405,7 @@ async fn commit_stream(
                                 first_token: Some(started.elapsed()),
                                 output_tokens: None,
                                 usage_tokens: None,
+                                usage_parts: (None, None),
                                 stream_state: Some(StreamStateSeed {
                                     gateway_id: gateway.clone(),
                                     upstream_id: upstream_id.clone(),
@@ -1420,6 +1468,7 @@ async fn commit_stream(
                         first_token: Some(started.elapsed()),
                         output_tokens: None,
                         usage_tokens: None,
+                        usage_parts: (None, None),
                         stream_state: None,
                     });
                 }
@@ -1563,6 +1612,7 @@ async fn commit_body(
         first_token: None,
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
+        usage_parts: stream::usage_parts(&parsed),
         stream_state: None,
     })
 }

@@ -39,6 +39,18 @@ fn uuid_like() -> u64 {
 
 /// 在请求记录表里补一条成功请求（成本聚合的直接输入）。
 async fn record(akhub: &Akhub, target: &common::Wired, logical_model: &str, effective: &str) {
+    record_tokens(akhub, target, logical_model, effective, 100, 20).await;
+}
+
+/// 带指定 Token 用量的一条成功请求。
+async fn record_tokens(
+    akhub: &Akhub,
+    target: &common::Wired,
+    logical_model: &str,
+    effective: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) {
     let now = akhub::storage::now_unix();
     akhub
         .state
@@ -66,6 +78,11 @@ async fn record(akhub: &Akhub, target: &common::Wired, logical_model: &str, effe
             attempts: 1,
             queued_ms: 0,
             sticky_hit: false,
+            first_token_ms: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            config_version: None,
+            attempts_detail: Vec::new(),
         }])
         .await
         .unwrap();
@@ -704,5 +721,80 @@ async fn backup_roundtrip_restores_the_full_configuration() {
     assert_eq!(
         group.models.get("glm-4.6").map(|m| m.targets.len()),
         Some(1)
+    );
+}
+
+/// 成本页要显示 Token 用量，并在有 Token 时按 Token 计算占比（§6.8）。
+#[tokio::test]
+async fn cost_page_reports_tokens_and_uses_them_for_shares() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream_a = FakeUpstream::spawn().await;
+    let upstream_b = FakeUpstream::spawn().await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_a.base_url,
+            Protocol::OpenAiChat,
+            "m1",
+            "m1",
+            100,
+        ),
+    )
+    .await;
+    let b = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号B",
+            &upstream_b.base_url,
+            Protocol::OpenAiChat,
+            "m1",
+            "m1",
+            100,
+        ),
+    )
+    .await;
+
+    // A：3 次请求、每次 10 token；B：1 次请求、90 token。
+    // 请求占比 75%/25%，Token 占比 25%/75%——口径必须按 Token 算。
+    for _ in 0..3 {
+        record_tokens(&akhub, &a, "m1", "0.5", 6, 4).await;
+    }
+    record_tokens(&akhub, &b, "m1", "0.5", 60, 30).await;
+
+    let view: Value = client
+        .get(format!("{}/admin/api/cost?period=day", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(view["share_basis"], "tokens", "{view}");
+    assert_eq!(view["total_tokens"], 120, "{view}");
+    assert_eq!(view["total_requests"], 4, "{view}");
+    let model = &view["models"][0];
+    assert_eq!(model["tokens"], 120, "{model}");
+    let accounts = model["accounts"].as_array().unwrap();
+    let share_a = accounts
+        .iter()
+        .find(|row| row["account_id"] == a.account_id)
+        .unwrap()["share"]
+        .as_f64()
+        .unwrap();
+    let share_b = accounts
+        .iter()
+        .find(|row| row["account_id"] == b.account_id)
+        .unwrap()["share"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (share_a - 0.25).abs() < 0.001,
+        "A 的 Token 占比应为 25%：{share_a}"
+    );
+    assert!(
+        (share_b - 0.75).abs() < 0.001,
+        "B 的 Token 占比应为 75%：{share_b}"
     );
 }

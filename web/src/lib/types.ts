@@ -74,6 +74,8 @@ export interface Account {
   new_api_group: string | null;
   /** 是否已保存 New API 访问令牌。令牌本身绝不回吐。 */
   has_new_api_token: boolean;
+  /** 账号自己没填凭据、但该 Base URL 配了站点级凭据（§6.4）。 */
+  uses_site_credentials: boolean;
   limits: Limits;
   allow_private_network: boolean;
   enabled: boolean;
@@ -172,6 +174,31 @@ export interface RequestRecord {
   attempts: number;
   queued_ms: number;
   sticky_hit: boolean;
+  /** 首个语义块到达耗时（毫秒）；非流式或上游未给时为 null（§6.6）。 */
+  first_token_ms: number | null;
+  /** 上游上报的输入/输出 Token；没上报就是 null，不做估算（§6.8）。 */
+  input_tokens: number | null;
+  output_tokens: number | null;
+  /** 产生这条记录时的配置快照版本。 */
+  config_version: number | null;
+  /** 每次上游尝试的明细（§6.6）。 */
+  attempts_detail: AttemptRecord[];
+}
+
+/** 一次上游尝试的明细（§6.6）。 */
+export interface AttemptRecord {
+  seq: number;
+  target_id: string | null;
+  account_id: string | null;
+  upstream_model: string | null;
+  endpoint: string | null;
+  started_at: number;
+  duration_ms: number;
+  /** ok / failed / missing_endpoint。 */
+  outcome: string;
+  error_code: string | null;
+  /** 这次失败是否计入尝试预算；廉价失败不计（§13.1）。 */
+  counts_against_budget: boolean;
 }
 
 export interface MultiplierAlert {
@@ -236,6 +263,12 @@ export interface NewApiGroupOption {
   description: string | null;
 }
 
+/** 站点级 New API 凭据：一个 Base URL 配一次，账号自动继承（§6.4）。 */
+export interface NewApiSite {
+  base_url: string;
+  user_id: string;
+}
+
 /** 同步执行倍率探测后的结果。 */
 export interface MultiplierRefreshResult {
   refreshed: boolean;
@@ -250,6 +283,8 @@ export interface CostAccountRow {
   account_id: string;
   name: string;
   requests: number;
+  /** 该账号在该逻辑模型上的 Token 用量（上游没上报时为 0）。 */
+  tokens: number;
   share: number;
   effective_multiplier: string | null;
 }
@@ -259,6 +294,9 @@ export interface CostModel {
   group_id: string;
   logical_model: string;
   requests: number;
+  tokens: number;
+  /** 该模型块的占比口径：tokens 或 requests。 */
+  share_basis: "tokens" | "requests";
   accounts: CostAccountRow[];
   weighted_avg_multiplier: string | null;
   cheapest_multiplier: string | null;
@@ -272,7 +310,16 @@ export interface CostView {
   period: string;
   since: number;
   total_requests: number;
-  account_shares: { account_id: string; name: string; requests: number; share: number }[];
+  total_tokens: number;
+  /** 全局占比口径：区间内出现过 Token 就按 Token，否则退回请求数。 */
+  share_basis: "tokens" | "requests";
+  account_shares: {
+    account_id: string;
+    name: string;
+    requests: number;
+    tokens: number;
+    share: number;
+  }[];
   models: CostModel[];
 }
 

@@ -450,6 +450,11 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
             attempts: 1,
             queued_ms: 0,
             sticky_hit: false,
+            first_token_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            config_version: None,
+            attempts_detail: Vec::new(),
         }])
         .await
         .unwrap();

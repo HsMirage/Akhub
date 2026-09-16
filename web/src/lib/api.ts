@@ -17,6 +17,7 @@ import type {
   SettingsPatch,
   SetupStatus,
   NewApiGroupOption,
+  NewApiSite,
   TestResult,
   MultiplierRefreshResult,
 } from "./types";
@@ -262,4 +263,10 @@ export const api = {
       current_password: current,
       new_password: next,
     }),
+  /** 站点级 New API 凭据（一个 Base URL 配一次，账号自动继承）。 */
+  newApiSites: () => request<{ sites: NewApiSite[] }>("/new-api-sites"),
+  saveNewApiSite: (base_url: string, user_id: string, access_token?: string) =>
+    post<NewApiSite>("/new-api-sites", { base_url, user_id, access_token }),
+  deleteNewApiSite: (base_url: string) =>
+    del(`/new-api-sites?base_url=${encodeURIComponent(base_url)}`),
 };

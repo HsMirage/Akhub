@@ -82,6 +82,7 @@ export function Cost({ data }: { data: Data }) {
                 key={`${model.group_id}/${model.logical_model}`}
                 model={model}
                 groupName={groupName(model.group_id)}
+                showTokenFallbackNote={view.share_basis === "requests"}
               />
             ))}
           </div>
@@ -92,17 +93,30 @@ export function Cost({ data }: { data: Data }) {
 }
 
 function CostOverview({ view }: { view: CostView }) {
+  const shareLabel = view.share_basis === "tokens" ? "Token 占比" : "请求占比";
   return (
     <div className="cost-overview">
       <div className="cost-total">
-        <div className="cost-label">成功请求总数</div>
-        <div className="cost-total-value mono">{view.total_requests.toLocaleString()}</div>
+        <div className="cost-total-stats">
+          <div>
+            <div className="cost-label">成功请求总数</div>
+            <div className="cost-total-value mono">{view.total_requests.toLocaleString()}</div>
+          </div>
+          <div>
+            <div className="cost-label">Token 总用量</div>
+            <div className="cost-total-value mono">{view.total_tokens.toLocaleString()}</div>
+          </div>
+        </div>
       </div>
       <div className="cost-share-summary">
-        <div className="cost-label">各账号占比</div>
+        <div className="cost-label">各账号 · {shareLabel}</div>
         <div className="cost-share-chips">
           {view.account_shares.map((share) => (
-            <span key={share.account_id} className="cost-share-chip">
+            <span
+              key={share.account_id}
+              className="cost-share-chip"
+              title={`${share.name} ${shareLabel} ${(share.share * 100).toFixed(1)}%`}
+            >
               <span>{share.name}</span>
               <span className="mono">{(share.share * 100).toFixed(1)}%</span>
               <span className="cost-chip-count mono">{share.requests.toLocaleString()} 次</span>
@@ -117,9 +131,11 @@ function CostOverview({ view }: { view: CostView }) {
 function ModelCostCard({
   model,
   groupName,
+  showTokenFallbackNote,
 }: {
   model: CostModel;
   groupName: string;
+  showTokenFallbackNote: boolean;
 }) {
   const saving = model.saving_vs_cheapest;
   const savingValue = saving == null ? "—" : `${(saving * 100).toFixed(1)}%`;
@@ -130,7 +146,8 @@ function ModelCostCard({
         <div className="cost-model-heading">
           <span className="cost-model-name mono">{model.logical_model}</span>
           <span className="cost-model-group">{groupName}</span>
-          <span className="cost-model-requests mono">{model.requests.toLocaleString()} 次</span>
+          <span className="cost-model-requests mono">请求数 {model.requests.toLocaleString()} 次</span>
+          <span className="cost-model-tokens mono">Token 数 {model.tokens.toLocaleString()}</span>
           {model.single_target && <Badge tone="neutral">单目标</Badge>}
         </div>
       </header>
@@ -156,6 +173,9 @@ function ModelCostCard({
       <p className="cost-footnote">
         口径：加权均倍率按本逻辑模型内的请求占比计算；可再省比例是假设全部请求走最便宜目标，始终不跨模型加总。
       </p>
+      {showTokenFallbackNote && (
+        <p className="cost-footnote cost-token-note">上游未上报 Token，占比按请求数</p>
+      )}
     </article>
   );
 }
@@ -191,9 +211,10 @@ function CostAccountRow({
         <span title={account.name}>{account.name}</span>
         <span className="cost-account-requests mono">{account.requests.toLocaleString()} 次</span>
       </div>
-      <span className="cost-account-multiplier mono">
-        {account.effective_multiplier ?? "—"}
-      </span>
+      <div className="cost-account-multiplier">
+        <span className="mono">{account.effective_multiplier ?? "—"}</span>
+        <span className="cost-account-tokens mono">{account.tokens.toLocaleString()} Token</span>
+      </div>
       <div
         className="cost-share-bar"
         role="img"

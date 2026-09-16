@@ -268,31 +268,58 @@ async fn probe_account(context: &Context, account: &Account) -> Result<probe::Re
             .await
         }
         MultiplierMode::NewApi => {
-            let token = decrypt(
-                context,
-                context
-                    .store
-                    .account_sealed_new_api_token(&account.id)
-                    .await?,
-            )?;
-            let user_id = account
-                .new_api_user_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-                // New API 的 sk-xxx 不被分组接口接受，缺凭据时只能报错，
-                // 由宽限期机制决定还能不能继续用旧值（§11.2）。
-                .ok_or_else(|| anyhow::anyhow!("缺少 New API 用户 ID，无法调用分组接口"))?;
+            // 账号自己的凭据优先；没填就回落到站点级凭据（§6.4：一个站点只配一次）。
+            let Some((token, user_id)) = new_api_credentials(context, account).await? else {
+                anyhow::bail!(
+                    "缺少 New API 访问令牌与用户 ID（可在账号编辑页填写，或在设置页按站点配置一次）"
+                );
+            };
             probe::new_api(
                 &context.upstream,
                 &account.base_url,
                 &token,
-                user_id,
+                &user_id,
                 account.new_api_group.as_deref(),
                 account.allow_private_network,
             )
             .await
         }
     }
+}
+
+/// 解析 New API 的（访问令牌, 用户 ID）：账号凭据优先，其次站点级凭据。
+///
+/// 站点级凭据存在 `new_api_sites` 表里（令牌加密），一个 Base URL 配一次，
+/// 该站点下所有账号共享——避免每个账号都重复填两遍（§6.4）。New API 的
+/// `sk-xxx` 不被分组接口接受，所以这两项无法省掉，只能省掉重复填写。
+pub(crate) async fn new_api_credentials(
+    context: &Context,
+    account: &Account,
+) -> Result<Option<(String, String)>> {
+    let account_token = context
+        .store
+        .account_sealed_new_api_token(&account.id)
+        .await?;
+    if let Some(sealed) = account_token {
+        let token = decrypt(context, Some(sealed))?;
+        let user_id = account
+            .new_api_user_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("缺少 New API 用户 ID，无法调用分组接口"))?;
+        return Ok(Some((token, user_id)));
+    }
+    let Some((site_user_id, sealed)) = context.store.new_api_site(&account.base_url).await? else {
+        return Ok(None);
+    };
+    let token = decrypt(context, Some(sealed))?;
+    // 账号自己填了用户 ID 就以它为准（同一站点可能有多个用户）。
+    let user_id = account
+        .new_api_user_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(site_user_id);
+    Ok(Some((token, user_id)))
 }
 
 fn decrypt(context: &Context, sealed: Option<Vec<u8>>) -> Result<String> {

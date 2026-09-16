@@ -254,6 +254,26 @@ pub fn usage_tokens(body: &serde_json::Value) -> Option<u64> {
         })
 }
 
+/// 非流式响应里的（输入 Token、输出 Token），用于请求记录与成本页（§6.6、§6.8）。
+///
+/// Anthropic 把缓存读写单独上报，必须并入输入侧；上游没给字段就返回 `None`，
+/// 绝不估算。
+pub fn usage_parts(body: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let Some(usage) = body.get("usage") else {
+        return (None, None);
+    };
+    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
+    let input = field("prompt_tokens").or_else(|| {
+        field("input_tokens").map(|input| {
+            let cache = field("cache_creation_input_tokens").unwrap_or(0)
+                + field("cache_read_input_tokens").unwrap_or(0);
+            input.saturating_add(cache)
+        })
+    });
+    let output = field("completion_tokens").or_else(|| field("output_tokens"));
+    (input, output)
+}
+
 /// 从一块 Responses SSE 字节里取出上游声明的响应 ID（§15.1）。
 ///
 /// `response.created` 帧的 `response.id` 是整条流唯一确定的身份；后面的帧
@@ -342,6 +362,11 @@ impl StreamAccounting {
     /// 输出 Token，供吞吐评分使用。
     pub fn output_tokens(&self) -> Option<u64> {
         self.output_tokens
+    }
+
+    /// 输入 Token（Anthropic 已并入缓存读写）；拿不到就是 `None`。
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
     }
 
     /// Responses：`response.completed` / `incomplete` / `failed` 里的最终对象。

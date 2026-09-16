@@ -1,5 +1,5 @@
 /** 上游账号：凭据、连接、倍率来源与限制。 */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type AccountInput } from "../lib/api";
 import type {
   Account,
@@ -470,9 +470,34 @@ function AccountDrawer({
       parseLimit(form.max_concurrency) === undefined ? "必须是正整数，留空表示不限" : null,
   };
 
+  // 站点级凭据：该 Base URL 配过一次就不必在账号里重复填（§6.4）。
+  const [sites, setSites] = useState<{ base_url: string; user_id: string }[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    api
+      .newApiSites()
+      .then((result) => setSites(result.sites))
+      .catch(() => setSites([]));
+  }, [open]);
+  const normalizeSite = (value: string) => value.trim().replace(/\/+$/, "").toLowerCase();
+  const siteCredential = sites.find(
+    (site) => normalizeSite(site.base_url) === normalizeSite(form.base_url),
+  );
+  const hasAccountToken = account?.has_new_api_token ?? false;
+  const usesSiteCredential = Boolean(
+    form.multiplier_mode === "new_api" &&
+      siteCredential &&
+      !form.new_api_token.trim() &&
+      !hasAccountToken,
+  );
+
   const needsNewApiToken =
-    form.multiplier_mode === "new_api" && !form.new_api_token.trim() && !account?.has_new_api_token;
-  const needsNewApiUser = form.multiplier_mode === "new_api" && !form.new_api_user_id.trim();
+    form.multiplier_mode === "new_api" &&
+    !form.new_api_token.trim() &&
+    !hasAccountToken &&
+    !usesSiteCredential;
+  const needsNewApiUser =
+    form.multiplier_mode === "new_api" && !form.new_api_user_id.trim() && !usesSiteCredential;
 
   const invalid =
     !form.name.trim() ||
@@ -684,6 +709,11 @@ function AccountDrawer({
 
         {form.multiplier_mode === "new_api" && (
           <>
+            {usesSiteCredential && siteCredential && (
+              <p className="text-faint" style={{ margin: "0 0 10px", fontSize: 12.5 }}>
+                这个 Base URL 已配置站点凭据（用户 ID {siteCredential.user_id}），将自动使用，无需在本账号重复填写。
+              </p>
+            )}
             <div className="form-row-2">
               <Field
                 label={
@@ -753,7 +783,7 @@ function AccountDrawer({
                     variant="ghost"
                     type="button"
                     onClick={() => void loadGroups()}
-                    disabled={groupsLoading || !form.new_api_user_id.trim() || !account}
+                    disabled={groupsLoading || (!form.new_api_user_id.trim() && !siteCredential) || !account}
                   >
                     {groupsLoading && <span className="spinner" aria-hidden="true" />}
                     {groupsLoading ? "拉取中…" : "拉取分组"}

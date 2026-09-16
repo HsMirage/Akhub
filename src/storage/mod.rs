@@ -17,7 +17,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///
 /// 结构变更时递增并编写迁移；用**更新的** Akhub 写出的数据库不能被**更旧的**
 /// 二进制打开——宁可拒绝启动，也不要在未知结构上写坏数据。
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2：请求记录补 `first_token_ms` / `input_tokens` / `output_tokens` /
+/// `config_version`，并新增每次尝试明细表 `request_attempts`（§6.6、§6.8）。
+const SCHEMA_VERSION: i64 = 2;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -81,27 +84,71 @@ fn restrict_dir_to_owner(dir: &Path) {
 
 /// 升级检查（§27）：数据库的结构版本不得高于当前二进制。
 async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
+    // 老库可能还没有版本行：按 0 处理，交给下面的迁移补齐。
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_optional(pool)
+            .await?;
+    let stored_version: i64 = stored.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if stored_version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "数据库结构版本 {stored_version} 比当前二进制认识的 {SCHEMA_VERSION} 新：\
+             请先升级 Akhub，不要用旧版本打开新数据库"
+        );
+    }
+    if stored_version < SCHEMA_VERSION {
+        migrate(pool, stored_version).await?;
+    }
     sqlx::query(
-        "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('schema_version', ?, ?)",
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('schema_version', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
     .bind(SCHEMA_VERSION.to_string())
     .bind(now_unix())
     .execute(pool)
     .await
     .context("写入结构版本失败")?;
+    Ok(())
+}
 
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
-            .fetch_one(pool)
-            .await?;
-    let stored_version: i64 = stored
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(SCHEMA_VERSION);
-    if stored_version > SCHEMA_VERSION {
-        anyhow::bail!(
-            "数据库结构版本 {stored_version} 比当前二进制认识的 {SCHEMA_VERSION} 新：\
-             请先升级 Akhub，不要用旧版本打开新数据库"
-        );
+/// 逐版本迁移。只在版本落后时执行，可重复运行（按列名判断是否已存在）。
+async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
+    if from >= 2 {
+        return Ok(());
+    }
+    // v2：请求记录补用量与时机列。新库由 schema.sql 直接建好，这里只补老库。
+    let existing: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(request_records)")
+            .fetch_all(pool)
+            .await
+            .context("读取 request_records 结构失败")?
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    for (column, ddl) in [
+        (
+            "first_token_ms",
+            "ALTER TABLE request_records ADD COLUMN first_token_ms INTEGER",
+        ),
+        (
+            "input_tokens",
+            "ALTER TABLE request_records ADD COLUMN input_tokens INTEGER",
+        ),
+        (
+            "output_tokens",
+            "ALTER TABLE request_records ADD COLUMN output_tokens INTEGER",
+        ),
+        (
+            "config_version",
+            "ALTER TABLE request_records ADD COLUMN config_version INTEGER",
+        ),
+    ] {
+        if !existing.contains(column) {
+            sqlx::query(ddl)
+                .execute(pool)
+                .await
+                .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+        }
     }
     Ok(())
 }

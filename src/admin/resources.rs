@@ -476,6 +476,8 @@ pub struct AccountDto {
     pub multiplier_note: Option<&'static str>,
     /// 是否已保存 New API 访问令牌。绝不回吐令牌本身。
     pub has_new_api_token: bool,
+    /// 账号自己没填凭据、但该 Base URL 有站点级凭据（§6.4）。
+    pub uses_site_credentials: bool,
     pub limits: Limits,
     pub allow_private_network: bool,
     pub enabled: bool,
@@ -485,7 +487,7 @@ pub struct AccountDto {
     pub model_synced_at: Option<i64>,
 }
 
-fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
+async fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
     let config = state.config.current();
     let limit = config
         .group_by_id(&account.group_id)
@@ -504,6 +506,16 @@ fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> Accou
         .entries()
         .find(|(id, _)| *id == &account.id)
         .and_then(|(_, entry)| entry.last_error.clone());
+    // 账号自己没存令牌、但站点级凭据已配置：界面上要显示"使用站点凭据"。
+    let uses_site_credentials = account.multiplier_mode == MultiplierMode::NewApi
+        && !has_token
+        && state
+            .store
+            .new_api_site(&account.base_url)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
 
     AccountDto {
         id: account.id.clone(),
@@ -527,6 +539,7 @@ fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> Accou
             && account.new_api_group.is_none())
         .then_some("未填写分组：探针按可用分组的最高倍率保守估算，可能高于这把 Key 的真实档位"),
         has_new_api_token: has_token,
+        uses_site_credentials,
         limits: account.limits,
         allow_private_network: account.allow_private_network,
         enabled: account.enabled,
@@ -552,7 +565,7 @@ pub async fn list_accounts(
             .await
             .map_err(AdminError::internal)?
             .is_some();
-        dtos.push(account_dto(&state, account, has_token));
+        dtos.push(account_dto(&state, account, has_token).await);
     }
     Ok(Json(dtos))
 }
@@ -576,7 +589,18 @@ pub async fn create_account(
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty());
-    validate_multiplier_source(mode, token, payload.new_api_user_id.as_deref())?;
+    let site_available = state
+        .store
+        .new_api_site(&base_url)
+        .await
+        .map_err(AdminError::internal)?
+        .is_some();
+    validate_multiplier_source(
+        mode,
+        token,
+        payload.new_api_user_id.as_deref(),
+        site_available,
+    )?;
 
     let account = Account {
         id: ids::account(),
@@ -615,7 +639,7 @@ pub async fn create_account(
     let has_token = token.is_some();
     Ok((
         StatusCode::CREATED,
-        Json(account_dto(&state, &account, has_token)),
+        Json(account_dto(&state, &account, has_token).await),
     ))
 }
 
@@ -684,11 +708,18 @@ pub async fn update_account(
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty());
+    let site_available = state
+        .store
+        .new_api_site(&account.base_url)
+        .await
+        .map_err(AdminError::internal)?
+        .is_some();
     validate_multiplier_source(
         account.multiplier_mode,
         // 已经存过令牌的账号不必每次改配置都重填。
         token.or(had_token.then_some("已保存")),
         account.new_api_user_id.as_deref(),
+        site_available,
     )?;
 
     let secrets = AccountSecrets {
@@ -718,11 +749,9 @@ pub async fn update_account(
     }
     audit(&state, &admin, "update_account", &account.id).await;
 
-    Ok(Json(account_dto(
-        &state,
-        &account,
-        had_token || token.is_some(),
-    )))
+    Ok(Json(
+        account_dto(&state, &account, had_token || token.is_some()).await,
+    ))
 }
 
 /// 立即刷新一个账号的自动倍率（§11.3 的账号级刷新按钮）。
@@ -773,19 +802,22 @@ pub async fn account_multiplier_groups(
     if account.multiplier_mode != MultiplierMode::NewApi {
         return Err(AdminError::bad_request("只有 New API 自动倍率需要选择分组"));
     }
-    let user_id = account
-        .new_api_user_id
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AdminError::bad_request("请先填写 New API 用户 ID"))?;
-    let sealed = state
-        .store
-        .account_sealed_new_api_token(&id)
-        .await
-        .map_err(AdminError::internal)?
-        .ok_or_else(|| AdminError::bad_request("该账号还没有保存 New API 访问令牌"))?;
-    let token = state.cipher.open(&sealed).map_err(AdminError::internal)?;
-    let token = String::from_utf8(token.to_vec()).map_err(AdminError::internal)?;
+    // 账号凭据优先，其次站点级凭据（§6.4）。
+    let context = crate::multiplier::refresh::Context {
+        store: state.store.clone(),
+        cipher: state.cipher.clone(),
+        upstream: state.upstream.clone(),
+        registry: std::sync::Arc::clone(&state.runtime.multipliers),
+    };
+    let Some((token, user_id)) =
+        crate::multiplier::refresh::new_api_credentials(&context, &account)
+            .await
+            .map_err(AdminError::internal)?
+    else {
+        return Err(AdminError::bad_request(
+            "还缺少 New API 访问令牌与用户 ID：可在本账号填写，或在设置页按站点配置一次",
+        ));
+    };
 
     let groups = crate::multiplier::probe::new_api_groups(
         &state.upstream,
@@ -814,6 +846,92 @@ pub async fn account_multiplier_groups(
             }))
             .collect::<Vec<_>>()
     })))
+}
+
+// ------------------------------------------------- New API 站点级凭据（§6.4）
+
+#[derive(Deserialize)]
+pub struct NewApiSitePayload {
+    pub base_url: String,
+    /// 留空表示沿用已保存的令牌；首次配置必须提供。
+    pub access_token: Option<String>,
+    pub user_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct NewApiSiteQuery {
+    pub base_url: String,
+}
+
+/// 列出已配置的站点级凭据（只回吐 Base URL 与用户 ID，令牌绝不回吐）。
+pub async fn list_new_api_sites(
+    State(state): State<SharedState>,
+    _: Admin,
+) -> AdminResult<Json<Value>> {
+    let sites = state
+        .store
+        .list_new_api_sites()
+        .await
+        .map_err(AdminError::internal)?;
+    Ok(Json(json!({
+        "sites": sites
+            .iter()
+            .map(|(base_url, user_id)| json!({
+                "base_url": base_url,
+                "user_id": user_id,
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// 保存站点级凭据：同一 Base URL 下的账号自动继承（§6.4）。
+pub async fn save_new_api_site(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Json(payload): Json<NewApiSitePayload>,
+) -> AdminResult<Json<Value>> {
+    let base_url = payload.base_url.trim().trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return Err(AdminError::bad_request("Base URL 不能为空"));
+    }
+    let user_id = payload.user_id.trim().to_string();
+    if user_id.is_empty() {
+        return Err(AdminError::bad_request("用户 ID 不能为空"));
+    }
+    // 令牌留空表示保持原值；首次配置必须给一个。
+    let sealed = match trimmed(payload.access_token) {
+        Some(token) => seal(&state, &token)?,
+        None => state
+            .store
+            .new_api_site(&base_url)
+            .await
+            .map_err(AdminError::internal)?
+            .map(|(_, sealed)| sealed)
+            .ok_or_else(|| AdminError::bad_request("首次配置必须提供 New API 访问令牌"))?,
+    };
+    state
+        .store
+        .upsert_new_api_site(&base_url, &user_id, &sealed)
+        .await
+        .map_err(AdminError::internal)?;
+    audit(&state, &admin, "save_new_api_site", &base_url).await;
+    Ok(Json(json!({"base_url": base_url, "user_id": user_id})))
+}
+
+/// 删除站点级凭据；已单独填过凭据的账号不受影响。
+pub async fn delete_new_api_site(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Query(query): Query<NewApiSiteQuery>,
+) -> AdminResult<StatusCode> {
+    let base_url = query.base_url.trim().trim_end_matches('/').to_string();
+    state
+        .store
+        .delete_new_api_site(&base_url)
+        .await
+        .map_err(AdminError::internal)?;
+    audit(&state, &admin, "delete_new_api_site", &base_url).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn seal(state: &SharedState, plaintext: &str) -> AdminResult<Vec<u8>> {
@@ -1671,7 +1789,7 @@ pub async fn copy_account(
     audit(&state, &admin, "copy_account", &copy.id).await;
     Ok((
         StatusCode::CREATED,
-        Json(account_dto(&state, &copy, has_token)),
+        Json(account_dto(&state, &copy, has_token).await),
     ))
 }
 
@@ -1846,7 +1964,8 @@ pub async fn cost(
     #[derive(Default)]
     struct ModelCost {
         requests: i64,
-        per_account: Vec<(String, String, i64, Option<Multiplier>)>,
+        tokens: i64,
+        per_account: Vec<(String, String, i64, i64, Option<Multiplier>)>,
         weighted_sum: i128,
         weighted_count: i64,
         cheapest: Option<Multiplier>,
@@ -1860,6 +1979,7 @@ pub async fn cost(
             .entry((row.group_id.clone(), row.logical_model.clone()))
             .or_default();
         entry.requests += row.requests;
+        entry.tokens += row.tokens;
         let (name, multiplier) = match accounts.get(row.account_id.as_str()) {
             Some(account) => {
                 let limit = config
@@ -1876,9 +1996,13 @@ pub async fn cost(
             }
             None => ("（已删除账号）".to_string(), None),
         };
-        entry
-            .per_account
-            .push((name, row.account_id.clone(), row.requests, multiplier));
+        entry.per_account.push((
+            name,
+            row.account_id.clone(),
+            row.requests,
+            row.tokens,
+            multiplier,
+        ));
     }
 
     for sample in &samples {
@@ -1897,9 +2021,19 @@ pub async fn cost(
         .into_iter()
         .map(|((group_id, name), cost)| {
             let mut cost = cost;
-            cost.per_account
-                .sort_by_key(|(_, _, requests, _)| -requests);
-            let total = cost.requests.max(1);
+            // 有 Token 就按 Token 排、按 Token 算占比；整段区间都没有 Token
+            // 时退化为请求数口径，绝不虚构 token 数（§6.8）。
+            let tokens_available = cost.tokens > 0;
+            cost.per_account.sort_by_key(
+                |entry| {
+                    if tokens_available { -entry.3 } else { -entry.2 }
+                },
+            );
+            let total = if tokens_available {
+                cost.tokens.max(1)
+            } else {
+                cost.requests.max(1)
+            };
             // 加权均倍率：请求级样本按次数平均，四舍五入回定点域（展示用）。
             let weighted_avg = (cost.weighted_count > 0).then(|| {
                 let scaled = (cost.weighted_sum + cost.weighted_count as i128 / 2)
@@ -1917,13 +2051,16 @@ pub async fn cost(
                 "group_id": group_id,
                 "logical_model": name,
                 "requests": cost.requests,
-                "accounts": cost.per_account.iter().map(|(name, id, requests, multiplier)| {
+                "tokens": cost.tokens,
+                "share_basis": if tokens_available { "tokens" } else { "requests" },
+                "accounts": cost.per_account.iter().map(|(name, id, requests, tokens, multiplier)| {
+                    let basis = if tokens_available { *tokens as f64 } else { *requests as f64 };
                     json!({
                         "account_id": id,
                         "name": name,
                         "requests": requests,
-                        // 流量占比按请求次数口径（tokens 未入元数据表）。
-                        "share": round4(*requests as f64 / total as f64),
+                        "tokens": tokens,
+                        "share": round4(basis / total as f64),
                         "effective_multiplier": multiplier,
                     })
                 }).collect::<Vec<_>>(),
@@ -1939,7 +2076,9 @@ pub async fn cost(
 
     // 全局区域：只显示不失真的量（§6.8）。没有任何跨模型的"总成本"。
     let total_requests: i64 = usage.iter().map(|r| r.requests).sum();
-    let mut by_account: std::collections::BTreeMap<String, (String, i64)> =
+    let total_tokens: i64 = usage.iter().map(|r| r.tokens).sum();
+    let tokens_available = total_tokens > 0;
+    let mut by_account: std::collections::BTreeMap<String, (String, i64, i64)> =
         std::collections::BTreeMap::new();
     for row in &usage {
         let name = accounts
@@ -1948,17 +2087,23 @@ pub async fn cost(
             .unwrap_or_else(|| "（已删除账号）".to_string());
         let entry = by_account
             .entry(row.account_id.clone())
-            .or_insert((name, 0));
+            .or_insert((name, 0, 0));
         entry.1 += row.requests;
+        entry.2 += row.tokens;
     }
     let account_shares: Vec<Value> = by_account
         .into_iter()
-        .map(|(id, (name, requests))| {
+        .map(|(id, (name, requests, tokens))| {
             json!({
                 "account_id": id,
                 "name": name,
                 "requests": requests,
-                "share": round4(requests as f64 / total_requests.max(1) as f64),
+                "tokens": tokens,
+                "share": round4(if tokens_available {
+                    tokens as f64 / total_tokens.max(1) as f64
+                } else {
+                    requests as f64 / total_requests.max(1) as f64
+                }),
             })
         })
         .collect();
@@ -1967,6 +2112,9 @@ pub async fn cost(
         "period": query.period.as_deref().unwrap_or("day"),
         "since": since,
         "total_requests": total_requests,
+        "total_tokens": total_tokens,
+        // 占比口径：区间内只要有任何一条记录带 Token 就按 Token，否则按请求数。
+        "share_basis": if tokens_available { "tokens" } else { "requests" },
         "account_shares": account_shares,
         "models": model_views,
     })))
@@ -2313,6 +2461,24 @@ pub async fn list_requests(
                 "attempts": record.attempts,
                 "queued_ms": record.queued_ms,
                 "sticky_hit": record.sticky_hit,
+                // 用量与时机（§6.6）；上游没上报时是 null，不估算。
+                "first_token_ms": record.first_token_ms,
+                "input_tokens": record.input_tokens,
+                "output_tokens": record.output_tokens,
+                "config_version": record.config_version,
+                // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
+                "attempts_detail": record.attempts_detail.iter().map(|attempt| json!({
+                    "seq": attempt.seq,
+                    "target_id": attempt.target_id,
+                    "account_id": attempt.account_id,
+                    "upstream_model": attempt.upstream_model,
+                    "endpoint": attempt.endpoint,
+                    "started_at": attempt.started_at,
+                    "duration_ms": attempt.duration_ms,
+                    "outcome": attempt.outcome,
+                    "error_code": attempt.error_code,
+                    "counts_against_budget": attempt.counts_against_budget,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -2393,12 +2559,16 @@ fn validate_limits(limits: Limits) -> AdminResult<Limits> {
 }
 
 /// 自动倍率来源必须配齐它需要的凭据（§11.2）。
+///
+/// `site_available` 表示该 Base URL 已经配了站点级凭据（§6.4）：账号自己不填
+/// 也能工作，此时不再强制要求账号级令牌与用户 ID。
 fn validate_multiplier_source(
     mode: MultiplierMode,
     new_api_token: Option<&str>,
     new_api_user_id: Option<&str>,
+    site_available: bool,
 ) -> AdminResult<()> {
-    if mode != MultiplierMode::NewApi {
+    if mode != MultiplierMode::NewApi || site_available {
         return Ok(());
     }
     // New API 的 sk-xxx 不被分组接口接受，必须另外提供访问令牌与用户 ID；

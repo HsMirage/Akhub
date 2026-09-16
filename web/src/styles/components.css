@@ -411,6 +411,60 @@ table.data tbody tr.row-degraded td:first-child {
   box-shadow: inset 3px 0 0 var(--danger);
 }
 
+/* 请求记录可展开：整行是交互入口，明细行与主表保持同一层级。 */
+table.data tbody tr.request-row {
+  cursor: pointer;
+}
+
+table.data tbody tr.request-row:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.request-expand-button {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+
+.request-details-row:hover {
+  background: transparent !important;
+}
+
+.request-details-row > td {
+  padding: 0 !important;
+  background: var(--surface);
+}
+
+.request-details {
+  padding: var(--space-3) var(--space-5) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.request-attempts {
+  font-size: 12px !important;
+}
+
+.request-attempts th,
+.request-attempts td {
+  padding: var(--space-2) var(--space-3) !important;
+}
+
+.request-attempts th:first-child,
+.request-attempts td:first-child {
+  padding-left: var(--space-3) !important;
+}
+
+.request-attempts th:last-child,
+.request-attempts td:last-child {
+  padding-right: var(--space-3) !important;
+}
+
 .cell-actions {
   display: flex;
   gap: var(--space-1);
@@ -982,6 +1036,12 @@ tr:hover .cell-actions,
   min-width: 0;
 }
 
+.cost-total-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
 .cost-label {
   color: var(--text-faint);
   font-size: 11.5px;
@@ -1072,6 +1132,11 @@ tr:hover .cell-actions,
   font-size: 11.5px;
 }
 
+.cost-model-tokens {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
 .cost-model-main {
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.45fr);
@@ -1115,7 +1180,7 @@ tr:hover .cell-actions,
 
 .cost-account-row {
   display: grid;
-  grid-template-columns: minmax(100px, 1fr) 70px minmax(100px, 1.35fr) 52px;
+  grid-template-columns: minmax(100px, 1fr) minmax(125px, auto) minmax(100px, 1.35fr) 52px;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
@@ -1148,6 +1213,18 @@ tr:hover .cell-actions,
   white-space: nowrap;
 }
 
+.cost-account-multiplier {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.cost-account-tokens {
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
 .cost-account-percent {
   color: var(--text);
   text-align: right;
@@ -1176,6 +1253,12 @@ tr:hover .cell-actions,
   color: var(--text-faint);
   font-size: 11.5px;
   line-height: 1.5;
+}
+
+.cost-footnote.cost-token-note {
+  margin-top: var(--space-2);
+  padding-top: 0;
+  border-top: none;
 }
 
 /* ---------------------------------------------------------------- 其它 */
@@ -1309,6 +1392,10 @@ tr:hover .cell-actions,
   }
   .cost-metrics {
     grid-template-columns: 1fr;
+  }
+  .cost-total-stats {
+    grid-template-columns: 1fr;
+    gap: var(--space-3);
   }
   .cost-account-row {
     grid-template-columns: minmax(0, 1fr) auto;

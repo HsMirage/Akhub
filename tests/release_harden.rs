@@ -345,6 +345,71 @@ async fn a_database_written_by_a_newer_binary_refuses_to_open() {
     assert!(message.contains("升级"), "错误信息要提示升级：{message}");
 }
 
+/// v1 的老库打开时必须自动迁移到 v2：补上用量/时机列与尝试明细表（§27）。
+#[tokio::test]
+async fn a_v1_database_is_migrated_to_v2_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    // 把当前库"降级"成 v1 形状：删掉 v2 的列与表，并把版本号写回 1。
+    for column in [
+        "first_token_ms",
+        "input_tokens",
+        "output_tokens",
+        "config_version",
+    ] {
+        // 列名来自下面的常量数组，不含用户输入。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE request_records DROP COLUMN {column}"
+        )))
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query("DROP TABLE request_attempts")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '1' WHERE key = 'schema_version'")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    std::mem::forget(state);
+
+    // 重新打开：迁移补回列与表，版本更新到 2。
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let columns: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(request_records)")
+            .fetch_all(reopened.store.pool())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    for column in [
+        "first_token_ms",
+        "input_tokens",
+        "output_tokens",
+        "config_version",
+    ] {
+        assert!(columns.contains(column), "迁移后缺少列 {column}");
+    }
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_attempts")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0, "迁移应建好空的尝试明细表");
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_one(reopened.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(version, "2");
+}
+
 /// 第三方声明里的版本必须与 Cargo.lock 一致。
 ///
 /// 阶段 6 包含"许可证与第三方声明审查"；声明漂移过一次（base64、getrandom、

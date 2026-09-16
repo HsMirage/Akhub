@@ -161,6 +161,10 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
 
     let mut record = settlement.record;
     record.duration_ms = settlement.request_started.elapsed().as_millis() as i64;
+    // 流式的用量与首字延迟只有在这里才拿得到（§6.6、§6.8）。
+    record.first_token_ms = Some(settlement.first_token.as_millis() as i64);
+    record.input_tokens = accounting.input_tokens().map(|value| value as i64);
+    record.output_tokens = accounting.output_tokens().map(|value| value as i64);
     if let Ending::Failed(code) = ending {
         record.error_code = Some(code.to_string());
     }

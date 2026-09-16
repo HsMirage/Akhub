@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
 import type { Data } from "../lib/store";
-import type { Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
+import type { NewApiSite, Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
 import { formatBytes } from "../lib/format";
 import { Button, Card, ConfirmDialog, Field, useToast } from "../components/ui";
 
@@ -148,6 +148,62 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
       toast.error(cause instanceof Error ? cause.message : "修改密码失败");
     } finally {
       setPasswordSaving(false);
+    }
+  };
+
+  // 站点级 New API 凭据：一个 Base URL 配一次，账号自动继承（§6.4）。
+  const [sites, setSites] = useState<NewApiSite[]>([]);
+  const [siteBaseUrl, setSiteBaseUrl] = useState("");
+  const [siteUserId, setSiteUserId] = useState("");
+  const [siteToken, setSiteToken] = useState("");
+  const [siteSaving, setSiteSaving] = useState(false);
+  const [deletingSite, setDeletingSite] = useState<string | null>(null);
+
+  const loadSites = async () => {
+    try {
+      const result = await api.newApiSites();
+      setSites(result.sites);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "读取站点凭据失败");
+    }
+  };
+
+  useEffect(() => {
+    void loadSites();
+    // 只在进入设置页时拉一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveSite = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (siteSaving) return;
+    setSiteSaving(true);
+    try {
+      await api.saveNewApiSite(
+        siteBaseUrl.trim(),
+        siteUserId.trim(),
+        siteToken.trim() || undefined,
+      );
+      setSiteToken("");
+      await loadSites();
+      toast.success("站点凭据已保存；该 Base URL 下的账号会自动使用它");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "保存站点凭据失败");
+    } finally {
+      setSiteSaving(false);
+    }
+  };
+
+  const removeSite = async (baseUrl: string) => {
+    setDeletingSite(baseUrl);
+    try {
+      await api.deleteNewApiSite(baseUrl);
+      await loadSites();
+      toast.success("站点凭据已删除");
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "删除站点凭据失败");
+    } finally {
+      setDeletingSite(null);
     }
   };
 
@@ -329,6 +385,103 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
             </Button>
           </div>
         </form>
+      </Card>
+
+      <Card
+        title="New API 站点凭据"
+        description="一个 Base URL 只配一次访问令牌与用户 ID，该站点下的账号自动继承；账号自己填的凭据优先。"
+      >
+        <div className="card-body">
+          <div className="table-wrap">
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>Base URL</th>
+                  <th>用户 ID</th>
+                  <th style={{ width: 90 }} />
+                </tr>
+              </thead>
+              <tbody>
+                {sites.length === 0 ? (
+                  <tr>
+                    <td colSpan={3} className="text-faint">
+                      还没有站点级凭据；下面的表单保存后即时生效。
+                    </td>
+                  </tr>
+                ) : (
+                  sites.map((site) => (
+                    <tr key={site.base_url}>
+                      <td className="mono cell-strong">{site.base_url}</td>
+                      <td className="mono">{site.user_id}</td>
+                      <td>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={deletingSite === site.base_url}
+                          onClick={() => void removeSite(site.base_url)}
+                        >
+                          {deletingSite === site.base_url ? "删除中…" : "删除"}
+                        </Button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <form className="form-grid" style={{ marginTop: 12 }} onSubmit={saveSite}>
+            <div className="form-row-2">
+              <Field label="Base URL" hint="例如 https://ai.hsnb.fun">
+                {(id) => (
+                  <input
+                    id={id}
+                    className="input mono"
+                    value={siteBaseUrl}
+                    onChange={(event) => setSiteBaseUrl(event.target.value)}
+                    placeholder="https://..."
+                  />
+                )}
+              </Field>
+              <Field label="用户 ID" hint="New API 个人设置页显示的用户 ID">
+                {(id) => (
+                  <input
+                    id={id}
+                    className="input mono"
+                    value={siteUserId}
+                    onChange={(event) => setSiteUserId(event.target.value)}
+                    placeholder="1"
+                  />
+                )}
+              </Field>
+            </div>
+            <Field
+              label="访问令牌"
+              hint="New API 个人设置页生成，不是登录密码；留空表示沿用已保存的令牌。"
+            >
+              {(id) => (
+                <input
+                  id={id}
+                  className="input mono"
+                  type="password"
+                  value={siteToken}
+                  autoComplete="off"
+                  onChange={(event) => setSiteToken(event.target.value)}
+                  placeholder="留空则保持不变"
+                />
+              )}
+            </Field>
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={siteSaving || !siteBaseUrl.trim() || !siteUserId.trim()}
+              >
+                {siteSaving && <span className="spinner" aria-hidden="true" />}
+                {siteSaving ? "保存中…" : "保存站点凭据"}
+              </Button>
+            </div>
+          </form>
+        </div>
       </Card>
 
       <Card title="版本信息">
