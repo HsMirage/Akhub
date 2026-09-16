@@ -229,6 +229,13 @@ export type SettingsNumericField =
 
 export type SettingsPatch = Partial<Pick<Settings, SettingsNumericField>>;
 
+/** New API 的一个可用分组（账号编辑页的分组下拉框）。 */
+export interface NewApiGroupOption {
+  name: string;
+  ratio: string;
+  description: string | null;
+}
+
 /** 同步执行倍率探测后的结果。 */
 export interface MultiplierRefreshResult {
   refreshed: boolean;

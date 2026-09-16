@@ -16,6 +16,7 @@ import type {
   Settings,
   SettingsPatch,
   SetupStatus,
+  NewApiGroupOption,
   TestResult,
   MultiplierRefreshResult,
 } from "./types";
@@ -151,6 +152,9 @@ export const api = {
   deleteAccount: (id: string) => del(`/accounts/${id}`),
   refreshMultiplier: (id: string) =>
     post<MultiplierRefreshResult>(`/accounts/${id}/refresh-multiplier`),
+  /** 拉取该账号可用的 New API 分组（只读，不落库）。 */
+  multiplierGroups: (id: string) =>
+    request<{ groups: NewApiGroupOption[] }>(`/accounts/${id}/multiplier-groups`),
   /** 一键独立复制：停用状态的「名称 - 副本」，Key 重新加密（§6.4）。 */
   copyAccount: (id: string) => post<Account>(`/accounts/${id}/copy`),
   /** 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。 */

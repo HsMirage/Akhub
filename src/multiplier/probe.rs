@@ -243,7 +243,7 @@ struct NewApiGroups {
 /// 全站倍率表，回答不了"我这把 Key 属于哪一档"（§11.2）。
 ///
 /// `group` 为空时取可用分组中的**最高**倍率——不知道自己在哪一档时，把成本
-/// 估高才是安全方向。
+/// 估高才是安全方向。后台账号表单会提示这一点，并提供"拉取可用分组"。
 pub async fn new_api(
     client: &UpstreamClient,
     base_url: &str,
@@ -252,6 +252,80 @@ pub async fn new_api(
     group: Option<&str>,
     allow_private: bool,
 ) -> Result<Reading> {
+    let data = fetch_new_api_groups(client, base_url, access_token, user_id, allow_private).await?;
+
+    let multiplier = match group {
+        Some(name) => {
+            let raw = data
+                .get(name)
+                .with_context(|| format!("New API 上不存在分组「{name}」，或这把 Key 无权使用"))?;
+            group_ratio(raw).with_context(|| format!("New API 分组「{name}」的倍率非法"))?
+        }
+        None => data
+            .values()
+            .filter_map(|raw| group_ratio(raw).ok())
+            .max()
+            .context("New API 返回的分组中没有一个带合法倍率")?,
+    };
+
+    Ok(Reading {
+        multiplier,
+        observed_at: None,
+        peak: None,
+    })
+}
+
+/// 一个可选的 New API 分组。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewApiGroup {
+    pub name: String,
+    pub ratio: Multiplier,
+    pub description: Option<String>,
+}
+
+/// 列出该访问令牌可用的分组与倍率，供后台在下拉框里选择（§6.4）。
+///
+/// 按倍率升序返回，让最便宜的分组排在最前面。
+pub async fn new_api_groups(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    allow_private: bool,
+) -> Result<Vec<NewApiGroup>> {
+    let data = fetch_new_api_groups(client, base_url, access_token, user_id, allow_private).await?;
+    let mut groups: Vec<NewApiGroup> = data
+        .iter()
+        .filter_map(|(name, raw)| {
+            group_ratio(raw).ok().map(|ratio| NewApiGroup {
+                name: name.clone(),
+                ratio,
+                description: raw
+                    .get("desc")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    groups.sort_by(|left, right| {
+        left.ratio
+            .cmp(&right.ratio)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if groups.is_empty() {
+        bail!("New API 返回的分组中没有一个带合法倍率");
+    }
+    Ok(groups)
+}
+
+/// 拉取并校验 `/api/user/self/groups` 的原始分组表。
+async fn fetch_new_api_groups(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    allow_private: bool,
+) -> Result<std::collections::HashMap<String, serde_json::Value>> {
     let url = join(base_url, "api/user/self/groups")?;
     url_guard::assert_resolvable(&url, allow_private).await?;
 
@@ -279,30 +353,10 @@ pub async fn new_api(
             }
         );
     }
-    let data = groups
+    groups
         .data
         .filter(|data| !data.is_empty())
-        .context("New API 分组接口没有返回任何可用分组")?;
-
-    let multiplier = match group {
-        Some(name) => {
-            let raw = data
-                .get(name)
-                .with_context(|| format!("New API 上不存在分组「{name}」，或这把 Key 无权使用"))?;
-            group_ratio(raw).with_context(|| format!("New API 分组「{name}」的倍率非法"))?
-        }
-        None => data
-            .values()
-            .filter_map(|raw| group_ratio(raw).ok())
-            .max()
-            .context("New API 返回的分组中没有一个带合法倍率")?,
-    };
-
-    Ok(Reading {
-        multiplier,
-        observed_at: None,
-        peak: None,
-    })
+        .context("New API 分组接口没有返回任何可用分组")
 }
 
 /// 分组条目既可能是 `{"ratio": 0.5, "desc": "..."}`，也可能直接是数字。

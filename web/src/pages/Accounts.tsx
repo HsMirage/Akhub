@@ -385,6 +385,33 @@ function AccountDrawer({
   const toast = useToast();
   const editing = account !== null;
 
+  // New API 分组下拉：点「拉取分组」时现场拉一次，不缓存过期数据。
+  const [groups, setGroups] = useState<{ name: string; ratio: string; description: string | null }[]>(
+    [],
+  );
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const loadGroups = async () => {
+    if (!account) return;
+    setGroupsLoading(true);
+    try {
+      const result = await api.multiplierGroups(account.id);
+      setGroups(result.groups);
+      const [only] = result.groups;
+      if (!only) {
+        toast.error("这个账号下没有可用分组");
+      } else if (!form.new_api_group && result.groups.length === 1) {
+        // 只有一个分组时直接选中，不必再点一次。
+        set("new_api_group", only.name);
+      } else {
+        toast.success(`拉到 ${result.groups.length} 个分组，从下拉框里选一个`);
+      }
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "拉取分组失败");
+    } finally {
+      setGroupsLoading(false);
+    }
+  };
+
   const [form, setForm] = useState({
     group_id: account?.group_id ?? data.groups[0]?.id ?? "",
     name: account?.name ?? "",
@@ -693,17 +720,45 @@ function AccountDrawer({
               </Field>
             </div>
             <Field
-              label="分组名（可选）"
-              hint="这把 Key 在 New API 上所属的分组。留空时取可用分组中的最高倍率——把成本估高才是安全方向。"
+              label="分组名"
+              hint="这把 Key 在 New API 上所属的分组；点「拉取分组」从账号里选。留空会按可用分组的最高倍率保守估算。"
             >
               {(id) => (
-                <input
-                  id={id}
-                  className="input mono"
-                  value={form.new_api_group}
-                  onChange={(e) => set("new_api_group", e.target.value)}
-                  placeholder="default"
-                />
+                <div className="row" style={{ gap: 8 }}>
+                  {groups.length > 0 ? (
+                    <select
+                      id={id}
+                      className="select mono"
+                      value={form.new_api_group}
+                      onChange={(e) => set("new_api_group", e.target.value)}
+                    >
+                      <option value="">（留空：按最高档估算）</option>
+                      {groups.map((group) => (
+                        <option key={group.name} value={group.name}>
+                          {group.name} · {group.ratio}
+                          {group.description ? ` · ${group.description}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      id={id}
+                      className="input mono"
+                      value={form.new_api_group}
+                      onChange={(e) => set("new_api_group", e.target.value)}
+                      placeholder="default"
+                    />
+                  )}
+                  <Button
+                    variant="ghost"
+                    type="button"
+                    onClick={() => void loadGroups()}
+                    disabled={groupsLoading || !form.new_api_user_id.trim() || !account}
+                  >
+                    {groupsLoading && <span className="spinner" aria-hidden="true" />}
+                    {groupsLoading ? "拉取中…" : "拉取分组"}
+                  </Button>
+                </div>
               )}
             </Field>
           </>

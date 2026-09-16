@@ -176,6 +176,10 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/refresh-multiplier",
             post(r::refresh_account_multiplier),
         )
+        .route(
+            "/admin/api/accounts/{id}/multiplier-groups",
+            get(r::account_multiplier_groups),
+        )
         .route("/admin/api/accounts/{id}/copy", post(r::copy_account))
         .route("/admin/api/accounts/{id}/test", post(r::test_account))
         .route(

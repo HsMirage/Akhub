@@ -472,6 +472,8 @@ pub struct AccountDto {
     pub multiplier_error: Option<String>,
     pub new_api_user_id: Option<String>,
     pub new_api_group: Option<String>,
+    /// New API 自动倍率的提示：没填分组时按最高档保守估算（§11.2）。
+    pub multiplier_note: Option<&'static str>,
     /// 是否已保存 New API 访问令牌。绝不回吐令牌本身。
     pub has_new_api_token: bool,
     pub limits: Limits,
@@ -521,6 +523,9 @@ fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> Accou
         multiplier_error: last_error,
         new_api_user_id: account.new_api_user_id.clone(),
         new_api_group: account.new_api_group.clone(),
+        multiplier_note: (account.multiplier_mode == MultiplierMode::NewApi
+            && account.new_api_group.is_none())
+        .then_some("未填写分组：探针按可用分组的最高倍率保守估算，可能高于这把 Key 的真实档位"),
         has_new_api_token: has_token,
         limits: account.limits,
         allow_private_network: account.allow_private_network,
@@ -753,6 +758,61 @@ pub async fn refresh_account_multiplier(
         "effective_multiplier": reading.multiplier,
         "observed_at": reading.observed_at,
         "notice": format!("已重新探测：当前有效倍率 {}", reading.multiplier),
+    })))
+}
+
+/// 列出该账号可用的 New API 分组与倍率（§6.4 的"分组"下拉框）。
+///
+/// 解密访问令牌只在本进程内使用，绝不回吐；返回按倍率升序，最便宜的排前面。
+pub async fn account_multiplier_groups(
+    State(state): State<SharedState>,
+    _: Admin,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    let account = find_account(&state, &id).await?;
+    if account.multiplier_mode != MultiplierMode::NewApi {
+        return Err(AdminError::bad_request("只有 New API 自动倍率需要选择分组"));
+    }
+    let user_id = account
+        .new_api_user_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AdminError::bad_request("请先填写 New API 用户 ID"))?;
+    let sealed = state
+        .store
+        .account_sealed_new_api_token(&id)
+        .await
+        .map_err(AdminError::internal)?
+        .ok_or_else(|| AdminError::bad_request("该账号还没有保存 New API 访问令牌"))?;
+    let token = state.cipher.open(&sealed).map_err(AdminError::internal)?;
+    let token = String::from_utf8(token.to_vec()).map_err(AdminError::internal)?;
+
+    let groups = crate::multiplier::probe::new_api_groups(
+        &state.upstream,
+        &account.base_url,
+        &token,
+        &user_id,
+        account.allow_private_network,
+    )
+    .await
+    .map_err(|error| {
+        AdminError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "拉取分组失败：{}",
+                crate::security::redact::text(&error.to_string())
+            ),
+        )
+    })?;
+    Ok(Json(json!({
+        "groups": groups
+            .iter()
+            .map(|group| json!({
+                "name": group.name,
+                "ratio": group.ratio,
+                "description": group.description,
+            }))
+            .collect::<Vec<_>>()
     })))
 }
 
