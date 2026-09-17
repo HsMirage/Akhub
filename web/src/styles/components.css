@@ -1907,3 +1907,89 @@ table.data td.table-empty-cell {
   flex-wrap: wrap;
   gap: 6px;
 }
+
+/* ---------------------------------------------------------- 请求趋势迷你图（§6.2） */
+
+.trend-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trend-chart {
+  width: 100%;
+  height: 120px;
+  display: block;
+}
+
+/* 成功部分用主色；失败部分用警示色，叠在同一根柱子上。 */
+.trend-bar-success {
+  fill: var(--accent);
+}
+
+.trend-bar-failure {
+  fill: var(--danger, #d9534f);
+  opacity: 0.55;
+}
+
+/* 零请求的小时留一条基线，避免看起来像断档。 */
+.trend-bar-empty {
+  fill: var(--border);
+}
+
+.trend-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+}
+
+.trend-empty {
+  padding: 24px 0;
+  text-align: center;
+  font-size: 12.5px;
+}
+
+/* ------------------------------------------------- 跨页定位与高亮（§6.6） */
+
+/* 行内可点击文本：用于"目标/账号"跳转，保持文本观感但可点。 */
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  min-height: 20px;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+/* 从请求记录跳过来时的提示条。 */
+.locate-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(64, 128, 255, 0.12));
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+/* 被定位的行：淡出式高亮，2.6 秒后由 JS 摘掉类名。 */
+table.data tbody tr.is-highlighted {
+  animation: locate-pulse 2.6s ease-out;
+  background: var(--accent-soft, rgba(64, 128, 255, 0.12));
+}
+
+@keyframes locate-pulse {
+  0% { background: var(--accent-soft, rgba(64, 128, 255, 0.28)); }
+  70% { background: var(--accent-soft, rgba(64, 128, 255, 0.14)); }
+  100% { background: transparent; }
+}

@@ -8,6 +8,7 @@
 import type { Data } from "../lib/store";
 import type { Route } from "../routes";
 import { Badge, Button, Card, EmptyState } from "../components/ui";
+import { TrendChart } from "../components/TrendChart";
 import {
   IconAlert,
   IconArrowRight,
@@ -152,6 +153,15 @@ export function Overview({
           hint={`${windowLabel}窗口`}
         />
       </div>
+
+      <Card
+        title="请求趋势"
+        description={`${windowLabel}窗口，按小时聚合；柱子深色部分为成功请求。`}
+      >
+        <div className="card-body">
+          <TrendChart points={overview.trend} />
+        </div>
+      </Card>
 
       {!ready && (
         <Card

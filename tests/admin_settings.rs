@@ -543,3 +543,68 @@ async fn group_available_models_aggregates_account_catalogs() {
         "要能看出是哪个账号提供的：{first}"
     );
 }
+
+/// 概览趋势：按小时聚合、补齐空桶，请求数正确（§6.2）。
+#[tokio::test]
+async fn overview_includes_an_hourly_trend_with_empty_buckets_filled() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    // 造两条"当前小时"的记录（其它桶应为 0）。
+    insert_record(
+        &akhub,
+        "trend-1",
+        "m-a",
+        None,
+        200,
+        None,
+        10,
+        Some(1),
+        Some(1),
+    )
+    .await;
+    insert_record(
+        &akhub,
+        "trend-2",
+        "m-a",
+        None,
+        500,
+        Some("upstream_exhausted"),
+        20,
+        None,
+        None,
+    )
+    .await;
+
+    let overview: Value = client()
+        .get(format!("{}/admin/api/overview", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(overview["trend_bucket_secs"], 3600, "{overview}");
+    let trend = overview["trend"].as_array().expect("trend 数组");
+    assert!(
+        trend.len() >= 24,
+        "24 小时要给出至少 24 个桶，实际 {}",
+        trend.len()
+    );
+    for pair in trend.windows(2) {
+        let gap =
+            pair[1]["bucket_start"].as_i64().unwrap() - pair[0]["bucket_start"].as_i64().unwrap();
+        assert_eq!(gap, 3600, "桶间距必须等于桶宽：{pair:?}");
+    }
+    let total: i64 = trend
+        .iter()
+        .map(|point| point["requests"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(total, 2, "趋势里的请求总数要与写入的两条一致");
+    let successes: i64 = trend
+        .iter()
+        .map(|point| point["success"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(successes, 1, "只有 2xx 计入成功");
+}

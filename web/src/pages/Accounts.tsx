@@ -22,6 +22,7 @@ import {
   parseLimit,
   validateMultiplier,
 } from "../lib/format";
+import { useRouteParams } from "../lib/store";
 import type { Data } from "../lib/store";
 import {
   Badge,
@@ -51,6 +52,34 @@ export function Accounts({
   const toast = useToast();
   const [editing, setEditing] = useState<Account | "new" | null>(null);
   const [confirm, setConfirm] = useState<Account | null>(null);
+  // 从请求记录跳过来时带着 account=<id>：定位并高亮该账号（§6.6）。
+  const params = useRouteParams();
+  const highlightId = params.get("account");
+  const [highlight, setHighlight] = useState<string | null>(highlightId);
+
+  useEffect(() => {
+    if (!highlightId) {
+      setHighlight(null);
+      return;
+    }
+    if (!data.accounts.some((account) => account.id === highlightId)) {
+      toast.error("这条请求记录里的账号已经不存在了");
+      setHighlight(null);
+      return;
+    }
+    setHighlight(highlightId);
+    const scrollTimer = window.setTimeout(() => {
+      document
+        .querySelector(`tr[data-account-id="${highlightId}"]`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 80);
+    const clearTimer = window.setTimeout(() => setHighlight(null), 2600);
+    return () => {
+      window.clearTimeout(scrollTimer);
+      window.clearTimeout(clearTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightId, data.accounts.length]);
   const [selecting, setSelecting] = useState<Account | null>(null);
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -297,7 +326,11 @@ export function Accounts({
                     </tr>
                   ) : (
                     filteredAccounts.map((account) => (
-                      <tr key={account.id}>
+                      <tr
+                        key={account.id}
+                        data-account-id={account.id}
+                        className={highlight === account.id ? "is-highlighted" : undefined}
+                      >
                         <td>
                           <div className="cell-strong">{account.name}</div>
                           <div className="text-faint" style={{ fontSize: 12 }}>

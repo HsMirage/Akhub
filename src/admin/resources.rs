@@ -87,9 +87,16 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
     // 运行指标（§6.2）：窗口内的请求量/成功率/延迟分位、队列超时、最近错误
     // 与最近配置变化。窗口固定 24 小时，响应里带上窗口长度供前端标注。
     let window_secs: i64 = 24 * 3600;
+    // 趋势图：24 小时分 24 个桶（每小时一根柱），空桶补齐。
+    let trend_bucket_secs: i64 = 3600;
     let stats = state
         .store
         .request_stats(now - window_secs, 2000)
+        .await
+        .map_err(AdminError::internal)?;
+    let trend = state
+        .store
+        .request_trend(now - window_secs, trend_bucket_secs, now)
         .await
         .map_err(AdminError::internal)?;
     let recent_errors = state
@@ -157,6 +164,13 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
             "action": entry.action,
             "object": entry.object,
             "result": entry.result,
+        })).collect::<Vec<_>>(),
+        // 趋势迷你图：按小时聚合的请求量与成功量（§6.2）。
+        "trend_bucket_secs": trend_bucket_secs,
+        "trend": trend.iter().map(|point| json!({
+            "bucket_start": point.bucket_start,
+            "requests": point.requests,
+            "success": point.success,
         })).collect::<Vec<_>>(),
     })))
 }

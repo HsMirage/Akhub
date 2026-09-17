@@ -8,8 +8,9 @@
  * 每一行同时显示动态状态与综合评分：前者决定它此刻能不能被选中，后者决定
  * 它在同层里分到多少流量。权重调错时，靠分维得分就能自我诊断（§6.9）。
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
+import { useRouteParams } from "../lib/store";
 import type { Account, DispatchTarget, Limits, LogicalModel } from "../lib/types";
 import { TARGET_STATUS_LABELS } from "../lib/types";
 import { formatLimits, parseLimit } from "../lib/format";
@@ -41,6 +42,36 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
   const toast = useToast();
   const [editing, setEditing] = useState<DispatchTarget | "new" | null>(null);
   const [confirm, setConfirm] = useState<DispatchTarget | null>(null);
+  // 从请求记录跳过来时带着 target=<id>：滚动到那一行并高亮一会儿（§6.6）。
+  const params = useRouteParams();
+  const highlightId = params.get("target");
+  const [highlight, setHighlight] = useState<string | null>(highlightId);
+
+  useEffect(() => {
+    if (!highlightId) {
+      setHighlight(null);
+      return;
+    }
+    if (!data.targets.some((target) => target.id === highlightId)) {
+      toast.error("这条请求记录里的调度目标已经不存在了");
+      setHighlight(null);
+      return;
+    }
+    setHighlight(highlightId);
+    // 等表格渲染完再滚动，避免刚跳过来时目标行还没挂到 DOM 上。
+    const scrollTimer = window.setTimeout(() => {
+      document
+        .querySelector(`tr[data-target-id="${highlightId}"]`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 80);
+    const clearTimer = window.setTimeout(() => setHighlight(null), 2600);
+    return () => {
+      window.clearTimeout(scrollTimer);
+      window.clearTimeout(clearTimer);
+    };
+    // 只在定位参数或目标数量变化时重跑。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightId, data.targets.length]);
 
   /** 按逻辑模型分组，再把目标按有效优先级折叠成层。 */
   const grouped = useMemo(() => {
@@ -84,6 +115,29 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
 
   return (
     <>
+      {highlight && (
+        <div className="locate-banner">
+          <span>
+            已从请求记录定位到目标 <span className="mono">{highlight}</span>
+          </span>
+          <button
+            type="button"
+            className="link-button"
+            onClick={() =>
+              document
+                .querySelector(`tr[data-target-id="${highlight}"]`)
+                ?.scrollIntoView({ block: "center", behavior: "smooth" })
+            }
+          >
+            再次定位
+          </button>
+          <span className="spacer" />
+          <button type="button" className="link-button" onClick={() => setHighlight(null)}>
+            关闭
+          </button>
+        </div>
+      )}
+
       {!canCreate && (
         <Card title="调度目标">
           <EmptyState
@@ -128,6 +182,7 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
                     key={entry.model.id}
                     model={entry.model}
                     layers={entry.layers}
+                    highlight={highlight}
                     onEdit={setEditing}
                     onDelete={setConfirm}
                   />
@@ -210,11 +265,14 @@ function StatusBadge({ target, account }: { target: DispatchTarget; account?: Ac
 function ModelBlock({
   model,
   layers,
+  highlight,
   onEdit,
   onDelete,
 }: {
   model: LogicalModel;
   layers: Layer[];
+  /** 从请求记录定位过来的目标 ID；命中时该行高亮。 */
+  highlight: string | null;
   onEdit: (target: DispatchTarget) => void;
   onDelete: (target: DispatchTarget) => void;
 }) {
@@ -273,7 +331,11 @@ function ModelBlock({
               </thead>
               <tbody>
                 {layer.targets.map(({ target, account }) => (
-                  <tr key={target.id}>
+                  <tr
+                    key={target.id}
+                    data-target-id={target.id}
+                    className={highlight === target.id ? "is-highlighted" : undefined}
+                  >
                     <td
                       style={{ overflow: "hidden", textOverflow: "ellipsis" }}
                       title={`${account?.name ?? "账号已删除"} / ${target.upstream_model}`}

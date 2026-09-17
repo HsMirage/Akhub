@@ -1,6 +1,7 @@
 /** 请求记录：只有元数据，没有正文。 */
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
+import { navigateTo } from "../lib/store";
 import type { Data } from "../lib/store";
 import {
   ENDPOINT_LABELS,
@@ -396,7 +397,20 @@ export function Requests({ data }: { data: Data; refresh: () => Promise<void> })
                       </td>
                       <td>
                         <span className="chain">
-                          <span className="cell-dim">{accountName(record.account_id)}</span>
+                          {record.account_id ? (
+                            <button
+                              type="button"
+                              className="link-button"
+                              title={`在「上游账号」里定位 ${accountName(record.account_id)}`}
+                              onClick={() =>
+                                navigateTo("accounts", { account: record.account_id ?? "" })
+                              }
+                            >
+                              {accountName(record.account_id)}
+                            </button>
+                          ) : (
+                            <span className="cell-dim">{accountName(record.account_id)}</span>
+                          )}
                           {record.upstream_model && (
                             <>
                               <span className="chain-arrow">/</span>
@@ -466,7 +480,24 @@ export function Requests({ data }: { data: Data; refresh: () => Promise<void> })
                                     {record.attempts_detail.map((attempt) => (
                                       <tr key={`${record.request_id}-${attempt.seq}`}>
                                         <td className="mono cell-dim">{attempt.seq}</td>
-                                        <td className="mono cell-dim">{attemptTarget(attempt)}</td>
+                                        <td className="mono cell-dim">
+                                          {attempt.target_id ? (
+                                            <button
+                                              type="button"
+                                              className="link-button mono"
+                                              title={`在「调度目标」里定位 ${attemptTarget(attempt)}`}
+                                              onClick={() =>
+                                                navigateTo("targets", {
+                                                  target: attempt.target_id ?? "",
+                                                })
+                                              }
+                                            >
+                                              {attemptTarget(attempt)}
+                                            </button>
+                                          ) : (
+                                            attemptTarget(attempt)
+                                          )}
+                                        </td>
                                         <td className="cell-dim">
                                           {attempt.endpoint === null
                                             ? "—"

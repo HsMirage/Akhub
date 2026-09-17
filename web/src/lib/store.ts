@@ -101,16 +101,30 @@ export function useTheme() {
 }
 
 /** 极简 hash 路由：内嵌单页应用不需要服务端配合的 history 模式。 */
+/**
+ * 解析 `#/route?key=value` 里的查询串。
+ *
+ * 从请求记录跳到"调度目标/上游账号"时要带着目标或账号 ID 做高亮定位，
+ * 但 hash 路由的主键仍然是 route 本身，所以这里把查询串单独解析出来，
+ * 不改变原有的 route 语义。
+ */
+function parseHash(hash: string): { route: string; params: URLSearchParams } {
+  const raw = hash.replace(/^#\/?/, "");
+  const [path = "", query = ""] = raw.split("?", 2);
+  return { route: path, params: new URLSearchParams(query) };
+}
+
 export function useRoute<T extends string>(routes: readonly T[], fallback: T) {
-  const parse = useCallback((): T => {
-    const raw = window.location.hash.replace(/^#\/?/, "");
-    return (routes as readonly string[]).includes(raw) ? (raw as T) : fallback;
+  const parse = useCallback((): { route: T; params: URLSearchParams } => {
+    const { route, params } = parseHash(window.location.hash);
+    const known = (routes as readonly string[]).includes(route) ? (route as T) : fallback;
+    return { route: known, params };
   }, [routes, fallback]);
 
-  const [route, setRoute] = useState<T>(parse);
+  const [state, setState] = useState(parse);
 
   useEffect(() => {
-    const onChange = () => setRoute(parse());
+    const onChange = () => setState(parse());
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, [parse]);
@@ -119,5 +133,24 @@ export function useRoute<T extends string>(routes: readonly T[], fallback: T) {
     window.location.hash = `/${next}`;
   }, []);
 
-  return [route, navigate] as const;
+  // 第三个返回值是查询参数，向后兼容：原有的 `const [route, navigate] = ...` 不受影响。
+  return [state.route, navigate, state.params] as const;
+}
+
+/** 当前 hash 里的查询参数；页面用它读取"带定位目标"的跳转参数。 */
+export function useRouteParams(): URLSearchParams {
+  const parse = useCallback(() => parseHash(window.location.hash).params, []);
+  const [params, setParams] = useState(parse);
+  useEffect(() => {
+    const onChange = () => setParams(parse());
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, [parse]);
+  return params;
+}
+
+/** 跳到某个页面并带上查询参数（用于跨页定位）。 */
+export function navigateTo(route: string, params: Record<string, string>): void {
+  const query = new URLSearchParams(params).toString();
+  window.location.hash = query ? `/${route}?${query}` : `/${route}`;
 }

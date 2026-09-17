@@ -921,6 +921,58 @@ impl Store {
         })
     }
 
+    /// 请求量趋势（§6.2）：按时间桶聚合请求数与成功数，供概览的迷你图。
+    ///
+    /// `bucket_secs` 是每根柱子的秒数，`since` 到 `now` 之间补齐空桶——
+    /// 前端不用自己对齐时间轴，也不用把"没有请求的小时"误画成断线。
+    pub async fn request_trend(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        now: i64,
+    ) -> Result<Vec<TrendPoint>> {
+        let bucket = bucket_secs.max(1);
+        let rows = sqlx::query(
+            "SELECT (started_at / ?) * ? AS bucket,
+                    COUNT(*) AS requests,
+                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END) AS success
+             FROM request_records
+             WHERE started_at >= ? AND started_at <= ?
+             GROUP BY bucket ORDER BY bucket",
+        )
+        .bind(bucket)
+        .bind(bucket)
+        .bind(since)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            by_bucket.insert(
+                row.try_get("bucket")?,
+                (
+                    row.try_get::<Option<i64>, _>("requests")?.unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("success")?.unwrap_or(0),
+                ),
+            );
+        }
+        // 补齐空桶：从 since 对齐到桶边界的第一个桶，一直排到 now。
+        let first = (since / bucket) * bucket;
+        let mut points = Vec::new();
+        let mut cursor = first;
+        while cursor <= now {
+            let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
+            points.push(TrendPoint {
+                bucket_start: cursor,
+                requests,
+                success,
+            });
+            cursor += bucket;
+        }
+        Ok(points)
+    }
+
     /// 最近错误（§6.2）：窗口内非 2xx 或带错误码的记录。
     pub async fn recent_errors(&self, since: i64, limit: i64) -> Result<Vec<RecentError>> {
         let rows = sqlx::query(
@@ -1845,6 +1897,15 @@ fn push_request_filter(builder: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         ),
         _ => {}
     }
+}
+
+/// 趋势图的一个时间桶（§6.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrendPoint {
+    /// 桶起始时间（Unix 秒，已对齐到桶边界）。
+    pub bucket_start: i64,
+    pub requests: i64,
+    pub success: i64,
 }
 
 /// 概览统计（§6.2）。

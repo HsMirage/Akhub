@@ -255,6 +255,13 @@ export interface RecentChange {
   result: string;
 }
 
+/** 概览趋势图的一个小时桶（§6.2）。 */
+export interface TrendPoint {
+  bucket_start: number;
+  requests: number;
+  success: number;
+}
+
 export interface Overview {
   config_version: number;
   groups: number;
@@ -283,6 +290,10 @@ export interface Overview {
   queue_timeouts: number;
   recent_errors: RecentError[];
   recent_changes: RecentChange[];
+  /** 趋势图的桶宽（秒），当前为 3600。 */
+  trend_bucket_secs: number;
+  /** 近 24 小时的请求趋势，空桶已由后端补齐。 */
+  trend: TrendPoint[];
 }
 
 export interface Settings {
