@@ -111,6 +111,7 @@ async fn spawn_akhub() -> (String, String, SharedState, tempfile::TempDir) {
         multiplier_limit: Multiplier::ONE,
         weights: SchedulingWeights::default(),
         queue_capacity: 100,
+        max_wait_secs: 60,
         allow_degrade: true,
         created_at: OffsetDateTime::now_utc(),
     };

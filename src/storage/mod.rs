@@ -20,7 +20,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///
 /// v2：请求记录补 `first_token_ms` / `input_tokens` / `output_tokens` /
 /// `config_version`，并新增每次尝试明细表 `request_attempts`（§6.6、§6.8）。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -113,44 +113,62 @@ async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
 
 /// 逐版本迁移。只在版本落后时执行，可重复运行（按列名判断是否已存在）。
 async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
-    if from >= 2 {
-        return Ok(());
+    if from < 2 {
+        // v2：请求记录补用量与时机列。新库由 schema.sql 直接建好，这里只补老库。
+        let existing = table_columns(pool, "request_records").await?;
+        for (column, ddl) in [
+            (
+                "first_token_ms",
+                "ALTER TABLE request_records ADD COLUMN first_token_ms INTEGER",
+            ),
+            (
+                "input_tokens",
+                "ALTER TABLE request_records ADD COLUMN input_tokens INTEGER",
+            ),
+            (
+                "output_tokens",
+                "ALTER TABLE request_records ADD COLUMN output_tokens INTEGER",
+            ),
+            (
+                "config_version",
+                "ALTER TABLE request_records ADD COLUMN config_version INTEGER",
+            ),
+        ] {
+            if !existing.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+            }
+        }
     }
-    // v2：请求记录补用量与时机列。新库由 schema.sql 直接建好，这里只补老库。
-    let existing: std::collections::HashSet<String> =
-        sqlx::query("PRAGMA table_info(request_records)")
-            .fetch_all(pool)
-            .await
-            .context("读取 request_records 结构失败")?
-            .iter()
-            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
-            .collect();
-    for (column, ddl) in [
-        (
-            "first_token_ms",
-            "ALTER TABLE request_records ADD COLUMN first_token_ms INTEGER",
-        ),
-        (
-            "input_tokens",
-            "ALTER TABLE request_records ADD COLUMN input_tokens INTEGER",
-        ),
-        (
-            "output_tokens",
-            "ALTER TABLE request_records ADD COLUMN output_tokens INTEGER",
-        ),
-        (
-            "config_version",
-            "ALTER TABLE request_records ADD COLUMN config_version INTEGER",
-        ),
-    ] {
-        if !existing.contains(column) {
-            sqlx::query(ddl)
+    if from < 3 {
+        // v3：分组补"队列最长等待"（§6.3）。默认 60 秒，0 表示跟随请求总超时。
+        let existing = table_columns(pool, "groups").await?;
+        if !existing.contains("max_wait_secs") {
+            sqlx::query("ALTER TABLE groups ADD COLUMN max_wait_secs INTEGER NOT NULL DEFAULT 60")
                 .execute(pool)
                 .await
-                .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+                .context("迁移 groups.max_wait_secs 失败")?;
         }
     }
     Ok(())
+}
+
+/// 读取某张表的列名集合。表名来自代码内常量，不是用户输入。
+async fn table_columns(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("读取 {table} 结构失败"))?
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect(),
+    )
 }
 
 /// 打开一个仅存在于内存中的数据库，供测试使用。

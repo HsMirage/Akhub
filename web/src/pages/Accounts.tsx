@@ -17,6 +17,7 @@ import {
 } from "../lib/types";
 import {
   formatLimits,
+  formatRelative,
   formatStaleFor,
   parseLimit,
   validateMultiplier,
@@ -54,6 +55,7 @@ export function Accounts({
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [refreshingMultiplierId, setRefreshingMultiplierId] = useState<string | null>(null);
+  const [syncingModelId, setSyncingModelId] = useState<string | null>(null);
   const [groupFilter, setGroupFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
   const [upstreamFilter, setUpstreamFilter] = useState<AccountUpstreamFilter>("all");
@@ -113,6 +115,22 @@ export function Accounts({
       toast.error(cause instanceof Error ? cause.message : "操作失败");
     } finally {
       setRefreshingMultiplierId(null);
+    }
+  };
+
+  const syncModels = async (account: Account) => {
+    if (syncingModelId === account.id) return;
+    setSyncingModelId(account.id);
+    try {
+      const count = account.auto_sync
+        ? (await api.syncAccountModels(account.id)).managed_models
+        : (await api.refreshAccountModels(account.id)).length;
+      await refresh();
+      toast.success(`已同步 ${count} 个模型`);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "同步模型失败");
+    } finally {
+      setSyncingModelId(null);
     }
   };
 
@@ -239,6 +257,23 @@ export function Accounts({
                 共 {data.accounts.length} 个账号（筛选后 {filteredAccounts.length} 个）
               </div>
             </div>
+            <div className="model-sync-meta">
+              <span>上次同步：</span>
+              <strong>
+                {(() => {
+                  const latest = filteredAccounts.reduce<number | null>(
+                    (current, account) =>
+                      account.model_synced_at !== null &&
+                      (current === null || account.model_synced_at > current)
+                        ? account.model_synced_at
+                        : current,
+                    null,
+                  );
+                  return latest === null ? "从未" : formatRelative(latest);
+                })()}
+              </strong>
+              <span className="text-faint">模型目录可手动更新，也可由自动同步托管</span>
+            </div>
             <div className="table-wrap">
               <table className="data">
                 <thead>
@@ -305,6 +340,17 @@ export function Accounts({
                         </td>
                         <td>
                           <div className="cell-actions">
+                            <Button
+                              size="sm"
+                              disabled={syncingModelId === account.id}
+                              title={account.auto_sync ? "立即执行托管同步" : "拉取并刷新上游模型目录"}
+                              onClick={() => void syncModels(account)}
+                            >
+                              {syncingModelId === account.id && (
+                                <span className="spinner spinner-sm" aria-hidden="true" />
+                              )}
+                              {syncingModelId === account.id ? "同步中…" : "同步模型"}
+                            </Button>
                             <Button size="sm" onClick={() => setSelecting(account)}>
                               模型
                             </Button>
@@ -438,7 +484,8 @@ function MultiplierCell({
         {automatic && (
           <button
             className="btn btn-ghost btn-sm"
-            style={{ padding: "0 4px", height: 18 }}
+            // 触达区域不小于 24×24：低于这个尺寸在触屏与高分屏上都难点中。
+            style={{ padding: "0 6px", minHeight: 26, minWidth: 26 }}
             title={account.multiplier_error ?? "立即刷新倍率"}
             aria-label={`刷新「${account.name}」倍率`}
             disabled={refreshing}

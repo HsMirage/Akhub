@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS groups (
     weight_first_token INTEGER NOT NULL,
     weight_throughput INTEGER NOT NULL,
     queue_capacity    INTEGER NOT NULL,
+    -- 层内全忙时最多等多久（秒）；0 表示跟随请求总超时（§6.3、§13.6）。
+    max_wait_secs     INTEGER NOT NULL DEFAULT 60,
     allow_degrade     INTEGER NOT NULL,
     created_at        INTEGER NOT NULL
 );

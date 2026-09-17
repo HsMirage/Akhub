@@ -146,6 +146,45 @@ async fn queue_timeout_when_the_layer_stays_busy_past_the_deadline() {
     assert_eq!(top.requests(), 0);
 }
 
+/// 分组的"队列最长等待"要比请求总超时更早生效（§6.3）：
+/// 用户最多按分组设置等这么久就拿到可重试的 429，而不是干等请求总超时。
+#[tokio::test]
+async fn the_group_max_wait_caps_queue_waiting_before_the_request_timeout() {
+    let top = FakeUpstream::spawn().await;
+    let settings = Settings {
+        // 请求总超时远大于分组的最长等待。
+        request_timeout: Duration::from_secs(30),
+        ..Settings::default()
+    };
+    let akhub = spawn_akhub_with(settings, |group| {
+        group.max_wait_secs = 1;
+    })
+    .await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new("A", &top.base_url, CHAT, MODEL, MODEL, 100).limits(one_slot()),
+    )
+    .await;
+    let _held = akhub
+        .state
+        .runtime
+        .health
+        .try_admit(&a.account_id, &a.target_id, one_slot(), 0)
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let response = chat(&akhub, small_body("s", "u")).await;
+    let waited = started.elapsed();
+
+    assert_eq!(response.status(), 429);
+    assert_eq!(error_code(response).await, "queue_timeout");
+    assert!(
+        waited < Duration::from_secs(10),
+        "必须按分组的最长等待（1s）退出，而不是等满请求总超时：实际 {waited:?}"
+    );
+    assert_eq!(top.requests(), 0);
+}
+
 #[tokio::test]
 async fn a_slow_upstream_is_neither_retried_nor_tripped() {
     let slow = FakeUpstream::spawn().await;

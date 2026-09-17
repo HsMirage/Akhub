@@ -222,6 +222,7 @@ mod tests {
                 multiplier_limit: Multiplier::ONE,
                 weights: SchedulingWeights::default(),
                 queue_capacity: 100,
+                max_wait_secs: 60,
                 allow_degrade: true,
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },

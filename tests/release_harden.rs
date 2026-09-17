@@ -347,12 +347,12 @@ async fn a_database_written_by_a_newer_binary_refuses_to_open() {
 
 /// v1 的老库打开时必须自动迁移到 v2：补上用量/时机列与尝试明细表（§27）。
 #[tokio::test]
-async fn a_v1_database_is_migrated_to_v2_on_open() {
+async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::bootstrap(dir.path(), Settings::default())
         .await
         .unwrap();
-    // 把当前库"降级"成 v1 形状：删掉 v2 的列与表，并把版本号写回 1。
+    // 把当前库"降级"成 v1 形状：删掉 v2/v3 的列与表，并把版本号写回 1。
     for column in [
         "first_token_ms",
         "input_tokens",
@@ -368,6 +368,10 @@ async fn a_v1_database_is_migrated_to_v2_on_open() {
         .unwrap();
     }
     sqlx::query("DROP TABLE request_attempts")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE groups DROP COLUMN max_wait_secs")
         .execute(state.store.pool())
         .await
         .unwrap();
@@ -402,12 +406,23 @@ async fn a_v1_database_is_migrated_to_v2_on_open() {
         .await
         .unwrap();
     assert_eq!(attempts, 0, "迁移应建好空的尝试明细表");
+    let group_columns: std::collections::HashSet<String> = sqlx::query("PRAGMA table_info(groups)")
+        .fetch_all(reopened.store.pool())
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+        .collect();
+    assert!(
+        group_columns.contains("max_wait_secs"),
+        "迁移后 groups 缺少 max_wait_secs"
+    );
     let version: String =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "2");
+    assert_eq!(version, "3");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

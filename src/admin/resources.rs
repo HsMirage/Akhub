@@ -287,6 +287,8 @@ pub struct GroupPayload {
     pub multiplier_limit: Multiplier,
     pub weights: Option<SchedulingWeights>,
     pub queue_capacity: Option<u32>,
+    /// 层内全忙时最多等多久（秒）；0=跟随请求总超时。
+    pub max_wait_secs: Option<u32>,
     pub allow_degrade: Option<bool>,
 }
 
@@ -296,6 +298,7 @@ pub struct GroupPatch {
     pub multiplier_limit: Option<Multiplier>,
     pub weights: Option<SchedulingWeights>,
     pub queue_capacity: Option<u32>,
+    pub max_wait_secs: Option<u32>,
     pub allow_degrade: Option<bool>,
 }
 
@@ -308,6 +311,8 @@ pub struct GroupDto {
     pub multiplier_limit: Multiplier,
     pub weights: SchedulingWeights,
     pub queue_capacity: u32,
+    /// 队列最长等待（秒）；0=跟随请求总超时（§6.3）。
+    pub max_wait_secs: u32,
     pub allow_degrade: bool,
     pub logical_models: usize,
     pub dispatch_targets: usize,
@@ -323,6 +328,7 @@ fn group_dto(state: &SharedState, group: &Group) -> GroupDto {
         multiplier_limit: group.multiplier_limit,
         weights: group.weights,
         queue_capacity: group.queue_capacity,
+        max_wait_secs: group.max_wait_secs,
         allow_degrade: group.allow_degrade,
         logical_models: view.map(|v| v.models.len()).unwrap_or(0),
         dispatch_targets: view
@@ -370,6 +376,7 @@ pub async fn create_group(
         multiplier_limit: payload.multiplier_limit,
         weights,
         queue_capacity: payload.queue_capacity.unwrap_or(100),
+        max_wait_secs: validate_max_wait(payload.max_wait_secs)?,
         allow_degrade: payload.allow_degrade.unwrap_or(true),
         created_at: OffsetDateTime::now_utc(),
     };
@@ -407,6 +414,9 @@ pub async fn update_group(
     }
     if let Some(weights) = patch.weights {
         group.weights = validate_weights(weights)?;
+    }
+    if let Some(max_wait) = patch.max_wait_secs {
+        group.max_wait_secs = validate_max_wait(Some(max_wait))?;
     }
     if let Some(capacity) = patch.queue_capacity {
         group.queue_capacity = capacity;
@@ -1057,6 +1067,34 @@ pub struct LogicalModelDto {
     pub dispatch_targets: usize,
     /// 是否会出现在 `/v1/models` 中。
     pub listed: bool,
+}
+
+/// 分组内可以从上游目录里挑的模型名（§6.5，创建逻辑模型时的下拉选择）。
+pub async fn group_available_models(
+    State(state): State<SharedState>,
+    _: Admin,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    find_group(&state, &id).await?;
+    let rows = state
+        .store
+        .group_available_models(&id)
+        .await
+        .map_err(AdminError::internal)?;
+    let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (public_name, account_name) in rows {
+        grouped.entry(public_name).or_default().push(account_name);
+    }
+    Ok(Json(json!({
+        "models": grouped
+            .into_iter()
+            .map(|(public_name, accounts)| json!({
+                "public_name": public_name,
+                "accounts": accounts,
+            }))
+            .collect::<Vec<_>>()
+    })))
 }
 
 pub async fn list_logical_models(
@@ -2690,6 +2728,15 @@ fn validate_multiplier_source(
         ));
     }
     Ok(())
+}
+
+/// 校验队列最长等待：0（跟随请求总超时）到 1 小时之间。
+fn validate_max_wait(value: Option<u32>) -> AdminResult<u32> {
+    let value = value.unwrap_or(60);
+    if value > 3600 {
+        return Err(AdminError::bad_request("队列最长等待不能超过 3600 秒"));
+    }
+    Ok(value)
 }
 
 /// 校验 Base URL；未开启内网访问时同时执行 SSRF 网段检查（§23.3）。

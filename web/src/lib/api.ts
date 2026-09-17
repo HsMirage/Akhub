@@ -2,6 +2,7 @@ import type {
   Account,
   AccountModel,
   Alias,
+  AvailableModel,
   CalibrationRecord,
   CalibrationResult,
   CostView,
@@ -95,6 +96,7 @@ export interface GroupInput {
   multiplier_limit: string;
   weights?: Group["weights"];
   queue_capacity?: number;
+  max_wait_secs?: number;
   allow_degrade?: boolean;
 }
 
@@ -141,6 +143,8 @@ export const api = {
   settings: () => request<Settings>("/settings"),
 
   groups: () => request<Group[]>("/groups"),
+  availableGroupModels: (id: string) =>
+    request<{ models: AvailableModel[] }>(`/groups/${id}/available-models`),
   createGroup: (input: GroupInput) => post<KeyReveal>("/groups", input),
   updateGroup: (id: string, input: Partial<GroupInput>) =>
     patch<Group>(`/groups/${id}`, input),
@@ -214,7 +218,7 @@ export const api = {
     selected: string[],
     force = false,
   ): Promise<
-    { warnings: SelectionWarning[] } | { created_targets: number; removed_targets: number }
+    { needs_confirm: SelectionWarning[] } | { created_targets: number; removed_targets: number }
   > => {
     try {
       return await post<{ created_targets: number; removed_targets: number }>(
@@ -223,8 +227,10 @@ export const api = {
       );
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 409) {
-        const payload = cause.payload as { warnings?: SelectionWarning[] } | null;
-        return { warnings: payload?.warnings ?? [] };
+        const payload = cause.payload as
+          | { needs_confirm?: SelectionWarning[]; warnings?: SelectionWarning[] }
+          | null;
+        return { needs_confirm: payload?.needs_confirm ?? payload?.warnings ?? [] };
       }
       throw cause;
     }

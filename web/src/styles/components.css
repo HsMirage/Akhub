@@ -139,9 +139,13 @@
   line-height: 1;
 }
 
+/* 行内链接也要有不小于 24px 的触达高度：16px 的行高在触屏上点不准。 */
 .external-link {
   color: var(--accent);
   text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
 }
 
 .external-link:hover {
@@ -367,6 +371,10 @@ table.data th {
   color: var(--text-faint);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface);
 }
 
 table.data td {
@@ -376,6 +384,11 @@ table.data td {
   /* 数据表默认不折行：中文没有词边界，窄列会把「主力」拆成两行。
      确实需要收窄的列用 .cell-truncate 截断并挂 title。 */
   white-space: nowrap;
+}
+
+table.data .tabular {
+  text-align: right;
+  font-family: var(--font-mono);
 }
 
 table.data th:first-child,
@@ -581,6 +594,17 @@ tr:hover .cell-actions,
   background: var(--surface);
 }
 
+.field:has(.field-error) .input,
+.field:has(.field-error) .select {
+  border-color: var(--danger);
+}
+
+.field:has(.field-error) .input:focus,
+.field:has(.field-error) .select:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px var(--danger-soft);
+}
+
 .input.mono {
   font-family: var(--font-mono);
   font-size: 12.5px;
@@ -664,6 +688,23 @@ tr:hover .cell-actions,
   color: var(--text-faint);
   font-size: 13px;
   text-align: center;
+}
+
+.model-sync-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 38px;
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.model-sync-meta strong {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: 550;
 }
 
 table.data td.table-empty-cell {
@@ -822,6 +863,208 @@ table.data td.table-empty-cell {
 
 .modal-body {
   padding: var(--space-5);
+}
+
+.modal.model-selection-modal {
+  width: min(760px, calc(100vw - 32px));
+  max-height: min(860px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
+}
+
+.model-selection-modal .modal-body {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.model-dialog-content {
+  min-width: 0;
+  gap: var(--space-4);
+}
+
+.model-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.model-search {
+  min-width: 0;
+}
+
+.model-new-filter {
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.model-bulk-actions,
+.alias-editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.model-selection-table-wrap {
+  max-height: 330px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.model-selection-table th:first-child,
+.model-selection-table td:first-child {
+  width: 42px;
+  text-align: center;
+}
+
+.model-selection-table th:last-child,
+.model-selection-table td:last-child {
+  width: 150px;
+}
+
+.model-checkbox-cell input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.model-upstream-name,
+.model-public-name {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-upstream-name {
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.model-public-name {
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.model-public-name.is-aliased {
+  color: var(--accent);
+}
+
+.model-state-badges {
+  flex-wrap: wrap;
+}
+
+.model-selection-table tr.is-missing {
+  opacity: 0.72;
+}
+
+.model-empty-copy {
+  margin: 0;
+  padding: var(--space-3) 0;
+}
+
+.model-manual-add {
+  align-items: stretch;
+}
+
+.alias-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.alias-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.alias-table-wrap {
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.alias-table th:nth-child(2),
+.alias-table td:nth-child(2) {
+  min-width: 220px;
+}
+
+.alias-table th:last-child,
+.alias-table td:last-child {
+  width: 92px;
+}
+
+.alias-input {
+  min-width: 180px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.model-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.model-picker-head {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.model-picker-list {
+  min-width: 0;
+}
+
+.model-picker-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.model-picker-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 0.7fr);
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-picker-option:hover,
+.model-picker-option:focus-visible,
+.model-picker-option.is-selected {
+  background: var(--accent-soft);
+  border-color: var(--border-focus);
+}
+
+.model-picker-accounts {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .modal-foot {
@@ -1487,6 +1730,52 @@ table.data td.table-empty-cell {
   }
 }
 
+/* 窄屏表格保留横向滚动，首列固定，用户不会在长模型名里迷路。 */
+@media (max-width: 900px) {
+  .table-wrap {
+    overflow-x: auto;
+  }
+
+  table.data {
+    min-width: 680px;
+  }
+
+  table.data th:first-child,
+  table.data td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 3;
+    background: var(--surface);
+    box-shadow: 1px 0 0 var(--border);
+  }
+
+  table.data th:first-child {
+    z-index: 4;
+  }
+
+  table.data tbody tr:hover td:first-child {
+    background: var(--surface-hover);
+  }
+
+  .model-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .model-toolbar .model-search {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+
+  .model-toolbar > .btn {
+    grid-row: 2;
+  }
+
+  .model-new-filter {
+    grid-row: 2;
+    justify-self: end;
+  }
+}
+
 @media (max-width: 560px) {
   .request-filters .table-filter-fields,
   .account-filters .table-filter-fields {
@@ -1530,6 +1819,25 @@ table.data td.table-empty-cell {
   .cost-account-percent {
     grid-column: 2;
     grid-row: 2;
+  }
+
+  .model-picker-head,
+  .alias-editor-head,
+  .model-bulk-actions,
+  .alias-editor-foot {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-picker-head .btn,
+  .alias-editor-head .btn,
+  .alias-editor-foot .btn {
+    width: 100%;
+  }
+
+  .model-picker-option {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 }
 

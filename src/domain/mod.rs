@@ -219,6 +219,8 @@ pub struct Group {
     pub multiplier_limit: Multiplier,
     pub weights: SchedulingWeights,
     pub queue_capacity: u32,
+    /// 层内全忙时最多等待多久；0 表示跟随请求总超时（§6.3）。
+    pub max_wait_secs: u32,
     pub allow_degrade: bool,
     pub created_at: OffsetDateTime,
 }

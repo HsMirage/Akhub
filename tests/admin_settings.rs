@@ -474,3 +474,72 @@ async fn overview_reports_runtime_metrics() {
         "配置变化列表必须存在"
     );
 }
+
+/// 分组"可选模型"接口：把该分组下所有账号目录里的模型汇总去重（§6.5）。
+#[tokio::test]
+async fn group_available_models_aggregates_account_catalogs() {
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "object": "list",
+        "data": [{"id": "glm-5.3-flash"}, {"id": "deepseek-v4-flash"}]
+    })));
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "glm-5.3-flash",
+            "glm-5.3-flash",
+            50,
+        ),
+    )
+    .await;
+
+    // 拉一次目录，让 account_models 里有可选项。
+    let http = client();
+    write(
+        http.post(format!(
+            "{}/admin/api/accounts/{}/models/refresh",
+            akhub.base_url, wired.account_id
+        ))
+        .header("cookie", &cookie),
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let body: Value = http
+        .get(format!(
+            "{}/admin/api/groups/{}/available-models",
+            akhub.base_url, akhub.group_id
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = body["models"].as_array().expect("models 数组");
+    let names: Vec<&str> = models
+        .iter()
+        .filter_map(|m| m["public_name"].as_str())
+        .collect();
+    assert!(names.contains(&"glm-5.3-flash"), "{body}");
+    assert!(names.contains(&"deepseek-v4-flash"), "{body}");
+    let first = models
+        .iter()
+        .find(|m| m["public_name"] == "glm-5.3-flash")
+        .unwrap();
+    assert!(
+        first["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "账号A"),
+        "要能看出是哪个账号提供的：{first}"
+    );
+}

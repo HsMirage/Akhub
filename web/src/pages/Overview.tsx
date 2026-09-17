@@ -217,7 +217,7 @@ export function Overview({
                       <td>
                         <div
                           className="mono cell-dim cell-truncate"
-                          style={{ maxWidth: 150 }}
+                          style={{ maxWidth: 190 }}
                           title={error.request_id}
                         >
                           {error.request_id}

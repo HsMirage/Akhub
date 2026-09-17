@@ -139,8 +139,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                 weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
-                queue_capacity, allow_degrade, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                queue_capacity, max_wait_secs, allow_degrade, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&group.id)
         .bind(&group.name)
@@ -152,6 +152,7 @@ impl Store {
         .bind(group.weights.first_token)
         .bind(group.weights.throughput)
         .bind(group.queue_capacity)
+        .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
         .bind(group.created_at.unix_timestamp())
         .execute(&self.pool)
@@ -164,7 +165,7 @@ impl Store {
         sqlx::query(
             "UPDATE groups SET name = ?, key_prefix = ?, key_digest_hex = ?, multiplier_limit = ?,
                 weight_multiplier = ?, weight_reliability = ?, weight_first_token = ?,
-                weight_throughput = ?, queue_capacity = ?, allow_degrade = ? WHERE id = ?",
+                weight_throughput = ?, queue_capacity = ?, max_wait_secs = ?, allow_degrade = ? WHERE id = ?",
         )
         .bind(&group.name)
         .bind(&group.key_prefix)
@@ -175,6 +176,7 @@ impl Store {
         .bind(group.weights.first_token)
         .bind(group.weights.throughput)
         .bind(group.queue_capacity)
+        .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
         .bind(&group.id)
         .execute(&self.pool)
@@ -521,6 +523,26 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 分组内所有账号目录里可选的模型（供创建逻辑模型时挑选，§6.5）。
+    ///
+    /// 返回（对外名, 提供它的账号名），按对外名与账号名排序；已标记缺失的
+    /// 模型不出现。
+    pub async fn group_available_models(&self, group_id: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT am.public_name AS public_name, a.name AS account_name
+             FROM account_models am
+             JOIN upstream_accounts a ON a.id = am.account_id
+             WHERE a.group_id = ? AND am.missing = 0
+             ORDER BY am.public_name, a.name",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("public_name")?, row.try_get("account_name")?)))
+            .collect()
     }
 
     pub async fn list_account_models(&self, account_id: &str) -> Result<Vec<AccountModelRow>> {
@@ -2020,6 +2042,7 @@ fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> Result<Group> {
             throughput: row.try_get::<i64, _>("weight_throughput")? as u32,
         },
         queue_capacity: row.try_get::<i64, _>("queue_capacity")? as u32,
+        max_wait_secs: row.try_get::<i64, _>("max_wait_secs").unwrap_or(60) as u32,
         allow_degrade: row.try_get("allow_degrade")?,
         created_at: to_time(row.try_get("created_at")?),
     })
@@ -2181,6 +2204,7 @@ mod tests {
             multiplier_limit: Multiplier::ONE,
             weights: SchedulingWeights::default(),
             queue_capacity: 100,
+            max_wait_secs: 60,
             allow_degrade: true,
             created_at: OffsetDateTime::now_utc(),
         }

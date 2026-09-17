@@ -165,6 +165,10 @@ pub fn router() -> Router<SharedState> {
             post(r::regenerate_key),
         )
         .route(
+            "/admin/api/groups/{id}/available-models",
+            get(r::group_available_models),
+        )
+        .route(
             "/admin/api/accounts",
             get(r::list_accounts).post(r::create_account),
         )

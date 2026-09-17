@@ -68,6 +68,7 @@ export function Groups({ data, refresh }: { data: Data; refresh: () => Promise<v
                   <th>倍率上限</th>
                   <th>调度权重</th>
                   <th>队列容量</th>
+                  <th>最长等待</th>
                   <th>降级</th>
                   <th>模型 / 目标</th>
                   <th />
@@ -84,6 +85,9 @@ export function Groups({ data, refresh }: { data: Data; refresh: () => Promise<v
                       {group.weights.first_token}·{group.weights.throughput}
                     </td>
                     <td className="cell-dim">{group.queue_capacity}</td>
+                    <td className="mono tabular">
+                      {group.max_wait_secs === 0 ? "跟随总超时" : `${group.max_wait_secs}s`}
+                    </td>
                     <td>
                       <Badge tone={group.allow_degrade ? "neutral" : "warn"}>
                         {group.allow_degrade ? "允许" : "禁止"}
@@ -213,6 +217,7 @@ function GroupDrawer({
   const [name, setName] = useState(group?.name ?? "");
   const [limit, setLimit] = useState(group?.multiplier_limit ?? "1");
   const [queue, setQueue] = useState(String(group?.queue_capacity ?? 100));
+  const [maxWait, setMaxWait] = useState(String(group?.max_wait_secs ?? 60));
   const [allowDegrade, setAllowDegrade] = useState(group?.allow_degrade ?? true);
   const [weights, setWeights] = useState<Record<keyof SchedulingWeights, string>>({
     multiplier: String(group?.weights.multiplier ?? DEFAULT_WEIGHTS.multiplier),
@@ -234,8 +239,14 @@ function GroupDrawer({
   const queueValue = Number(queue);
   const queueError =
     Number.isInteger(queueValue) && queueValue >= 0 ? null : "必须是非负整数";
+  const maxWaitValue = Number(maxWait);
+  const maxWaitError =
+    Number.isInteger(maxWaitValue) && maxWaitValue >= 0 && maxWaitValue <= 3600
+      ? null
+      : "必须是 0 到 3600 之间的整数";
 
-  const invalid = !name.trim() || !!limitError || !!weightsError || !!queueError;
+  const invalid =
+    !name.trim() || !!limitError || !!weightsError || !!queueError || !!maxWaitError;
 
   const submit = async () => {
     if (invalid) return;
@@ -245,6 +256,7 @@ function GroupDrawer({
         name: name.trim(),
         multiplier_limit: limit.trim(),
         queue_capacity: queueValue,
+        max_wait_secs: maxWaitValue,
         allow_degrade: allowDegrade,
         weights: {
           multiplier: Number(weights.multiplier),
@@ -362,6 +374,24 @@ function GroupDrawer({
               min={0}
               value={queue}
               onChange={(e) => setQueue(e.target.value)}
+            />
+          )}
+        </Field>
+
+        <Field
+          label="队列最长等待（秒）"
+          error={maxWaitError ?? undefined}
+          hint="层内目标全忙时最多等这么久，超时返回可重试的 429；填 0 表示跟随请求总超时。"
+        >
+          {(id) => (
+            <input
+              id={id}
+              className="input mono"
+              type="number"
+              min={0}
+              max={3600}
+              value={maxWait}
+              onChange={(e) => setMaxWait(e.target.value)}
             />
           )}
         </Field>

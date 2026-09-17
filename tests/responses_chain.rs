@@ -301,6 +301,7 @@ async fn another_group_cannot_reference_our_states() {
         multiplier_limit: akhub::domain::Multiplier::ONE,
         weights: Default::default(),
         queue_capacity: 10,
+        max_wait_secs: 60,
         allow_degrade: true,
         created_at: time::OffsetDateTime::now_utc(),
     };

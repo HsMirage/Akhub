@@ -47,6 +47,8 @@ export interface Group {
   multiplier_limit: string;
   weights: SchedulingWeights;
   queue_capacity: number;
+  /** 层内目标全忙时的最长排队时间；0 表示跟随请求总超时。 */
+  max_wait_secs: number;
   allow_degrade: boolean;
   logical_models: number;
   dispatch_targets: number;
@@ -94,6 +96,12 @@ export interface AccountModel {
   missing: boolean;
   /** 仅"获取模型"响应里有意义：本次拉取新出现的模型。 */
   is_new: boolean;
+}
+
+/** 分组下游账号目录里可直接选择的模型。 */
+export interface AvailableModel {
+  public_name: string;
+  accounts: string[];
 }
 
 /** 账号级模型别名：上游真名 → 对外名（§16.4）。 */

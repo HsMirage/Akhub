@@ -162,6 +162,8 @@ struct Walk<'a> {
     streaming: bool,
     estimated_tokens: u64,
     deadline: Instant,
+    /// 队列等待的截止时刻：分组配置的"最长等待"与请求总超时取更早者（§6.3）。
+    queue_deadline: Instant,
     now_unix: i64,
     /// 已经真正发过请求的目标。每个目标最多尝试一次（§13.1）。
     attempted: Vec<String>,
@@ -245,13 +247,20 @@ async fn forward_inner<'a>(
         now: Instant::now(),
     };
 
+    let deadline = forward.started_at + forward.state.settings.get().request_timeout;
+    let queue_deadline = match forward.group.group.max_wait_secs {
+        // 0 = 跟随请求总超时。
+        0 => deadline,
+        secs => deadline.min(forward.started_at + Duration::from_secs(u64::from(secs))),
+    };
     let mut walk = Walk {
         forward: &forward,
         translation: &translation,
         telemetry: Telemetry::default(),
         streaming,
         estimated_tokens: estimate_tokens(forward.request_bytes, &forward.body),
-        deadline: forward.started_at + forward.state.settings.get().request_timeout,
+        deadline,
+        queue_deadline,
         now_unix,
         attempted: Vec::new(),
         last: None,
@@ -300,7 +309,12 @@ async fn forward_inner<'a>(
     // 第一步：粘性命中时先按等待预算争取原目标（§10.3）。
     if let Some((candidate, binding)) = bound {
         walk.telemetry.sticky_hit = true;
-        let budget = sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at);
+        // 粘性等待同样不能超过分组的"队列最长等待"（§6.3）。
+        let budget = sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at)
+            .min(
+                walk.queue_deadline
+                    .saturating_duration_since(Instant::now()),
+            );
         match walk
             .wait_and_run(&[candidate], budget, &sticky_key, true)
             .await
@@ -358,7 +372,9 @@ impl Walk<'_> {
             Err(flow) => return flow,
         };
         if !busy.is_empty() {
-            let budget = self.deadline.saturating_duration_since(Instant::now());
+            let budget = self
+                .queue_deadline
+                .saturating_duration_since(Instant::now());
             match self.wait_and_run(&busy, budget, sticky_key, false).await {
                 Flow::Continue => {}
                 other => return other,
@@ -373,7 +389,9 @@ impl Walk<'_> {
         if busy.is_empty() {
             return Flow::Continue;
         }
-        let budget = self.deadline.saturating_duration_since(Instant::now());
+        let budget = self
+            .queue_deadline
+            .saturating_duration_since(Instant::now());
         match self.wait_and_run(&busy, budget, sticky_key, false).await {
             Flow::Continue => Flow::Exhausted,
             other => other,

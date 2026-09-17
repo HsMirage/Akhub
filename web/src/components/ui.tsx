@@ -218,12 +218,14 @@ export function Modal({
   open,
   onClose,
   title,
+  className,
   footer,
   children,
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
+  className?: string;
   footer?: ReactNode;
   children: ReactNode;
 }) {
@@ -232,7 +234,12 @@ export function Modal({
   return (
     <>
       <div className="overlay" onClick={onClose} />
-      <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+      <div
+        className={className ? `modal ${className}` : "modal"}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
         <header className="modal-head">
           <h2 className="card-title">{title}</h2>
           <div className="spacer" />
