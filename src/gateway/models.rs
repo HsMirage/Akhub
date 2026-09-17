@@ -223,6 +223,7 @@ mod tests {
                 weights: SchedulingWeights::default(),
                 queue_capacity: 100,
                 max_wait_secs: 60,
+                allow_managed_background: false,
                 allow_degrade: true,
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },

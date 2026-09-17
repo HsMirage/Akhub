@@ -1,5 +1,6 @@
 //! 下游入口路由与请求生命周期（§7.1、§8）。
 
+pub mod background;
 pub mod error;
 pub mod models;
 pub mod passthrough;

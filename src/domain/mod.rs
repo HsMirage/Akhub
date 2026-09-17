@@ -222,6 +222,8 @@ pub struct Group {
     /// 层内全忙时最多等待多久；0 表示跟随请求总超时（§6.3）。
     pub max_wait_secs: u32,
     pub allow_degrade: bool,
+    /// 上游不支持原生后台时，是否允许网关托管后台任务（计划 §29.1）。
+    pub allow_managed_background: bool,
     pub created_at: OffsetDateTime,
 }
 

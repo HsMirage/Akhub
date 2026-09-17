@@ -375,6 +375,14 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .execute(state.store.pool())
         .await
         .unwrap();
+    sqlx::query("ALTER TABLE groups DROP COLUMN allow_managed_background")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE background_tasks")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
     sqlx::query("UPDATE app_settings SET value = '1' WHERE key = 'schema_version'")
         .execute(state.store.pool())
         .await
@@ -417,12 +425,22 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         group_columns.contains("max_wait_secs"),
         "迁移后 groups 缺少 max_wait_secs"
     );
+    assert!(
+        group_columns.contains("allow_managed_background"),
+        "迁移后 groups 缺少 allow_managed_background"
+    );
+    let background_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'background_tasks'")
+            .fetch_one(reopened.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(background_tables, 1, "迁移后应存在 background_tasks 表");
     let version: String =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "3");
+    assert_eq!(version, "4");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

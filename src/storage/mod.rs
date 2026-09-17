@@ -20,7 +20,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///
 /// v2：请求记录补 `first_token_ms` / `input_tokens` / `output_tokens` /
 /// `config_version`，并新增每次尝试明细表 `request_attempts`（§6.6、§6.8）。
-const SCHEMA_VERSION: i64 = 3;
+/// v3：分组补"队列最长等待"`max_wait_secs`（§6.3）。
+/// v4：分组补"允许托管后台"`allow_managed_background`，并新增网关托管后台
+/// 任务表 `background_tasks`（计划 §29.1）。
+const SCHEMA_VERSION: i64 = 4;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -140,6 +143,19 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                     .await
                     .with_context(|| format!("迁移 request_records.{column} 失败"))?;
             }
+        }
+    }
+    if from < 4 {
+        // v4：分组的托管后台开关（老库补列；任务表由 schema.sql 的
+        // CREATE TABLE IF NOT EXISTS 建好，这里不用重复建）。
+        let existing = table_columns(pool, "groups").await?;
+        if !existing.contains("allow_managed_background") {
+            sqlx::query(
+                "ALTER TABLE groups ADD COLUMN allow_managed_background INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 groups.allow_managed_background 失败")?;
         }
     }
     if from < 3 {

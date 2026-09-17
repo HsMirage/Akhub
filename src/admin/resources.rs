@@ -304,6 +304,8 @@ pub struct GroupPayload {
     /// 层内全忙时最多等多久（秒）；0=跟随请求总超时。
     pub max_wait_secs: Option<u32>,
     pub allow_degrade: Option<bool>,
+    /// 允许网关托管后台任务（上游不支持原生后台时才有意义，计划 §29.1）。
+    pub allow_managed_background: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +316,7 @@ pub struct GroupPatch {
     pub queue_capacity: Option<u32>,
     pub max_wait_secs: Option<u32>,
     pub allow_degrade: Option<bool>,
+    pub allow_managed_background: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -328,6 +331,8 @@ pub struct GroupDto {
     /// 队列最长等待（秒）；0=跟随请求总超时（§6.3）。
     pub max_wait_secs: u32,
     pub allow_degrade: bool,
+    /// 允许网关托管后台任务（计划 §29.1）。
+    pub allow_managed_background: bool,
     pub logical_models: usize,
     pub dispatch_targets: usize,
 }
@@ -344,6 +349,7 @@ fn group_dto(state: &SharedState, group: &Group) -> GroupDto {
         queue_capacity: group.queue_capacity,
         max_wait_secs: group.max_wait_secs,
         allow_degrade: group.allow_degrade,
+        allow_managed_background: group.allow_managed_background,
         logical_models: view.map(|v| v.models.len()).unwrap_or(0),
         dispatch_targets: view
             .map(|v| v.models.values().map(|m| m.targets.len()).sum())
@@ -391,6 +397,7 @@ pub async fn create_group(
         weights,
         queue_capacity: payload.queue_capacity.unwrap_or(100),
         max_wait_secs: validate_max_wait(payload.max_wait_secs)?,
+        allow_managed_background: payload.allow_managed_background.unwrap_or(false),
         allow_degrade: payload.allow_degrade.unwrap_or(true),
         created_at: OffsetDateTime::now_utc(),
     };
@@ -431,6 +438,9 @@ pub async fn update_group(
     }
     if let Some(max_wait) = patch.max_wait_secs {
         group.max_wait_secs = validate_max_wait(Some(max_wait))?;
+    }
+    if let Some(allow) = patch.allow_managed_background {
+        group.allow_managed_background = allow;
     }
     if let Some(capacity) = patch.queue_capacity {
         group.queue_capacity = capacity;

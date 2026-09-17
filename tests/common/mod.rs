@@ -483,6 +483,7 @@ pub async fn spawn_akhub_with(settings: Settings, configure: impl FnOnce(&mut Gr
         weights: SchedulingWeights::default(),
         queue_capacity: 100,
         max_wait_secs: 60,
+        allow_managed_background: false,
         allow_degrade: true,
         created_at: OffsetDateTime::now_utc(),
     };

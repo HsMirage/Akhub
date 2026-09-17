@@ -139,8 +139,9 @@ impl Store {
         sqlx::query(
             "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                 weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
-                queue_capacity, max_wait_secs, allow_degrade, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
+                created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&group.id)
         .bind(&group.name)
@@ -154,6 +155,7 @@ impl Store {
         .bind(group.queue_capacity)
         .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
+        .bind(group.allow_managed_background)
         .bind(group.created_at.unix_timestamp())
         .execute(&self.pool)
         .await
@@ -165,7 +167,8 @@ impl Store {
         sqlx::query(
             "UPDATE groups SET name = ?, key_prefix = ?, key_digest_hex = ?, multiplier_limit = ?,
                 weight_multiplier = ?, weight_reliability = ?, weight_first_token = ?,
-                weight_throughput = ?, queue_capacity = ?, max_wait_secs = ?, allow_degrade = ? WHERE id = ?",
+                weight_throughput = ?, queue_capacity = ?, max_wait_secs = ?,
+                allow_degrade = ?, allow_managed_background = ? WHERE id = ?",
         )
         .bind(&group.name)
         .bind(&group.key_prefix)
@@ -178,6 +181,7 @@ impl Store {
         .bind(group.queue_capacity)
         .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
+        .bind(group.allow_managed_background)
         .bind(&group.id)
         .execute(&self.pool)
         .await
@@ -332,6 +336,101 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?,
         )
+    }
+
+    // ------------------------------------------------------- 托管后台任务
+
+    /// 写入或更新一条托管后台任务（计划 §29.1）。
+    pub async fn upsert_background_task(&self, task: &BackgroundTaskRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO background_tasks (id, group_id, logical_model, account_id, target_id,
+                status, upstream_id, created_at, heartbeat_at, finished_at, error_code,
+                sealed_output, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                upstream_id = COALESCE(excluded.upstream_id, background_tasks.upstream_id),
+                heartbeat_at = excluded.heartbeat_at,
+                finished_at = excluded.finished_at,
+                error_code = excluded.error_code,
+                sealed_output = COALESCE(excluded.sealed_output, background_tasks.sealed_output)",
+        )
+        .bind(&task.id)
+        .bind(&task.group_id)
+        .bind(&task.logical_model)
+        .bind(&task.account_id)
+        .bind(&task.target_id)
+        .bind(&task.status)
+        .bind(&task.upstream_id)
+        .bind(task.created_at)
+        .bind(task.heartbeat_at)
+        .bind(task.finished_at)
+        .bind(&task.error_code)
+        .bind(&task.sealed_output)
+        .bind(task.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取一条托管后台任务；分组不匹配时视为不存在（§26.8 的跨组隔离）。
+    pub async fn background_task(
+        &self,
+        id: &str,
+        group_id: &str,
+    ) -> Result<Option<BackgroundTaskRow>> {
+        let row = sqlx::query("SELECT * FROM background_tasks WHERE id = ? AND group_id = ?")
+            .bind(id)
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| background_task_row(&row)).transpose()
+    }
+
+    /// 按 ID 读取一条托管后台任务，不限制分组。
+    ///
+    /// **只给任务执行器内部使用**：执行器已经知道这条任务的归属，而面向客户端的
+    /// 查询必须走带 `group_id` 的版本（§26.8 的跨组隔离）。
+    pub async fn background_task_all_groups(&self, id: &str) -> Result<Option<BackgroundTaskRow>> {
+        let row = sqlx::query("SELECT * FROM background_tasks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| background_task_row(&row)).transpose()
+    }
+
+    /// 列出所有需要恢复的遗留任务：还在 queued/running 但没有心跳推进的。
+    ///
+    /// 进程重启后由启动流程调用，把它们标记为 interrupted（或按上游状态重绑），
+    /// 绝不留下永远 in_progress 的假任务（计划 §29.1）。
+    pub async fn stall_background_tasks(&self, stale_before: i64, finished_at: i64) -> Result<u64> {
+        let affected = sqlx::query(
+            "UPDATE background_tasks
+             SET status = 'interrupted', finished_at = ?, heartbeat_at = ?,
+                 error_code = 'gateway_restart'
+             WHERE status IN ('queued', 'running') AND heartbeat_at < ?",
+        )
+        .bind(finished_at)
+        .bind(finished_at)
+        .bind(stale_before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// 删除过期的托管后台任务。
+    pub async fn prune_background_tasks(&self, now: i64, batch: i64) -> Result<u64> {
+        let affected = sqlx::query(
+            "DELETE FROM background_tasks WHERE id IN
+                (SELECT id FROM background_tasks WHERE expires_at < ? LIMIT ?)",
+        )
+        .bind(now)
+        .bind(batch)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
     }
 
     // -------------------------------------------------- New API 站点级凭据
@@ -1825,6 +1924,43 @@ pub struct AttemptRecord {
     pub counts_against_budget: bool,
 }
 
+/// 一条网关托管的后台任务（计划 §29.1）。
+#[derive(Debug, Clone)]
+pub struct BackgroundTaskRow {
+    pub id: String,
+    pub group_id: String,
+    pub logical_model: String,
+    pub account_id: Option<String>,
+    pub target_id: Option<String>,
+    /// queued / running / completed / incomplete / failed / cancelled / interrupted
+    pub status: String,
+    pub upstream_id: Option<String>,
+    pub created_at: i64,
+    pub heartbeat_at: i64,
+    pub finished_at: Option<i64>,
+    pub error_code: Option<String>,
+    pub sealed_output: Option<Vec<u8>>,
+    pub expires_at: i64,
+}
+
+fn background_task_row(row: &sqlx::sqlite::SqliteRow) -> Result<BackgroundTaskRow> {
+    Ok(BackgroundTaskRow {
+        id: row.try_get("id")?,
+        group_id: row.try_get("group_id")?,
+        logical_model: row.try_get("logical_model")?,
+        account_id: row.try_get("account_id")?,
+        target_id: row.try_get("target_id")?,
+        status: row.try_get("status")?,
+        upstream_id: row.try_get("upstream_id")?,
+        created_at: row.try_get("created_at")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
+        finished_at: row.try_get("finished_at")?,
+        error_code: row.try_get("error_code")?,
+        sealed_output: row.try_get("sealed_output")?,
+        expires_at: row.try_get("expires_at")?,
+    })
+}
+
 /// 请求记录筛选条件（§6.6）。全部字段可选，空表示不限。
 #[derive(Debug, Clone, Default)]
 pub struct RequestFilter {
@@ -2105,6 +2241,10 @@ fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> Result<Group> {
         queue_capacity: row.try_get::<i64, _>("queue_capacity")? as u32,
         max_wait_secs: row.try_get::<i64, _>("max_wait_secs").unwrap_or(60) as u32,
         allow_degrade: row.try_get("allow_degrade")?,
+        allow_managed_background: row
+            .try_get::<i64, _>("allow_managed_background")
+            .unwrap_or(0)
+            != 0,
         created_at: to_time(row.try_get("created_at")?),
     })
 }
@@ -2266,6 +2406,7 @@ mod tests {
             weights: SchedulingWeights::default(),
             queue_capacity: 100,
             max_wait_secs: 60,
+            allow_managed_background: false,
             allow_degrade: true,
             created_at: OffsetDateTime::now_utc(),
         }

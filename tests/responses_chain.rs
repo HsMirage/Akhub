@@ -302,6 +302,7 @@ async fn another_group_cannot_reference_our_states() {
         weights: Default::default(),
         queue_capacity: 10,
         max_wait_secs: 60,
+        allow_managed_background: false,
         allow_degrade: true,
         created_at: time::OffsetDateTime::now_utc(),
     };

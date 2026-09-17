@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS groups (
     -- 层内全忙时最多等多久（秒）；0 表示跟随请求总超时（§6.3、§13.6）。
     max_wait_secs     INTEGER NOT NULL DEFAULT 60,
     allow_degrade     INTEGER NOT NULL,
+    -- 上游不支持原生后台时，是否允许网关托管后台任务（第二期 §29.1）。默认关。
+    allow_managed_background INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL
 );
 
@@ -276,3 +278,27 @@ CREATE TABLE IF NOT EXISTS new_api_sites (
     sealed_token BLOB NOT NULL,
     updated_at  INTEGER NOT NULL
 );
+
+-- 网关托管的后台任务（计划 §29.1）。状态与执行者都落 SQLite：
+-- 进程重启后能明确区分"还在跑""跟着上游走""已中断"，绝不停留在 in_progress。
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id            TEXT PRIMARY KEY,
+    group_id      TEXT NOT NULL,
+    logical_model TEXT NOT NULL,
+    account_id    TEXT,
+    target_id     TEXT,
+    -- queued / running / completed / incomplete / failed / cancelled / interrupted
+    status        TEXT NOT NULL,
+    upstream_id   TEXT,
+    created_at    INTEGER NOT NULL,
+    -- 任务循环每次推进都会更新；重启时用它判断是否为遗留任务。
+    heartbeat_at  INTEGER NOT NULL,
+    finished_at   INTEGER,
+    error_code    TEXT,
+    -- 加密的输出正文（可重放历史），与响应状态链同一套密封格式。
+    sealed_output BLOB,
+    expires_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_background_status ON background_tasks(status, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_background_expiry ON background_tasks(expires_at);

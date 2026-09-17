@@ -204,6 +204,8 @@ pub struct Runtime {
     /// 当前在途请求数（§6.2 概览指标）。计数绑定在响应体上，流式请求直到
     /// 连接结束才算完成。
     in_flight: Arc<std::sync::atomic::AtomicU64>,
+    /// 正在执行的托管后台任务（计划 §29.1）：保存句柄才能做到"真取消"。
+    pub background: crate::gateway::background::RunningTasks,
 }
 
 /// 在途计数守卫：随响应体一起析构，客户端断开也会准确 -1。
@@ -227,6 +229,7 @@ impl Default for Runtime {
             capabilities: Default::default(),
             shutdown: tokio::sync::watch::channel(false).0,
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            background: crate::gateway::background::RunningTasks::new(),
         }
     }
 }
@@ -348,6 +351,16 @@ impl AppState {
                 settings
             }
         };
+
+        // 上次进程遗留的托管后台任务：标记为 interrupted，绝不留假 in_progress
+        // （计划 §29.1）。心跳超过 30 秒没推进的任务不可能是活的。
+        match crate::gateway::background::recover_stale(&store, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "已把遗留的托管后台任务标记为中断"),
+            Err(error) => tracing::warn!(%error, "恢复遗留托管任务失败"),
+        }
 
         // 上次异常退出遗留的临时请求体：启动时清掉（§1291、§1292）。
         let temp_dir = data_dir.join(TEMP_DIR_NAME);
