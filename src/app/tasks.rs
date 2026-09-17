@@ -267,6 +267,14 @@ async fn cleanup(state: Weak<AppState>) {
             Err(error) => tracing::warn!(%error, "清理 Responses 状态失败"),
             _ => {}
         }
+        // 托管后台任务与响应状态共用保留期（计划 §29.1）。
+        match state.store.prune_background_tasks(now, 500).await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "已清理过期托管后台任务");
+            }
+            Err(error) => tracing::warn!(%error, "清理托管后台任务失败"),
+            _ => {}
+        }
     }
 }
 

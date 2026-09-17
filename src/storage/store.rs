@@ -419,6 +419,17 @@ impl Store {
         Ok(affected)
     }
 
+    /// 删除一条托管任务（客户端 DELETE 用；分组不匹配时视为不存在）。
+    pub async fn delete_background_task(&self, id: &str, group_id: &str) -> Result<bool> {
+        let affected = sqlx::query("DELETE FROM background_tasks WHERE id = ? AND group_id = ?")
+            .bind(id)
+            .bind(group_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
     /// 删除过期的托管后台任务。
     pub async fn prune_background_tasks(&self, now: i64, batch: i64) -> Result<u64> {
         let affected = sqlx::query(

@@ -207,6 +207,20 @@ enum Flow {
 
 /// 按严格阶梯依次尝试候选目标，返回第一个成功的上游响应。
 pub async fn forward(forward: Forward<'_>) -> Response {
+    // 网关托管后台任务：满足条件时登记任务并立刻返回任务对象，真正的执行在
+    // 后台跑（计划 §29.1）。不满足条件就照常走同步转发。
+    if let Some(response) = crate::gateway::background::maybe_start_managed(&forward).await {
+        return response;
+    }
+    forward_no_managed(forward).await
+}
+
+/// 不走托管分流的转发入口。
+///
+/// 托管任务内部调用它：任务执行时已经去掉 `background`，再进一次分流既没有
+/// 意义，也会让 `Send` 推断形成环（`forward` → 托管 → spawn(`execute`) →
+/// `forward` → …）。类型上把这条回路切断，编译器才能证明 future 是 `Send`。
+pub async fn forward_no_managed(forward: Forward<'_>) -> Response {
     let streaming = forward
         .body
         .get("stream")

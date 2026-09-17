@@ -400,6 +400,13 @@ pub async fn retrieve(
     let Some(group) = authenticate(&state, &headers) else {
         return auth_error(protocol);
     };
+    // 托管任务（`bg_akh_*`）走自己的表：不问上游，也不看响应状态链（§29.1）。
+    if crate::gateway::background::is_managed(&id) {
+        return match crate::gateway::background::lookup(&state, &group, &id).await {
+            Some(object) => axum::Json(object).into_response(),
+            None => expired_error(protocol, &id).into_response(),
+        };
+    }
     let record = match lookup(&state, &group, &id, protocol).await {
         Ok(record) => record,
         Err(error) => return error.into_response(),
@@ -489,6 +496,15 @@ pub async fn destroy(
     let Some(group) = authenticate(&state, &headers) else {
         return auth_error(protocol);
     };
+    // 托管任务：先中断在跑的执行，再删记录（§29.1）。
+    if crate::gateway::background::is_managed(&id) {
+        let deleted = crate::gateway::background::destroy(&state, &group, &id).await;
+        return if deleted {
+            axum::Json(json!({"id": id, "object": "response", "deleted": true})).into_response()
+        } else {
+            expired_error(protocol, &id).into_response()
+        };
+    }
     let record = match lookup(&state, &group, &id, protocol).await {
         Ok(record) => record,
         Err(error) => return error.into_response(),
@@ -525,6 +541,27 @@ pub async fn cancel(
     let Some(group) = authenticate(&state, &headers) else {
         return auth_error(protocol);
     };
+    // 托管任务：真的中断在跑的任务（断开上游连接），再把状态写进库（§29.1）。
+    if crate::gateway::background::is_managed(&id) {
+        return match crate::gateway::background::cancel(&state, &group, &id).await {
+            None => expired_error(protocol, &id).into_response(),
+            Some((mut object, aborted)) => {
+                if let Some(map) = object.as_object_mut() {
+                    map.insert(
+                        "upstream_connection_aborted".into(),
+                        serde_json::json!(aborted),
+                    );
+                    if !aborted {
+                        map.insert(
+                            "note".into(),
+                            serde_json::json!("任务当时已结束，没有正在执行的上游连接需要中断"),
+                        );
+                    }
+                }
+                axum::Json(object).into_response()
+            }
+        };
+    }
     let record = match lookup(&state, &group, &id, protocol).await {
         Ok(record) => record,
         Err(error) => return error.into_response(),
