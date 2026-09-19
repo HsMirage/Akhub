@@ -24,6 +24,8 @@ export function CalibrationDialog({
 }) {
   const toast = useToast();
   const [model, setModel] = useState("");
+  /** 对账区间天数（§6.8）。站点改过倍率时，区间太长会把新旧两档混在一起。 */
+  const [periodDays, setPeriodDays] = useState(30);
   const [reported, setReported] = useState("");
   const [result, setResult] = useState<CalibrationResult | null>(null);
   const [records, setRecords] = useState<CalibrationRecord[]>([]);
@@ -54,7 +56,10 @@ export function CalibrationDialog({
     if (!accountId || !model || !reported.trim()) return;
     setBusy(true);
     try {
-      const result = await api.calibrate(accountId, model, reported.trim());
+      // 把区间起点算成绝对时间戳传给后端：区间必须由用户明确指定，不能
+      // 让"最近多久"这件事藏在服务端默认值里（§6.8）。
+      const periodStart = Math.floor(Date.now() / 1000) - periodDays * 86_400;
+      const result = await api.calibrate(accountId, model, reported.trim(), periodStart);
       setResult(result);
       toast.success(`校准系数已算出：${result.calibration}`);
       await loadRecords();
@@ -115,6 +120,25 @@ export function CalibrationDialog({
               </select>
             )}
           </Field>
+          <Field
+            label="对账区间"
+            hint="站点改过倍率就选短一点，否则新旧两档会被混在一起，算出的系数两边都不对。"
+          >
+            {(id) => (
+              <select
+                id={id}
+                className="select"
+                value={periodDays}
+                onChange={(e) => setPeriodDays(Number(e.target.value))}
+              >
+                <option value={7}>最近 7 天</option>
+                <option value={30}>最近 30 天</option>
+                <option value={90}>最近 90 天</option>
+              </select>
+            )}
+          </Field>
+        </div>
+        <div className="form-row-2">
           <Field
             label="站点后台该模型扣费倍率"
             hint="去站点后台看这个模型实际扣了多少倍率，填到这里。"

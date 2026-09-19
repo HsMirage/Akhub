@@ -138,6 +138,32 @@ CREATE TABLE IF NOT EXISTS target_perf_snapshot (
     PRIMARY KEY (target_id, protocol, streaming)
 );
 
+-- 分钟级目标性能聚合（§20.1、§22）。后台任务把 request_records 滚进这里，
+-- 后台的 /admin/api/metrics 直接读它，不再对明细表做全表扫描。
+CREATE TABLE IF NOT EXISTS performance_buckets (
+    -- 桶起点（unix 秒，按 bucket_secs 对齐）。
+    bucket_start      INTEGER NOT NULL,
+    target_id         TEXT NOT NULL,
+    protocol          TEXT NOT NULL,
+    streaming         INTEGER NOT NULL,
+    requests          INTEGER NOT NULL,
+    success           INTEGER NOT NULL,
+    -- 延迟与吞吐的累加量，除以 requests 得到桶内均值。
+    total_ms_sum      INTEGER NOT NULL,
+    first_token_sum   INTEGER NOT NULL,
+    -- 只有上报了首字的请求才计入，避免把非流式请求的 0 拉进均值。
+    first_token_count INTEGER NOT NULL,
+    output_tokens_sum INTEGER NOT NULL,
+    -- 失败分类计数（§9.3 的 429/5xx/损坏响应维度）。
+    rate_limited      INTEGER NOT NULL DEFAULT 0,
+    server_errors     INTEGER NOT NULL DEFAULT 0,
+    protocol_errors   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_start, target_id, protocol, streaming)
+);
+
+CREATE INDEX IF NOT EXISTS idx_buckets_time ON performance_buckets(bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_buckets_target ON performance_buckets(target_id, bucket_start DESC);
+
 -- 不含正文的请求元数据（§24.1）。
 CREATE TABLE IF NOT EXISTS request_records (
     request_id       TEXT PRIMARY KEY,
@@ -170,7 +196,24 @@ CREATE TABLE IF NOT EXISTS request_records (
     first_token_ms   INTEGER,
     input_tokens     INTEGER,
     output_tokens    INTEGER,
-    config_version   INTEGER
+    config_version   INTEGER,
+    -- Token 细分（§11.6）：缓存读写与思考 Token。上游没上报就是 NULL，不估算。
+    cache_read_tokens  INTEGER,
+    cache_write_tokens INTEGER,
+    reasoning_tokens   INTEGER,
+    -- 粘性等待与普通排队分开计（§6.6、§24.1）：粘性等待是为了保住前缀缓存，
+    -- 与临时容量不足的排队是两个不同的成本，混在一个 queued_ms 里无法诊断。
+    sticky_wait_ms   INTEGER,
+    -- 缓存新鲜度系数（§10.3 的三档），解释这次为什么愿意等/不愿意等。
+    sticky_freshness REAL,
+    -- 输出速度（token/秒），流式与非流式都算得出（§24.1）。
+    output_tps       REAL,
+    -- 倍率来源（auto/manual）与本次资格的判定结果（§24.1）。
+    multiplier_source TEXT,
+    quota_status      TEXT,
+    -- 候选过滤原因与最终选中的层（§24.1）。只在诊断时读，不参与调度。
+    filter_summary   TEXT,
+    selected_layer   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_started ON request_records(started_at DESC);

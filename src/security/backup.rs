@@ -42,6 +42,12 @@ pub struct BackupData {
     pub dispatch_targets: Vec<Value>,
     pub account_models: Vec<Value>,
     pub account_aliases: Vec<Value>,
+    /// 系统设置（保留期、超时、同步间隔等）。
+    ///
+    /// 带 `serde(default)`：v1 时代导出的备份没有这一项，恢复时按默认值处理，
+    /// 不能因为多了个字段就拒绝一份本来完好的备份（§23.5）。
+    #[serde(default)]
+    pub app_settings: Vec<Value>,
 }
 
 /// 导出的加密信封。
@@ -73,6 +79,7 @@ pub async fn export_backup(
         dispatch_targets: store.backup_targets().await?,
         account_models: store.backup_account_models().await?,
         account_aliases: store.backup_account_aliases().await?,
+        app_settings: store.backup_app_settings().await?,
     };
     if data.groups.is_empty() {
         bail!("当前配置没有任何分组，导出空备份没有意义");
@@ -164,6 +171,7 @@ mod tests {
             dispatch_targets: vec![],
             account_models: vec![],
             account_aliases: vec![],
+            app_settings: vec![],
         };
         let bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "口令123").unwrap();
 
@@ -188,6 +196,7 @@ mod tests {
             dispatch_targets: vec![],
             account_models: vec![],
             account_aliases: vec![],
+            app_settings: vec![],
         };
         let mut bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "pw").unwrap();
         // 翻转信封 JSON 里的一个密文字节。

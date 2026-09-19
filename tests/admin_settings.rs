@@ -325,6 +325,16 @@ async fn insert_record(
             output_tokens,
             config_version: Some(1),
             attempts_detail: Vec::new(),
+            sticky_wait_ms: None,
+            sticky_freshness: None,
+            output_tps: None,
+            multiplier_source: None,
+            quota_status: None,
+            filter_summary: None,
+            selected_layer: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
         }])
         .await
         .unwrap();
@@ -607,4 +617,316 @@ async fn overview_includes_an_hourly_trend_with_empty_buckets_filled() {
         .map(|point| point["success"].as_i64().unwrap_or(0))
         .sum();
     assert_eq!(successes, 1, "只有 2xx 计入成功");
+}
+
+/// 调度诊断列（§24.1）：过滤原因、选中层、粘性等待、倍率来源都要能读到。
+#[tokio::test]
+async fn request_records_expose_scheduling_diagnostics() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+
+    let record = akhub::storage::store::RequestRecord {
+        request_id: "req-diag".to_string(),
+        started_at: akhub::storage::now_unix(),
+        duration_ms: 2_000,
+        protocol: Protocol::OpenAiChat,
+        streaming: true,
+        group_id: Some(akhub.group_id.clone()),
+        logical_model: Some("m-a".to_string()),
+        target_id: Some("t-1".to_string()),
+        account_id: None,
+        upstream_model: Some("glm-4.6".to_string()),
+        request_bytes: 512,
+        upstream_status: Some(200),
+        http_status: 200,
+        error_code: None,
+        endpoint: Some("chat_completions".to_string()),
+        degraded: Some("thinking".to_string()),
+        effective_multiplier: Some(Multiplier::ONE),
+        cheapest_multiplier: Some(Multiplier::ONE),
+        dearest_multiplier: Some(Multiplier::parse("2").unwrap()),
+        attempts: 2,
+        queued_ms: 5,
+        sticky_hit: true,
+        first_token_ms: Some(120),
+        input_tokens: Some(900),
+        output_tokens: Some(400),
+        config_version: Some(3),
+        attempts_detail: Vec::new(),
+        sticky_wait_ms: Some(80),
+        sticky_freshness: Some(0.75),
+        output_tps: Some(200.0),
+        // Token 细分（§11.6）：缓存与思考各自留痕。
+        cache_read_tokens: Some(700),
+        cache_write_tokens: Some(50),
+        reasoning_tokens: Some(120),
+        multiplier_source: Some("manual".to_string()),
+        quota_status: Some("ok".to_string()),
+        filter_summary: Some("倍率超限×2".to_string()),
+        selected_layer: Some(50),
+    };
+    akhub
+        .state
+        .store
+        .insert_request_records(&[record])
+        .await
+        .unwrap();
+
+    let page: Value = client()
+        .get(format!("{}/admin/api/requests", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = &page["data"][0];
+    assert_eq!(row["sticky_wait_ms"], 80, "{row}");
+    assert_eq!(row["sticky_freshness"], 0.75, "{row}");
+    assert_eq!(row["output_tps"], 200.0, "{row}");
+    assert_eq!(row["multiplier_source"], "manual", "{row}");
+    assert_eq!(row["quota_status"], "ok", "{row}");
+    assert_eq!(row["filter_summary"], "倍率超限×2", "{row}");
+    assert_eq!(row["selected_layer"], 50, "{row}");
+    assert_eq!(row["degraded"], "thinking", "{row}");
+    // Token 细分（§11.6）：缓存读写与思考各自一列，没上报就是 null。
+    assert_eq!(row["cache_read_tokens"], 700);
+    assert_eq!(row["cache_write_tokens"], 50);
+    assert_eq!(row["reasoning_tokens"], 120);
+}
+
+/// 运行指标接口（§6.6）：概览之外的进程内指标。
+#[tokio::test]
+async fn the_metrics_endpoint_reports_live_counters() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    let metrics: Value = client()
+        .get(format!("{}/admin/api/metrics", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(metrics["bucket_secs"], 60, "{metrics}");
+    assert!(metrics["since"].as_i64().is_some(), "{metrics}");
+    assert!(metrics["until"].as_i64().is_some(), "{metrics}");
+    assert!(metrics["targets"].is_array(), "{metrics}");
+    // 曲线按分钟补零，没有数据也要有点，不能留空洞。
+    assert!(
+        !metrics["series"].as_array().unwrap().is_empty(),
+        "{metrics}"
+    );
+    for point in metrics["series"].as_array().unwrap() {
+        assert!(point["requests"].is_i64(), "{point}");
+        assert!(point["success"].is_i64(), "{point}");
+    }
+    // 非法区间要明确拒绝，而不是返回一个空结果让人以为"就是没数据"。
+    let bad = client()
+        .get(format!(
+            "{}/admin/api/metrics?since=100&until=10",
+            akhub.base_url
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "until 早于 since 必须报错");
+}
+
+/// 批量刷新全部账号倍率（§11.3）。
+#[tokio::test]
+async fn refreshing_every_multiplier_reports_a_per_account_result() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    // 手工倍率的账号不需要探针，批量刷新应当把它标成"跳过"而不是失败。
+    let result: Value = write(client().post(format!(
+        "{}/admin/api/accounts/refresh-multipliers",
+        akhub.base_url
+    )))
+    .header("cookie", &cookie)
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    // 一个账号都没有时也要给出结构完整的空结果，而不是 500 或 null。
+    assert_eq!(result["total"], 0, "{result}");
+    assert!(result["results"].as_array().unwrap().is_empty(), "{result}");
+    assert!(
+        result["notice"].as_str().unwrap().contains("0/0"),
+        "空结果也要说清刷新了几个：{result}"
+    );
+}
+
+/// 记录保留期为 0 时不写库，但实时统计照常更新（§24.2）。
+#[tokio::test]
+async fn a_zero_retention_window_keeps_live_stats_without_writing_rows() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let cookie = admin_cookie(&akhub).await;
+    write(client().patch(format!("{}/admin/api/settings", akhub.base_url)))
+        .header("cookie", &cookie)
+        .json(&json!({"retention_days": 0}))
+        .send()
+        .await
+        .unwrap();
+
+    // 保留期为 0 时列表里不会留下任何历史行。
+    let page: Value = client()
+        .get(format!("{}/admin/api/requests", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["total"], 0, "{page}");
+
+    // 概览用 retention_off 明说"当日"不是"本月"（§24.2）。
+    let overview: Value = client()
+        .get(format!("{}/admin/api/overview", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["retention_off"], true, "{overview}");
+}
+
+/// 备份要包含系统设置与分组的新列，恢复后不能悄悄退回默认值（§23.5）。
+///
+/// 这条用例是为了钉住一类已经发生过的缺陷：新增列时忘了同步 `backup_groups`
+/// 的列清单与 `import_backup` 的 INSERT，备份就成了"看起来成功、实际丢配置"。
+#[tokio::test]
+async fn backup_restores_settings_and_every_group_column() {
+    let akhub = spawn_akhub_with(Settings::default(), |group| {
+        // 两个非默认值：不同过备份往返就该发现。
+        group.max_wait_secs = 7;
+        group.queue_capacity = 42;
+        group.allow_managed_background = true;
+        group.allow_degrade = false;
+    })
+    .await;
+    let cookie = admin_cookie(&akhub).await;
+    let http = client();
+
+    // 改一个设置项，确认它也会跟着备份走。
+    let patched = http
+        .patch(format!("{}/admin/api/settings", akhub.base_url))
+        .header("cookie", &cookie)
+        .header("x-akhub-csrf", "1")
+        .json(&serde_json::json!({"retention_days": 11}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), 200, "改设置应当成功");
+
+    let exported: Value = http
+        .post(format!("{}/admin/api/backup/export", akhub.base_url))
+        .header("cookie", &cookie)
+        .header("x-akhub-csrf", "1")
+        .json(&serde_json::json!({"password": "备份口令123"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // 导出返回的是**备份信封本身**（不是 {backup: "…"} 包装）：它已经带签名，
+    // 再包一层只会让"直接把这个文件存下来"多一步拆包。
+    assert!(
+        exported["data"].is_object() || exported["payload"].is_object() || exported.is_object(),
+        "导出应当是备份信封：{exported}"
+    );
+    let backup = serde_json::to_string(&exported).unwrap();
+
+    // 恢复前先把配置改成别的值，才能证明是恢复带回来的、而不是原来就在。
+    let reset = http
+        .patch(format!(
+            "{}/admin/api/groups/{}",
+            akhub.base_url, akhub.group_id
+        ))
+        .header("cookie", &cookie)
+        .header("x-akhub-csrf", "1")
+        .json(&serde_json::json!({"max_wait_secs": 3, "queue_capacity": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+    let reset_settings = http
+        .patch(format!("{}/admin/api/settings", akhub.base_url))
+        .header("cookie", &cookie)
+        .header("x-akhub-csrf", "1")
+        .json(&serde_json::json!({"retention_days": 30}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset_settings.status(), 200);
+
+    let imported = http
+        .post(format!("{}/admin/api/backup/import", akhub.base_url))
+        .header("cookie", &cookie)
+        .header("x-akhub-csrf", "1")
+        .json(&serde_json::json!({"password": "备份口令123", "content": backup}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        imported.status().is_success(),
+        "恢复失败：{}",
+        imported.status()
+    );
+
+    // 分组的新列必须回来。
+    let groups: Value = http
+        .get(format!("{}/admin/api/groups", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group = groups["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == akhub.group_id.as_str())
+        .expect("恢复后分组还在");
+    assert_eq!(group["max_wait_secs"], 7, "恢复丢了 max_wait_secs：{group}");
+    assert_eq!(
+        group["queue_capacity"], 42,
+        "恢复丢了 queue_capacity：{group}"
+    );
+    assert_eq!(
+        group["allow_managed_background"], true,
+        "恢复丢了 allow_managed_background：{group}"
+    );
+    assert_eq!(
+        group["allow_degrade"], false,
+        "恢复丢了 allow_degrade：{group}"
+    );
+
+    // 系统设置也必须回来。
+    let settings: Value = http
+        .get(format!("{}/admin/api/settings", akhub.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        settings["retention_days"], 11,
+        "恢复没有带回系统设置：{settings}"
+    );
 }

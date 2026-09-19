@@ -1,17 +1,23 @@
 //! 端点选择顺序（§14.3）。
 //!
-//! 对一个已选调度目标，按以下顺序排出可用端点：
+//! 对一个已选调度目标，按五个档位排出可用端点。档位由下面的 tier() 计算，
+//! 数字小的先试；**同档内保持候选的自然顺序**（稳定排序）：
 //!
-//! 1. 与下游协议相同且未被证实不支持的端点——透传，零转换代价。
-//! 2. 账号首选端点，前提是请求可无损转换。
-//! 3. 其他转换保真度相同的端点。
-//! 4. 需要降级白名单内能力才能使用的端点。
+//! 1. 与下游协议相同，且**已确认支持**——透传，零转换代价。
+//! 2. 与下游协议相同，但**能力未知**（还没成功过一次，也没被证伪）。
+//! 3. 账号首选端点，前提是请求可无损转换。
+//! 4. 其他**已确认支持**且能无损表达的端点。
+//! 5. 其余能无损表达的端点（能力未知）。需要降级白名单内能力的端点排在所有
+//!    无损端点之后。
 //!
-//! 第 4 档被排在最后，等价于"降级只在故障切换时生效"：层内的无损目标全部
-//! 试完之前，需要降级的端点根本轮不到（§14.8）。分组关掉降级开关时它们直接
-//! 被剔除。
+//! 第 1 档与第 2 档的差别只在"有没有成功过一次"，但它和第 4 档一起构成了
+//! "已确认支持优先于能力未知"这条规则：两个都能表达这次请求的端点里，已经
+//! 成功过的那个先试，不必再拿一次失败去试错。
 //!
-//! ��确不支持的端点在证据过期或配置变化前不会重复尝试。
+//! 降级端点排在最后，等价于"降级只在故障切换时生效"：层内的无损端点全部试完
+//! 之前，需要降级的端点根本轮不到（§14.8）。分组关掉降级开关时它们直接被剔除。
+//!
+//! 已证实**不支持**的端点在证据过期或配置变化前不会重复尝试。
 
 use std::time::Instant;
 
@@ -143,10 +149,37 @@ pub fn choices(
             Unsupported::new(format!("账号「{}」没有可用于本次请求的端点", account.name))
         }));
     }
-    // 无损端点一律排在需要降级的端点之前。
-    choices.sort_by_key(|choice| u8::from(!choice.is_lossless()));
+    // 按 §14.3 的五档排序。sort_by_key 是稳定排序，所以同档内保留候选的
+    // 自然顺序——INFERENCE 列表本身有一定道理（越靠前的越通用），不该被打乱。
+    choices.sort_by_key(|choice| tier(choice, account, translation.downstream(), evidence, now));
     choices.truncate(MAX_ENDPOINTS_PER_TARGET);
     Ok(choices)
+}
+
+/// 一个端点候选在 §14.3 里的档位。数字小的先试。
+///
+/// 抽成独立函数是为了让"档位"这件事可以被单独测试：排序规则散在循环里时，
+/// 只能靠构造整个账号来间接验证，很难说清哪一档到底有没有生效。
+fn tier(
+    choice: &Choice,
+    account: &Account,
+    downstream: Protocol,
+    evidence: &Evidence,
+    now: Instant,
+) -> u8 {
+    // 需要降级的端点不参与"已确认支持"的比较：先按无损与否分开，再看证据，
+    // 才不会出现"降级但已确认支持"插到"无损但未知"前面（§14.8）。
+    if !choice.is_lossless() {
+        return 6;
+    }
+    let supported = evidence.is_supported(&account.id, choice.endpoint, now);
+    if choice.endpoint.protocol() == downstream {
+        return if supported { 1 } else { 2 };
+    }
+    if choice.endpoint == Endpoint::native(account.preferred_protocol) {
+        return 3;
+    }
+    if supported { 4 } else { 5 }
 }
 
 /// 该端点的 404 / 405 是否足以证明"这条路由不存在"（§16.7）。
@@ -459,5 +492,109 @@ mod tests {
         // 5xx 与超时不能证明任何能力（§16.7）。
         assert!(!proves_missing_endpoint(&account, Endpoint::Messages, 500));
         assert!(!proves_missing_endpoint(&account, Endpoint::Messages, 429));
+    }
+    /// 五档排序：已确认支持的原生端点最前，其次是能力未知的原生端点，
+    /// 然后是账号首选端点，再是已确认支持的其他端点，降级端点永远最后（§14.3）。
+    #[test]
+    fn the_five_tiers_order_endpoints_by_confirmed_support() {
+        let account = account(Protocol::OpenAiChat, true);
+        let downstream = Protocol::AnthropicMessages;
+        let now = Instant::now();
+        let evidence = Evidence::new();
+        let choice = |endpoint| Choice {
+            endpoint,
+            fidelity: Fidelity::Lossless,
+        };
+
+        // 没有任何证据时：
+        //  - 与下游同协议的 messages 落在第 2 档（未知）
+        //  - 账号首选 chat_completions 落在第 3 档
+        //  - 剩下的推测端点落在第 5 档
+        let messages = choice(Endpoint::Messages);
+        let chat = choice(Endpoint::ChatCompletions);
+        let responses = choice(Endpoint::Responses);
+        assert_eq!(tier(&messages, &account, downstream, &evidence, now), 2);
+        assert_eq!(tier(&chat, &account, downstream, &evidence, now), 3);
+        assert_eq!(tier(&responses, &account, downstream, &evidence, now), 5);
+
+        // messages 成功过一次之后升到第 1 档。
+        evidence.note_supported(&account.id, Endpoint::Messages, now);
+        assert_eq!(tier(&messages, &account, downstream, &evidence, now), 1);
+
+        // responses 成功过一次之后从第 5 档升到第 4 档——但仍排在首选端点之后，
+        // 因为首选端点是管理员显式选的（第 3 档）。
+        evidence.note_supported(&account.id, Endpoint::Responses, now);
+        assert_eq!(tier(&responses, &account, downstream, &evidence, now), 4);
+    }
+
+    /// 降级端点永远排在无损端点之后，哪怕它已经被证实支持（§14.8）。
+    #[test]
+    fn a_degraded_endpoint_never_outranks_a_lossless_one() {
+        let account = account(Protocol::OpenAiChat, true);
+        let now = Instant::now();
+        let evidence = Evidence::new();
+        evidence.note_supported(&account.id, Endpoint::Responses, now);
+
+        let degraded = Choice {
+            endpoint: Endpoint::Responses,
+            fidelity: Fidelity::Degraded(vec!["thinking".to_string()]),
+        };
+        let lossless_unknown = Choice {
+            endpoint: Endpoint::Messages,
+            fidelity: Fidelity::Lossless,
+        };
+        let degraded_tier = tier(
+            &degraded,
+            &account,
+            Protocol::AnthropicMessages,
+            &evidence,
+            now,
+        );
+        let lossless_tier = tier(
+            &lossless_unknown,
+            &account,
+            Protocol::AnthropicMessages,
+            &evidence,
+            now,
+        );
+        assert!(
+            degraded_tier > lossless_tier,
+            "降级端点（{degraded_tier}）必须排在无损端点（{lossless_tier}）之后"
+        );
+    }
+
+    /// 证据过期后退回"能力未知"，不能一直享受第 1 档（§16.7）。
+    #[test]
+    fn support_evidence_expires_back_to_unknown() {
+        let account = account(Protocol::OpenAiChat, true);
+        let now = Instant::now();
+        let evidence = Evidence::new();
+        evidence.note_supported(&account.id, Endpoint::Messages, now);
+        let choice = Choice {
+            endpoint: Endpoint::Messages,
+            fidelity: Fidelity::Lossless,
+        };
+        assert_eq!(
+            tier(
+                &choice,
+                &account,
+                Protocol::AnthropicMessages,
+                &evidence,
+                now
+            ),
+            1
+        );
+        let later = now + crate::upstream::evidence::TTL + std::time::Duration::from_secs(1);
+        assert_eq!(
+            tier(
+                &choice,
+                &account,
+                Protocol::AnthropicMessages,
+                &evidence,
+                later
+            ),
+            2,
+            "过期后退回未知档"
+        );
     }
 }

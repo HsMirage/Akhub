@@ -143,6 +143,10 @@ impl AttemptFailure {
 struct Telemetry {
     attempts: i64,
     queued: Duration,
+    /// 为保住前缀缓存而等待的时长，与普通排队分开计（§6.6、§24.1）。
+    sticky_wait: Option<Duration>,
+    /// 这次粘性等待用到的缓存新鲜度系数（§10.3）。
+    sticky_freshness: Option<f64>,
     sticky_hit: bool,
     cheapest: Option<Multiplier>,
     dearest: Option<Multiplier>,
@@ -151,6 +155,12 @@ struct Telemetry {
     endpoint: Option<Endpoint>,
     /// 本次为了完成请求丢弃的白名单能力（§14.8）。
     degraded: Vec<String>,
+    /// 倍率来源：`auto` / `manual`（§24.1）。
+    multiplier_source: Option<&'static str>,
+    /// 候选过滤原因摘要（§24.1）。
+    filter_summary: Option<String>,
+    /// 最终选中的层；粘性命中时是绑定目标所在的层（§24.1）。
+    selected_layer: Option<i64>,
 }
 
 /// 一次请求在候选之间游走时的全部可变状态。
@@ -173,6 +183,8 @@ struct Walk<'a> {
     last_retry_after: Option<Duration>,
     /// 本次请求最终的 (输入, 输出) Token，成功时写入（§6.6）。
     usage_parts: (Option<u64>, Option<u64>),
+    /// 非流式成功时拿到的完整 Token 细分（§11.6）。
+    usage_detail: Option<stream::UsageBreakdown>,
     /// 每次上游尝试的明细，随请求记录一起落库（§6.6）。
     attempt_log: Vec<AttemptRecord>,
 }
@@ -280,6 +292,7 @@ async fn forward_inner<'a>(
         last: None,
         last_retry_after: None,
         usage_parts: (None, None),
+        usage_detail: None,
         attempt_log: Vec::new(),
     };
 
@@ -294,6 +307,14 @@ async fn forward_inner<'a>(
     };
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
+    walk.telemetry.filter_summary = Some(plan.filter_summary());
+    walk.telemetry.selected_layer = plan.layers.first().map(|layer| i64::from(layer.priority));
+    // 倍率来源与额度状态：都取自账号配置与动态状态，解释"为什么它能被选中"（§24.1）。
+    walk.telemetry.multiplier_source = plan
+        .layers
+        .first()
+        .and_then(|layer| layer.candidates.first())
+        .map(|candidate| candidate.target.account.multiplier_mode.as_str());
 
     // 粘性命中的请求不参与抽签，直接走已绑定目标（§9.5）。
     let sticky_key = sticky::derive(
@@ -323,16 +344,22 @@ async fn forward_inner<'a>(
     // 第一步：粘性命中时先按等待预算争取原目标（§10.3）。
     if let Some((candidate, binding)) = bound {
         walk.telemetry.sticky_hit = true;
+        // 命中粘性即开始计这一项：即使目标当时有空位、一秒没等，也要写下 0
+        // 而不是 null——"命中但没等"与"根本没命中"是两回事（§24.1）。
+        walk.telemetry.sticky_wait = Some(Duration::ZERO);
         // 粘性等待同样不能超过分组的"队列最长等待"（§6.3）。
+        let freshness = sticky::freshness_for(now_unix - binding.last_used_at);
         let budget = sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at)
             .min(
                 walk.queue_deadline
                     .saturating_duration_since(Instant::now()),
             );
-        match walk
+        // 新鲜度系数记下来，解释"这次为什么愿意等/不愿意等"（§24.1）。
+        walk.telemetry.sticky_freshness = Some(freshness);
+        let outcome = walk
             .wait_and_run(&[candidate], budget, &sticky_key, true)
-            .await
-        {
+            .await;
+        match outcome {
             Flow::Done(response) => return response,
             Flow::QueueFull => return walk.queue_full(),
             // 预算耗尽或原目标失败：降级为无粘性请求重新走层内选择，并重绑
@@ -560,7 +587,15 @@ impl Walk<'_> {
 
             let waited = Instant::now();
             let outcome = queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await;
-            self.telemetry.queued += waited.elapsed();
+            let elapsed = waited.elapsed();
+            // 粘性路径上的等待记到 sticky_wait，其余记到普通排队（§6.6、§24.1）。
+            // 两者分开才能回答"这次请求为前缀缓存等了多久"。
+            if sticky {
+                let total = self.telemetry.sticky_wait.unwrap_or_default() + elapsed;
+                self.telemetry.sticky_wait = Some(total);
+            } else {
+                self.telemetry.queued += elapsed;
+            }
 
             if let queue::CapacityWaitOutcome::ShuttingDown = outcome {
                 return Flow::Done(self.fail(
@@ -668,10 +703,12 @@ impl Walk<'_> {
                             record,
                             admission: Some(admission),
                             responses,
+                            degraded: success.degraded.unwrap_or_else(translate::degradation_sink),
                         },
                     ))
                 } else {
                     self.usage_parts = success.usage_parts;
+                    self.usage_detail = success.usage_detail;
                     self.note_attempt(candidate, started, "ok", None, false);
                     admission.settle(health::Outcome::Success, success.usage_tokens);
                     self.forward.state.runtime.perf.observe(
@@ -1113,8 +1150,52 @@ impl Walk<'_> {
             input_tokens: self.usage_parts.0.map(|value| value as i64),
             output_tokens: self.usage_parts.1.map(|value| value as i64),
             config_version: Some(forward.state.config.current().version as i64),
+            sticky_wait_ms: self.telemetry.sticky_wait.map(|d| d.as_millis() as i64),
+            sticky_freshness: self.telemetry.sticky_freshness,
+            output_tps: self.output_tps(),
+            // Token 细分只有拿到 usage 才知道；流式在结算时补写（§11.6）。
+            cache_read_tokens: self
+                .usage_detail
+                .and_then(|usage| usage.cache_read)
+                .map(|value| value as i64),
+            cache_write_tokens: self
+                .usage_detail
+                .and_then(|usage| usage.cache_write)
+                .map(|value| value as i64),
+            reasoning_tokens: self
+                .usage_detail
+                .and_then(|usage| usage.reasoning)
+                .map(|value| value as i64),
+            multiplier_source: self.telemetry.multiplier_source.map(str::to_string),
+            // 额度状态直接读当时的健康注册表：它解释"这次为什么被拦或放行"（§24.1）。
+            quota_status: self.quota_status(candidate),
+            filter_summary: self.telemetry.filter_summary.clone(),
+            selected_layer: self.telemetry.selected_layer,
             attempts_detail: self.attempt_log.clone(),
         }
+    }
+
+    /// 本次请求涉及的账号/目标在记录时刻的额度状态（§24.1）。
+    ///
+    /// 没有候选（例如在鉴权或模型解析阶段就失败）时给 `None`，不编造状态。
+    fn quota_status(&self, candidate: Option<&routing::Candidate>) -> Option<String> {
+        let target = candidate?.target.as_ref();
+        let account = self
+            .forward
+            .state
+            .runtime
+            .health
+            .account(&target.account.id);
+        let state = self.forward.state.runtime.health.target(&target.target.id);
+        Some(state.status(&account).as_str().to_string())
+    }
+
+    /// 输出速度（token/秒）。只有拿到输出 Token 与真实总耗时才算得出；
+    /// 拿不到就给 `None`，绝不估算（§6.8 的同一口径）。
+    fn output_tps(&self) -> Option<f64> {
+        let output = self.usage_parts.1? as f64;
+        let elapsed = self.forward.started_at.elapsed().as_secs_f64();
+        (elapsed > 0.0 && output > 0.0).then(|| output / elapsed)
     }
 
     /// 记一次上游尝试的明细（§6.6）。`endpoint` 取当前尝试真正用到的端点。
@@ -1138,6 +1219,17 @@ impl Walk<'_> {
             error_code: error_code.map(|code| code.as_str().to_string()),
             counts_against_budget,
         });
+        // 成功的尝试就是这个端点"已确认支持"的证据（§14.3 第 1、4 档）。
+        // 只认真正服务过的：发出去被拒绝不构成支持证据。
+        if outcome == "ok"
+            && let Some(endpoint) = self.telemetry.endpoint
+        {
+            self.forward.state.runtime.evidence.note_supported(
+                &candidate.target.account.id,
+                endpoint,
+                Instant::now(),
+            );
+        }
     }
 }
 
@@ -1150,8 +1242,12 @@ struct Success {
     usage_tokens: Option<u64>,
     /// (输入, 输出) Token；流式在结算时才拿得到，这里为 None（§6.6）。
     usage_parts: (Option<u64>, Option<u64>),
+    /// 完整 Token 细分（含缓存与思考）；流式为 None，由结算补（§11.6）。
+    usage_detail: Option<stream::UsageBreakdown>,
     /// 流式 Responses：提交时先落骨架状态，流结束后据此补写完整历史。
     stream_state: Option<StreamStateSeed>,
+    /// 流式过程中解析阶段丢掉的能力（§14.8）。非流式为 None。
+    degraded: Option<translate::DegradationSink>,
 }
 
 /// 流式 Responses 在提交时留下的状态种子。
@@ -1365,14 +1461,19 @@ async fn commit_stream(
             None
         };
         let responses_id = stream_state.as_ref().map(|seed| seed.gateway_id.clone());
-        return match translate::commit_stream(
-            upstream_protocol,
+        // 先建好收集器：它一路走到结算，记录里就能看见"这次流丢了什么"（§14.8）。
+        let degraded = translate::degradation_sink();
+        return match translate::commit_stream(translate::StreamRequest {
+            upstream: upstream_protocol,
             downstream,
             include_usage,
-            &target.account.name,
+            account: &target.account.name,
             response,
             responses_id,
-        )
+            request_id: forward.request_id,
+            // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
+            degraded: degraded.clone(),
+        })
         .await
         {
             Ok(committed) => Ok(Success {
@@ -1382,7 +1483,9 @@ async fn commit_stream(
                 output_tokens: None,
                 usage_tokens: None,
                 usage_parts: (None, None),
+                usage_detail: None,
                 stream_state,
+                degraded: Some(degraded),
             }),
             Err(failure) => {
                 Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
@@ -1429,8 +1532,12 @@ async fn commit_stream(
                                 upstream_protocol,
                             )
                             .await;
-                            let body =
-                                translate::passthrough_responses_stream(prefix, response, &gateway);
+                            let body = translate::passthrough_responses_stream(
+                                prefix,
+                                response,
+                                &gateway,
+                                forward.request_id,
+                            );
                             return Ok(Success {
                                 status,
                                 response: build_response(forward, status, &headers, prepared, body),
@@ -1438,11 +1545,14 @@ async fn commit_stream(
                                 output_tokens: None,
                                 usage_tokens: None,
                                 usage_parts: (None, None),
+                                usage_detail: None,
                                 stream_state: Some(StreamStateSeed {
                                     gateway_id: gateway.clone(),
                                     upstream_id: upstream_id.clone(),
                                     endpoint: prepared.endpoint.as_str().to_string(),
                                 }),
+                                // 同协议原样透传：没有解析，也就没有解析侧降级。
+                                degraded: None,
                             });
                         }
                         stream::Verdict::Error(message) => {
@@ -1493,7 +1603,12 @@ async fn commit_stream(
                 stream::Verdict::Pending => continue,
                 stream::Verdict::Semantic => {
                     let prefix = sniffer.take_buffer();
-                    let body = translate::passthrough_stream(prefix, response, downstream);
+                    let body = translate::passthrough_stream(
+                        prefix,
+                        response,
+                        downstream,
+                        forward.request_id,
+                    );
                     return Ok(Success {
                         status,
                         response: build_response(forward, status, &headers, prepared, body),
@@ -1501,7 +1616,9 @@ async fn commit_stream(
                         output_tokens: None,
                         usage_tokens: None,
                         usage_parts: (None, None),
+                        usage_detail: None,
                         stream_state: None,
+                        degraded: None,
                     });
                 }
                 // 语义内容出现前的明确错误事件：还没花钱，可以换号。
@@ -1645,7 +1762,9 @@ async fn commit_body(
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
         usage_parts: stream::usage_parts(&parsed),
+        usage_detail: Some(stream::usage_breakdown(&parsed)),
         stream_state: None,
+        degraded: None,
     })
 }
 

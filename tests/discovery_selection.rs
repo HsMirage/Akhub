@@ -454,6 +454,16 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
             input_tokens: None,
             output_tokens: None,
             config_version: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            sticky_wait_ms: None,
+            sticky_freshness: None,
+            output_tps: None,
+            multiplier_source: None,
+            quota_status: None,
+            filter_summary: None,
+            selected_layer: None,
             attempts_detail: Vec::new(),
         }])
         .await

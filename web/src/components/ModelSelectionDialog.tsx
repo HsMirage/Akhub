@@ -315,6 +315,9 @@ export function ModelSelectionDialog({
                             <td>
                               <div className="row model-state-badges">
                                 {model.is_new && <Badge tone="info">新增</Badge>}
+                {/* "你排除过"（§16.2）：和"从没出现过"分开。没有这一条，
+                    管理员会以为之前的取消勾选没生效，于是再点一次。 */}
+                {model.excluded && !model.selected && <Badge tone="warn">你排除过</Badge>}
                                 {model.missing && <Badge tone="danger">上游已消失</Badge>}
                                 {!model.is_new && !model.missing && model.selected && <Badge tone="success">已在用</Badge>}
                               </div>

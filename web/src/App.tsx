@@ -107,7 +107,7 @@ function Console({
   const toast = useToast();
   const { theme: mode, toggle } = theme;
   const [route, navigate] = useRoute(ROUTES, "overview");
-  const { data, loading, error, refresh } = useData(true, onSignedOut);
+  const { data, loading, error, truncated, refresh } = useData(true, onSignedOut);
 
   const signOut = async () => {
     try {
@@ -203,6 +203,16 @@ function Console({
             {error && (
               <div className="callout callout-warn" style={{ padding: 16 }}>
                 <span>{error}</span>
+              </div>
+            )}
+            {/* 列表被服务端截断时必须明说（§7.4）：否则管理员会以为配置里
+                就只有这些，而漏掉的恰恰可能是出问题的那一条。 */}
+            {truncated.length > 0 && (
+              <div className="callout callout-warn" style={{ padding: 16 }}>
+                <span>
+                  列表超出单次返回上限，以下内容未完整显示：{truncated.join("、")}。
+                  请用筛选条件缩小范围，或直接调用带 limit/offset 的接口。
+                </span>
               </div>
             )}
             {data && (

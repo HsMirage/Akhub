@@ -97,6 +97,16 @@ impl ErrorCode {
         }
     }
 
+    /// 流内错误帧用的 OpenAI `type`（§18.2）。与完整响应同口径。
+    pub fn openai_type_for_stream(self) -> &'static str {
+        self.openai_type()
+    }
+
+    /// 流内错误帧用的 Anthropic `error.type`（§18.2）。
+    pub fn anthropic_type_for_stream(self) -> &'static str {
+        self.anthropic_type()
+    }
+
     /// Anthropic 错误对象的 `error.type` 字段。
     fn anthropic_type(self) -> &'static str {
         match self.status() {

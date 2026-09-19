@@ -1,7 +1,7 @@
 /** 分组：调度硬边界，签发下游 Key。 */
 import { useState } from "react";
 import { api } from "../lib/api";
-import type { Group, KeyReveal, SchedulingWeights } from "../lib/types";
+import type { Group, GroupAlert, KeyReveal, SchedulingWeights } from "../lib/types";
 import { validateMultiplier } from "../lib/format";
 import type { Data } from "../lib/store";
 import {
@@ -17,6 +17,35 @@ import {
   useToast,
 } from "../components/ui";
 import { IconKey, IconPlus, IconRefresh, IconTrash } from "../components/Icons";
+
+/**
+ * 分组行内的告警（§6.3）。
+ *
+ * 只显示这个分组自己的问题：账号硬停、倍率过期/未知、目标不可用、模型列表为空。
+ * 没有告警时给一个明确的"正常"，避免留白让人以为没加载出来。
+ */
+function GroupAlerts({ alerts }: { alerts: GroupAlert[] }) {
+  if (alerts.length === 0) {
+    return (
+      <Badge tone="success" dot>
+        正常
+      </Badge>
+    );
+  }
+  // 最严重的排前面：一行里能看到的内容有限，先让人看到"新请求会失败"的那种。
+  const sorted = [...alerts].sort((a, b) =>
+    a.level === b.level ? 0 : a.level === "danger" ? -1 : 1,
+  );
+  return (
+    <div className="group-alerts">
+      {sorted.map((alert, index) => (
+        <Badge key={index} tone={alert.level === "danger" ? "danger" : "warn"} dot>
+          {alert.text}
+        </Badge>
+      ))}
+    </div>
+  );
+}
 
 export function Groups({ data, refresh }: { data: Data; refresh: () => Promise<void> }) {
   const toast = useToast();
@@ -71,6 +100,7 @@ export function Groups({ data, refresh }: { data: Data; refresh: () => Promise<v
                   <th>最长等待</th>
                   <th>降级</th>
                   <th>模型 / 目标</th>
+                  <th>告警</th>
                   <th />
                 </tr>
               </thead>
@@ -97,6 +127,9 @@ export function Groups({ data, refresh }: { data: Data; refresh: () => Promise<v
                       <Badge tone={group.dispatch_targets > 0 ? "success" : "neutral"}>
                         {group.logical_models} / {group.dispatch_targets}
                       </Badge>
+                    </td>
+                    <td>
+                      <GroupAlerts alerts={group.alerts} />
                     </td>
                     <td>
                       <div className="cell-actions">

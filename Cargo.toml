@@ -31,7 +31,8 @@ thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.1", features = ["fs", "trace", "limit", "cors"] }
+# catch-panic：单个请求任务的 panic 要隔离成 500，不能让客户端只看到连接被重置（§19.4）。
+tower-http = { version = "0.7.1", features = ["fs", "trace", "limit", "cors", "catch-panic"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "3.0.0"

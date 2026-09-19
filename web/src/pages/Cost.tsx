@@ -76,6 +76,12 @@ export function Cost({ data }: { data: Data }) {
       ) : (
         <div className="cost-content">
           <CostOverview view={view} />
+          {view.retention_off && (
+            <div className="callout callout-warn">
+              保留天数当前为 0：成本口径来自内存汇总，<b>只统计当天</b>；
+              选择「本月」也只能看到当天的数据。
+            </div>
+          )}
           <div className="cost-model-list">
             {view.models.map((model) => (
               <ModelCostCard
@@ -148,7 +154,13 @@ function ModelCostCard({
           <span className="cost-model-group">{groupName}</span>
           <span className="cost-model-requests mono">请求数 {model.requests.toLocaleString()} 次</span>
           <span className="cost-model-tokens mono">Token 数 {model.tokens.toLocaleString()}</span>
-          {model.single_target && <Badge tone="neutral">单目标</Badge>}
+          {model.single_target && (
+            <span
+              title="该模型只挂在一个账号下：省不了钱也谈不上分散风险，加权均倍率就等于它的倍率。新增第二家同价或更低的上游后，这一项才会开始有意义。"
+            >
+              <Badge tone="neutral">单目标</Badge>
+            </span>
+          )}
         </div>
       </header>
 

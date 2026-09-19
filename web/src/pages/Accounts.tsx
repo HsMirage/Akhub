@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, type AccountInput } from "../lib/api";
 import type {
   Account,
+  AccountHealth,
   Limits,
   MultiplierMode,
   Protocol,
@@ -84,6 +85,8 @@ export function Accounts({
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [refreshingMultiplierId, setRefreshingMultiplierId] = useState<string | null>(null);
+  /** 批量刷新倍率进行中（§11.3）。 */
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [syncingModelId, setSyncingModelId] = useState<string | null>(null);
   const [groupFilter, setGroupFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
@@ -147,6 +150,26 @@ export function Accounts({
     }
   };
 
+  const refreshAllMultipliers = async () => {
+    if (refreshingAll) return;
+    setRefreshingAll(true);
+    try {
+      const result = await api.refreshAllMultipliers();
+      await refresh();
+      if (result.failed > 0) {
+        // 部分失败要如实说清楚是哪几个，不能只报"完成"（§11.3）。
+        const names = result.errors.map((item) => item.name).join("、");
+        toast.error(`${result.refreshed}/${result.total} 成功；失败：${names}`);
+      } else {
+        toast.success(result.notice);
+      }
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "批量刷新失败");
+    } finally {
+      setRefreshingAll(false);
+    }
+  };
+
   const syncModels = async (account: Account) => {
     if (syncingModelId === account.id) return;
     setSyncingModelId(account.id);
@@ -198,14 +221,25 @@ export function Accounts({
         title="上游账号"
         description="一个账号 = 一套独立凭据。同一把 Key 要用在两个分组，请复制成两个账号。"
         actions={
-          <Button
-            variant="primary"
-            icon={<IconPlus />}
-            onClick={() => setEditing("new")}
-            disabled={data.groups.length === 0}
-          >
-            新建账号
-          </Button>
+          <div className="row" style={{ gap: 8 }}>
+            {/* 批量刷新：一次探测所有自动倍率账号（§11.3）。 */}
+            <Button
+              icon={<IconRefresh size={13} />}
+              onClick={() => void refreshAllMultipliers()}
+              disabled={refreshingAll || data.accounts.length === 0}
+              title="重新探测所有自动倍率账号"
+            >
+              {refreshingAll ? "刷新中…" : "刷新全部倍率"}
+            </Button>
+            <Button
+              variant="primary"
+              icon={<IconPlus />}
+              onClick={() => setEditing("new")}
+              disabled={data.groups.length === 0}
+            >
+              新建账号
+            </Button>
+          </div>
         }
       >
         {data.groups.length === 0 ? (
@@ -313,6 +347,7 @@ export function Accounts({
                     <th>优先级</th>
                     <th>有效倍率</th>
                     <th>限制</th>
+                    <th>健康</th>
                     <th>状态</th>
                     <th />
                   </tr>
@@ -359,6 +394,9 @@ export function Accounts({
                         </td>
                         <td className="cell-dim" style={{ fontSize: 12 }}>
                           {formatLimits(account.limits)}
+                        </td>
+                        <td>
+                          <AccountHealthBadge health={account.health} />
                         </td>
                         <td>
                           <button
@@ -479,7 +517,57 @@ export function Accounts({
 }
 
 /**
- * 有效倍率一格：数字 + 来源 + 状态。
+ * 账号级健康徽标（§6.9）。
+ *
+ * 账号的熔断与额度是整账号范围的（同一把 Key 下的所有模型共享，§12.1），所以
+ * 必须在这个列表里就能看见——否则只能逐个点进目标页猜，而"这个号还能不能用"
+ * 正是翻这个列表时最想知道的事。
+ */
+function AccountHealthBadge({ health }: { health: AccountHealth }) {
+  const labels: Record<string, string> = {
+    active: "正常",
+    cooldown: "冷却中",
+    half_open: "半开试运行",
+    quota_exhausted: "额度耗尽",
+    key_invalid: "Key 失效",
+    disabled: "已停用",
+  };
+  const tones: Record<string, "success" | "warn" | "danger" | "neutral"> = {
+    active: "success",
+    cooldown: "warn",
+    half_open: "warn",
+    quota_exhausted: "danger",
+    key_invalid: "danger",
+    disabled: "neutral",
+  };
+  const tone = tones[health.status] ?? "neutral";
+  const label = labels[health.status] ?? health.status;
+  // 不可用目标的计数只在有问题的显示，正常时不占版面。
+  const unhealthy = Object.entries(health.targets)
+    .filter(([status]) => status !== "active")
+    .reduce((sum, [, count]) => sum + count, 0);
+
+  return (
+    <div title={health.reason ?? undefined}>
+      <Badge tone={tone} dot>
+        {label}
+      </Badge>
+      {health.target_total > 0 && unhealthy > 0 && (
+        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
+          {health.target_total - unhealthy}/{health.target_total} 目标可用
+        </div>
+      )}
+      {health.target_total === 0 && (
+        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
+          无目标
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+* 有效倍率一格：数字 + 来源 + 状态。
  *
  * 宽限期内显示"已过期 N 分钟"（黄），宽限期结束显示"倍率未知"（红）——
  * 这两种状态直接决定目标能不能被调度，必须在列表里就看见（§11.4）。
@@ -607,6 +695,7 @@ function AccountDrawer({
     max_concurrency: account?.limits.max_concurrency?.toString() ?? "",
     allow_private_network: account?.allow_private_network ?? false,
     auto_sync: account?.auto_sync ?? false,
+    adaptive_protocol: account?.adaptive_protocol ?? true,
   });
   const [busy, setBusy] = useState(false);
 
@@ -706,6 +795,7 @@ function AccountDrawer({
         limits,
         allow_private_network: form.allow_private_network,
         auto_sync: form.auto_sync,
+        adaptive_protocol: form.adaptive_protocol,
       };
       if (form.new_api_token.trim()) payload.new_api_token = form.new_api_token.trim();
       if (editing) {
@@ -1037,6 +1127,19 @@ function AccountDrawer({
             </div>
           )}
         </Field>
+
+        {/* 运行时适配（§6.4）：关掉之后只走账号自己声明的首选端点，不再按
+            端点证据猜别的路径。上游只肯接受一种协议时才关。 */}
+        <Switch
+          checked={form.adaptive_protocol}
+          onChange={(value) => set("adaptive_protocol", value)}
+          label="运行时自动适配端点"
+          hint={
+            form.adaptive_protocol
+              ? "按端点证据依次尝试：能无损表达请求的端点优先，猜错会自动回退。"
+              : "只用首选端点，不做任何推断。上游只接受一种协议、或回退会造成副作用时关闭。"
+          }
+        />
 
         <Switch
           checked={form.allow_private_network}

@@ -23,6 +23,10 @@ const REFRESH_TICK: Duration = Duration::from_secs(10);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 /// 模型自动同步的检查周期。真正的同步时刻由每个账号自己的间隔决定（§16.2）。
 const MODEL_SYNC_TICK: Duration = Duration::from_secs(30);
+/// 分钟桶聚合的检查周期（§22）。每分钟滚一次上一个完整分钟的明细。
+const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
+/// 性能桶的桶宽（秒）。
+const BUCKET_SECS: i64 = 60;
 /// 性能快照的保鲜期：超过就宁可丢弃（§20.1）。
 const SNAPSHOT_HORIZON: i64 = 24 * 3600;
 /// 单次清理的删除批量，避免长事务阻塞写入。
@@ -60,6 +64,38 @@ pub fn spawn(state: &SharedState) {
     ));
     tokio::spawn(model_sync(Arc::downgrade(state)));
     tokio::spawn(cleanup(Arc::downgrade(state)));
+    tokio::spawn(rollup(Arc::downgrade(state)));
+}
+
+/// 把请求明细滚进分钟桶（§22 的"性能分钟桶聚合"）。
+///
+/// 只聚合**已经结束**的分钟，避免把正在进行中的那一分钟反复重算。聚合本身是
+/// 幂等的（先删后建），所以 tick 抖动或重复执行都不会重复计数。
+async fn rollup(state: Weak<AppState>) {
+    let mut ticker = tokio::time::interval(ROLLUP_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 第一次 tick 立即触发，跳过它，从下一个完整周期开始。
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let now = crate::storage::now_unix();
+        // 上一分钟的边界；只滚 [last_minute, this_minute) 这一段。
+        let until = (now / BUCKET_SECS) * BUCKET_SECS;
+        let since = until - BUCKET_SECS;
+        match state
+            .store
+            .rollup_performance_buckets(since, until, BUCKET_SECS)
+            .await
+        {
+            Ok(0) => {}
+            Ok(rows) => tracing::debug!(rows, since, until, "性能分钟桶聚合完成"),
+            // 聚合失败只记日志：它不参与推理热路径，不能因此影响服务（§22）。
+            Err(error) => tracing::warn!(%error, "性能分钟桶聚合失败"),
+        }
+    }
 }
 
 /// 每 60 秒把粘性绑定与性能 EWMA 批量写盘。
@@ -274,6 +310,14 @@ async fn cleanup(state: Weak<AppState>) {
             }
             Err(error) => tracing::warn!(%error, "清理托管后台任务失败"),
             _ => {}
+        }
+        // 性能桶与请求明细同一保留期（§24.2），否则明细删了、聚合还在。
+        let retention_days = state.settings.get().retention_days;
+        if retention_days > 0 {
+            let bucket_cutoff = now - i64::from(retention_days) * 86_400;
+            if let Err(error) = state.store.prune_performance_buckets(bucket_cutoff).await {
+                tracing::warn!(%error, "清理性能桶失败");
+            }
         }
     }
 }

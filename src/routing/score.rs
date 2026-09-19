@@ -121,6 +121,12 @@ pub struct Dimension {
 /// 一个目标在各维度上的统计，按目标独立加锁。
 type TargetStats = Arc<Mutex<HashMap<Dimension, Stats>>>;
 
+/// 性能统计表的内存上限（§19.4）。
+///
+/// 正常路径由 \`retain\` 按"当前配置里还存在的目标"清理；这个上限是兜底：
+/// 万一清理没被调用（例如某种没走配置重载的路径），表也不能无限涨。
+const MAX_TRACKED_TARGETS: usize = 5_000;
+
 /// 全进程的性能统计表。
 #[derive(Default)]
 pub struct Registry {
@@ -153,6 +159,18 @@ impl Registry {
             return Arc::clone(found);
         }
         let mut guard = crate::sync::write(&self.inner);
+        if guard.len() >= MAX_TRACKED_TARGETS && !guard.contains_key(target_id) {
+            // 兜底淘汰：这些条目本来就该由 retain 清掉，走到这里说明清理漏了。
+            // 丢一个已有目标比无界增长好，但要在日志里留下痕迹。
+            if let Some(victim) = guard.keys().next().cloned() {
+                guard.remove(&victim);
+                tracing::warn!(
+                    limit = MAX_TRACKED_TARGETS,
+                    evicted = %victim,
+                    "性能统计表达到上限，已淘汰一个条目（retain 可能漏了）"
+                );
+            }
+        }
         Arc::clone(guard.entry(target_id.to_string()).or_default())
     }
 
@@ -199,6 +217,15 @@ impl Registry {
                 },
             );
         }
+    }
+
+    /// 当前跟踪的目标数，供测试与诊断确认表没有无界增长。
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|guard| guard.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// 丢弃已经不在配置里的目标。
@@ -726,5 +753,33 @@ mod tests {
             let value = random_unit();
             assert!((0.0..1.0).contains(&value), "{value}");
         }
+    }
+
+    /// 性能统计表有兜底上限，即使 retain 没被调用也不会无界增长（§19.4）。
+    #[test]
+    fn the_registry_stops_growing_at_its_cap() {
+        use crate::domain::Protocol;
+        let registry = Registry::new();
+        let dimension = Dimension {
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+        };
+        for i in 0..MAX_TRACKED_TARGETS + 50 {
+            registry.observe(
+                &format!("t{i}"),
+                dimension,
+                &Sample {
+                    success: true,
+                    first_token: None,
+                    total: Duration::from_millis(10),
+                    output_tokens: None,
+                },
+            );
+        }
+        assert!(
+            registry.len() <= MAX_TRACKED_TARGETS + 1,
+            "统计表不该无界增长：{}",
+            registry.len()
+        );
     }
 }

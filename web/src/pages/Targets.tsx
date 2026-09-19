@@ -323,6 +323,7 @@ function ModelBlock({
                   <th>目标</th>
                   <th>有效倍率</th>
                   <th>综合评分</th>
+                  <th>首字 / 速度</th>
                   <th>限制</th>
                   <th>在途</th>
                   <th>状态</th>
@@ -359,12 +360,37 @@ function ModelBlock({
                         <span className="text-faint">—</span>
                       )}
                     </td>
+                    <td className="mono cell-dim" style={{ fontSize: 12 }}>
+                      {/* 冷启动时给 "—" 而不是 0：0 会被读成"很快"（§6.5）。 */}
+                      {target.first_token_ms == null && target.output_tps == null ? (
+                        "—"
+                      ) : (
+                        <>
+                          <div>
+                            {target.first_token_ms == null
+                              ? "—"
+                              : Math.round(target.first_token_ms) + " ms"}
+                          </div>
+                          <div className="text-faint" style={{ fontSize: 11 }}>
+                            {target.output_tps == null
+                              ? "—"
+                              : target.output_tps.toFixed(1) + " tok/s"}
+                          </div>
+                        </>
+                      )}
+                    </td>
                     <td className="cell-dim" style={{ fontSize: 12 }}>
                       {formatLimits(target.effective_limits)}
                     </td>
                     <td className="mono cell-dim">{target.inflight}</td>
                     <td>
                       <StatusBadge target={target} account={account} />
+                      {/* 暂停原因：具体差哪个环节，而不是只说"不可用"（§6.5）。 */}
+                      {target.pause_reason && (
+                        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
+                          {target.pause_reason}
+                        </div>
+                      )}
                     </td>
                     <td>
                       <div className="cell-actions">

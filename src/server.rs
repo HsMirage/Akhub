@@ -8,22 +8,50 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::app::SharedState;
 
 /// 装配全部路由。
 pub fn router(state: SharedState) -> Router {
-    Router::new()
-        .merge(crate::gateway::router())
-        .merge(crate::admin::router())
-        .route("/health/live", get(live))
-        .route("/health/ready", get(ready))
-        .route("/", get(|| async { Redirect::temporary("/admin") }))
-        .fallback(not_found)
+    assemble(
+        Router::new()
+            .merge(crate::gateway::router())
+            .merge(crate::admin::router())
+            .route("/health/live", get(live))
+            .route("/health/ready", get(ready))
+            .route("/", get(|| async { Redirect::temporary("/admin") }))
+            .fallback(not_found),
+        state,
+    )
+}
+
+/// 给路由套上全部公共中间件。
+///
+/// 单独抽出来是为了让测试能用**同一套**中间件包一个会 panic 的处理器，
+/// 验证隔离层真的生效——测 tower-http 自己的行为没有意义，要测的是我们的接线。
+fn assemble(router: Router<SharedState>, state: SharedState) -> Router {
+    router
         .layer(TraceLayer::new_for_http())
+        // 单个请求任务的 panic 必须被隔离（§19.4）。tokio 本来就只终止出错的
+        // 那个任务、不会杀进程，但客户端会看到连接被重置、拿不到任何解释。
+        // 这一层把它变成一个带稳定错误码的 500，同时记一条日志。
+        .layer(CatchPanicLayer::custom(|_| {
+            tracing::error!("请求处理任务 panic，已隔离为 500");
+            crate::gateway::error::GatewayError::new(
+                crate::gateway::error::ErrorCode::InternalError,
+                "内部错误，详见服务端日志",
+            )
+            .into_response()
+        }))
         .layer(axum::middleware::from_fn(security_headers))
-        .with_state(state)
+        .with_state(state.clone())
+        // 每个响应都回带当前配置版本，供后台的乐观锁更新基准（§7.4）。
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::admin::attach_config_version,
+        ))
 }
 
 /// 给所有响应补上最小安全响应头（§23.2）。
@@ -169,4 +197,57 @@ async fn shutdown_signal(grace: Duration) {
         grace_secs = grace.as_secs(),
         "收到停止信号，正在等待在途请求完成"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+
+    /// 单个请求任务 panic 时，客户端拿到的是带稳定错误码的 500，而不是连接被重置（§19.4）。
+    #[tokio::test]
+    async fn a_panicking_handler_becomes_a_500_instead_of_a_dropped_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::app::AppState::bootstrap(dir.path(), crate::app::Settings::default())
+            .await
+            .unwrap();
+
+        // 一个必然 panic 的处理器。显式返回类型是必需的：panic! 的 ! 类型
+        // 无法让编译器推断出处理器该返回什么。
+        async fn boom() -> Response {
+            panic!("故意炸一个请求任务");
+        }
+
+        let app = assemble(Router::new().route("/boom", get(boom)), state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/boom"))
+            .send()
+            .await
+            .expect("请求本身要能拿到响应，而不是连接被重置");
+        assert_eq!(response.status(), 500);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "internal_error",
+            "隔离后的 500 要用网关的稳定错误码：{body}"
+        );
+        assert!(
+            !body.to_string().contains("故意炸"),
+            "不能把 panic 文案回给客户端：{body}"
+        );
+
+        // 隔离的意义在于"只死这一个请求"：下一个请求照常。
+        let again = reqwest::Client::new()
+            .get(format!("http://{addr}/boom"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 500, "服务仍然在跑，能继续回 500");
+    }
 }

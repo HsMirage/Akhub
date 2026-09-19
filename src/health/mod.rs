@@ -165,6 +165,11 @@ impl TargetStatus {
     }
 }
 
+/// 动态状态表的内存上限（§19.4）。
+///
+/// 正常路径由 \`retain\` 按"当前配置里还存在的账号/目标"清理；这是兜底。
+const MAX_TRACKED: usize = 5_000;
+
 /// 所有账号与目标的动态状态。
 #[derive(Default)]
 pub struct Registry {
@@ -230,6 +235,18 @@ fn get_or_insert<T>(
         return Arc::clone(found);
     }
     let mut guard = crate::sync::write(map);
+    if guard.len() >= MAX_TRACKED && !guard.contains_key(key) {
+        // 兜底淘汰：这些条目本该由 retain 清掉。丢掉一个已有目标的熔断状态
+        // 意味着它下次会被当成"健康"重新试一次——比无界增长可接受，但要留痕。
+        if let Some(victim) = guard.keys().next().cloned() {
+            guard.remove(&victim);
+            tracing::warn!(
+                limit = MAX_TRACKED,
+                evicted = %victim,
+                "动态状态表达到上限，已淘汰一个条目（retain 可能漏了）"
+            );
+        }
+    }
     Arc::clone(
         guard
             .entry(key.to_string())
@@ -251,6 +268,16 @@ impl AccountState {
             quota: Mutex::new(Circuit::default()),
             budget: Budget::new(),
         }
+    }
+
+    /// Key 是否已被上游明确判定为失效（§12.3）。供后台的账号健康摘要使用。
+    pub fn key_invalid(&self) -> bool {
+        self.key_invalid.load(Ordering::Acquire)
+    }
+
+    /// 额度是否处于耗尽等待中（§12.3）。
+    pub fn quota_exhausted(&self) -> bool {
+        crate::sync::lock(&self.quota).is_cooling(Instant::now())
     }
 
     /// 不改变半开状态的资格检查。真正占用半开试运行名额由 `try_enter` 完成。

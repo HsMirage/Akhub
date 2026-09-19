@@ -25,6 +25,12 @@ export interface DataStore {
   data: Data | null;
   loading: boolean;
   error: string | null;
+  /**
+   * 被服务端截断的列表名（§7.4）。
+   *
+   * 列表接口有 1000 条上限；超了要明说，否则管理员会以为配置里就只有这些。
+   */
+  truncated: string[];
   refresh: () => Promise<void>;
 }
 
@@ -36,6 +42,7 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
   const [data, setData] = useState<Data | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState<string[]>([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,12 +59,25 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
       setData({
         overview,
         settings,
-        groups,
-        accounts,
-        models,
-        targets,
+        groups: groups.data,
+        accounts: accounts.data,
+        models: models.data,
+        targets: targets.data,
         requests: requests.data,
       });
+      // 哪个列表被截断了要说出来（§7.4）。
+      setTruncated(
+        (
+          [
+            ["分组", groups],
+            ["账号", accounts],
+            ["逻辑模型", models],
+            ["调度目标", targets],
+          ] as const
+        )
+          .filter(([, page]) => page.total > page.data.length)
+          .map(([name, page]) => name + "（" + page.data.length + "/" + page.total + "）"),
+      );
       setError(null);
     } catch (cause) {
       if (cause instanceof ApiError && cause.unauthorized) {
@@ -76,7 +96,7 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
     void refresh();
   }, [active, refresh]);
 
-  return { data, loading, error, refresh };
+  return { data, loading, error, truncated, refresh };
 }
 
 /** 主题：跟随系统，允许手动覆盖并记住选择。 */

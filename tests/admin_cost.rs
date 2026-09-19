@@ -82,6 +82,16 @@ async fn record_tokens(
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             config_version: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            sticky_wait_ms: None,
+            sticky_freshness: None,
+            output_tps: None,
+            multiplier_source: None,
+            quota_status: None,
+            filter_summary: None,
+            selected_layer: None,
             attempts_detail: Vec::new(),
         }])
         .await

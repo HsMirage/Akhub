@@ -72,6 +72,16 @@ impl IntoResponse for AdminError {
 
 pub type AdminResult<T> = Result<T, AdminError>;
 
+/// 配置版本头（§7.4），**收发共用一个名字**。
+///
+/// - 请求方向：写操作带上它读到的版本，对不上就 409。
+/// - 响应方向：每个响应回带当前版本，客户端不必再拉一次概览。
+///
+/// 两个方向刻意用同一个头名（类似 ETag 与 If-Match 的关系），所以这里只有
+/// **一个**常量。曾经写成两个同名常量，那是纯粹的陷阱：改掉其中一个不会有
+/// 任何编译错误，只会让乐观锁静默失效。
+pub const CONFIG_VERSION_HEADER: &str = "x-akhub-config-version";
+
 /// 已登录的管理员。作为提取器出现在任何需要鉴权的处理函数签名中。
 #[derive(Debug, Clone)]
 pub struct Admin {
@@ -99,6 +109,32 @@ impl FromRequestParts<SharedState> for Admin {
                 format!("写操作必须携带 {CSRF_HEADER} 请求头"),
             ));
         }
+
+        // 乐观锁（§7.4）：写操作带上它读到的配置版本，与当前版本不一致说明
+        // 别人已经改过配置，返回 409 让用户重新加载，而不是静默覆盖。
+        // 不带头部表示"我知道自己在做什么"（例如脚本初始化），保持兼容。
+        if parts.method != axum::http::Method::GET
+            && let Some(raw) = parts.headers.get(CONFIG_VERSION_HEADER)
+        {
+            let expected = raw
+                .to_str()
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .ok_or_else(|| {
+                    AdminError::bad_request(format!(
+                        "{CONFIG_VERSION_HEADER} 必须是配置版本号（整数）"
+                    ))
+                })?;
+            let current = state.config.current().version;
+            if expected != current {
+                return Err(AdminError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "config_conflict: 配置已被其他修改更新（你的版本 {expected}，当前 {current}），                         请重新加载后再保存，避免覆盖别人的修改。"
+                    ),
+                ));
+            }
+        }
         Ok(Admin { username })
     }
 }
@@ -115,16 +151,31 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
-/// 构造登录成功时下发的 Cookie。
+/// 构造登录成功时下发的 Cookie（§23.2）。
 ///
-/// 不设 `Secure`：Akhub 第一期建议由反向代理终止 HTTPS，也支持 `127.0.0.1`
-/// 直连，硬加 `Secure` 会让本地部署无法登录。生产环境请置于 HTTPS 之后。
-pub(crate) fn session_cookie_header(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
+/// `secure` 由请求判定：Akhub 自己不终止 TLS，所以看反向代理给的
+/// `X-Forwarded-Proto`。硬加 `Secure` 会让 `127.0.0.1` 直连无法登录，
+/// 完全不加又等于在 HTTPS 部署下放弃一层保护，因此按实际情况决定。
+pub(crate) fn session_cookie_header(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200{secure}")
 }
 
 fn cleared_cookie_header() -> String {
     format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+}
+
+/// 这个请求是不是走 HTTPS 进来的（§23.2）。
+///
+/// 只认反向代理的 `X-Forwarded-Proto`：Akhub 监听的是明文 HTTP，直连时
+/// 该头不存在，就不加 `Secure`，本地开发因此仍然能登录。
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        // 代理链可能给出 "https, http" 这种列表，取最左边（最初的那一跳）。
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
 }
 
 #[derive(Deserialize)]
@@ -175,6 +226,10 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/admin/api/accounts/{id}",
             patch_or_delete(r::update_account, r::delete_account),
+        )
+        .route(
+            "/admin/api/accounts/refresh-multipliers",
+            post(r::refresh_all_multipliers),
         )
         .route(
             "/admin/api/accounts/{id}/refresh-multiplier",
@@ -234,6 +289,7 @@ pub fn router() -> Router<SharedState> {
             patch_or_delete(r::update_target, r::delete_target),
         )
         .route("/admin/api/requests", get(r::list_requests))
+        .route("/admin/api/metrics", get(r::metrics))
         .route(
             "/admin/api/settings",
             get(r::get_settings).patch(r::update_settings),
@@ -252,6 +308,24 @@ pub fn router() -> Router<SharedState> {
             "/admin/{*path}",
             get(|Path(path): Path<String>| async move { ui::serve(&path).await }),
         )
+}
+
+/// 把当前配置版本写到响应头（§7.4）。
+///
+/// 在 server.rs 装配路由时挂载——那里才有具体的状态可用。写在处理器之后：
+/// 写操作会先 bump 版本，客户端拿到的必须是**写完之后**的新值，否则下一次
+/// 写又会 409。
+pub async fn attach_config_version(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let version = state.config.current().version;
+    if let Ok(value) = axum::http::HeaderValue::from_str(&version.to_string()) {
+        response.headers_mut().insert(CONFIG_VERSION_HEADER, value);
+    }
+    response
 }
 
 /// 把 PATCH 与 DELETE 装配到同一路径上。
@@ -281,6 +355,7 @@ async fn setup_status(State(state): State<SharedState>) -> AdminResult<axum::Jso
 /// 创建首个管理员。只能成功一次。
 async fn setup(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     axum::Json(credentials): axum::Json<Credentials>,
 ) -> AdminResult<Response> {
     if credentials.username.trim().is_empty() {
@@ -305,12 +380,17 @@ async fn setup(
         .await
         .map_err(|_| AdminError::conflict("管理员已存在，首次设置只能执行一次"))?;
 
-    issue_session(&state, credentials.username.trim())
+    issue_session(
+        &state,
+        credentials.username.trim(),
+        request_is_https(&headers),
+    )
 }
 
 /// 管理员登录。
 async fn login(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     axum::Json(credentials): axum::Json<Credentials>,
 ) -> AdminResult<Response> {
     let username = credentials.username.trim();
@@ -336,7 +416,7 @@ async fn login(
         return Err(AdminError::unauthorized("用户名或密码错误"));
     }
 
-    issue_session(&state, username)
+    issue_session(&state, username, request_is_https(&headers))
 }
 
 /// 退出登录，令牌立即失效。
@@ -351,13 +431,13 @@ async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Respons
         .into_response()
 }
 
-fn issue_session(state: &SharedState, username: &str) -> AdminResult<Response> {
+fn issue_session(state: &SharedState, username: &str, secure: bool) -> AdminResult<Response> {
     let token = state
         .sessions
         .create(username)
         .map_err(AdminError::internal)?;
     Ok((
-        [(header::SET_COOKIE, session_cookie_header(&token))],
+        [(header::SET_COOKIE, session_cookie_header(&token, secure))],
         axum::Json(json!({ "username": username, "csrf_header": CSRF_HEADER })),
     )
         .into_response())
@@ -390,10 +470,36 @@ mod tests {
 
     #[test]
     fn issued_cookies_are_http_only_and_same_site_strict() {
-        let cookie = session_cookie_header("tok123");
+        let cookie = session_cookie_header("tok123", false);
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("tok123"));
+        // 明文直连（本地 127.0.0.1）不加 Secure，否则本地根本登不上去。
+        assert!(!cookie.contains("Secure"));
+    }
+
+    /// HTTPS 部署下必须加 `Secure`（§23.2）。
+    #[test]
+    fn https_requests_get_a_secure_cookie() {
+        let cookie = session_cookie_header("tok123", true);
+        assert!(cookie.contains("; Secure"), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+    }
+
+    /// `X-Forwarded-Proto` 的判定：只认 https，且能吃下代理链的列表。
+    #[test]
+    fn forwarded_proto_decides_whether_the_cookie_is_secure() {
+        let proto = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-proto", HeaderValue::from_str(value).unwrap());
+            request_is_https(&headers)
+        };
+        assert!(!request_is_https(&HeaderMap::new()), "没有该头说明是直连");
+        assert!(proto("https"));
+        assert!(proto("HTTPS"), "大小写不敏感");
+        assert!(proto("https, http"), "取最初那一跳");
+        assert!(!proto("http"), "明文反代不能加 Secure");
+        assert!(!proto("http, https"));
     }
 
     #[test]

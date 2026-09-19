@@ -1,5 +1,6 @@
 //! 进程共享状态、后台任务与优雅关闭（§19.1、§22、§25.3）。
 
+pub mod live_stats;
 pub mod recorder;
 pub mod tasks;
 
@@ -206,6 +207,8 @@ pub struct Runtime {
     in_flight: Arc<std::sync::atomic::AtomicU64>,
     /// 正在执行的托管后台任务（计划 §29.1）：保存句柄才能做到"真取消"。
     pub background: crate::gateway::background::RunningTasks,
+    /// 保留期为 0 时的内存实时汇总（§3、§24.2）。与请求记录器共享同一个实例。
+    pub live: Arc<live_stats::LiveStats>,
 }
 
 /// 在途计数守卫：随响应体一起析构，客户端断开也会准确 -1。
@@ -230,6 +233,7 @@ impl Default for Runtime {
             shutdown: tokio::sync::watch::channel(false).0,
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             background: crate::gateway::background::RunningTasks::new(),
+            live: Arc::new(live_stats::LiveStats::new()),
         }
     }
 }
@@ -332,7 +336,6 @@ impl AppState {
         let pool = crate::storage::open(data_dir).await?;
         let store = Store::new(pool);
         let config = ConfigService::load(store.clone()).await?;
-        let recorder = RequestRecorder::spawn(store.clone());
         let runtime = Runtime::default();
         restore(&store, &runtime).await?;
 
@@ -370,6 +373,14 @@ impl AppState {
             sweep_stale_temp_files(&temp_dir);
         }
 
+        // 请求记录器要看保留期决定"落库还是只进内存"，所以必须在设置服务之后建。
+        let settings_service = SettingsService::new(settings);
+        let recorder = RequestRecorder::spawn(
+            store.clone(),
+            settings_service.clone(),
+            Arc::clone(&runtime.live),
+        );
+
         let state = Arc::new(AppState {
             cipher: master_key.cipher(),
             key_digest: master_key.key_digest(),
@@ -378,7 +389,7 @@ impl AppState {
             store,
             upstream: UpstreamClient::new().context("构造上游 HTTP 客户端失败")?,
             sessions: SessionStore::new(),
-            settings: SettingsService::new(settings),
+            settings: settings_service,
             recorder,
             runtime,
             refresh: tasks::RefreshHandle::default(),

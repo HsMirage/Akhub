@@ -498,6 +498,18 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
                   <td className="mono">{settings.capability_catalog_revision}</td>
                 </tr>
                 <tr>
+                  <td className="text-faint">协议适配层版本</td>
+                  <td className="mono">{settings.adapter_version}</td>
+                </tr>
+                {/* 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里，
+                    排查"密钥文件在哪""数据库在哪"时要能一眼看到。 */}
+                <tr>
+                  <td className="text-faint">数据目录</td>
+                  <td className="mono cell-truncate" title={data.overview.data_dir}>
+                    {data.overview.data_dir}
+                  </td>
+                </tr>
+                <tr>
                   <td className="text-faint">主密钥来源</td>
                   <td>
                     {data.overview.master_key_from_env ? (

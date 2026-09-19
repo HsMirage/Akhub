@@ -316,8 +316,9 @@ async fn the_full_configuration_path_works_end_to_end() {
         .json()
         .await
         .unwrap();
-    assert_eq!(models[0]["dispatch_targets"], 1);
-    assert_eq!(models[0]["listed"], true);
+    // 列表接口现在是分页信封（§7.4）。
+    assert_eq!(models["data"][0]["dispatch_targets"], 1);
+    assert_eq!(models["data"][0]["listed"], true);
 
     // 用刚拿到的下游 Key 真的能取到模型列表。
     let listed: Value = reqwest::Client::new()
@@ -879,4 +880,531 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .await
     .unwrap();
     assert_eq!(zero.status(), 400);
+}
+
+/// 配置版本乐观锁（§7.4）：带上对不上的版本写 → 409，带上当前版本 → 成功，
+/// 每次响应都回带最新版本，不带头部时保持兼容。
+#[tokio::test]
+async fn writes_carry_config_version_and_conflict_is_reported() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+
+    // 读一次拿到当前版本（响应头里就有）。客户端开了 cookie_store，
+    // 会话 Cookie 会自动带上，不需要手动传。
+    let listed = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap();
+    let header = listed
+        .headers()
+        .get("x-akhub-config-version")
+        .expect("响应必须回带配置版本")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let version: u64 = header.parse().unwrap();
+
+    let create = |expected: Option<u64>, name: &str| {
+        let mut builder = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/groups"),
+        );
+        if let Some(value) = expected {
+            builder = builder.header("x-akhub-config-version", value.to_string());
+        }
+        builder.json(&json!({"name": name, "multiplier_limit": "1"}))
+    };
+
+    // 带一个对不上的版本号：必须 409，且错误里点明是版本冲突。
+    // 刻意用 version + 1000 而不是 version - 1：版本号可能本来就是 0/1，
+    // 减一之后容易撞上当前值，那条用例就白测了。
+    let stale = create(Some(version + 1000), "不该写进去")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409, "对不上的版本必须被拒绝");
+    let body: Value = stale.json().await.unwrap();
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("config_conflict"),
+        "错误里要能认出是版本冲突：{message}"
+    );
+
+    // 被拒绝的写入不能真的落库。
+    let groups: Value = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        groups["data"].as_array().unwrap().is_empty(),
+        "冲突的写入不该产生分组：{groups}"
+    );
+
+    // 带当前版本：成功，并且响应头里的版本已经前进。
+    let ok = create(Some(version), "主力").send().await.unwrap();
+    assert_eq!(ok.status(), 201, "当前版本应当允许写入");
+    let after: u64 = ok
+        .headers()
+        .get("x-akhub-config-version")
+        .expect("写响应也要回带版本")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        after > version,
+        "写成功后版本号必须前进：{version} → {after}"
+    );
+
+    // 不带版本头：老客户端与脚本仍然可用，不强制升级。
+    let no_header = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "脚本建的", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(no_header.status(), 201, "不带头部应当保持兼容");
+
+    // 版本号不是数字时明确报错，而不是当成"没带"。
+    let malformed = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .header("x-akhub-config-version", "不是数字")
+    .json(&json!({"name": "坏的", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(malformed.status(), 400, "非法版本号要明确拒绝");
+}
+
+/// 版本冲突后必须重新加载才能再写：同一份陈旧版本重试仍然 409（§7.4）。
+///
+/// 这条钉住的是"提示重新加载"到底有没有约束力——如果冲突响应把新版本号
+/// 回带并被客户端采纳，用户再点一次保存就会成功并覆盖别人的修改。
+#[tokio::test]
+async fn a_stale_version_keeps_failing_until_a_read_refreshes_it() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+
+    let current: u64 = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let stale = current + 1000;
+
+    let attempt = |version: u64, name: &str| {
+        write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/groups"),
+        )
+        .header("x-akhub-config-version", version.to_string())
+        .json(&json!({"name": name, "multiplier_limit": "1"}))
+    };
+
+    // 连续两次用同一个陈旧版本：都必须是 409。
+    for round in 0..2 {
+        let response = attempt(stale, "覆盖尝试").send().await.unwrap();
+        assert_eq!(response.status(), 409, "第 {round} 次重试也应当被拒绝");
+    }
+
+    // 冲突响应里仍然带着当前版本（客户端可以据此提示用户），只是客户端
+    // 不该采纳它去写。
+    let conflict = attempt(stale, "再看一次").send().await.unwrap();
+    let advertised: u64 = conflict
+        .headers()
+        .get("x-akhub-config-version")
+        .expect("冲突响应也要说明当前版本")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(advertised, current);
+
+    // 重新读一次拿到最新版本，再用它写就成功——这就是"重新加载后保存"。
+    let refreshed: u64 = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ok = attempt(refreshed, "重新加载后写入").send().await.unwrap();
+    assert_eq!(ok.status(), 201, "用最新版本应当写入成功");
+}
+
+/// 账号健康摘要（§6.9）：正常、无目标、停用三种情况都要有明确状态与原因。
+#[tokio::test]
+async fn accounts_report_a_health_summary() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+    let account: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts"),
+    )
+    .json(&json!({
+        "group_id": group_id,
+        "name": "账号A",
+        "upstream_type": "openai_compatible",
+        "base_url": "https://api.example.com",
+        "api_key": "sk-x",
+        "preferred_protocol": "openai_chat",
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let account_id = account["id"].as_str().unwrap().to_string();
+
+    // 还没有目标：状态正常但原因要说清"没有目标"。
+    assert_eq!(account["health"]["status"], "active", "{account}");
+    assert_eq!(account["health"]["target_total"], 0, "{account}");
+    assert!(
+        account["health"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("没有任何调度目标"),
+        "{account}"
+    );
+
+    // 加一个目标后：正常，没有原因，目标计数为 1。
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/targets"),
+    )
+    .json(&json!({
+        "logical_model_id": model["id"],
+        "account_id": account_id,
+        "upstream_model": "glm-4.6",
+    }))
+    .send()
+    .await
+    .unwrap();
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/accounts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == account_id.as_str())
+        .unwrap();
+    assert_eq!(row["health"]["status"], "active", "{row}");
+    assert_eq!(row["health"]["target_total"], 1, "{row}");
+    assert_eq!(row["health"]["targets"]["active"], 1, "{row}");
+    assert!(row["health"]["reason"].is_null(), "{row}");
+
+    // 停用账号：状态与原因都要立刻反映出来。
+    let disabled: Value = write(
+        &client,
+        reqwest::Method::PATCH,
+        format!("{base}/admin/api/accounts/{account_id}"),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(disabled["health"]["status"], "disabled", "{disabled}");
+    assert!(
+        disabled["health"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("已停用"),
+        "{disabled}"
+    );
+}
+
+/// 分组告警（§6.3）：没有目标的分组要明说 "/v1/models 会返回空列表"。
+#[tokio::test]
+async fn groups_report_their_own_alerts() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == group_id.as_str())
+        .unwrap();
+    let alerts = row["alerts"].as_array().unwrap();
+    assert!(!alerts.is_empty(), "空分组必须有告警：{row}");
+    assert!(
+        alerts
+            .iter()
+            .any(|a| a["text"].as_str().unwrap().contains("/v1/models")),
+        "要明说模型列表会为空：{row}"
+    );
+    assert!(
+        alerts
+            .iter()
+            .all(|a| a["level"] == "warn" || a["level"] == "danger"),
+        "{row}"
+    );
+
+    // 建好账号与目标之后，告警应当清空。
+    let account: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts"),
+    )
+    .json(&json!({
+        "group_id": group_id,
+        "name": "账号A",
+        "upstream_type": "openai_compatible",
+        "base_url": "https://api.example.com",
+        "api_key": "sk-x",
+        "preferred_protocol": "openai_chat",
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/targets"),
+    )
+    .json(&json!({
+        "logical_model_id": model["id"],
+        "account_id": account["id"],
+        "upstream_model": "glm-4.6",
+    }))
+    .send()
+    .await
+    .unwrap();
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == group_id.as_str())
+        .unwrap();
+    assert!(
+        row["alerts"].as_array().unwrap().is_empty(),
+        "配好之后不该还有告警：{row}"
+    );
+}
+
+/// 停用的目标要说清"为什么不动了"，而不是只给一个灰点（§6.9）。
+#[tokio::test]
+async fn a_disabled_target_reports_its_pause_reason() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+    let account: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts"),
+    )
+    .json(&json!({
+        "group_id": group_id,
+        "name": "账号A",
+        "upstream_type": "openai_compatible",
+        "base_url": "https://api.example.com",
+        "api_key": "sk-x",
+        "preferred_protocol": "openai_chat",
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let target: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/targets"),
+    )
+    .json(&json!({
+        "logical_model_id": model["id"],
+        "account_id": account["id"],
+        "upstream_model": "glm-4.6",
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let target_id = target["id"].as_str().unwrap().to_string();
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == target_id.as_str())
+        .unwrap();
+    assert_eq!(row["status"], "active", "{row}");
+    assert!(row["pause_reason"].is_null(), "{row}");
+
+    // 通过分组开关停用整个账号的调度：目标状态与原因都要立刻反映出来。
+    write(
+        &client,
+        reqwest::Method::PATCH,
+        format!("{base}/admin/api/targets/{target_id}"),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == target_id.as_str())
+        .unwrap();
+    assert_eq!(
+        row["status"], "disabled",
+        "停用的目标状态应当是 disabled：{row}"
+    );
+    assert!(
+        row["pause_reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "停用必须给出原因：{row}"
+    );
 }

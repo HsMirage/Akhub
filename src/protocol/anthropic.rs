@@ -831,12 +831,21 @@ impl StreamEmitter {
 }
 
 /// 流中途出错时的错误帧（§18.2）。
-pub fn error_event(message: &str) -> (String, Value) {
+pub fn error_event(
+    code: crate::gateway::error::ErrorCode,
+    message: &str,
+    request_id: Option<&str>,
+) -> (String, Value) {
     (
         "error".into(),
         json!({
             "type": "error",
-            "error": {"type": "api_error", "message": message},
+            "error": {
+                "type": code.anthropic_type_for_stream(),
+                "message": message,
+                "code": code.as_str(),
+            },
+            "request_id": request_id,
         }),
     )
 }

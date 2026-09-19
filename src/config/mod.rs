@@ -59,14 +59,26 @@ pub struct GroupView {
 pub struct RuntimeConfig {
     pub version: u64,
     pub groups: Vec<Arc<GroupView>>,
-    /// 下游 Key 摘要 → 分组。鉴权只需一次哈希查表。
-    by_key_digest: HashMap<String, Arc<GroupView>>,
 }
 
 impl RuntimeConfig {
-    /// 按下游 Key 的摘要定位分组。
+    /// 按下游 Key 的摘要定位分组（§19.2、§7.2）。
+    ///
+    /// 用**定长常量时间扫描**而不是哈希查表。表里存的是 Key 的 HMAC 摘要而非
+    /// Key 本身，所以即使旁路出摘要也无法反推出可用的 Key；但提前返回的比较会
+    /// 泄漏"前几个字符猜对了"，而分组数量是个位数、每次比较 64 字节，这点代价
+    /// 换来的是这个问题彻底消失。
+    ///
+    /// 注意：找到之后**不能 break**，否则耗时又和"第几个分组命中"相关。
     pub fn group_by_key_digest(&self, digest_hex: &str) -> Option<&Arc<GroupView>> {
-        self.by_key_digest.get(digest_hex)
+        let candidate = digest_hex.as_bytes();
+        let mut found: Option<&Arc<GroupView>> = None;
+        for group in &self.groups {
+            if crate::security::ct_eq(candidate, group.group.key_digest_hex.as_bytes()) {
+                found = Some(group);
+            }
+        }
+        found
     }
 
     pub fn group_by_id(&self, id: &str) -> Option<&Arc<GroupView>> {
@@ -197,19 +209,14 @@ fn build(
     }
 
     let mut views = Vec::with_capacity(groups.len());
-    let mut by_key_digest = HashMap::with_capacity(groups.len());
     for group in groups {
         let models = models_by_group.remove(&group.id).unwrap_or_default();
-        let digest = group.key_digest_hex.clone();
-        let view = Arc::new(GroupView { group, models });
-        by_key_digest.insert(digest, Arc::clone(&view));
-        views.push(view);
+        views.push(Arc::new(GroupView { group, models }));
     }
 
     RuntimeConfig {
         version,
         groups: views,
-        by_key_digest,
     }
 }
 

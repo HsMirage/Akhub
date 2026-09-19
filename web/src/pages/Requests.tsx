@@ -25,6 +25,8 @@ interface RequestFilterForm {
   timeRange: TimeRange;
   groupId: string;
   logicalModel: string;
+  /** 实际目标（账号 ID 或上游模型名）（§6.6）。 */
+  targetId: string;
   status: "" | RequestStatus;
   errorCode: string;
   requestId: string;
@@ -35,6 +37,7 @@ const EMPTY_FILTERS: RequestFilterForm = {
   timeRange: "all",
   groupId: "",
   logicalModel: "",
+  targetId: "",
   status: "",
   errorCode: "",
   requestId: "",
@@ -56,6 +59,7 @@ function toRequestFilters(form: RequestFilterForm): RequestFilters {
   }
   if (form.groupId) filters.group_id = form.groupId;
   if (form.logicalModel) filters.logical_model = form.logicalModel;
+  if (form.targetId.trim()) filters.target_id = form.targetId.trim();
   if (form.status) filters.status = form.status;
   if (form.errorCode.trim()) filters.error_code = form.errorCode.trim();
   if (form.requestId.trim()) filters.request_id = form.requestId.trim();
@@ -253,6 +257,17 @@ export function Requests({ data }: { data: Data; refresh: () => Promise<void> })
               </select>
             )}
           </Field>
+          <Field label="实际目标">
+            {(id) => (
+              <input
+                id={id}
+                className="input mono"
+                value={filters.targetId}
+                placeholder="账号 ID 或上游模型名"
+                onChange={(event) => updateFilter("targetId", event.target.value)}
+              />
+            )}
+          </Field>
           <Field label="状态">
             {(id) => (
               <select
@@ -430,13 +445,29 @@ export function Requests({ data }: { data: Data; refresh: () => Promise<void> })
                             <Badge tone="warn">切换 {record.attempts - 1} 次</Badge>
                           )}
                           {record.queued_ms > 0 && (
-                            <span title="排队等待">等 {formatDuration(record.queued_ms)}</span>
+                            <span title="容量排队等待">排队 {formatDuration(record.queued_ms)}</span>
                           )}
-                          {!record.sticky_hit && record.attempts <= 1 && record.queued_ms === 0 && "直达"}
+                          {record.sticky_wait_ms != null && record.sticky_wait_ms > 0 && (
+                            <span
+                              className="cell-dim"
+                              title={"粘性等待（缓存新鲜度系数 " + (record.sticky_freshness ?? "—") + "）"}
+                            >
+                              粘性等 {formatDuration(record.sticky_wait_ms)}
+                            </span>
+                          )}
+                          {!record.sticky_hit &&
+                            record.attempts <= 1 &&
+                            record.queued_ms === 0 &&
+                            "直达"}
                         </span>
                       </td>
                       <td className="mono cell-dim" style={{ fontSize: 12 }}>
                         {record.effective_multiplier ?? "—"}
+                        {record.multiplier_source && (
+                          <div className="text-faint" style={{ fontSize: 11 }}>
+                            {record.multiplier_source === "manual" ? "手动" : "自动"}
+                          </div>
+                        )}
                         {record.cheapest_multiplier &&
                           record.dearest_multiplier &&
                           record.cheapest_multiplier !== record.dearest_multiplier && (
@@ -460,6 +491,49 @@ export function Requests({ data }: { data: Data; refresh: () => Promise<void> })
                       <tr key={`${record.request_id}-details`} className="request-details-row">
                         <td colSpan={REQUEST_COLUMN_COUNT}>
                           <div className="request-details">
+                            {/* 调度诊断：解释"这次为什么这么选"（§24.1）。 */}
+                            <div className="request-diagnostics">
+                              <span>
+                                <b>选中层</b>{" "}
+                                <span className="mono">
+                                  {record.selected_layer ?? "—"}
+                                </span>
+                              </span>
+                              <span>
+                                <b>额度状态</b>{" "}
+                                <span className="mono">{record.quota_status ?? "—"}</span>
+                              </span>
+                              <span>
+                                <b>输出速度</b>{" "}
+                                <span className="mono">
+                                  {record.output_tps == null
+                                    ? "—"
+                                    : record.output_tps.toFixed(1) + " tok/s"}
+                                </span>
+                              </span>
+                              <span>
+                                <b>配置版本</b>{" "}
+                                <span className="mono">{record.config_version ?? "—"}</span>
+                              </span>
+                              {/* Token 细分：上游没上报的项显示 "—"，不显示 0。 */}
+                              <span>
+                                <b>缓存读/写</b>{" "}
+                                <span className="mono">
+                                  {formatTokenPair(
+                                    record.cache_read_tokens,
+                                    record.cache_write_tokens,
+                                  )}
+                                </span>
+                              </span>
+                              <span>
+                                <b>思考</b>{" "}
+                                <span className="mono">{record.reasoning_tokens ?? "—"}</span>
+                              </span>
+                              <span className="request-diagnostics-filter">
+                                <b>候选过滤</b>{" "}
+                                <span className="mono">{record.filter_summary ?? "—"}</span>
+                              </span>
+                            </div>
                             {record.attempts_detail.length === 0 ? (
                               <span className="text-faint">无尝试明细</span>
                             ) : (

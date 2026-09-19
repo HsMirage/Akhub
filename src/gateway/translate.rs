@@ -52,14 +52,17 @@ impl Failure {
 ///
 /// 在第一个语义事件之前返回 `Err` 表示"还没花钱，可以换目标"；一旦提交，
 /// 后续错误只能按下游协议发一个终止错误事件（§13.4）。
-pub async fn commit_stream(
-    upstream: Protocol,
-    downstream: Protocol,
-    include_usage: bool,
-    account: &str,
-    mut response: reqwest::Response,
-    responses_id: Option<String>,
-) -> Result<Committed, Failure> {
+pub async fn commit_stream(request: StreamRequest<'_>) -> Result<Committed, Failure> {
+    let StreamRequest {
+        upstream,
+        downstream,
+        include_usage,
+        account,
+        mut response,
+        responses_id,
+        request_id,
+        degraded,
+    } = request;
     let started = Instant::now();
     let mut reader = sse::FrameReader::new();
     let mut parser = protocol::StreamParser::new(upstream);
@@ -90,6 +93,10 @@ pub async fn commit_stream(
         };
 
         buffered += chunk.len();
+        // 单帧超限说明上游不是在发 SSE。提交之前发现就还能换目标（§13.2）。
+        if let Some(reason) = reader.overflow() {
+            return Err(Failure::new(ErrorCode::UpstreamProtocolError, reason));
+        }
         let mut frames = reader.push(&chunk).into_iter();
         while let Some(frame) = frames.next() {
             if let Some(message) = protocol::frame_error(&frame) {
@@ -103,15 +110,25 @@ pub async fn commit_stream(
                 committed |= event.is_semantic();
                 prefix.extend(emitter.push(&event));
             }
+            // 解析阶段丢掉的东西要立刻收进 sink，不能等流结束（§14.8）。
+            drain_degraded(&mut parser, &degraded);
             if committed {
                 // 同一块里还没处理的帧必须一起交出去，否则它们连同上游已经
                 // 生成的内容一起消失。
-                let pending = frames.collect();
+                let pending: Vec<sse::Frame> = frames.collect();
                 return Ok(Committed {
                     first_token: started.elapsed(),
-                    body: continue_stream(
-                        prefix, pending, reader, parser, emitter, response, account,
-                    ),
+                    body: continue_stream(StreamPlumbing {
+                        prefix,
+                        degraded,
+                        pending,
+                        reader,
+                        parser,
+                        emitter,
+                        response,
+                        account,
+                        request_id,
+                    }),
                 });
             }
         }
@@ -119,40 +136,115 @@ pub async fn commit_stream(
         if buffered >= MAX_BUFFER_BYTES {
             return Ok(Committed {
                 first_token: started.elapsed(),
-                body: continue_stream(
+                body: continue_stream(StreamPlumbing {
                     prefix,
-                    Vec::new(),
+                    degraded,
+                    pending: Vec::new(),
                     reader,
                     parser,
                     emitter,
                     response,
                     account,
-                ),
+                    request_id,
+                }),
             });
         }
     }
 }
 
-/// 提交之后继续消费上游，把剩余事件转换给下游。
+/// 继续消费上游所需要的全部管道对象。
 ///
-/// `pending` 是提交那一刻还留在同一块字节里、尚未处理的帧。
-fn continue_stream(
+/// 打包成一个结构体而不是八个参数：这些字段总是一起传递，散开之后既容易
+/// 传错位置，也超出函数参数个数的合理范围。
+struct StreamPlumbing<'a> {
     prefix: Vec<Bytes>,
+    degraded: DegradationSink,
+    /// 提交那一刻还留在同一块字节里、尚未处理的帧。
     pending: Vec<sse::Frame>,
-    mut reader: sse::FrameReader,
-    mut parser: protocol::StreamParser,
-    mut emitter: protocol::StreamEmitter,
+    reader: sse::FrameReader,
+    parser: protocol::StreamParser,
+    emitter: protocol::StreamEmitter,
     response: reqwest::Response,
-    account: &str,
-) -> Body {
+    account: &'a str,
+    request_id: &'a str,
+}
+
+/// 一次跨协议流式转换的全部输入。
+///
+/// 打包成结构体而不是八个参数：这些字段总是一起传递，散开之后既容易传错位置，
+/// 也超出函数参数个数的合理范围。
+pub struct StreamRequest<'a> {
+    /// 上游协议：决定怎么解析帧。
+    pub upstream: Protocol,
+    /// 下游协议：决定怎么发射帧。
+    pub downstream: Protocol,
+    /// 下游是否要求 usage 事件。
+    pub include_usage: bool,
+    /// 账号名，只用于日志与错误文案。
+    pub account: &'a str,
+    /// 上游响应体。
+    pub response: reqwest::Response,
+    /// Responses 入口的网关 ID；决定要不要重写响应 ID。
+    pub responses_id: Option<String>,
+    /// 网关请求 ID，写进流内错误帧（§18.2）。
+    pub request_id: &'a str,
+    /// 解析阶段的能力降级收集器（§14.8）。
+    pub degraded: DegradationSink,
+}
+
+/// 共享的"这次流丢了什么能力"收集器（§14.8）。
+///
+/// 解析器在流的中途才会发现丢东西（例如 Anthropic 的签名增量出现在思考块
+/// 末尾），而请求记录要到流结束才写，两边必须共享同一个位置。
+pub type DegradationSink = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// 新建一个收集器。
+pub fn degradation_sink() -> DegradationSink {
+    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+/// 把解析器刚记下的降级搬进共享收集器。
+fn drain_degraded(parser: &mut protocol::StreamParser, sink: &DegradationSink) {
+    let taken = parser.take_degraded();
+    if taken.is_empty() {
+        return;
+    }
+    if let Ok(mut sink) = sink.lock() {
+        for capability in taken {
+            let name = capability.to_string();
+            if !sink.contains(&name) {
+                sink.push(name);
+            }
+        }
+    }
+}
+
+/// 提交之后继续消费上游，把剩余事件转换给下游。
+fn continue_stream(plumbing: StreamPlumbing<'_>) -> Body {
+    let StreamPlumbing {
+        prefix,
+        degraded,
+        pending,
+        mut reader,
+        mut parser,
+        mut emitter,
+        response,
+        account,
+        request_id,
+    } = plumbing;
     let account = account.to_string();
+    let request_id = request_id.to_string();
     let stream = async_stream::stream! {
         for bytes in prefix {
             yield Ok::<Bytes, std::io::Error>(bytes);
         }
         for frame in pending {
             if let Some(message) = protocol::frame_error(&frame) {
-                yield Ok(emitter.error(&message));
+                yield Ok(emitter.error(
+                    ErrorCode::UpstreamProtocolError,
+                    &message,
+                    Some(&request_id),
+                ));
                 return;
             }
             for event in parser.push(&frame) {
@@ -160,6 +252,7 @@ fn continue_stream(
                     yield Ok(bytes);
                 }
             }
+            drain_degraded(&mut parser, &degraded);
         }
 
         let mut upstream = response.bytes_stream();
@@ -175,7 +268,11 @@ fn continue_stream(
             for frame in reader.push(&chunk) {
                 if let Some(message) = protocol::frame_error(&frame) {
                     // 已经提交，只能在流内报错（§18.2）；绝不伪造正常完成。
-                    yield Ok(emitter.error(&message));
+                    yield Ok(emitter.error(
+                        ErrorCode::UpstreamProtocolError,
+                        &message,
+                        Some(&request_id),
+                    ));
                     return;
                 }
                 for event in parser.push(&frame) {
@@ -183,11 +280,26 @@ fn continue_stream(
                         yield Ok(bytes);
                     }
                 }
+                drain_degraded(&mut parser, &degraded);
+            }
+            // 单帧超限：已经提交，同样只能在流内报错。不报的话下游会收到一个
+            // 突然断掉的流，无从判断是正常结束还是上游坏了（§14.8、§19.4）。
+            if let Some(reason) = reader.overflow() {
+                yield Ok(emitter.error(
+                    ErrorCode::UpstreamProtocolError,
+                    reason,
+                    Some(&request_id),
+                ));
+                return;
             }
         }
 
         if broken {
-            yield Ok(emitter.error(&format!("账号「{account}」的上游流式响应中断")));
+            yield Ok(emitter.error(
+                ErrorCode::UpstreamExhausted,
+                &format!("账号「{account}」的上游流式响应中断"),
+                Some(&request_id),
+            ));
             return;
         }
         // 上游正常结束：补齐下游协议要求的收尾事件。
@@ -197,6 +309,7 @@ fn continue_stream(
                     yield Ok(bytes);
                 }
             }
+            drain_degraded(&mut parser, &degraded);
         }
         for event in parser.finish() {
             for bytes in emitter.push(&event) {
@@ -217,7 +330,9 @@ pub fn passthrough_stream(
     prefix: Bytes,
     response: reqwest::Response,
     downstream: Protocol,
+    request_id: &str,
 ) -> Body {
+    let request_id = request_id.to_string();
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::io::Error>(prefix);
         let mut upstream = response.bytes_stream();
@@ -225,7 +340,13 @@ pub fn passthrough_stream(
             match item {
                 Ok(chunk) => yield Ok(chunk),
                 Err(_) => {
-                    yield Ok(protocol::stream_error(downstream, "上游流式响应中断"));
+                    // 流已经开始，稳定错误码与请求 ID 只能写进事件体（§18.2）。
+                    yield Ok(protocol::stream_error(
+                        downstream,
+                        ErrorCode::UpstreamExhausted,
+                        "上游流式响应中断",
+                        Some(&request_id),
+                    ));
                     return;
                 }
             }
@@ -243,15 +364,22 @@ pub fn passthrough_responses_stream(
     prefix: Bytes,
     response: reqwest::Response,
     gateway_id: &str,
+    request_id: &str,
 ) -> Body {
     let gateway_id = gateway_id.to_string();
+    let request_id = request_id.to_string();
     let stream = async_stream::stream! {
         let mut rewriter = ResponseIdRewriter::new(&gateway_id);
         match rewriter.push(&prefix) {
             Ok(Some(bytes)) => yield Ok::<Bytes, std::io::Error>(bytes),
             Ok(None) => {},
             Err(message) => {
-                yield Ok(protocol::stream_error(Protocol::OpenAiResponses, message));
+                yield Ok(protocol::stream_error(
+                    Protocol::OpenAiResponses,
+                    ErrorCode::UpstreamProtocolError,
+                    message,
+                    Some(&request_id),
+                ));
                 return;
             }
         }
@@ -263,7 +391,12 @@ pub fn passthrough_responses_stream(
                         Ok(Some(bytes)) => yield Ok(bytes),
                         Ok(None) => {},
                         Err(message) => {
-                            yield Ok(protocol::stream_error(Protocol::OpenAiResponses, message));
+                            yield Ok(protocol::stream_error(
+                                Protocol::OpenAiResponses,
+                                ErrorCode::UpstreamProtocolError,
+                                message,
+                                Some(&request_id),
+                            ));
                             return;
                         }
                     }
@@ -271,7 +404,9 @@ pub fn passthrough_responses_stream(
                 Err(_) => {
                     yield Ok(protocol::stream_error(
                         Protocol::OpenAiResponses,
+                        ErrorCode::UpstreamExhausted,
                         "上游流式响应中断",
+                        Some(&request_id),
                     ));
                     return;
                 }
@@ -406,14 +541,16 @@ mod tests {
         )
         .await;
 
-        let committed = commit_stream(
-            Protocol::OpenAiChat,
-            Protocol::AnthropicMessages,
-            true,
-            "账号A",
+        let committed = commit_stream(StreamRequest {
+            upstream: Protocol::OpenAiChat,
+            downstream: Protocol::AnthropicMessages,
+            include_usage: true,
+            account: "账号A",
             response,
-            None,
-        )
+            responses_id: None,
+            request_id: "req_test",
+            degraded: degradation_sink(),
+        })
         .await
         .unwrap();
         let text = text_of(committed.body).await;
@@ -431,14 +568,16 @@ mod tests {
         )
         .await;
 
-        let failure = commit_stream(
-            Protocol::AnthropicMessages,
-            Protocol::OpenAiChat,
-            false,
-            "账号A",
+        let failure = commit_stream(StreamRequest {
+            upstream: Protocol::AnthropicMessages,
+            downstream: Protocol::OpenAiChat,
+            include_usage: false,
+            account: "账号A",
             response,
-            None,
-        )
+            responses_id: None,
+            request_id: "req_test",
+            degraded: degradation_sink(),
+        })
         .await
         .err()
         .expect("语义内容之前的错误必须可切换");
@@ -450,14 +589,16 @@ mod tests {
     async fn a_stream_that_produces_nothing_is_a_broken_response() {
         let response =
             upstream("event: message_start\ndata: {\"type\":\"message_start\"}\n\n").await;
-        let failure = commit_stream(
-            Protocol::AnthropicMessages,
-            Protocol::OpenAiChat,
-            false,
-            "账号A",
+        let failure = commit_stream(StreamRequest {
+            upstream: Protocol::AnthropicMessages,
+            downstream: Protocol::OpenAiChat,
+            include_usage: false,
+            account: "账号A",
             response,
-            None,
-        )
+            responses_id: None,
+            request_id: "req_test",
+            degraded: degradation_sink(),
+        })
         .await
         .err()
         .expect("一个字都没产出属于损坏响应");
@@ -474,14 +615,16 @@ mod tests {
         )
         .await;
 
-        let committed = commit_stream(
-            Protocol::AnthropicMessages,
-            Protocol::OpenAiChat,
-            false,
-            "账号A",
+        let committed = commit_stream(StreamRequest {
+            upstream: Protocol::AnthropicMessages,
+            downstream: Protocol::OpenAiChat,
+            include_usage: false,
+            account: "账号A",
             response,
-            None,
-        )
+            responses_id: None,
+            request_id: "req_test",
+            degraded: degradation_sink(),
+        })
         .await
         .unwrap();
         let text = text_of(committed.body).await;

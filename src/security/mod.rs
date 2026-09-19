@@ -227,6 +227,21 @@ impl KeyDigest {
     }
 }
 
+/// 定长常量时间比较（§19.2）。
+///
+/// 长度不同直接返回 false（长度本身不是秘密）；长度相同时逐字节异或累加，
+/// **不提前返回**，因此耗时只与长度有关，与"前几个字节猜对了"无关。
+pub fn ct_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// 生成一把新的下游分组 Key，返回明文与可显示前缀。
 pub fn generate_group_key() -> Result<(Zeroizing<String>, String)> {
     let entropy = random_bytes(32)?;

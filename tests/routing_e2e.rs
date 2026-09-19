@@ -1059,6 +1059,30 @@ async fn request_records_capture_scheduling_telemetry() {
         latest.dearest_multiplier,
         Some(Multiplier::parse("0.5").unwrap())
     );
+    // §24.1 的诊断字段：倍率来源、额度状态、候选过滤原因、选中的层。
+    assert_eq!(latest.multiplier_source.as_deref(), Some("manual"));
+    assert_eq!(latest.quota_status.as_deref(), Some("active"));
+    assert_eq!(latest.selected_layer, Some(50), "目标在优先级 50 这一层");
+    assert_eq!(
+        latest.filter_summary.as_deref(),
+        Some("无"),
+        "唯一目标全合格时不该有过滤原因"
+    );
+    // 会话粘性：这几个要素齐全才能解释"这次为什么换了号"（§24.1）。
+    // latest 是命中的那一条，records[1] 是首次绑定（没绑定可等）。
+    assert!(
+        latest.sticky_wait_ms.is_some(),
+        "粘性命中的记录要写下等待时长"
+    );
+    assert!(
+        latest.sticky_freshness.is_some(),
+        "粘性命中的记录要写下缓存新鲜度系数"
+    );
+    assert!(
+        records[1].sticky_wait_ms.is_none(),
+        "首次绑定没有可复用的绑定，不该有粘性等待"
+    );
+    assert!(records[1].sticky_freshness.is_none());
 }
 
 #[tokio::test]

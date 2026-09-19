@@ -39,6 +39,19 @@ export interface SchedulingWeights {
   throughput: number;
 }
 
+/**
+ * 列表接口的分页信封（§7.4）。
+ *
+ * 服务端默认返回 200 条、最多 1000 条；\`total\` 大于 \`data.length\` 就说明
+ * 被截断了，界面要明说，不能让人以为配置里就只有这么多。
+ */
+export interface Page<T> {
+  data: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface Group {
   id: string;
   name: string;
@@ -50,8 +63,17 @@ export interface Group {
   /** 层内目标全忙时的最长排队时间；0 表示跟随请求总超时。 */
   max_wait_secs: number;
   allow_degrade: boolean;
+  allow_managed_background: boolean;
   logical_models: number;
   dispatch_targets: number;
+  /** 该分组当前的告警（§6.3）。 */
+  alerts: GroupAlert[];
+}
+
+/** 一条分组级告警（§6.3）。 */
+export interface GroupAlert {
+  level: "danger" | "warn";
+  text: string;
 }
 
 export interface Account {
@@ -85,6 +107,18 @@ export interface Account {
   auto_sync: boolean;
   /** 上一次托管同步完成的时间戳；null 表示从未同步。 */
   model_synced_at: number | null;
+  /** 账号级健康摘要（§6.9）：列表行内徽标用它。 */
+  health: AccountHealth;
+}
+
+/** 账号级健康摘要（§6.9）。 */
+export interface AccountHealth {
+  /** active / cooldown / half_open / quota_exhausted / key_invalid / disabled */
+  status: string;
+  reason: string | null;
+  /** 该账号下的目标状态计数。 */
+  targets: Record<string, number>;
+  target_total: number;
 }
 
 /** 账号模型目录里的一行（§16.2 的选择集状态）。 */
@@ -96,6 +130,8 @@ export interface AccountModel {
   missing: boolean;
   /** 仅"获取模型"响应里有意义：本次拉取新出现的模型。 */
   is_new: boolean;
+  /** 管理员明确取消过勾选（§16.2）。与"从没出现过"分开。 */
+  excluded: boolean;
 }
 
 /** 分组下游账号目录里可直接选择的模型。 */
@@ -137,6 +173,18 @@ export interface Score {
   samples: number;
   /** 样本不足 20 时性能三维用的是保守中性分。 */
   warm: boolean;
+  /**
+   * 各维度的加权贡献（得分 × 权重 ÷ 100），四项之和即总分（§6.5）。
+   *
+   * 只有归一化得分时，得回分组页查权重才能判断"是哪一维把分数拉下去的"；
+   * 有贡献值就能直接横向比较。
+   */
+  contribution: {
+    multiplier: number;
+    reliability: number;
+    first_token: number;
+    throughput: number;
+  };
 }
 
 export interface DispatchTarget {
@@ -155,6 +203,14 @@ export interface DispatchTarget {
   cooldown_secs: number | null;
   inflight: number;
   score: Score | null;
+  /** 首字延迟的当前 EWMA（毫秒）；冷启动或没数据时为 null（§6.5）。 */
+  first_token_ms: number | null;
+  /** 输出速度的当前 EWMA（token/秒）（§6.5）。 */
+  output_tps: number | null;
+  /** 非流式总延迟的当前 EWMA（毫秒）（§6.5）。 */
+  total_ms: number | null;
+  /** 暂停原因；正常参与调度时为 null（§6.5）。 */
+  pause_reason: string | null;
 }
 
 export interface RequestRecord {
@@ -189,6 +245,24 @@ export interface RequestRecord {
   output_tokens: number | null;
   /** 产生这条记录时的配置快照版本。 */
   config_version: number | null;
+  /** 为保住前缀缓存等待的毫秒数；与 queued_ms 分开（§6.6、§24.1）。 */
+  sticky_wait_ms: number | null;
+  /** 这次粘性等待用的缓存新鲜度系数（§10.3 的三档）。 */
+  sticky_freshness: number | null;
+  /** 输出速度（token/秒）。上游没上报 Token 时为 null。 */
+  output_tps: number | null;
+  /** Token 细分（§11.6）：缓存读/写与思考。上游没上报就是 null，不估算。 */
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  reasoning_tokens: number | null;
+  /** 有效倍率来源：auto / manual（§24.1）。 */
+  multiplier_source: string | null;
+  /** 记录时刻的额度状态（§24.1）。 */
+  quota_status: string | null;
+  /** 候选过滤原因摘要，形如 "倍率超限×2,能力不支持×1"（§24.1）。 */
+  filter_summary: string | null;
+  /** 最终选中的层（优先级数字）（§24.1）。 */
+  selected_layer: number | null;
   /** 每次上游尝试的明细（§6.6）。 */
   attempts_detail: AttemptRecord[];
 }
@@ -278,8 +352,12 @@ export interface Overview {
   missing_endpoints: number;
   dropped_request_records: number;
   master_key_from_env: boolean;
+  /** 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里。 */
+  data_dir: string;
   /** 运行指标的统计窗口，当前固定为 24 小时。 */
   window_secs: number;
+  /** 保留期为 0：明细不落库，这里的数字来自内存汇总，只覆盖当日（§24.2）。 */
+  retention_off: boolean;
   requests: number;
   success_rate: number | null;
   avg_latency_ms: number | null;
@@ -308,6 +386,8 @@ export interface Settings {
   model_sync_secs: number;
   /** 内置能力目录版本（§6.7）。 */
   capability_catalog_revision: string;
+  /** 协议适配层版本（§6.7）。它变了，学到的能力证据会整体失效。 */
+  adapter_version: string;
   version: string;
   /** 修改后需要下一次重启才能生效的字段。 */
   restart_required: string[];
@@ -349,6 +429,21 @@ export interface MultiplierRefreshResult {
   notice: string;
 }
 
+/** 批量刷新倍率的结果：逐账号收集，一个失败不影响其余（§11.3）。 */
+export interface BatchMultiplierRefreshResult {
+  total: number;
+  refreshed: number;
+  failed: number;
+  results: {
+    account_id: string;
+    name: string;
+    effective_multiplier: string;
+    observed_at: number | null;
+  }[];
+  errors: { account_id: string; name: string; error: string }[];
+  notice: string;
+}
+
 /** 成本页的一条账号流量行（§6.8）。 */
 export interface CostAccountRow {
   account_id: string;
@@ -382,6 +477,8 @@ export interface CostView {
   since: number;
   total_requests: number;
   total_tokens: number;
+  /** 保留期为 0：只统计当日，选了"本月"也只有当天数据（§24.2）。 */
+  retention_off: boolean;
   /** 全局占比口径：区间内出现过 Token 就按 Token，否则退回请求数。 */
   share_basis: "tokens" | "requests";
   account_shares: {
@@ -428,6 +525,8 @@ export interface TestResult {
 export interface SetupStatus {
   needs_setup: boolean;
   master_key_from_env: boolean;
+  /** 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里。 */
+  data_dir: string;
 }
 
 /** 创建分组与重新生成 Key 的响应，`key` 是唯一一次出现的明文。 */

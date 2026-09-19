@@ -459,6 +459,36 @@ table.data tbody tr.request-row:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
+/* 分组行内的告警：可以有多条，纵向排列不挤表格。 */
+.group-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  max-width: 260px;
+}
+
+.request-diagnostics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  padding-bottom: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-bottom: 1px dashed var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.request-diagnostics b {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 过滤原因可以很长，占满一整行，避免把其他项挤成窄条。 */
+.request-diagnostics-filter {
+  flex-basis: 100%;
+}
+
 .request-attempts {
   font-size: 12px !important;
 }

@@ -31,8 +31,9 @@ Responses 状态链与模型发现（选择集、别名、自动同步、能力�
 - `GET /v1/models` 与 `/v1/models/{model}`，响应形状按鉴权头双形态切换。
 - 请求 ID、稳定错误码、§18.3 的 HTTP 状态码映射、上游凭据加密与日志脱敏。
 - **严格优先级阶梯**：优先级数字相同的目标构成一层，高层只要还有合格目标就
-  应当优先使用高层；常规路径层内全忙时在本层排队，不降层。
-  普通粘性绑定仍有绕过已恢复高层的缺陷，见下方审查状态。
+  优先使用高层；常规路径层内全忙时在本层排队，不降层。普通粘性绑定也只在
+  当前最高合格层内查找，低层绑定不会绕过已恢复的高层（曾有的缺陷已于
+  2026-09-06 修复，回归用例见 `review/2026-09-06/gateway_probes.rs`）。
 - **层内四维评分**（倍率 / 可靠性 / 首字延迟 / 输出速度）：比值归一化、分组级
   可调权重、`score^k` 加权随机分配；性能用 EWMA 统计，样本不足时取中性分。
 - **会话粘性**：Responses 状态链 → 显式会话头 → `prompt_cache_key` → 稳定前缀
@@ -73,13 +74,23 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
 随后的加固轮次又补上了流式结算、Responses 生命周期、内存上限、SSRF 解析与关闭宽限期，
 详见 `2026-09-06_功能审查-Akhub-report.md` 与本节的"已补齐"清单。
 
-**仍待完成**（功能补齐、发布硬化与真实环境验收）：
+**仍待完成**（发布硬化与真实环境验收）：
 
 | 能力 | 计划阶段 |
 |---|---|
-| Docker 构建、多架构镜像与 Linux 工件（当前只有原生 systemd 部署） | 阶段 6 |
-| §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、长连接与内存上限） | 阶段 6 |
-| 关闭信号到达时"取消排队请求并返回可重试错误"（§25.3 第 2 步；当前靠宽限期兜底） | 阶段 6 |
+| §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、连接复用率与每请求分配量） | 阶段 6 |
+| Docker 容器内"空数据目录首次启动 + 真实调用"的落地验收（镜像与工件已产出，缺容器内实跑记录） | 阶段 6 |
+| 真实上游上的跨账号故障切换实测（现有测试 Key 下同一逻辑模型只有一个可用目标） | 阶段 6 |
+
+已完成（本轮校正）：
+
+- **Docker 与多架构发布**：`Dockerfile`（非 root、`/data` 唯一持久卷、健康检查、
+  `STOPSIGNAL`）、`docker-compose.yml`（`restart: unless-stopped`、`stop_grace_period: 200s`）、
+  `.github/workflows/release.yml`（x86_64/aarch64 二进制 + buildx amd64/arm64 推 GHCR）、
+  `scripts/release.sh`，以及 `dist/` 下的双架构工件。
+- **关闭信号取消排队请求**（§25.3 第 2 步）：`src/app/mod.rs:239 begin_shutdown`、
+  `src/routing/queue.rs:130-152`、`src/gateway/passthrough.rs:480-484` 返回可重试的
+  `queue_timeout`，并有回归测试 `src/routing/queue.rs:262,291`。
 
 已补齐（本轮）：
 
@@ -223,7 +234,9 @@ Linux 双架构（x86_64 / aarch64）二进制（依赖 [cargo-zigbuild](https:/
 
 ## 许可与来源
 
-本项目以 MIT 许可发布。协议适配部分为干净实现，行为参考了 New API
-（AGPL-3.0）、Sub2API（LGPL-3.0）、AxonHub（Apache-2.0 / LGPL-3.0）与
-LiteLLM（MIT），未直接复制其实现代码；第三方依赖清单见
-[`NOTICES.md`](NOTICES.md)。
+本项目以 **Akhub 非商业署名许可**发布，不是 OSI 定义的"开源软件"：非商业使用
+必须保留署名，商业使用需事先取得书面授权。完整条款见 [`LICENSE`](LICENSE)，
+第三方依赖清单见 [`NOTICES.md`](NOTICES.md)。
+
+协议适配部分为干净实现，行为参考了 New API（AGPL-3.0）、Sub2API（LGPL-3.0）、
+AxonHub（Apache-2.0 / LGPL-3.0）与 LiteLLM（MIT），未直接复制其实现代码。

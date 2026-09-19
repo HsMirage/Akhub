@@ -352,12 +352,22 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
     let state = AppState::bootstrap(dir.path(), Settings::default())
         .await
         .unwrap();
-    // 把当前库"降级"成 v1 形状：删掉 v2/v3 的列与表，并把版本号写回 1。
+    // 把当前库"降级"成 v1 形状：删掉 v2/v3/v5/v6 的列与表，版本号写回 1。
     for column in [
         "first_token_ms",
         "input_tokens",
         "output_tokens",
         "config_version",
+        "sticky_wait_ms",
+        "sticky_freshness",
+        "output_tps",
+        "multiplier_source",
+        "quota_status",
+        "filter_summary",
+        "selected_layer",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
     ] {
         // 列名来自下面的常量数组，不含用户输入。
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -380,6 +390,10 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .await
         .unwrap();
     sqlx::query("DROP TABLE background_tasks")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE performance_buckets")
         .execute(state.store.pool())
         .await
         .unwrap();
@@ -406,6 +420,16 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         "input_tokens",
         "output_tokens",
         "config_version",
+        "sticky_wait_ms",
+        "sticky_freshness",
+        "output_tps",
+        "multiplier_source",
+        "quota_status",
+        "filter_summary",
+        "selected_layer",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
     ] {
         assert!(columns.contains(column), "迁移后缺少列 {column}");
     }
@@ -435,12 +459,19 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     assert_eq!(background_tables, 1, "迁移后应存在 background_tasks 表");
+    // v5：分钟级性能聚合表（§20.1、§22）。
+    let bucket_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'performance_buckets'")
+            .fetch_one(reopened.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(bucket_tables, 1, "迁移后应存在 performance_buckets 表");
     let version: String =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "4");
+    assert_eq!(version, "7");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

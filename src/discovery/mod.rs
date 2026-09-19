@@ -44,6 +44,12 @@ pub struct CatalogEntry {
     pub missing: bool,
     /// 本次拉取新出现的模型，前端用"只看新增"过滤。
     pub is_new: bool,
+    /// 管理员**明确取消过勾选**的模型（§16.2）。
+    ///
+    /// 与"从没出现过"必须分开：勾选对话框要显示"你排除过"，
+    /// 否则一个被主动排除的模型和一个从未见过的模型长得一模一样，
+    /// 管理员会以为自己之前的操作没生效。
+    pub excluded: bool,
 }
 
 /// "最近有流量"的判定窗口（§16.3）。
@@ -133,6 +139,8 @@ pub async fn refresh_catalog(state: &SharedState, account: &Account) -> Result<V
             selected,
             missing: false,
             is_new: known.is_none(),
+            // 有历史记录、且当时是未勾选状态 → 管理员明确排除过。
+            excluded: known.is_some_and(|prev| !prev.selected),
         });
     }
 
@@ -154,6 +162,7 @@ pub async fn refresh_catalog(state: &SharedState, account: &Account) -> Result<V
             selected: true,
             missing: true,
             is_new: false,
+            excluded: false,
         });
     }
 

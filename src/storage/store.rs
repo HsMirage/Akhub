@@ -904,8 +904,11 @@ impl Store {
                     endpoint, degraded,
                     effective_multiplier, cheapest_multiplier, dearest_multiplier,
                     attempts, queued_ms, sticky_hit,
-                    first_token_ms, input_tokens, output_tokens, config_version)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    first_token_ms, input_tokens, output_tokens, config_version,
+                    sticky_wait_ms, sticky_freshness, output_tps, multiplier_source,
+                    quota_status, filter_summary, selected_layer,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -933,6 +936,16 @@ impl Store {
             .bind(record.input_tokens)
             .bind(record.output_tokens)
             .bind(record.config_version)
+            .bind(record.sticky_wait_ms)
+            .bind(record.sticky_freshness)
+            .bind(record.output_tps)
+            .bind(&record.multiplier_source)
+            .bind(&record.quota_status)
+            .bind(&record.filter_summary)
+            .bind(record.selected_layer)
+            .bind(record.cache_read_tokens)
+            .bind(record.cache_write_tokens)
+            .bind(record.reasoning_tokens)
             .execute(&mut *tx)
             .await?;
 
@@ -1320,7 +1333,9 @@ impl Store {
                         "weight_first_token",
                         "weight_throughput",
                         "queue_capacity",
+                        "max_wait_secs",
                         "allow_degrade",
+                        "allow_managed_background",
                         "created_at",
                     ],
                 )
@@ -1459,6 +1474,19 @@ impl Store {
             .collect()
     }
 
+    /// 备份系统设置（§23.5）。
+    ///
+    /// 排除 `schema_version`：它是数据库结构版本，由启动时的迁移逻辑管理，
+    /// 恢复一份旧备份不该把版本号倒回去。
+    pub async fn backup_app_settings(&self) -> Result<Vec<Value>> {
+        let rows = sqlx::query("SELECT * FROM app_settings WHERE key <> 'schema_version'")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Self::backup_row(row, &["key", "value"]))
+            .collect()
+    }
+
     /// 恢复一份配置快照：单事务内清空现有配置并整体写入（§23.5）。
     ///
     /// 引用校验在调用方完成；这里保证原子性——任何一步失败整体回滚，
@@ -1486,8 +1514,9 @@ impl Store {
             sqlx::query(
                 "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                     weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
-                    queue_capacity, allow_degrade, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
+                    created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(group, "id"))
             .bind(str_field(group, "name"))
@@ -1499,7 +1528,10 @@ impl Store {
             .bind(int_field(group, "weight_first_token"))
             .bind(int_field(group, "weight_throughput"))
             .bind(int_field(group, "queue_capacity"))
+            // 老备份没有这两列：按列默认值恢复，不要把 0 当成管理员的选择。
+            .bind(int_field_or(group, "max_wait_secs", 60))
             .bind(bool_field(group, "allow_degrade"))
+            .bind(bool_field(group, "allow_managed_background"))
             .bind(int_field(group, "created_at"))
             .execute(&mut *tx)
             .await?;
@@ -1617,6 +1649,25 @@ impl Store {
             .bind(str_field(row, "account_id"))
             .bind(str_field(row, "upstream_model"))
             .bind(str_field(row, "public_name"))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 系统设置：整体替换而不是合并，否则旧备份恢复后会留下一半新一半旧的
+        // 设置项。`schema_version` 不动——它由启动时的迁移逻辑管理（§23.5）。
+        for row in &data.app_settings {
+            let key = str_field(row, "key");
+            if key.is_empty() || key == "schema_version" {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+            )
+            .bind(&key)
+            .bind(str_field(row, "value"))
+            .bind(crate::storage::now_unix())
             .execute(&mut *tx)
             .await?;
         }
@@ -1784,6 +1835,119 @@ impl Store {
         Ok(affected)
     }
 
+    /// 把 `request_records` 里尚未聚合的明细滚进 `performance_buckets`（§22）。
+    ///
+    /// 幂等：先删掉待聚合区间内已有的桶，再从明细重建，所以同一个区间重复调用
+    /// 不会重复计数。`since` 到 `until` 之间按 `bucket_secs` 对齐。
+    pub async fn rollup_performance_buckets(
+        &self,
+        since: i64,
+        until: i64,
+        bucket_secs: i64,
+    ) -> Result<u64> {
+        let bucket = bucket_secs.max(1);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM performance_buckets WHERE bucket_start >= ? AND bucket_start < ?")
+            .bind(since)
+            .bind(until)
+            .execute(&mut *tx)
+            .await?;
+        // 按（桶、目标、协议、流式）聚合；target_id 为空的记录不参与目标维度聚合。
+        let result = sqlx::query(
+            "INSERT INTO performance_buckets (bucket_start, target_id, protocol, streaming,
+                requests, success, total_ms_sum, first_token_sum, first_token_count,
+                output_tokens_sum, rate_limited, server_errors, protocol_errors)
+             SELECT (started_at / ?) * ? AS bucket_start,
+                    target_id, protocol, streaming,
+                    COUNT(*),
+                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END),
+                    SUM(duration_ms),
+                    SUM(COALESCE(first_token_ms, 0)),
+                    SUM(CASE WHEN first_token_ms IS NULL THEN 0 ELSE 1 END),
+                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
+                    SUM(CASE WHEN error_code = 'rate_limited' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN error_code = 'upstream_protocol_error' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN error_code = 'upstream_exhausted' THEN 1 ELSE 0 END)
+             FROM request_records
+             WHERE started_at >= ? AND started_at < ? AND target_id IS NOT NULL
+             GROUP BY bucket_start, target_id, protocol, streaming",
+        )
+        .bind(bucket)
+        .bind(bucket)
+        .bind(since)
+        .bind(until)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 读取某个时间范围内的分钟桶（§7.4 的 `/admin/api/metrics`）。
+    pub async fn list_performance_buckets(
+        &self,
+        since: i64,
+        until: i64,
+        target_id: Option<&str>,
+    ) -> Result<Vec<PerformanceBucketRow>> {
+        // 两条固定语句，不用动态拼串：sqlx 只接受字面量 SQL。
+        let query = if let Some(target) = target_id {
+            sqlx::query(concat!(
+                "SELECT bucket_start, target_id, protocol, streaming, requests, success, ",
+                "total_ms_sum, first_token_sum, first_token_count, output_tokens_sum, ",
+                "rate_limited, server_errors, protocol_errors FROM performance_buckets ",
+                "WHERE bucket_start >= ? AND bucket_start < ? AND target_id = ? ",
+                "ORDER BY bucket_start DESC, target_id LIMIT 10000"
+            ))
+            .bind(since)
+            .bind(until)
+            .bind(target)
+        } else {
+            sqlx::query(concat!(
+                "SELECT bucket_start, target_id, protocol, streaming, requests, success, ",
+                "total_ms_sum, first_token_sum, first_token_count, output_tokens_sum, ",
+                "rate_limited, server_errors, protocol_errors FROM performance_buckets ",
+                "WHERE bucket_start >= ? AND bucket_start < ? ",
+                "ORDER BY bucket_start DESC, target_id LIMIT 10000"
+            ))
+            .bind(since)
+            .bind(until)
+        };
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(PerformanceBucketRow {
+                    bucket_start: row.try_get("bucket_start")?,
+                    target_id: row.try_get("target_id")?,
+                    // 库里的协议字符串一定是本进程写进去的；真遇到脏数据就退回
+                    // OpenAI Chat（§18 的错误体形状默认值），不要因此丢掉整条记录。
+                    protocol: Protocol::parse(row.try_get("protocol")?)
+                        .unwrap_or(Protocol::OpenAiChat),
+                    streaming: row.try_get::<i64, _>("streaming")? != 0,
+                    requests: row.try_get("requests")?,
+                    success: row.try_get("success")?,
+                    total_ms_sum: row.try_get("total_ms_sum")?,
+                    first_token_sum: row.try_get("first_token_sum")?,
+                    first_token_count: row.try_get("first_token_count")?,
+                    output_tokens_sum: row.try_get("output_tokens_sum")?,
+                    rate_limited: row.try_get("rate_limited")?,
+                    server_errors: row.try_get("server_errors")?,
+                    protocol_errors: row.try_get("protocol_errors")?,
+                })
+            })
+            .collect()
+    }
+
+    /// 删除过期的性能桶（§24.2，与请求明细同一保留期）。
+    pub async fn prune_performance_buckets(&self, older_than: i64) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM performance_buckets WHERE bucket_start < ?")
+                .bind(older_than)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
     /// 批量覆盖性能 EWMA 快照。
     pub async fn save_perf_snapshots(&self, rows: &[PerfSnapshotRow]) -> Result<()> {
         if rows.is_empty() {
@@ -1914,6 +2078,25 @@ pub struct RequestRecord {
     pub output_tokens: Option<i64>,
     /// 产生这条记录时的配置快照版本（§6.6）。
     pub config_version: Option<i64>,
+    /// 为保住前缀缓存而等待的时长（§6.6、§24.1）。与 `queued_ms` 分开，
+    /// 因为"等一个忙但健康的粘性目标"和"等一个空闲槽位"是两种成本。
+    pub sticky_wait_ms: Option<i64>,
+    /// 这次粘性等待用到的缓存新鲜度系数（§10.3 的三档）。
+    pub sticky_freshness: Option<f64>,
+    /// 输出速度（token/秒），流式与非流式都算得出（§24.1）。
+    pub output_tps: Option<f64>,
+    /// 缓存读/写与思考 Token（§11.6）。上游没上报就是 None，绝不估算。
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    /// 本次有效倍率的来源：`auto` / `manual`（§24.1）。
+    pub multiplier_source: Option<String>,
+    /// 本次的额度状态快照（§24.1）。
+    pub quota_status: Option<String>,
+    /// 候选过滤原因摘要（§24.1）；格式为 `原因×个数` 的逗号分隔串。
+    pub filter_summary: Option<String>,
+    /// 最终选中的层（优先级数字）；粘性命中时是绑定目标所在的层（§24.1）。
+    pub selected_layer: Option<i64>,
     /// 每次上游尝试的明细（§6.6）。写入时与主记录同一事务。
     pub attempts_detail: Vec<AttemptRecord>,
 }
@@ -2163,6 +2346,28 @@ pub struct PerfSnapshotRow {
     pub updated_at: i64,
 }
 
+/// 一个分钟级性能桶（§20.1、§22）。
+///
+/// 这是 `GET /admin/api/metrics` 的数据源：后台读它而不是对 `request_records`
+/// 做全表扫描，明细表清理后历史趋势仍然保留。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerformanceBucketRow {
+    /// 桶起点（Unix 秒，按桶宽对齐）。
+    pub bucket_start: i64,
+    pub target_id: String,
+    pub protocol: Protocol,
+    pub streaming: bool,
+    pub requests: i64,
+    pub success: i64,
+    pub total_ms_sum: i64,
+    pub first_token_sum: i64,
+    pub first_token_count: i64,
+    pub output_tokens_sum: i64,
+    pub rate_limited: i64,
+    pub server_errors: i64,
+    pub protocol_errors: i64,
+}
+
 /// 一条 Responses 状态链记录（§15.1、§15.2）。
 #[derive(Debug, Clone)]
 pub struct ResponseStateRow {
@@ -2221,6 +2426,17 @@ fn int_field(object: &serde_json::Value, key: &str) -> i64 {
         .get(key)
         .and_then(serde_json::Value::as_i64)
         .unwrap_or_default()
+}
+
+/// 取整数，缺字段时用给定默认值。
+///
+/// 恢复旧备份时用得上：新增列在老备份里不存在，直接取 0 会悄悄改掉语义
+/// （比如 `max_wait_secs=0` 表示"跟随请求总超时"，而不是默认的 60 秒）。
+fn int_field_or(object: &serde_json::Value, key: &str, fallback: i64) -> i64 {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(fallback)
 }
 
 fn int_opt_field(object: &serde_json::Value, key: &str) -> Option<i64> {
@@ -2374,6 +2590,16 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         input_tokens: row.try_get("input_tokens")?,
         output_tokens: row.try_get("output_tokens")?,
         config_version: row.try_get("config_version")?,
+        sticky_wait_ms: row.try_get("sticky_wait_ms")?,
+        sticky_freshness: row.try_get("sticky_freshness")?,
+        output_tps: row.try_get("output_tps")?,
+        cache_read_tokens: row.try_get("cache_read_tokens")?,
+        cache_write_tokens: row.try_get("cache_write_tokens")?,
+        reasoning_tokens: row.try_get("reasoning_tokens")?,
+        multiplier_source: row.try_get("multiplier_source")?,
+        quota_status: row.try_get("quota_status")?,
+        filter_summary: row.try_get("filter_summary")?,
+        selected_layer: row.try_get("selected_layer")?,
         // 尝试明细由 `attach_attempts` 单独填充。
         attempts_detail: Vec::new(),
     })
@@ -2617,6 +2843,16 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 config_version: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                sticky_wait_ms: None,
+                sticky_freshness: None,
+                output_tps: None,
+                multiplier_source: None,
+                quota_status: None,
+                filter_summary: None,
+                selected_layer: None,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
@@ -2753,5 +2989,166 @@ mod tests {
         // 目标被删除后，指向它的绑定必须一起消失，否则重启会复活一个死目标。
         store.delete_target(&target.id).await.unwrap();
         assert_eq!(store.prune_sticky_bindings(0).await.unwrap(), 2);
+    }
+
+    fn bucket_record(
+        id: &str,
+        started_at: i64,
+        target: &str,
+        status: i64,
+        code: Option<&str>,
+    ) -> RequestRecord {
+        RequestRecord {
+            request_id: id.into(),
+            started_at,
+            duration_ms: 100,
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+            group_id: Some("g1".into()),
+            logical_model: Some("glm-4.6".into()),
+            target_id: Some(target.into()),
+            account_id: Some("a1".into()),
+            upstream_model: None,
+            request_bytes: 64,
+            upstream_status: Some(status),
+            http_status: status,
+            error_code: code.map(str::to_string),
+            endpoint: Some("chat_completions".into()),
+            degraded: None,
+            effective_multiplier: None,
+            cheapest_multiplier: None,
+            dearest_multiplier: None,
+            attempts: 1,
+            first_token_ms: Some(50),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            config_version: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            sticky_wait_ms: None,
+            sticky_freshness: None,
+            output_tps: None,
+            multiplier_source: None,
+            quota_status: None,
+            filter_summary: None,
+            selected_layer: None,
+            attempts_detail: Vec::new(),
+            queued_ms: 0,
+            sticky_hit: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn performance_buckets_roll_up_request_records() {
+        let store = store().await;
+        // 同一分钟内的两条成功 + 一条 429，分属两个目标。
+        store
+            .insert_request_records(&[
+                bucket_record("r1", 1_200, "tgt-a", 200, None),
+                bucket_record("r2", 1_230, "tgt-a", 200, None),
+                bucket_record("r3", 1_250, "tgt-b", 429, Some("rate_limited")),
+            ])
+            .await
+            .unwrap();
+
+        // 只滚 [1200, 1260) 这一分钟。
+        let rows = store
+            .rollup_performance_buckets(1_200, 1_260, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "两个目标各一个桶");
+
+        let buckets = store
+            .list_performance_buckets(1_200, 1_260, None)
+            .await
+            .unwrap();
+        assert_eq!(buckets.len(), 2);
+        let a = buckets.iter().find(|b| b.target_id == "tgt-a").unwrap();
+        assert_eq!(a.requests, 2);
+        assert_eq!(a.success, 2);
+        assert_eq!(a.total_ms_sum, 200);
+        assert_eq!(a.first_token_count, 2);
+        assert_eq!(a.output_tokens_sum, 60);
+        let b = buckets.iter().find(|b| b.target_id == "tgt-b").unwrap();
+        assert_eq!(b.requests, 1);
+        assert_eq!(b.success, 0, "429 不算成功");
+        assert_eq!(b.rate_limited, 1, "429 要单独计数（§9.3）");
+
+        // 按目标筛选。
+        let only_b = store
+            .list_performance_buckets(1_200, 1_260, Some("tgt-b"))
+            .await
+            .unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].target_id, "tgt-b");
+    }
+
+    #[tokio::test]
+    async fn rolling_up_the_same_window_twice_does_not_double_count() {
+        let store = store().await;
+        store
+            .insert_request_records(&[bucket_record("r1", 1_200, "tgt-a", 200, None)])
+            .await
+            .unwrap();
+        store
+            .rollup_performance_buckets(1_200, 1_260, 60)
+            .await
+            .unwrap();
+        store
+            .rollup_performance_buckets(1_200, 1_260, 60)
+            .await
+            .unwrap();
+        let buckets = store
+            .list_performance_buckets(1_200, 1_260, None)
+            .await
+            .unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].requests, 1, "重复聚合必须幂等");
+    }
+
+    #[tokio::test]
+    async fn without_target_id_records_do_not_enter_target_buckets() {
+        let store = store().await;
+        let mut record = bucket_record("r1", 1_200, "tgt-a", 200, None);
+        // 没选中目标就失败的请求不该污染目标维度的聚合。
+        record.target_id = None;
+        store.insert_request_records(&[record]).await.unwrap();
+        let rows = store
+            .rollup_performance_buckets(1_200, 1_260, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn performance_buckets_are_pruned_by_retention() {
+        let store = store().await;
+        store
+            .insert_request_records(&[
+                bucket_record("r1", 1_200, "tgt-a", 200, None),
+                bucket_record("r2", 5_000, "tgt-a", 200, None),
+            ])
+            .await
+            .unwrap();
+        store
+            .rollup_performance_buckets(1_200, 5_060, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_performance_buckets(0, 10_000, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.prune_performance_buckets(2_000).await.unwrap(), 1);
+        let left = store
+            .list_performance_buckets(0, 10_000, None)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].bucket_start > 2_000);
     }
 }

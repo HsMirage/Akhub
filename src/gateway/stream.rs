@@ -312,10 +312,47 @@ pub struct StreamAccounting {
     protocol: Protocol,
     reader: crate::protocol::sse::FrameReader,
     error: Option<String>,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
+    usage: UsageBreakdown,
     total_tokens: Option<u64>,
     finished: Option<serde_json::Value>,
+}
+
+/// 一次请求的 Token 细分（§11.6）。
+///
+/// 每一项都是"上游报了才有"，缺失留 None。绝不估算、绝不用 0 冒充已知。
+/// 三个协议字段名不同，统一在这里归一。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageBreakdown {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
+    pub reasoning: Option<u64>,
+}
+
+/// 从上游响应体里读出 Token 细分（§11.6）。
+pub fn usage_breakdown(body: &serde_json::Value) -> UsageBreakdown {
+    let Some(usage) = body.get("usage") else {
+        return UsageBreakdown::default();
+    };
+    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
+    // 缓存与思考的字段名：Anthropic 用 cache_*_input_tokens，OpenAI 用
+    // prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens。
+    let details = |parent: &str, name: &str| {
+        usage
+            .get(parent)
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_u64)
+    };
+    UsageBreakdown {
+        input: field("prompt_tokens").or_else(|| field("input_tokens")),
+        output: field("completion_tokens").or_else(|| field("output_tokens")),
+        cache_read: field("cache_read_input_tokens")
+            .or_else(|| details("prompt_tokens_details", "cached_tokens")),
+        cache_write: field("cache_creation_input_tokens"),
+        reasoning: field("reasoning_tokens")
+            .or_else(|| details("completion_tokens_details", "reasoning_tokens")),
+    }
 }
 
 impl StreamAccounting {
@@ -324,8 +361,7 @@ impl StreamAccounting {
             protocol,
             reader: crate::protocol::sse::FrameReader::new(),
             error: None,
-            input_tokens: None,
-            output_tokens: None,
+            usage: UsageBreakdown::default(),
             total_tokens: None,
             finished: None,
         }
@@ -335,6 +371,14 @@ impl StreamAccounting {
     pub fn push(&mut self, chunk: &[u8]) {
         for frame in self.reader.push(chunk) {
             self.observe(&frame);
+        }
+        // 这里的字节是我们自己发出去的，正常不会触顶。触顶说明发射器写出了一个
+        // 超大的坏帧——用量会从这一刻起统计不到，必须记下来而不是让结算静默
+        // 按"没有 usage"处理（§19.4）。
+        if let Some(reason) = self.reader.overflow()
+            && self.error.is_none()
+        {
+            self.error = Some(format!("下游流出现超限帧，用量统计已中断：{reason}"));
         }
     }
 
@@ -353,20 +397,26 @@ impl StreamAccounting {
     /// TPM 结算用的完整用量；上游没有给足字段时返回 `None`，绝不估算。
     pub fn usage_tokens(&self) -> Option<u64> {
         self.total_tokens.or_else(|| {
-            self.input_tokens
-                .zip(self.output_tokens)
+            self.usage
+                .input
+                .zip(self.usage.output)
                 .map(|(input, output)| input.saturating_add(output))
         })
     }
 
     /// 输出 Token，供吞吐评分使用。
+    /// 完整的 Token 细分，写进请求记录（§11.6）。
+    pub fn usage_breakdown(&self) -> UsageBreakdown {
+        self.usage
+    }
+
     pub fn output_tokens(&self) -> Option<u64> {
-        self.output_tokens
+        self.usage.output
     }
 
     /// 输入 Token（Anthropic 已并入缓存读写）；拿不到就是 `None`。
     pub fn input_tokens(&self) -> Option<u64> {
-        self.input_tokens
+        self.usage.input
     }
 
     /// Responses：`response.completed` / `incomplete` / `failed` 里的最终对象。
@@ -448,14 +498,27 @@ impl StreamAccounting {
             .or_else(|| usage.get("input_tokens"))
             .and_then(serde_json::Value::as_u64)
         {
-            self.input_tokens = Some(input);
+            self.usage.input = Some(input);
         }
         if let Some(output) = usage
             .get("completion_tokens")
             .or_else(|| usage.get("output_tokens"))
             .and_then(serde_json::Value::as_u64)
         {
-            self.output_tokens = Some(output);
+            self.usage.output = Some(output);
+        }
+        // 缓存与思考在 OpenAI 侧藏在 details 子对象里（§11.6）。
+        let details = |parent: &str, name: &str| {
+            usage
+                .get(parent)
+                .and_then(|value| value.get(name))
+                .and_then(serde_json::Value::as_u64)
+        };
+        if let Some(cached) = details("prompt_tokens_details", "cached_tokens") {
+            self.usage.cache_read = Some(cached);
+        }
+        if let Some(reasoning) = details("completion_tokens_details", "reasoning_tokens") {
+            self.usage.reasoning = Some(reasoning);
         }
     }
 
@@ -465,10 +528,14 @@ impl StreamAccounting {
         if let Some(input) = field("input_tokens") {
             let cache = field("cache_creation_input_tokens").unwrap_or(0)
                 + field("cache_read_input_tokens").unwrap_or(0);
-            self.input_tokens = Some(input.saturating_add(cache));
+            // Anthropic 的 input_tokens 不含缓存部分；记录里要的是总数，
+            // 同时缓存读写各自单独留一列（§11.6）。
+            self.usage.input = Some(input.saturating_add(cache));
+            self.usage.cache_read = field("cache_read_input_tokens");
+            self.usage.cache_write = field("cache_creation_input_tokens");
         }
         if let Some(output) = field("output_tokens") {
-            self.output_tokens = Some(output);
+            self.usage.output = Some(output);
         }
         if let Some(total) = field("total_tokens") {
             self.total_tokens = Some(total);

@@ -204,6 +204,17 @@ fn key_with(digest: &KeyDigest, scope: &str, kind: &str, value: &[u8]) -> Key {
     ))
 }
 
+/// 粘性绑定表的内存上限（§19.4）。
+///
+/// 一个"项目"一行，正常规模是几十到几百。这个上限纯粹是失控保护：配置写错、
+/// 上游返回的 system prompt 每次都不同、或者有人拿随机前缀打网关时，表不能
+/// 无限涨下去。
+const MAX_BINDINGS: usize = 10_000;
+/// 触发上限时一次淘汰多少条。
+///
+/// 按批淘汰而不是只淘汰一条：否则表会长期贴着上限，每次绑定都做一次全表扫描。
+const EVICT_BATCH: usize = MAX_BINDINGS / 10;
+
 /// 内存中的粘性绑定表。写盘由 60 秒快照任务批量完成（§19.4）。
 #[derive(Default)]
 pub struct Bindings {
@@ -239,6 +250,9 @@ impl Bindings {
     /// 建立或改写绑定。
     pub fn bind(&self, key: Key, group_id: &str, logical_model: &str, target_id: &str, now: i64) {
         let mut guard = crate::sync::write(&self.inner);
+        if guard.len() >= MAX_BINDINGS && !guard.contains_key(&key) {
+            evict_oldest(&mut guard);
+        }
         guard.insert(
             key,
             Arc::new(BindingEntry {
@@ -336,6 +350,34 @@ const SIZE_BUDGET: &[(usize, u64)] = &[
 /// 超过最大档位后的预算。
 const MAX_BUDGET: u64 = 90;
 
+/// 淘汰最久未使用的若干条绑定（§19.4）。
+///
+/// 只在超过上限时调用。代价是一次 O(n log n) 排序，但按批淘汰之后它摊到上千次
+/// 绑定上，可以忽略。被淘汰的前缀下一次请求会重新抽签——只损失那一个前缀的
+/// 缓存，不会影响其他会话。
+fn evict_oldest(guard: &mut HashMap<Key, Arc<BindingEntry>>) {
+    let mut ages: Vec<(i64, Key)> = guard
+        .iter()
+        .map(|(key, entry)| {
+            let last = entry
+                .state
+                .lock()
+                .map(|state| state.last_used_at)
+                .unwrap_or_default();
+            (last, key.clone())
+        })
+        .collect();
+    ages.sort_by_key(|(last, _)| *last);
+    for (_, key) in ages.into_iter().take(EVICT_BATCH) {
+        guard.remove(&key);
+    }
+    tracing::warn!(
+        limit = MAX_BINDINGS,
+        evicted = EVICT_BATCH,
+        "粘性绑定表达到上限，已淘汰最久未使用的条目"
+    );
+}
+
 /// 缓存新鲜度系数（§10.3）。
 ///
 /// 粘性命中不等于缓存命中：Anthropic 的缓存默认 TTL 5 分钟，OpenAI 的自动
@@ -347,6 +389,11 @@ fn freshness(since_last_hit: i64) -> f64 {
         s if s <= 6 * 60 => 0.5,
         _ => 0.1,
     }
+}
+
+/// 暴露给请求记录：这次粘性等待用的新鲜度系数（§24.1）。
+pub fn freshness_for(since_last_hit: i64) -> f64 {
+    freshness(since_last_hit)
 }
 
 /// 粘性请求愿意为"等到原目标空出来"付出的时间（§10.3）。
@@ -569,5 +616,51 @@ mod tests {
     fn a_cold_cache_makes_waiting_nearly_worthless() {
         let big = 1024 * 1024;
         assert!(wait_budget(big, 20 * 60) < wait_budget(big, 60) / 5);
+    }
+
+    /// 绑定表到上限时淘汰最久未使用的条目，而不是无限增长（§19.4）。
+    #[test]
+    fn bindings_evict_the_oldest_when_the_table_is_full() {
+        let bindings = Bindings::new();
+        // 填满到上限，每条的最后使用时间依次递增：最先写入的最旧。
+        for i in 0..MAX_BINDINGS {
+            let (key, _) = derive_prefix(&json!({"system": format!("项目 {i}")})).unwrap();
+            bindings.bind(key, "g1", "m1", "t1", i as i64);
+        }
+        assert_eq!(bindings.len(), MAX_BINDINGS);
+
+        // 再写一条，触发按批淘汰。
+        let (fresh, _) = derive_prefix(&json!({"system": "新项目"})).unwrap();
+        bindings.bind(fresh.clone(), "g1", "m1", "t2", 1_000_000);
+        assert!(
+            bindings.len() <= MAX_BINDINGS,
+            "淘汰后不该超过上限：{}",
+            bindings.len()
+        );
+        assert_eq!(
+            bindings.len(),
+            MAX_BINDINGS - EVICT_BATCH + 1,
+            "一次淘汰一批，加上新写入的一条"
+        );
+        // 刚写进去的必须在。
+        assert!(
+            bindings.get(&fresh, 1_000_000).is_some(),
+            "新绑定不能被淘汰"
+        );
+
+        // 最旧的那些已经被淘汰。
+        let (oldest, _) = derive_prefix(&json!({"system": "项目 0"})).unwrap();
+        assert!(
+            bindings.get(&oldest, 1_000_000).is_none(),
+            "最久未使用的绑定应当先被淘汰"
+        );
+        // 较新的还在。查询时间要贴近它的写入时间，否则会被 1 小时的滑动过期
+        // 判成失效——那是 TTL 的行为，不是淘汰的行为。
+        let (newer, _) =
+            derive_prefix(&json!({"system": format!("项目 {}", MAX_BINDINGS - 1)})).unwrap();
+        assert!(
+            bindings.get(&newer, MAX_BINDINGS as i64 - 1).is_some(),
+            "较新的绑定不该被淘汰"
+        );
     }
 }

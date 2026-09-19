@@ -128,6 +128,11 @@ pub struct StreamParser {
     finished: bool,
     /// 是否已经发出 `Done`。之后的任何事件都不再放行。
     done: bool,
+    /// 解析阶段被丢弃的能力（§14.8、§16.6）。
+    ///
+    /// 上游协议里有些东西在中间格式里没有位置，只能丢。丢可以，但必须记下来：
+    /// 静默丢失正是 §14.8 要避免的。目前只有 Anthropic 的 `signature_delta`。
+    degraded: Vec<&'static str>,
 }
 
 #[derive(Debug)]
@@ -147,6 +152,19 @@ impl StreamParser {
             },
             finished: false,
             done: false,
+            degraded: Vec::new(),
+        }
+    }
+
+    /// 取走并清空解析阶段记录的能力降级，交给请求记录与响应头（§14.8）。
+    pub fn take_degraded(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.degraded)
+    }
+
+    /// 记一次"这个东西跨协议表达不了，只能丢"。
+    fn note_degraded(&mut self, capability: &'static str) {
+        if !self.degraded.contains(&capability) {
+            self.degraded.push(capability);
         }
     }
 
@@ -164,7 +182,15 @@ impl StreamParser {
         let events = match &mut self.inner {
             Inner::Chat(parser) => parser.push(&data),
             Inner::Responses => openai_responses::parse_event(frame.event.as_deref(), &data),
-            Inner::Anthropic => anthropic::parse_event(frame.event.as_deref(), &data),
+            Inner::Anthropic => {
+                // 签名增量只对 Anthropic 自己有意义（§14.6：思考在白名单内，
+                // 但签名是 Anthropic 独有的生命周期元数据）。跨协议时它无处
+                // 安放——丢掉是允许的，但必须记成降级，不能静默丢。
+                if is_signature_delta(&data) {
+                    self.note_degraded("thinking");
+                }
+                anthropic::parse_event(frame.event.as_deref(), &data)
+            }
         };
         self.guard(events)
     }
@@ -212,6 +238,19 @@ impl StreamParser {
         }
         guarded
     }
+}
+
+/// 这一帧是不是 Anthropic 的 `signature_delta`（§14.6）。
+///
+/// 判断放在管道层而不是协议解析器里：解析器是纯函数（帧进事件出），没有地方
+/// 记录"我丢了什么"；而"丢了什么"必须在同一条链路上被累计。
+fn is_signature_delta(data: &serde_json::Value) -> bool {
+    data.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta")
+        && data
+            .get("delta")
+            .and_then(|delta| delta.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("signature_delta")
 }
 
 /// 中间事件 → 下游 SSE 帧。
@@ -263,8 +302,16 @@ impl StreamEmitter {
     }
 
     /// 流中途出错时按下游协议发送的终止错误事件（§13.4、§18.2）。
-    pub fn error(&self, message: &str) -> axum::body::Bytes {
-        stream_error(self.protocol(), message)
+    ///
+    /// 带上稳定错误码与请求 ID：流已经开始，HTTP 状态码发不出去了，这两样只能
+    /// 落在事件体里。
+    pub fn error(
+        &self,
+        code: crate::gateway::error::ErrorCode,
+        message: &str,
+        request_id: Option<&str>,
+    ) -> axum::body::Bytes {
+        stream_error(self.protocol(), code, message, request_id)
     }
 
     fn protocol(&self) -> Protocol {
@@ -300,18 +347,34 @@ pub fn frame_error(frame: &sse::Frame) -> Option<String> {
     Some(message.chars().take(200).collect())
 }
 
+/// 协议适配层版本（§6.7）。
+///
+/// 能力证据的失效条件之一是"适配器版本变化"（§16.7）——转换规则改了之后，
+/// 之前学到的"这个模型不支持某能力"未必还成立。所以这个号要显式存在，并在
+/// 后台可见，改了它就该让证据失效。
+pub const ADAPTER_VERSION: &str = "2026-09-17.1";
+
 /// 按协议构造一个可直接写进流的错误帧（§18.2）。
-pub fn stream_error(protocol: Protocol, message: &str) -> axum::body::Bytes {
+///
+/// 流已经开始之后 HTTP 状态码早就发出去了，稳定错误码与请求 ID 只能写进事件体；
+/// 不带的话客户端拿到的就只是一句人话，没法据此重试或报工单（§18.2 第 3 条）。
+pub fn stream_error(
+    protocol: Protocol,
+    code: crate::gateway::error::ErrorCode,
+    message: &str,
+    request_id: Option<&str>,
+) -> axum::body::Bytes {
     match protocol {
-        Protocol::OpenAiChat => {
-            sse::format_frame(None, &openai_chat::error_event(message).to_string())
-        }
+        Protocol::OpenAiChat => sse::format_frame(
+            None,
+            &openai_chat::error_event(code, message, request_id).to_string(),
+        ),
         Protocol::OpenAiResponses => {
-            let (name, data) = openai_responses::error_event(message);
+            let (name, data) = openai_responses::error_event(code, message, request_id);
             sse::format_frame(Some(&name), &data.to_string())
         }
         Protocol::AnthropicMessages => {
-            let (name, data) = anthropic::error_event(message);
+            let (name, data) = anthropic::error_event(code, message, request_id);
             sse::format_frame(Some(&name), &data.to_string())
         }
     }
@@ -706,9 +769,19 @@ mod tests {
     fn a_stream_error_uses_the_downstream_protocol_shape() {
         for protocol in ALL {
             let emitter = StreamEmitter::new(protocol, false, None);
-            let bytes = emitter.error("上游中断");
+            let bytes = emitter.error(
+                crate::gateway::error::ErrorCode::UpstreamProtocolError,
+                "上游中断",
+                Some("req_stream_1"),
+            );
             let text = String::from_utf8_lossy(&bytes);
             assert!(text.contains("上游中断"));
+            // 流内错误必须带稳定错误码与请求 ID，否则客户端只剩一句人话（§18.2）。
+            assert!(
+                text.contains("upstream_protocol_error"),
+                "缺少稳定错误码：{text}"
+            );
+            assert!(text.contains("req_stream_1"), "缺少请求 ID：{text}");
             match protocol {
                 Protocol::AnthropicMessages | Protocol::OpenAiResponses => {
                     assert!(text.starts_with("event: error\n"))
@@ -716,6 +789,27 @@ mod tests {
                 Protocol::OpenAiChat => assert!(text.starts_with("data: ")),
             }
         }
+    }
+
+    /// 不同错误码在流内帧里映射到不同的协议错误类型（§18.2）。
+    #[test]
+    fn stream_errors_carry_a_code_specific_protocol_type() {
+        use crate::gateway::error::ErrorCode;
+
+        let chat = |code| {
+            let emitter = StreamEmitter::new(Protocol::OpenAiChat, false, None);
+            String::from_utf8_lossy(&emitter.error(code, "x", None)).to_string()
+        };
+        assert!(chat(ErrorCode::RateLimited).contains("rate_limit_error"));
+        assert!(chat(ErrorCode::UpstreamTimeout).contains("api_error"));
+
+        let anthropic = |code| {
+            let emitter = StreamEmitter::new(Protocol::AnthropicMessages, false, None);
+            String::from_utf8_lossy(&emitter.error(code, "x", None)).to_string()
+        };
+        // Anthropic 把"上游超时/不可用"归到 overloaded_error，与完整响应同口径。
+        assert!(anthropic(ErrorCode::UpstreamTimeout).contains("overloaded_error"));
+        assert!(anthropic(ErrorCode::RateLimited).contains("rate_limit_error"));
     }
 
     #[test]
@@ -789,5 +883,58 @@ mod tests {
              event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         assert!(out.contains("\"finish_reason\":\"length\""), "{out}");
+    }
+
+    /// Anthropic 的签名增量跨协议无处安放，丢掉要记成降级（§14.6、§14.8）。
+    ///
+    /// 这条钉的是"静默丢失"：签名不能表达是可以接受的（thinking 在白名单内），
+    /// 但必须留下痕迹，否则违反 §28 的"没有静默丢失"。
+    #[test]
+    fn a_dropped_signature_is_recorded_as_a_degradation() {
+        let raw = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"1\",\"model\":\"m\"}}\n\n\
+                   event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                   event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"想了想\"}}\n\n\
+                   event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-abc\"}}\n\n\
+                   event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                   event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                   event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let mut parser = StreamParser::new(Protocol::AnthropicMessages);
+        let mut reader = sse::FrameReader::new();
+        let mut emitted = String::new();
+        let mut emitter = StreamEmitter::new(Protocol::OpenAiChat, false, None);
+        for frame in reader.push(raw.as_bytes()) {
+            for event in parser.push(&frame) {
+                for bytes in emitter.push(&event) {
+                    emitted.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        // 思考文本本身要留住——丢的只是签名。
+        assert!(emitted.contains("想了想"), "思考文本不该被丢：{emitted}");
+        assert!(!emitted.contains("sig-abc"), "签名确实无处安放");
+        // 关键：丢签名必须留下痕迹。
+        assert_eq!(
+            parser.take_degraded(),
+            vec!["thinking"],
+            "丢掉签名必须记成 thinking 降级"
+        );
+        // 取走之后不重复上报。
+        assert!(parser.take_degraded().is_empty());
+    }
+
+    /// 没有签名时不该凭空记一笔降级。
+    #[test]
+    fn a_stream_without_a_signature_reports_no_degradation() {
+        let raw = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"1\"}}\n\n\
+                   event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                   event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n\
+                   event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                   event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let mut parser = StreamParser::new(Protocol::AnthropicMessages);
+        let mut reader = sse::FrameReader::new();
+        for frame in reader.push(raw.as_bytes()) {
+            let _ = parser.push(&frame);
+        }
+        assert!(parser.take_degraded().is_empty(), "没有丢东西就不该报降级");
     }
 }

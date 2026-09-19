@@ -78,6 +78,27 @@ impl Catalog {
     pub fn get(&self, model: &str) -> Option<&ModelCapability> {
         self.models.get(model)
     }
+
+    /// 目录对这个模型的某项能力怎么说（§16.6）。
+    ///
+    /// 三个返回值含义严格区分：
+    /// - \`Some(true)\`：目录明确说支持；
+    /// - \`Some(false)\`：目录明确说不支持；
+    /// - \`None\`：目录里没有这个模型，或该项字段没写——**一律按未知处理**。
+    ///
+    /// 把 \`None\` 当成 \`Some(false)\` 会让目录里没收录的新模型全部被降权，
+    /// 那比不接入还糟。
+    pub fn supports(&self, model: &str, capability: &str) -> Option<bool> {
+        let entry = self.models.get(model)?;
+        match capability {
+            "function_calling" => Some(entry.function_calling),
+            "vision" => Some(entry.vision),
+            "response_schema" => Some(entry.response_schema),
+            "reasoning" => Some(entry.reasoning),
+            // 其余能力目录不表态。capability 词汇表见 DEGRADABLE 与端点规则。
+            _ => None,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Catalog {
@@ -247,6 +268,24 @@ mod tests {
     #[test]
     fn unknown_models_fall_back_to_none() {
         assert!(builtin().get("不存在的模型").is_none());
+        // 目录里没有的模型 -> 能力未知，绝不等于"不支持"（§16.6）。
+        assert_eq!(builtin().supports("不存在的模型", "vision"), None);
+        // 目录不表态的能力也是未知，而不是不支持。
+        assert_eq!(builtin().supports("gpt-4o", "some_exotic_capability"), None);
+    }
+
+    #[test]
+    fn the_catalog_answers_the_capabilities_it_knows() {
+        let catalog = builtin();
+        // 只用目录里一定存在的模型断言，避免目录换版后测试变脆。
+        assert_eq!(catalog.supports("gpt-4o", "vision"), Some(true));
+        assert_eq!(catalog.supports("gpt-4o", "function_calling"), Some(true));
+        // gpt-3.5-turbo 在 LiteLLM 目录里不标 vision。
+        assert_eq!(
+            catalog.supports("gpt-3.5-turbo", "vision"),
+            Some(false),
+            "目录明确标了不支持就要如实返回 false"
+        );
     }
 
     #[test]

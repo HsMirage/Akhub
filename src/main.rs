@@ -59,12 +59,58 @@ async fn healthcheck(addr: SocketAddr) -> Result<()> {
     }
 }
 
-/// 默认只打印 info 及以上；用 `RUST_LOG` 覆盖。
+/// 默认只打印 info 及以上；用环境变量 RUST_LOG 覆盖。
+///
+/// 输出统一经过 RedactingFormat：日志脱敏不能只靠"每个调用点记得调一次"，
+/// 新增的日志点很容易漏（§20.2、§23.4）。
 fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::{EnvFilter, fmt};
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("akhub=info,tower_http=warn,warn"));
-    fmt().with_env_filter(filter).init();
+    let layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .event_format(RedactingFormat {
+            inner: fmt::format(),
+        });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
+        .init();
+}
+
+/// 把事件先渲染成文本、过一遍脱敏再输出（§20.2、§23.4）。
+///
+/// 包在格式化器外面而不是做成 Layer：tracing 的字段是结构化的，逐字段判断
+/// 类型既繁琐又容易漏；先渲染成最终要写出去的那串文本，再对文本做一次与手工
+/// 脱敏完全相同的处理，覆盖面就是百分之百。
+struct RedactingFormat<F> {
+    inner: F,
+}
+
+impl<S, N, F> tracing_subscriber::fmt::format::FormatEvent<S, N> for RedactingFormat<F>
+where
+    F: tracing_subscriber::fmt::format::FormatEvent<S, N>,
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::format::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut rendered = String::new();
+        self.inner.format_event(
+            ctx,
+            tracing_subscriber::fmt::format::Writer::new(&mut rendered),
+            event,
+        )?;
+        // 渲染结果一定以换行结尾；text() 按空白切分并原样保留，换行不会丢。
+        write!(writer, "{}", akhub::security::redact::text(&rendered))
+    }
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {

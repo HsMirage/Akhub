@@ -40,6 +40,23 @@ pub enum Ineligible {
 }
 
 impl Ineligible {
+    /// 给请求记录用的可读原因（§24.1）。只描述类别，不带账号 ID 等细节。
+    fn describe(&self) -> String {
+        match self {
+            Self::Disabled => "已停用".to_string(),
+            Self::MultiplierExceeded => "倍率超限".to_string(),
+            Self::MultiplierUnknown => "倍率未知".to_string(),
+            Self::Unsupported(_) => "能力不支持".to_string(),
+            Self::Unavailable(reason) => match reason {
+                health::Unavailable::KeyInvalid => "Key 失效".to_string(),
+                health::Unavailable::QuotaExhausted => "额度耗尽".to_string(),
+                health::Unavailable::Cooling => "冷却中".to_string(),
+                health::Unavailable::ConcurrencyFull => "并发已满".to_string(),
+                health::Unavailable::RateLimited => "限流中".to_string(),
+            },
+        }
+    }
+
     fn error_code(&self) -> ErrorCode {
         match self {
             Self::MultiplierExceeded => ErrorCode::MultiplierExceeded,
@@ -72,12 +89,35 @@ pub struct Candidate {
     pub score: score::Score,
     /// 按 §14.3 排好的端点尝试顺序，第一个是保真度最高的。
     pub endpoints: Vec<Choice>,
+    /// 内置能力目录明确说"这个模型不支持本次请求需要的某项能力"（§16.6）。
+    ///
+    /// 这只是**初判**，不是硬性不合格：目录可能过时，而真实请求结果才是最高
+    /// 优先级的证据。所以它只让这个候选在层内排到后面，不把它踢出计划。
+    pub catalog_discouraged: bool,
 }
 
 impl Candidate {
     /// 这个目标能否无损表达本次请求。
     pub fn is_lossless(&self) -> bool {
         self.endpoints.first().is_some_and(Choice::is_lossless)
+    }
+
+    /// 层内选谁时的偏好档：0 最好。
+    ///
+    /// - 0：无损，且目录没有异议；
+    /// - 1：无损，但目录说这个模型缺某项能力（先试别的，最后才轮到它）；
+    /// - 2：需要降级表达（本来就在最后，§14.8）。
+    ///
+    /// 目录档排在"需要降级"之前是有意的：宁可试一个目录存疑但能无损表达的目标，
+    /// 也不要直接丢掉 thinking 这类白名单内的能力。目录也会出错，丢能力不会。
+    pub fn preference(&self) -> u8 {
+        if !self.is_lossless() {
+            2
+        } else if self.catalog_discouraged {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -96,6 +136,8 @@ pub struct Plan {
     /// 分组内最便宜与最贵的合格目标倍率，用于成本反事实基准（§11.6）。
     pub cheapest: Option<Multiplier>,
     pub dearest: Option<Multiplier>,
+    /// 被过滤掉的目标及原因，用于请求记录的"候选过滤原因"（§24.1）。
+    pub filtered: Vec<(String, usize)>,
 }
 
 impl Plan {
@@ -118,6 +160,21 @@ impl Plan {
 
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+
+    /// 候选过滤原因摘要（§24.1）。
+    ///
+    /// 形如 `倍率超限×2,能力不支持×1`；没有过滤掉任何目标时返回 `无`。
+    /// 只用于诊断，不参与调度。
+    pub fn filter_summary(&self) -> String {
+        if self.filtered.is_empty() {
+            return "无".to_string();
+        }
+        self.filtered
+            .iter()
+            .map(|(reason, count)| format!("{reason}×{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// 在计划里找出某个目标，供粘性命中时复用已算好的倍率与评分。
@@ -322,31 +379,71 @@ pub fn plan(
         .collect();
     let scores = score::score_all(&scoring, group.group.weights, cheapest_in_group);
 
+    // 本次请求真正需要的能力（§14.2 的 requested_capabilities）。
+    let requested = context.translation.requested_capabilities();
     let candidates: Vec<Candidate> = eligible
         .into_iter()
         .zip(scores)
-        .map(|((target, multiplier, endpoints), score)| Candidate {
-            target,
-            multiplier,
-            score,
-            endpoints,
+        .map(|((target, multiplier, endpoints), score)| {
+            let catalog_discouraged = catalog_discouraged(context, &target, &requested);
+            Candidate {
+                target,
+                multiplier,
+                score,
+                endpoints,
+                catalog_discouraged,
+            }
         })
         .collect();
 
     let cheapest = candidates.iter().map(|c| c.multiplier).min();
     let dearest = candidates.iter().map(|c| c.multiplier).max();
+    // 过滤原因按文本合并计数，写进请求记录供诊断（§24.1）。
+    let mut filtered: Vec<(String, usize)> = Vec::new();
+    for reason in &reasons {
+        let label = reason.describe();
+        match filtered.iter_mut().find(|(name, _)| *name == label) {
+            Some((_, count)) => *count += 1,
+            None => filtered.push((label, 1)),
+        }
+    }
     Ok(Plan {
         layers: into_layers(candidates, random),
         cheapest,
         dearest,
+        filtered,
+    })
+}
+
+/// 内置能力目录是否明确说这个目标缺本次请求需要的能力（§16.6）。
+///
+/// **只在该能力没有任何真实证据时才看目录**——证据优先级是
+/// `明确的真实请求结果 > 上游接口返回 > 内置适配规则 > 开源目录`，
+/// 有了更高优先级的证据，目录的意见就作废。
+fn catalog_discouraged(
+    context: &Context<'_>,
+    target: &TargetView,
+    requested: &[&'static str],
+) -> bool {
+    let catalog = crate::capability::builtin();
+    requested.iter().any(|capability| {
+        // 已经学到证据的能力不归目录管：支持或不支持都由证据说话。
+        let learned = context.capabilities.is_unsupported(
+            &target.account.id,
+            &target.target.upstream_model,
+            capability,
+            context.now,
+        );
+        !learned && catalog.supports(&target.target.upstream_model, capability) == Some(false)
     })
 }
 
 /// 把候选按有效优先级切成层，层内用 `score^k` 加权随机排序（§9.2、§9.5）。
 ///
-/// 层内还有一道**硬**分界：能无损表达请求的目标一律排在只能降级表达的目标
-/// 之前。这就是 §14.8 的"降级只在故障切换时生效"——层内的无损目标全部试完
-/// 之前，需要丢弃 thinking 的目标根本轮不到。
+/// 层内还有一道**硬**分界，按 §14.8 与 §16.6：能无损表达且目录没有异议的目标
+/// 排最前；能无损表达但目录存疑的排中间；只能降级表达的排最后。这就是
+/// "降级只在故障切换时生效"——层内的无损目标全部试完之前，需要丢弃 thinking
+/// 的目标根本轮不到。
 fn into_layers(mut candidates: Vec<Candidate>, random: &mut impl FnMut() -> f64) -> Vec<Layer> {
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.target.priority));
 
@@ -363,10 +460,16 @@ fn into_layers(mut candidates: Vec<Candidate>, random: &mut impl FnMut() -> f64)
     }
 
     for layer in &mut layers {
-        let (lossless, degraded): (Vec<Candidate>, Vec<Candidate>) =
-            layer.candidates.drain(..).partition(Candidate::is_lossless);
-        layer.candidates = shuffle(lossless, random);
-        layer.candidates.extend(shuffle(degraded, random));
+        // 按偏好档分成三段：目录无异议的无损目标、目录存疑的无损目标、需要降级的
+        // 目标（§14.8、§16.6）。档与档之间是硬顺序，档内才抽签。
+        let mut buckets: [Vec<Candidate>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for candidate in layer.candidates.drain(..) {
+            buckets[candidate.preference() as usize].push(candidate);
+        }
+        layer.candidates = buckets
+            .into_iter()
+            .flat_map(|bucket| shuffle(bucket, random))
+            .collect();
     }
     layers
 }
@@ -505,6 +608,27 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
             account,
+            priority,
+        })
+    }
+
+    /// 指定上游模型名，用来驱动内置能力目录的判断（§16.6）。
+    ///
+    /// 逻辑模型名与上游真名是两件事：目录按**上游真名**查，所以测目录行为
+    /// 必须能控制这个名字。
+    fn target_of_model(
+        id: &str,
+        account: Arc<Account>,
+        priority: i32,
+        upstream_model: &str,
+    ) -> Arc<TargetView> {
+        let base = target(id, account, priority);
+        Arc::new(TargetView {
+            target: DispatchTarget {
+                upstream_model: upstream_model.into(),
+                ..base.target.clone()
+            },
+            account: Arc::clone(&base.account),
             priority,
         })
     }
@@ -1119,5 +1243,117 @@ mod tests {
             clamp_wait(Duration::from_secs(6), Duration::from_secs(600)),
             Duration::from_secs(6)
         );
+    }
+
+    /// 目录明确说不支持某项能力时，该目标在同一层内排到最后（§16.6）。
+    ///
+    /// 这是目录接入路由决策的可见效果：它**不**把目标踢出计划（目录可能过时，
+    /// 真实请求结果才是最高优先级的证据），只是让别的候选先被尝试。
+    #[test]
+    fn a_catalog_objection_moves_a_target_to_the_back_of_its_layer() {
+        let fixture = Fixture::new();
+        let view = fixture.multipliers.view();
+        // 带图片的请求：目录里 gpt-3.5-turbo 明确不标 vision。
+        let body = serde_json::json!({
+            "model": "glm-4.6",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}]
+        });
+        let translation = Translation::new(Protocol::OpenAiChat, &body);
+        let group = group_with(
+            "1",
+            vec![
+                // 目录里 gpt-3.5-turbo 明确不标 vision，gpt-4o 标了。
+                target_of_model(
+                    "discouraged",
+                    account("a1", "0.1", Protocol::OpenAiChat, true),
+                    50,
+                    "gpt-3.5-turbo",
+                ),
+                target_of_model(
+                    "capable",
+                    account("a2", "0.1", Protocol::OpenAiChat, true),
+                    50,
+                    "gpt-4o",
+                ),
+            ],
+        );
+        let context = Context {
+            health: &fixture.health,
+            perf: &fixture.perf,
+            multipliers: &view,
+            evidence: &fixture.evidence,
+            capabilities: &fixture.capabilities,
+            translation: &translation,
+            endpoint: Endpoint::ChatCompletions,
+            allow_degrade: true,
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+            now_unix: 0,
+            now: std::time::Instant::now(),
+        };
+        let planned = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        // 两个候选都还在计划里——目录不构成硬性不合格。
+        assert_eq!(planned.attempts().len(), 2, "目录不该把目标踢出计划");
+        // 两个都在第一层。
+        assert_eq!(planned.layers.len(), 1, "同优先级应当同层");
+        let layer = &planned.layers[0];
+        // 目录无异议的 gpt-4o 必须排在目录存疑的 gpt-3.5-turbo 之前。
+        assert_eq!(
+            layer.candidates[0].target.target.upstream_model, "gpt-4o",
+            "目录无异议的无损目标应当先被尝试"
+        );
+        assert!(
+            !layer.candidates[0].catalog_discouraged && layer.candidates[1].catalog_discouraged,
+            "档位应当反映目录的意见"
+        );
+    }
+
+    /// 有了真实证据就不再听目录的（§16.6 的证据优先级）。
+    #[test]
+    fn learned_evidence_outranks_the_catalog() {
+        let fixture = Fixture::new();
+        let view = fixture.multipliers.view();
+        let body = serde_json::json!({
+            "model": "glm-4.6",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}]
+        });
+        let translation = Translation::new(Protocol::OpenAiChat, &body);
+        let group = group_with(
+            "1",
+            vec![target(
+                "t1",
+                account("a1", "0.1", Protocol::OpenAiChat, true),
+                50,
+            )],
+        );
+        let now = std::time::Instant::now();
+        // 假设这个模型被真实请求证实"支持 vision"——目录就算说不行也不算数。
+        // 这里用"学到的是别的能力"来间接表达：学到证据的能力不归目录管。
+        fixture
+            .capabilities
+            .note_unsupported("a1", "glm-4.6", "reasoning", now);
+        let context = Context {
+            health: &fixture.health,
+            perf: &fixture.perf,
+            multipliers: &view,
+            evidence: &fixture.evidence,
+            capabilities: &fixture.capabilities,
+            translation: &translation,
+            endpoint: Endpoint::ChatCompletions,
+            allow_degrade: true,
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+            now_unix: 0,
+            now,
+        };
+        let planned = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        // 图片请求仍然只有一个候选，且没有因为目录被降权之外的影响。
+        assert_eq!(planned.attempts().len(), 1);
     }
 }

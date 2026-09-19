@@ -51,6 +51,11 @@ pub struct StreamSettlement {
     pub admission: Option<health::Admission>,
     /// Responses 入口才有的状态链补写计划。
     pub responses: Option<ResponsesCompletion>,
+    /// 流式过程中解析阶段丢掉的能力（§14.8）。
+    ///
+    /// 响应头在流开始前就发出去了，中途才知道的降级只能落到请求记录里——
+    /// 记录页照样能标红，这是"不静默丢失"的实际落点。
+    pub degraded: crate::gateway::translate::DegradationSink,
 }
 
 /// Responses 流完成后的状态链补写计划（§15.2）。
@@ -165,8 +170,30 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     record.first_token_ms = Some(settlement.first_token.as_millis() as i64);
     record.input_tokens = accounting.input_tokens().map(|value| value as i64);
     record.output_tokens = accounting.output_tokens().map(|value| value as i64);
+    // Token 细分同样只有流结束才拿得到（§11.6）。
+    let usage = accounting.usage_breakdown();
+    record.cache_read_tokens = usage.cache_read.map(|value| value as i64);
+    record.cache_write_tokens = usage.cache_write.map(|value| value as i64);
+    record.reasoning_tokens = usage.reasoning.map(|value| value as i64);
     if let Ending::Failed(code) = ending {
         record.error_code = Some(code.to_string());
+    }
+    // 把流中途记下的能力降级并进请求记录（§14.8）。去重后与发射阶段的
+    // 降级合并，避免同一项出现两次。
+    if let Ok(extra) = settlement.degraded.lock() {
+        for capability in extra.iter() {
+            let already = record
+                .degraded
+                .as_deref()
+                .is_some_and(|existing| existing.split(',').any(|item| item == capability));
+            if already {
+                continue;
+            }
+            record.degraded = Some(match record.degraded.take() {
+                Some(existing) => format!("{existing},{capability}"),
+                None => capability.clone(),
+            });
+        }
     }
     settlement.state.recorder.record(record);
 

@@ -23,7 +23,12 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v3：分组补"队列最长等待"`max_wait_secs`（§6.3）。
 /// v4：分组补"允许托管后台"`allow_managed_background`，并新增网关托管后台
 /// 任务表 `background_tasks`（计划 §29.1）。
-const SCHEMA_VERSION: i64 = 4;
+/// v5：新增分钟级目标性能聚合表 `performance_buckets`，支撑
+/// `GET /api/metrics`（§7.4、§20.1、§22）。
+/// v6：请求记录补粘性等待/新鲜度、输出速度、倍率来源、额度状态、
+/// 候选过滤原因与选中层（§6.6、§24.1）。
+/// v7：请求记录补 Token 细分：缓存读/写与思考 Token（§11.6）。
+const SCHEMA_VERSION: i64 = 7;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -167,6 +172,109 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .await
                 .context("迁移 groups.max_wait_secs 失败")?;
         }
+    }
+    if from < 6 {
+        // v6：请求记录补诊断列（§6.6、§24.1）。新库由 schema.sql 直接建好。
+        let existing = table_columns(pool, "request_records").await?;
+        for (column, ddl) in [
+            (
+                "sticky_wait_ms",
+                "ALTER TABLE request_records ADD COLUMN sticky_wait_ms INTEGER",
+            ),
+            (
+                "sticky_freshness",
+                "ALTER TABLE request_records ADD COLUMN sticky_freshness REAL",
+            ),
+            (
+                "output_tps",
+                "ALTER TABLE request_records ADD COLUMN output_tps REAL",
+            ),
+            (
+                "multiplier_source",
+                "ALTER TABLE request_records ADD COLUMN multiplier_source TEXT",
+            ),
+            (
+                "quota_status",
+                "ALTER TABLE request_records ADD COLUMN quota_status TEXT",
+            ),
+            (
+                "filter_summary",
+                "ALTER TABLE request_records ADD COLUMN filter_summary TEXT",
+            ),
+            (
+                "selected_layer",
+                "ALTER TABLE request_records ADD COLUMN selected_layer INTEGER",
+            ),
+        ] {
+            if !existing.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+            }
+        }
+    }
+    if from < 7 {
+        // v7：Token 细分（§11.6）。上游不上报的项留 NULL，绝不估算。
+        let existing = table_columns(pool, "request_records").await?;
+        for (column, ddl) in [
+            (
+                "cache_read_tokens",
+                "ALTER TABLE request_records ADD COLUMN cache_read_tokens INTEGER",
+            ),
+            (
+                "cache_write_tokens",
+                "ALTER TABLE request_records ADD COLUMN cache_write_tokens INTEGER",
+            ),
+            (
+                "reasoning_tokens",
+                "ALTER TABLE request_records ADD COLUMN reasoning_tokens INTEGER",
+            ),
+        ] {
+            if !existing.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+            }
+        }
+    }
+    if from < 5 {
+        // v5：分钟级性能聚合表。老库需要补建；新库已由 schema.sql 建好，
+        // 这里用 CREATE TABLE IF NOT EXISTS 保持幂等（§20.1）。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS performance_buckets (
+                bucket_start      INTEGER NOT NULL,
+                target_id         TEXT NOT NULL,
+                protocol          TEXT NOT NULL,
+                streaming         INTEGER NOT NULL,
+                requests          INTEGER NOT NULL,
+                success           INTEGER NOT NULL,
+                total_ms_sum      INTEGER NOT NULL,
+                first_token_sum   INTEGER NOT NULL,
+                first_token_count INTEGER NOT NULL,
+                output_tokens_sum INTEGER NOT NULL,
+                rate_limited      INTEGER NOT NULL DEFAULT 0,
+                server_errors     INTEGER NOT NULL DEFAULT 0,
+                protocol_errors   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_start, target_id, protocol, streaming)
+            )",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 performance_buckets 建表失败")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_buckets_time ON performance_buckets(bucket_start DESC)",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 performance_buckets 建索引失败")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_buckets_target ON performance_buckets(target_id, bucket_start DESC)",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 performance_buckets 建目标索引失败")?;
     }
     Ok(())
 }

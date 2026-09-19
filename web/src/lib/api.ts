@@ -12,6 +12,7 @@ import type {
   Limits,
   LogicalModel,
   Overview,
+  Page,
   RequestFilters,
   RequestPage,
   SelectionWarning,
@@ -22,11 +23,28 @@ import type {
   NewApiSite,
   TestResult,
   MultiplierRefreshResult,
+  BatchMultiplierRefreshResult,
 } from "./types";
 
 const BASE = "/admin/api";
 /** 写操作必须携带的自定义头，配合 SameSite=Strict 构成 CSRF 防护。 */
 const CSRF_HEADER = "x-akhub-csrf";
+/** 乐观锁：服务端在每个响应里回带当前配置版本（§7.4）。 */
+const CONFIG_VERSION_HEADER = "x-akhub-config-version";
+
+/**
+ * 最近一次从服务端读到的配置版本。
+ *
+ * 每次响应都会刷新它，写操作把它带回去；服务端发现版本对不上就返回 409，
+ * 从而把"打开两个标签页各改一半、后保存的覆盖先保存的"挡在门外（§7.4）。
+ * 用 0 表示"还没读到过"，此时不带头部，服务端按兼容模式处理。
+ */
+let configVersion = 0;
+
+/** 当前已知的配置版本，供界面判断是否需要提示重新加载。 */
+export function knownConfigVersion(): number {
+  return configVersion;
+}
 
 /** 后台接口返回的错误。`unauthorized` 让上层能区分"要重新登录"与"操作失败"。 */
 export class ApiError extends Error {
@@ -43,6 +61,11 @@ export class ApiError extends Error {
   get unauthorized(): boolean {
     return this.status === 401;
   }
+
+  /** 配置版本冲突：别人已经改过配置，需要重新加载再保存（§7.4）。 */
+  get configConflict(): boolean {
+    return this.status === 409 && this.message.includes("config_conflict");
+  }
 }
 
 async function request<T>(
@@ -52,13 +75,32 @@ async function request<T>(
   const method = init.method ?? "GET";
   const headers = new Headers(init.headers);
   if (init.body) headers.set("content-type", "application/json");
-  if (method !== "GET") headers.set(CSRF_HEADER, "1");
+  if (method !== "GET") {
+    headers.set(CSRF_HEADER, "1");
+    // 写操作带上读到的版本，让服务端能发现并发修改。
+    if (configVersion > 0) {
+      headers.set(CONFIG_VERSION_HEADER, String(configVersion));
+    }
+  }
 
   let response: Response;
   try {
     response = await fetch(BASE + path, { ...init, method, headers });
   } catch {
     throw new ApiError("无法连接到 Akhub 服务", 0);
+  }
+
+  // 服务端在**每次**响应里回带最新版本：写成功之后版本已经 bump，
+  // 不跟着更新的话下一次写必然 409。
+  //
+  // 只在**成功**响应上采纳版本号。失败时一律保持旧版本：写失败说明配置没
+  // 被这次改过，旧版本仍然有效；而版本冲突时更不能采纳，否则用户直接再点一次
+  // 保存就会成功并悄悄覆盖别人的修改——"请重新加载"必须真的靠一次 GET 才能
+  // 拿到新版本（§7.4）。
+  const returned = response.headers.get(CONFIG_VERSION_HEADER);
+  if (returned && response.ok) {
+    const parsed = Number.parseInt(returned, 10);
+    if (Number.isFinite(parsed)) configVersion = parsed;
   }
 
   if (response.status === 204) return undefined as T;
@@ -142,7 +184,7 @@ export const api = {
   overview: () => request<Overview>("/overview"),
   settings: () => request<Settings>("/settings"),
 
-  groups: () => request<Group[]>("/groups"),
+  groups: () => request<Page<Group>>("/groups"),
   availableGroupModels: (id: string) =>
     request<{ models: AvailableModel[] }>(`/groups/${id}/available-models`),
   createGroup: (input: GroupInput) => post<KeyReveal>("/groups", input),
@@ -151,13 +193,16 @@ export const api = {
   deleteGroup: (id: string) => del(`/groups/${id}`),
   regenerateKey: (id: string) => post<KeyReveal>(`/groups/${id}/regenerate-key`),
 
-  accounts: () => request<Account[]>("/accounts"),
+  accounts: () => request<Page<Account>>("/accounts"),
   createAccount: (input: AccountInput) => post<Account>("/accounts", input),
   updateAccount: (id: string, input: Partial<AccountInput>) =>
     patch<Account>(`/accounts/${id}`, input),
   deleteAccount: (id: string) => del(`/accounts/${id}`),
   refreshMultiplier: (id: string) =>
     post<MultiplierRefreshResult>(`/accounts/${id}/refresh-multiplier`),
+  /** 批量刷新所有自动倍率账号（§11.3、§27 阶段5）。 */
+  refreshAllMultipliers: () =>
+    post<BatchMultiplierRefreshResult>("/accounts/refresh-multipliers"),
   /** 拉取该账号可用的 New API 分组（只读，不落库）。 */
   multiplierGroups: (id: string) =>
     request<{ groups: NewApiGroupOption[] }>(`/accounts/${id}/multiplier-groups`),
@@ -246,14 +291,14 @@ export const api = {
       body: JSON.stringify({ aliases }),
     }),
 
-  models: () => request<LogicalModel[]>("/logical-models"),
+  models: () => request<Page<LogicalModel>>("/logical-models"),
   createModel: (input: { group_id: string; name: string; enabled?: boolean }) =>
     post<LogicalModel>("/logical-models", input),
   updateModel: (id: string, input: { name?: string; enabled?: boolean }) =>
     patch<void>(`/logical-models/${id}`, input),
   deleteModel: (id: string) => del(`/logical-models/${id}`),
 
-  targets: () => request<DispatchTarget[]>("/targets"),
+  targets: () => request<Page<DispatchTarget>>("/targets"),
   createTarget: (input: TargetInput) => post<DispatchTarget>("/targets", input),
   updateTarget: (id: string, input: Partial<TargetInput>) =>
     patch<DispatchTarget>(`/targets/${id}`, input),

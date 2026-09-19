@@ -422,14 +422,29 @@ export function ScoreMeter({ score }: { score: Score }) {
     { key: "first_token", label: "首字延迟" },
     { key: "throughput", label: "输出速度" },
   ];
+  const cold = score.warm ? "" : `；样本 ${score.samples}/20，性能三维暂用中性分`;
   return (
-    <span className="score" title={score.warm ? undefined : `样本 ${score.samples}/20，性能三维暂用中性分`}>
-      <span className="score-total mono">{score.total.toFixed(2)}</span>
+    <span className="score">
+      <span
+        className="score-total mono"
+        title={`综合评分 ${score.total.toFixed(2)}${cold}`}
+      >
+        {score.total.toFixed(2)}
+      </span>
       <span className="score-bars">
         {dimensions.map(({ key, label }) => {
           const value = Number(score[key]);
+          // 提示里同时给归一化得分与该维对总分的实际贡献：只看得分容易误判
+          // ——"这一维很低"和"这一维把总分拉下去了"是两件事（§6.5）。
+          const share = Number(score.contribution[key as keyof typeof score.contribution]);
+          const pct = score.total > 0 ? Math.round((share / score.total) * 100) : 0;
+          const suffix = score.total > 0 ? `（占总分 ${pct}%）` : "";
           return (
-            <span key={key} className="score-bar" title={`${label} ${value.toFixed(2)}`}>
+            <span
+              key={key}
+              className="score-bar"
+              title={`${label}：得分 ${value.toFixed(2)}，贡献 ${share.toFixed(3)}${suffix}`}
+            >
               <i style={{ width: `${Math.round(value * 100)}%` }} />
             </span>
           );

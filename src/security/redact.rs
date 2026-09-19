@@ -19,7 +19,13 @@ pub fn is_sensitive_header(name: &str) -> bool {
 }
 
 /// 把凭据压缩成"前缀 + 长度"形式，既可用于排查又不泄漏密钥。
+///
+/// **幂等**：对已经脱敏过的文本再跑一次不会变成"脱敏的脱敏"。全局日志层会对
+/// 所有输出再过一遍，而调用点自己也常常先脱敏一次，两次都得安全。
 pub fn secret(value: &str) -> String {
+    if value.contains('…') {
+        return value.to_string();
+    }
     let visible: String = value.chars().take(6).collect();
     format!("{visible}…({} 字符)", value.chars().count())
 }
@@ -92,6 +98,30 @@ fn looks_like_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 脱敏必须幂等：全局日志层会对所有输出再过一遍，而调用点自己也常常
+    /// 先脱敏一次。不幂等的话日志里会出现"脱敏的脱敏"。
+    #[test]
+    fn redaction_is_idempotent() {
+        let once = text("上游拒绝 sk-abcdef1234567890 这个 Key");
+        let twice = text(&once);
+        assert_eq!(once, twice, "二次脱敏不该改变结果");
+        assert!(!twice.contains("abcdef1234567890"), "密钥不能残留：{twice}");
+    }
+
+    /// 已知的密钥形态都要被替换掉（§20.2、§23.4）。
+    #[test]
+    fn every_known_key_shape_is_replaced() {
+        for raw in [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+            "akh-abcdefghijklmnopqrstuvwxyz012345",
+            "Authorization: Bearer sk-abcdefghijklmnop",
+            "api_key=sk_abcdefghijklmnopqrst",
+        ] {
+            let out = text(raw);
+            assert!(out.contains('…'), "这个形态没被脱敏：{raw:?} → {out:?}");
+        }
+    }
 
     #[test]
     fn sensitive_headers_are_matched_case_insensitively() {

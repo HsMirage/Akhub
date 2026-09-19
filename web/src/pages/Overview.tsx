@@ -81,6 +81,14 @@ export function Overview({
         navigate={navigate}
       />
 
+      {/* 保留期为 0 时明细不落库，统计只覆盖当日——不说清楚会被误读成"没数据"（§24.2）。 */}
+      {overview.retention_off && (
+        <div className="callout callout-warn">
+          请求元数据保留天数当前为 0：明细不落库，这里的运行指标来自内存汇总，
+          <b>只覆盖当天</b>，重启后清零。要保留历史请在「设置」里调大保留天数。
+        </div>
+      )}
+
       <div className="stat-grid">
         <Stat
           icon={<IconKey size={13} />}

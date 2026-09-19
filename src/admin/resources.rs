@@ -69,19 +69,19 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         }
     }
 
-    // 各目标的运行状态汇总，让概览一眼看出有多少目标在冷却或硬停。
+    // 各目标的运行状态汇总（§6.2、§12.2）。与逻辑模型页的状态列、账号健康摘要
+    // 用**同一个**判定函数，三处口径不会漂移。
     let mut status_counts = std::collections::BTreeMap::new();
-    for target in config
-        .groups
-        .iter()
-        .flat_map(|g| g.models.values())
-        .flat_map(|m| m.targets.iter())
-    {
-        let health = state.runtime.health.target(&target.target.id);
-        let account = state.runtime.health.account(&target.account.id);
-        *status_counts
-            .entry(health.status(&account).as_str())
-            .or_insert(0usize) += 1;
+    for group in &config.groups {
+        for target in group.models.values().flat_map(|m| m.targets.iter()) {
+            *status_counts
+                .entry(effective_target_status(
+                    &state,
+                    group.group.multiplier_limit,
+                    target,
+                ))
+                .or_insert(0usize) += 1;
+        }
     }
 
     // 运行指标（§6.2）：窗口内的请求量/成功率/延迟分位、队列超时、最近错误
@@ -89,21 +89,63 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
     let window_secs: i64 = 24 * 3600;
     // 趋势图：24 小时分 24 个桶（每小时一根柱），空桶补齐。
     let trend_bucket_secs: i64 = 3600;
+    // 保留期为 0 时明细不落库，运行指标改从内存汇总读（§24.2）。两种模式
+    // 对外形状完全一致，前端不需要知道数据是从哪来的。
+    let retention_off = state.settings.get().retention_days == 0;
+    let live = state.runtime.live.snapshot(now);
     let stats = state
         .store
         .request_stats(now - window_secs, 2000)
         .await
         .map_err(AdminError::internal)?;
-    let trend = state
-        .store
-        .request_trend(now - window_secs, trend_bucket_secs, now)
-        .await
-        .map_err(AdminError::internal)?;
-    let recent_errors = state
-        .store
-        .recent_errors(now - window_secs, 5)
-        .await
-        .map_err(AdminError::internal)?;
+    let trend = if retention_off {
+        // 内存里只有小时桶，直接补零成 24 根柱子。
+        let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for (start, requests, success) in &live.buckets {
+            by_bucket.insert(*start, (*requests, *success));
+        }
+        let mut points = Vec::with_capacity(24);
+        let mut cursor = ((now - window_secs) / trend_bucket_secs) * trend_bucket_secs;
+        let last = (now / trend_bucket_secs) * trend_bucket_secs;
+        while cursor <= last {
+            let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
+            points.push(crate::storage::store::TrendPoint {
+                bucket_start: cursor,
+                requests,
+                success,
+            });
+            cursor += trend_bucket_secs;
+        }
+        points
+    } else {
+        state
+            .store
+            .request_trend(now - window_secs, trend_bucket_secs, now)
+            .await
+            .map_err(AdminError::internal)?
+    };
+    let recent_errors = if retention_off {
+        live.recent_errors
+            .iter()
+            .rev()
+            .take(5)
+            .map(|error| crate::storage::store::RecentError {
+                request_id: error.request_id.clone(),
+                started_at: error.started_at,
+                logical_model: error.logical_model.clone(),
+                target_id: error.target_id.clone(),
+                http_status: error.http_status,
+                error_code: error.error_code.clone(),
+            })
+            .collect()
+    } else {
+        state
+            .store
+            .recent_errors(now - window_secs, 5)
+            .await
+            .map_err(AdminError::internal)?
+    };
     let recent_changes = state
         .store
         .recent_audit(5)
@@ -120,9 +162,29 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
                 .waiting(&group.group.id, group.group.queue_capacity)
         })
         .sum();
-    let mut durations = stats.durations.clone();
-    durations.sort_unstable();
-    let success_rate = (stats.total > 0).then(|| stats.success as f64 / stats.total as f64);
+    // 保留期为 0 时用内存汇总覆盖统计量；字段名与读库路径完全一致。
+    let (total_requests, total_success, queue_timeouts, avg_latency, p50, p95) = if retention_off {
+        (
+            live.requests,
+            live.success,
+            live.queue_timeouts,
+            live.avg_latency_ms,
+            live.p50_latency_ms,
+            live.p95_latency_ms,
+        )
+    } else {
+        let mut durations = stats.durations.clone();
+        durations.sort_unstable();
+        (
+            stats.total,
+            stats.success,
+            stats.queue_timeouts,
+            (stats.total > 0).then(|| stats.durations.iter().sum::<i64>() / stats.total),
+            percentile(&durations, 0.50),
+            percentile(&durations, 0.95),
+        )
+    };
+    let success_rate = (total_requests > 0).then(|| total_success as f64 / total_requests as f64);
 
     Ok(Json(json!({
         "config_version": config.version,
@@ -140,16 +202,20 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         "missing_endpoints": state.runtime.evidence.len(std::time::Instant::now()),
         "dropped_request_records": state.recorder.dropped(),
         "master_key_from_env": state.master_key_from_env,
+        // 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里，排查时要能一眼看到。
+        "data_dir": state.data_dir.display().to_string(),
         // 运行指标（§6.2）。
         "window_secs": window_secs,
-        "requests": stats.total,
+        "requests": total_requests,
         "success_rate": success_rate,
-        "avg_latency_ms": (stats.total > 0).then(|| stats.durations.iter().sum::<i64>() / stats.total),
-        "p50_latency_ms": percentile(&durations, 0.50),
-        "p95_latency_ms": percentile(&durations, 0.95),
+        "avg_latency_ms": avg_latency,
+        "p50_latency_ms": p50,
+        "p95_latency_ms": p95,
+        // 保留期为 0 时明细不落库，这里明确告诉前端"数据只在内存里、只覆盖当日"。
+        "retention_off": retention_off,
         "in_flight": in_flight,
         "queued": queued,
-        "queue_timeouts": stats.queue_timeouts,
+        "queue_timeouts": queue_timeouts,
         "recent_errors": recent_errors.iter().map(|error| json!({
             "request_id": error.request_id,
             "started_at": error.started_at,
@@ -206,6 +272,8 @@ fn settings_json(settings: &crate::app::Settings) -> Value {
         "model_sync_secs": settings.model_sync.as_secs(),
         // 内置能力目录的版本（§6.7：当前版本、模型目录版本和适配器版本）。
         "capability_catalog_revision": crate::capability::builtin().revision().to_string(),
+        // 适配器版本（§6.7）：转换规则改动后能力证据会整体失效，得让管理员看得到。
+        "adapter_version": crate::protocol::ADAPTER_VERSION,
         "version": env!("CARGO_PKG_VERSION"),
         // 这些字段在进程启动时读取一次，保存后要等下次重启才生效。
         "restart_required": ["shutdown_grace_secs"],
@@ -247,6 +315,7 @@ pub async fn update_settings(
 pub async fn change_password(
     State(state): State<SharedState>,
     admin: Admin,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<PasswordChange>,
 ) -> AdminResult<Response> {
     let hash = state
@@ -281,7 +350,10 @@ pub async fn change_password(
         .map_err(AdminError::internal)?;
     audit(&state, &admin, "change_password", &admin.username).await;
     Ok((
-        [(header::SET_COOKIE, super::session_cookie_header(&token))],
+        [(
+            header::SET_COOKIE,
+            super::session_cookie_header(&token, super::request_is_https(&headers)),
+        )],
         Json(json!({"username": admin.username})),
     )
         .into_response())
@@ -335,6 +407,16 @@ pub struct GroupDto {
     pub allow_managed_background: bool,
     pub logical_models: usize,
     pub dispatch_targets: usize,
+    /// 该分组当前的告警（§6.3）。分组列表行内直接显示，不必回概览页找。
+    pub alerts: Vec<GroupAlertDto>,
+}
+
+/// 一条分组级告警（§6.3）。
+#[derive(Serialize)]
+pub struct GroupAlertDto {
+    /// \`danger\`：新请求可能发不出去；\`warn\`：能用但有值得处理的情况。
+    pub level: &'static str,
+    pub text: String,
 }
 
 fn group_dto(state: &SharedState, group: &Group) -> GroupDto {
@@ -354,19 +436,125 @@ fn group_dto(state: &SharedState, group: &Group) -> GroupDto {
         dispatch_targets: view
             .map(|v| v.models.values().map(|m| m.targets.len()).sum())
             .unwrap_or(0),
+        alerts: group_alerts(state, group, view),
     }
+}
+
+/// 汇总一个分组当前的告警（§6.3）。
+///
+/// 只报**这个分组自己**的问题：账号硬停、倍率过期/未知、目标全不可用、
+/// 没有可列出的模型。全局性的东西（例如探针系统性故障）仍然留在概览页。
+fn group_alerts(
+    state: &SharedState,
+    group: &Group,
+    view: Option<&std::sync::Arc<crate::config::GroupView>>,
+) -> Vec<GroupAlertDto> {
+    let mut alerts = Vec::new();
+    let Some(view) = view else {
+        return alerts;
+    };
+    let now = crate::storage::now_unix();
+    let multipliers = state.runtime.multipliers.view();
+
+    // 账号维度：硬停与倍率问题都会让整个分组掉能力，所以按账号去重后再报。
+    let mut seen = std::collections::HashSet::new();
+    let (mut hard_stopped, mut stale, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
+    for target in view.models.values().flat_map(|m| m.targets.iter()) {
+        if !seen.insert(target.account.id.clone()) {
+            continue;
+        }
+        let effective = multipliers.effective(&target.account, group.multiplier_limit, now);
+        match effective.status {
+            crate::multiplier::Status::Unknown => unknown.push(target.account.name.clone()),
+            crate::multiplier::Status::Stale => stale.push(target.account.name.clone()),
+            crate::multiplier::Status::Known => {}
+        }
+        let account = state.runtime.health.account(&target.account.id);
+        if account.key_invalid() {
+            hard_stopped.push(format!("{}（Key 失效）", target.account.name));
+        } else if account.quota_exhausted() {
+            hard_stopped.push(format!("{}（额度耗尽）", target.account.name));
+        }
+    }
+    if !hard_stopped.is_empty() {
+        alerts.push(GroupAlertDto {
+            level: "danger",
+            text: format!("账号被硬停，不会再接新请求：{}", hard_stopped.join("、")),
+        });
+    }
+    if !unknown.is_empty() {
+        alerts.push(GroupAlertDto {
+            level: "danger",
+            text: format!("倍率未知且已超过宽限期，已被硬停：{}", unknown.join("、")),
+        });
+    }
+    if !stale.is_empty() {
+        alerts.push(GroupAlertDto {
+            level: "warn",
+            text: format!(
+                "倍率已过期但在宽限期内，仍可用且已降权：{}",
+                stale.join("、")
+            ),
+        });
+    }
+
+    // 目标维度：全部分组内目标都不可用时，这个分组的模型列表会照常返回，
+    // 但任何请求都会失败——这是最该提前说清楚的一种情况。
+    let total: usize = view.models.values().map(|m| m.targets.len()).sum();
+    if total > 0 {
+        let unusable = view
+            .models
+            .values()
+            .flat_map(|m| m.targets.iter())
+            .filter(|target| {
+                let account = state.runtime.health.account(&target.account.id);
+                let target_state = state.runtime.health.target(&target.target.id);
+                // 冷却与半开算"暂时不可用"，和 /v1/models 的口径一致（§7.3）。
+                !matches!(
+                    target_state.status(&account),
+                    crate::health::TargetStatus::Active
+                )
+            })
+            .count();
+        if unusable == total {
+            alerts.push(GroupAlertDto {
+                level: "danger",
+                text: format!("该分组 {total} 个调度目标当前全部不可用，新请求会直接失败"),
+            });
+        } else if unusable > 0 {
+            alerts.push(GroupAlertDto {
+                level: "warn",
+                text: format!("{unusable}/{total} 个调度目标当前不可用"),
+            });
+        }
+    }
+
+    // 一个可列出的模型都没有：客户端拉 /v1/models 会拿到空列表。
+    if view.models.values().all(|model| !model.is_listable()) {
+        alerts.push(GroupAlertDto {
+            level: "warn",
+            text: if total == 0 {
+                "该分组还没有任何调度目标，/v1/models 会返回空列表".to_string()
+            } else {
+                "所有逻辑模型都被停用或没有目标，/v1/models 会返回空列表".to_string()
+            },
+        });
+    }
+    alerts
 }
 
 pub async fn list_groups(
     State(state): State<SharedState>,
     _: Admin,
-) -> AdminResult<Json<Vec<GroupDto>>> {
+    Query(page): Query<Pagination>,
+) -> AdminResult<Json<Value>> {
     let groups = state
         .store
         .list_groups()
         .await
         .map_err(AdminError::internal)?;
-    Ok(Json(groups.iter().map(|g| group_dto(&state, g)).collect()))
+    let dtos: Vec<GroupDto> = groups.iter().map(|g| group_dto(&state, g)).collect();
+    Ok(paged(dtos, &page))
 }
 
 pub async fn get_group(
@@ -586,6 +774,25 @@ pub struct AccountDto {
     pub auto_sync: bool,
     /// 上一次模型同步完成的时间。
     pub model_synced_at: Option<i64>,
+    /// 账号级健康摘要（§6.9）。账号列表行内徽标直接用它，不必点进目标页。
+    pub health: AccountHealthDto,
+}
+
+/// 账号级健康摘要（§6.9）。
+///
+/// 账号的熔断与额度是**整个账号**范围的（同一把 Key 下的所有模型共享，§12.1），
+/// 所以列表里必须能一眼看出来——不然只能逐个点进目标页猜。
+#[derive(Serialize)]
+pub struct AccountHealthDto {
+    /// 最严重的那个状态：\`active\` / \`cooldown\` / \`half_open\` /
+    /// \`quota_exhausted\` / \`key_invalid\` / \`disabled\`。
+    pub status: &'static str,
+    /// 有暂停原因时的可读说明。
+    pub reason: Option<String>,
+    /// 该账号下的目标状态计数。
+    pub targets: std::collections::BTreeMap<&'static str, usize>,
+    /// 目标总数，方便前端显示"3/5 可用"。
+    pub target_total: usize,
 }
 
 async fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
@@ -646,13 +853,141 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
         enabled: account.enabled,
         auto_sync: account.auto_sync,
         model_synced_at: account.model_synced_at,
+        health: account_health(state, account),
+    }
+}
+
+/// 汇总一个账号及其目标的健康状态（§6.9）。
+///
+/// 严重程度排序：Key 失效 > 额度耗尽 > 停用 > 冷却 > 半开 > 正常。
+/// 取最严重的那个当账号状态——列表徽标要回答的是"这个号现在能不能用"。
+fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
+    let config = state.config.current();
+    let mut targets = std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    let mut worst: Option<&'static str> = None;
+    let mut reason: Option<String> = None;
+    let health = state.runtime.health.account(&account.id);
+
+    for group in &config.groups {
+        for model in group.models.values() {
+            for target in &model.targets {
+                if target.account.id != account.id {
+                    continue;
+                }
+                total += 1;
+                let target_state = state.runtime.health.target(&target.target.id);
+                let status = target_state.status(&health).as_str();
+                *targets.entry(status).or_insert(0usize) += 1;
+                // 只记第一个最严重的原因，避免列出十几条同样的话。
+                if rank(status) > worst.map(rank).unwrap_or(0) {
+                    worst = Some(status);
+                    reason = Some(format!(
+                        "{} / {}",
+                        model.model.name, target.target.upstream_model
+                    ));
+                }
+            }
+        }
+    }
+
+    let status = if !account.enabled {
+        "disabled"
+    } else if health.key_invalid() {
+        "key_invalid"
+    } else if health.quota_exhausted() {
+        "quota_exhausted"
+    } else {
+        worst.unwrap_or("active")
+    };
+    let reason = match status {
+        "disabled" => Some("管理员已停用该账号".to_string()),
+        "key_invalid" => Some("上游 Key 失效，需重新配置凭据".to_string()),
+        "quota_exhausted" => Some("额度耗尽，等待上游恢复时间".to_string()),
+        "active" if total == 0 => Some("该账号还没有任何调度目标".to_string()),
+        // 只有目标级问题时把具体是哪个目标说出来。
+        _ if total > 0 && status != "active" => reason,
+        _ => None,
+    };
+
+    AccountHealthDto {
+        status,
+        reason,
+        targets,
+        target_total: total,
+    }
+}
+
+/// 一个调度目标此刻对外的**唯一**状态名（§12.2）。
+///
+/// 概览的目标计数、逻辑模型页的状态列、账号健康摘要都从这里取值，三处口径
+/// 因此不会漂移。判断顺序就是严重程度：先看配置（停用/模型消失），再看倍率
+/// （硬停优先于降权），最后才是健康状态。
+///
+/// 关于 §12.2 里的 \`degraded\`：它描述的是"能用但层内评分降低"，而不是一个可以
+/// 独立展示的状态——真正的降权原因（倍率过期、冷启动）各自有更具体的位置。
+/// 把它做成状态只会和 \`multiplier_stale\` 重复报同一件事，所以这里不设该状态，
+/// 由计划文本说明（§12.2 的脚注）。
+/// \`missing_model\` 不作为独立状态：上游模型消失时同步路径会把目标置为
+/// \`enabled = false\`（§16.5），所以它已经落在 \`disabled\` 里。要把它单列就得给
+/// 目标加一个持久化字段，而"这个模型还在不在上游列表里"本来就该由同步逻辑
+/// 表达，不该在展示层重新推断一遍。
+pub fn effective_target_status(
+    state: &SharedState,
+    multiplier_limit: crate::domain::Multiplier,
+    target: &crate::config::TargetView,
+) -> &'static str {
+    if !target.target.enabled || !target.account.enabled {
+        return "disabled";
+    }
+    let now = crate::storage::now_unix();
+    let effective =
+        state
+            .runtime
+            .multipliers
+            .view()
+            .effective(&target.account, multiplier_limit, now);
+    match effective.status {
+        crate::multiplier::Status::Unknown => return "multiplier_unknown",
+        crate::multiplier::Status::Known | crate::multiplier::Status::Stale => {
+            if effective.value > multiplier_limit {
+                return "multiplier_exceeded";
+            }
+        }
+    }
+    let account = state.runtime.health.account(&target.account.id);
+    let health = state.runtime.health.target(&target.target.id);
+    match health.status(&account) {
+        crate::health::TargetStatus::KeyInvalid => "key_invalid",
+        crate::health::TargetStatus::QuotaExhausted => "quota_exhausted",
+        crate::health::TargetStatus::Cooldown => "cooldown",
+        crate::health::TargetStatus::HalfOpen => "half_open",
+        // 健康上没毛病，但倍率在宽限期内：能用，层内已降权（§11.4）。
+        crate::health::TargetStatus::Active
+            if effective.status == crate::multiplier::Status::Stale =>
+        {
+            "multiplier_stale"
+        }
+        crate::health::TargetStatus::Active => "active",
+    }
+}
+
+/// 状态严重程度，用于从目标状态里挑出最严重的那个。
+fn rank(status: &str) -> u8 {
+    match status {
+        "key_invalid" => 6,
+        "quota_exhausted" => 5,
+        "cooldown" => 3,
+        "half_open" => 2,
+        _ => 1,
     }
 }
 
 pub async fn list_accounts(
     State(state): State<SharedState>,
     _: Admin,
-) -> AdminResult<Json<Vec<AccountDto>>> {
+    Query(page): Query<Pagination>,
+) -> AdminResult<Json<Value>> {
     let accounts = state
         .store
         .list_accounts()
@@ -668,7 +1003,7 @@ pub async fn list_accounts(
             .is_some();
         dtos.push(account_dto(&state, account, has_token).await);
     }
-    Ok(Json(dtos))
+    Ok(paged(dtos, &page))
 }
 
 pub async fn create_account(
@@ -888,6 +1223,54 @@ pub async fn refresh_account_multiplier(
         "effective_multiplier": reading.multiplier,
         "observed_at": reading.observed_at,
         "notice": format!("已重新探测：当前有效倍率 {}", reading.multiplier),
+    })))
+}
+
+/// 批量刷新所有自动倍率账号（§11.3、§27 阶段5）。
+///
+/// 与单个刷新同一路径：每次都是真实探测并同步返回结果。一个账号失败不影响
+/// 其他账号，逐个收集结果而不是整批失败——探测失败本来就该按账号隔离。
+pub async fn refresh_all_multipliers(
+    State(state): State<SharedState>,
+    admin: Admin,
+) -> AdminResult<Json<Value>> {
+    let accounts: Vec<_> = state
+        .store
+        .list_accounts()
+        .await
+        .map_err(AdminError::internal)?
+        .into_iter()
+        .filter(|account| account.enabled && account.multiplier_mode.is_automatic())
+        .collect();
+
+    let mut refreshed = Vec::new();
+    let mut failed = Vec::new();
+    for account in &accounts {
+        match crate::multiplier::refresh::refresh_account_now(&state, account).await {
+            Ok(reading) => refreshed.push(json!({
+                "account_id": account.id,
+                "name": account.name,
+                "effective_multiplier": reading.multiplier,
+                "observed_at": reading.observed_at,
+            })),
+            Err(error) => failed.push(json!({
+                "account_id": account.id,
+                "name": account.name,
+                // 探测错误可能带上游原文，转发前必须脱敏（§20.2）。
+                "error": crate::security::redact::text(&error.to_string()),
+            })),
+        }
+    }
+    audit(&state, &admin, "refresh_all_multipliers", "all").await;
+    let total = accounts.len();
+    let ok = refreshed.len();
+    Ok(Json(json!({
+        "total": total,
+        "refreshed": ok,
+        "failed": failed.len(),
+        "results": refreshed,
+        "errors": failed,
+        "notice": format!("已刷新 {ok}/{total} 个自动倍率账号"),
     })))
 }
 
@@ -1124,32 +1507,32 @@ pub async fn group_available_models(
 pub async fn list_logical_models(
     State(state): State<SharedState>,
     _: Admin,
-) -> AdminResult<Json<Vec<LogicalModelDto>>> {
+    Query(page): Query<Pagination>,
+) -> AdminResult<Json<Value>> {
     let models = state
         .store
         .list_logical_models()
         .await
         .map_err(AdminError::internal)?;
     let config = state.config.current();
-    Ok(Json(
-        models
-            .iter()
-            .map(|model| {
-                let view = config
-                    .group_by_id(&model.group_id)
-                    .and_then(|g| g.models.get(&model.name));
-                LogicalModelDto {
-                    id: model.id.clone(),
-                    group_id: model.group_id.clone(),
-                    name: model.name.clone(),
-                    origin: model.origin,
-                    enabled: model.enabled,
-                    dispatch_targets: view.map(|v| v.targets.len()).unwrap_or(0),
-                    listed: view.map(|v| v.is_listable()).unwrap_or(false),
-                }
-            })
-            .collect(),
-    ))
+    let dtos: Vec<LogicalModelDto> = models
+        .iter()
+        .map(|model| {
+            let view = config
+                .group_by_id(&model.group_id)
+                .and_then(|g| g.models.get(&model.name));
+            LogicalModelDto {
+                id: model.id.clone(),
+                group_id: model.group_id.clone(),
+                name: model.name.clone(),
+                origin: model.origin,
+                enabled: model.enabled,
+                dispatch_targets: view.map(|v| v.targets.len()).unwrap_or(0),
+                listed: view.map(|v| v.is_listable()).unwrap_or(false),
+            }
+        })
+        .collect();
+    Ok(paged(dtos, &page))
 }
 
 pub async fn create_logical_model(
@@ -1281,6 +1664,14 @@ pub struct TargetDto {
     pub inflight: u32,
     /// 综合评分与四个分维得分。权重调错时靠这一列自我诊断（§6.9）。
     pub score: Option<ScoreDto>,
+    /// 首字延迟的当前 EWMA（毫秒）；样本不足或没数据时为 None（§6.5）。
+    pub first_token_ms: Option<f64>,
+    /// 输出速度的当前 EWMA（token/秒）；没数据时为 None（§6.5）。
+    pub output_tps: Option<f64>,
+    /// 非流式总延迟的当前 EWMA（毫秒），作为首字的补充（§6.5）。
+    pub total_ms: Option<f64>,
+    /// 暂停原因：有则给出可读原因，正常参与调度时为 None（§6.5）。
+    pub pause_reason: Option<String>,
 }
 
 /// 分维得分。流式与非流式分开统计，这里给出该模型下样本更多的那一份。
@@ -1294,6 +1685,20 @@ pub struct ScoreDto {
     pub samples: u64,
     /// 样本不足 20 时性能三维用的是保守中性分（§9.4）。
     pub warm: bool,
+    /// 各维度的加权贡献（得分 × 权重 ÷ 100），四个加起来就是总分（§6.5）。
+    ///
+    /// 只有归一化得分时，管理员得回分组页查权重才能判断"是哪一维把分数拉下去的"；
+    /// 给出贡献值就能直接排序比较。
+    pub contribution: ScoreContributionDto,
+}
+
+/// 分维加权贡献（§6.5）。
+#[derive(Serialize)]
+pub struct ScoreContributionDto {
+    pub multiplier: f64,
+    pub reliability: f64,
+    pub first_token: f64,
+    pub throughput: f64,
 }
 
 fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
@@ -1308,8 +1713,8 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
     let (priority, effective_limits) = view
         .map(|view| (view.priority, view.limits()))
         .unwrap_or((50, target.limits));
+    // 状态统一走 effective_target_status（§12.2），这里不再单独算一遍健康状态。
     let health = state.runtime.health.target(&target.id);
-    let account = state.runtime.health.account(&target.account_id);
 
     TargetDto {
         id: target.id.clone(),
@@ -1321,31 +1726,122 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
         limits: target.limits,
         effective_limits,
         enabled: target.enabled,
-        status: health.status(&account).as_str(),
+        status: view
+            .map(|view| {
+                let limit = config
+                    .group_by_id(&view.account.group_id)
+                    .map(|group| group.group.multiplier_limit)
+                    .unwrap_or(crate::domain::Multiplier::ONE);
+                effective_target_status(state, limit, view)
+            })
+            .unwrap_or("active"),
         cooldown_secs: health
             .cooldown_remaining(tokio::time::Instant::now())
             .map(|d| d.as_secs()),
         inflight: health.inflight(),
         score: view.and_then(|view| score_dto(state, view)),
+        first_token_ms: ewma_metric(state, view, |stats| stats.first_token_ms),
+        output_tps: ewma_metric(state, view, |stats| stats.output_tps),
+        total_ms: ewma_metric(state, view, |stats| stats.total_ms),
+        pause_reason: pause_reason(state, target, view),
+    }
+}
+
+/// 取某个目标的 EWMA 指标。样本不足（冷启动）时返回 None 而不是 0——0 会被
+/// 误读成"这个目标很快"（§6.5、§9.4）。
+fn ewma_metric(
+    state: &SharedState,
+    view: Option<&std::sync::Arc<crate::config::TargetView>>,
+    pick: impl Fn(&crate::routing::score::Stats) -> f64,
+) -> Option<f64> {
+    let view = view?;
+    let dimension = display_dimension(state, view)?;
+    let stats = state.runtime.perf.stats(&view.target.id, dimension);
+    stats.is_warm().then(|| pick(&stats))
+}
+
+/// 暂停原因（§6.5）。只有真正"不能参与调度"的状态才给原因，正常或仅降权的
+/// 目标返回 None，避免把"慢"也说成"停"。
+fn pause_reason(
+    state: &SharedState,
+    target: &DispatchTarget,
+    view: Option<&std::sync::Arc<crate::config::TargetView>>,
+) -> Option<String> {
+    if !target.enabled {
+        return Some("管理员已停用".to_string());
+    }
+    // 账号是否停用看配置（健康注册表只管熔断与额度）。
+    if let Some(view) = view
+        && !view.account.enabled
+    {
+        return Some("所属账号已停用".to_string());
+    }
+    let account = state.runtime.health.account(&target.account_id);
+    let health = state.runtime.health.target(&target.id);
+    match health.status(&account) {
+        crate::health::TargetStatus::Active => {
+            // 参与调度也可能因为倍率被拦，这里把倍率原因补上。
+            multiplier_pause_reason(state, view)
+        }
+        crate::health::TargetStatus::Cooldown => {
+            let secs = health
+                .cooldown_remaining(tokio::time::Instant::now())
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            Some(format!("冷却中，剩余 {secs} 秒"))
+        }
+        crate::health::TargetStatus::HalfOpen => Some("半开试运行中，只放行一个请求".to_string()),
+        crate::health::TargetStatus::QuotaExhausted => Some("额度耗尽，等待恢复时间".to_string()),
+        crate::health::TargetStatus::KeyInvalid => {
+            Some("上游 Key 失效，需重新配置凭据".to_string())
+        }
+    }
+}
+
+/// 倍率相关的暂停原因（§11.4、§12.2）。
+fn multiplier_pause_reason(
+    state: &SharedState,
+    view: Option<&std::sync::Arc<crate::config::TargetView>>,
+) -> Option<String> {
+    let view = view?;
+    let limit = state
+        .config
+        .current()
+        .group_by_id(&view.account.group_id)
+        .map(|group| group.group.multiplier_limit)
+        .unwrap_or(crate::domain::Multiplier::ONE);
+    let effective = state.runtime.multipliers.view().effective(
+        &view.account,
+        limit,
+        crate::storage::now_unix(),
+    );
+    match effective.status {
+        crate::multiplier::Status::Unknown => Some("倍率未知且已超过宽限期".to_string()),
+        _ if effective.value > limit => Some(format!(
+            "有效倍率 {} 高于分组上限 {}",
+            effective.value, limit
+        )),
+        _ => None,
     }
 }
 
 /// 用与调度完全相同的算法算出这个目标当前的综合评分。
 ///
 /// 后台看到的分数必须和调度器用的是同一个数字，否则诊断毫无意义。
-fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<ScoreDto> {
+/// 展示用的统计维度：取这个逻辑模型下样本最多的"协议 + 是否流式"组合。
+///
+/// 跨协议之后一个目标可能同时服务三种下游协议，展示时整个模型统一用同一维，
+/// 否则参照系不一致，分数就不可比了（§9.4）。评分和 EWMA 列共用它。
+fn display_dimension(
+    state: &SharedState,
+    view: &crate::config::TargetView,
+) -> Option<crate::routing::score::Dimension> {
     let config = state.config.current();
     let group = config.group_by_id(&view.account.group_id)?;
-    let multipliers = state.runtime.multipliers.view();
-    let now = crate::storage::now_unix();
-
     let model = group
         .models
         .values()
         .find(|model| model.model.id == view.target.logical_model_id)?;
-    // 性能统计按"协议 + 是否流式"分开。跨协议之后一个目标可能同时服务三种
-    // 下游协议，展示时取这个模型下样本最多的那一维，且整个模型统一用它——
-    // 否则参照系不一致，分数就不可比了。
     let samples_of = |dimension: crate::routing::score::Dimension| -> u64 {
         model
             .targets
@@ -1359,23 +1855,38 @@ fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<Sc
             })
             .sum()
     };
-    let dimension = [
-        Protocol::OpenAiChat,
-        Protocol::OpenAiResponses,
-        Protocol::AnthropicMessages,
-    ]
-    .into_iter()
-    .flat_map(|protocol| {
-        [true, false].map(|streaming| crate::routing::score::Dimension {
-            protocol,
-            streaming,
+    Some(
+        [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ]
+        .into_iter()
+        .flat_map(|protocol| {
+            [true, false].map(|streaming| crate::routing::score::Dimension {
+                protocol,
+                streaming,
+            })
         })
-    })
-    .max_by_key(|dimension| samples_of(*dimension))
-    .unwrap_or(crate::routing::score::Dimension {
-        protocol: view.account.preferred_protocol,
-        streaming: false,
-    });
+        .max_by_key(|dimension| samples_of(*dimension))
+        .unwrap_or(crate::routing::score::Dimension {
+            protocol: view.account.preferred_protocol,
+            streaming: false,
+        }),
+    )
+}
+
+fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<ScoreDto> {
+    let config = state.config.current();
+    let group = config.group_by_id(&view.account.group_id)?;
+    let multipliers = state.runtime.multipliers.view();
+    let now = crate::storage::now_unix();
+
+    let model = group
+        .models
+        .values()
+        .find(|model| model.model.id == view.target.logical_model_id)?;
+    let dimension = display_dimension(state, view)?;
     let candidates: Vec<_> = model
         .targets
         .iter()
@@ -1408,6 +1919,11 @@ fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<Sc
         .position(|target| target.target.id == view.target.id)?;
     let score = scores.get(index)?;
     let stats = state.runtime.perf.stats(&view.target.id, dimension);
+    // 贡献 = 归一化得分 × 该维权重 ÷ 总分权重（§9.4）；四项之和即综合评分。
+    let weights = group.group.weights;
+    let share = |value: f64, weight: u32| {
+        round4(value * f64::from(weight) / f64::from(crate::domain::SchedulingWeights::TOTAL))
+    };
     Some(ScoreDto {
         total: round4(score.total),
         multiplier: round4(score.multiplier),
@@ -1416,6 +1932,12 @@ fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<Sc
         throughput: round4(score.throughput),
         samples: stats.samples,
         warm: stats.is_warm(),
+        contribution: ScoreContributionDto {
+            multiplier: share(score.multiplier, weights.multiplier),
+            reliability: share(score.reliability, weights.reliability),
+            first_token: share(score.first_token, weights.first_token),
+            throughput: share(score.throughput, weights.throughput),
+        },
     })
 }
 
@@ -1426,15 +1948,15 @@ fn round4(value: f64) -> f64 {
 pub async fn list_targets(
     State(state): State<SharedState>,
     _: Admin,
-) -> AdminResult<Json<Vec<TargetDto>>> {
+    Query(page): Query<Pagination>,
+) -> AdminResult<Json<Value>> {
     let targets = state
         .store
         .list_targets()
         .await
         .map_err(AdminError::internal)?;
-    Ok(Json(
-        targets.iter().map(|t| target_dto(&state, t)).collect(),
-    ))
+    let dtos: Vec<TargetDto> = targets.iter().map(|t| target_dto(&state, t)).collect();
+    Ok(paged(dtos, &page))
 }
 
 pub async fn create_target(
@@ -1559,6 +2081,8 @@ pub struct AccountModelDto {
     pub missing: bool,
     /// 仅"获取模型"响应里有意义：本次拉取新出现的模型。
     pub is_new: bool,
+    /// 管理员明确取消过勾选的模型（§16.2）。与"从没出现过"分开。
+    pub excluded: bool,
 }
 
 fn catalog_entry_dto(entry: &discovery::CatalogEntry) -> AccountModelDto {
@@ -1568,6 +2092,7 @@ fn catalog_entry_dto(entry: &discovery::CatalogEntry) -> AccountModelDto {
         selected: entry.selected,
         missing: entry.missing,
         is_new: entry.is_new,
+        excluded: entry.excluded,
     }
 }
 
@@ -1591,6 +2116,8 @@ pub async fn list_account_models(
                 selected: row.selected,
                 missing: row.missing,
                 is_new: false,
+                // 这个接口不带"本次新增"的上下文，但"排除过"是持久状态，照样给。
+                excluded: !row.selected && !row.missing,
             })
             .collect(),
     ))
@@ -2064,16 +2591,72 @@ pub async fn cost(
         _ => now - 86_400,
     };
 
-    let usage = state
-        .store
-        .cost_usage(since)
-        .await
-        .map_err(AdminError::internal)?;
-    let samples = state
-        .store
-        .cost_multiplier_samples(since)
-        .await
-        .map_err(AdminError::internal)?;
+    // 保留期为 0 时明细不落库，成本口径改从内存汇总取（§24.2）。
+    // 内存只覆盖当日，所以这种情况下即使请求的是"本月"也只能给当日数据，
+    // 响应里用 `retention_off` 明确标注，不让前端把当日当本月。
+    let retention_off = state.settings.get().retention_days == 0;
+    let (usage, samples) = if retention_off {
+        let live_usage = state.runtime.live.usage(now);
+        let live_samples = state.runtime.live.samples(now);
+        let mut usage: Vec<crate::storage::store::CostUsageRow> = live_usage
+            .iter()
+            .flat_map(|((group_id, logical_model), entry)| {
+                entry
+                    .per_account
+                    .iter()
+                    .map(move |(account_id, (requests, tokens))| {
+                        crate::storage::store::CostUsageRow {
+                            group_id: group_id.clone(),
+                            logical_model: logical_model.clone(),
+                            account_id: account_id.clone(),
+                            requests: *requests,
+                            tokens: *tokens,
+                        }
+                    })
+            })
+            .collect();
+        usage.sort_by(|a, b| {
+            (&a.group_id, &a.logical_model, &a.account_id).cmp(&(
+                &b.group_id,
+                &b.logical_model,
+                &b.account_id,
+            ))
+        });
+        let mut samples: Vec<crate::storage::store::CostSampleRow> = live_samples
+            .iter()
+            .flat_map(|((group_id, logical_model), entry)| {
+                entry.by_multiplier.iter().map(move |(raw, requests)| {
+                    crate::storage::store::CostSampleRow {
+                        group_id: group_id.clone(),
+                        logical_model: logical_model.clone(),
+                        effective_multiplier: Multiplier::from_raw(*raw),
+                        requests: *requests,
+                    }
+                })
+            })
+            .collect();
+        samples.sort_by(|a, b| {
+            (&a.group_id, &a.logical_model, a.effective_multiplier.raw()).cmp(&(
+                &b.group_id,
+                &b.logical_model,
+                b.effective_multiplier.raw(),
+            ))
+        });
+        (usage, samples)
+    } else {
+        (
+            state
+                .store
+                .cost_usage(since)
+                .await
+                .map_err(AdminError::internal)?,
+            state
+                .store
+                .cost_multiplier_samples(since)
+                .await
+                .map_err(AdminError::internal)?,
+        )
+    };
     let config = state.config.current();
 
     // 账号名与有效倍率全部从当前配置解析；已删除的账号行保留计数但标 unknown。
@@ -2244,6 +2827,8 @@ pub async fn cost(
         "total_tokens": total_tokens,
         // 占比口径：区间内只要有任何一条记录带 Token 就按 Token，否则按请求数。
         "share_basis": if tokens_available { "tokens" } else { "requests" },
+        // 保留期为 0 时明细不落库，这里的数字来自内存汇总，只覆盖当日（§24.2）。
+        "retention_off": retention_off,
         "account_shares": account_shares,
         "models": model_views,
     })))
@@ -2528,6 +3113,20 @@ pub async fn import_backup(
     state.runtime.capabilities.clear();
     state.runtime.health.clear_all();
     reload(&state).await?;
+    // 设置是内存快照：只写库不刷新的话，运行中的进程会继续用旧设置，
+    // 直到下一次重启——那正好是"看起来恢复成功、实际没生效"（§23.5）。
+    if let Some(raw) = state
+        .store
+        .app_setting(crate::app::SETTINGS_KEY)
+        .await
+        .map_err(AdminError::internal)?
+        && let Ok(persisted) = serde_json::from_str::<crate::app::PersistedSettings>(&raw)
+    {
+        // 以当前设置为底再叠加：备份里有的字段用备份值，备份里没有的（例如
+        // 更早版本导出的、还不含设置的备份）保持现状，不会被清成默认值。
+        let restored = persisted.apply_to((*state.settings.get()).clone());
+        state.settings.replace(restored);
+    }
     audit(&state, &admin, "backup_import", "config").await;
     Ok(Json(json!({
         "groups": data.groups.len(),
@@ -2546,10 +3145,40 @@ fn str_of(value: &serde_json::Value, key: &str) -> Option<String> {
 
 // -------------------------------------------------------------- 请求记录
 
+/// 列表接口的分页参数（§7.4）。
 #[derive(Deserialize)]
 pub struct Pagination {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// 列表接口默认返回多少条、最多返回多少条（§7.4）。
+const DEFAULT_PAGE: i64 = 200;
+const MAX_PAGE: i64 = 1_000;
+
+impl Pagination {
+    /// 规范化成 \`(limit, offset)\`，把上限与非法值都夹住。
+    fn resolve(&self) -> (usize, usize) {
+        let limit = self.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE) as usize;
+        let offset = self.offset.unwrap_or(0).max(0) as usize;
+        (limit, offset)
+    }
+}
+
+/// 给一个列表套上分页，返回 \`{data, total, limit, offset}\`。
+///
+/// 统一形状而不是各自为政：前端拿到 \`total\` 才知道要不要翻页。已经分页的
+/// \`/requests\` 保持不变（它有自己的 limit 上限与筛选参数）。
+fn paged<T: serde::Serialize>(items: Vec<T>, page: &Pagination) -> Json<Value> {
+    let (limit, offset) = page.resolve();
+    let total = items.len();
+    let slice: Vec<&T> = items.iter().skip(offset).take(limit).collect();
+    Json(json!({
+        "data": slice,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
 }
 
 /// 请求记录的筛选参数（§6.6）。全部可选，空表示不限。
@@ -2606,6 +3235,25 @@ pub async fn list_requests(
     let items: Vec<Value> = records
         .iter()
         .map(|record| {
+            // 尝试明细先单独构造成数组：直接内联会让 json! 展开深度超过递归上限。
+            let attempts_detail: Vec<Value> = record
+                .attempts_detail
+                .iter()
+                .map(|attempt| {
+                    json!({
+                        "seq": attempt.seq,
+                        "target_id": attempt.target_id,
+                        "account_id": attempt.account_id,
+                        "upstream_model": attempt.upstream_model,
+                        "endpoint": attempt.endpoint,
+                        "started_at": attempt.started_at,
+                        "duration_ms": attempt.duration_ms,
+                        "outcome": attempt.outcome,
+                        "error_code": attempt.error_code,
+                        "counts_against_budget": attempt.counts_against_budget,
+                    })
+                })
+                .collect();
             json!({
                 "request_id": record.request_id,
                 "started_at": record.started_at,
@@ -2634,23 +3282,180 @@ pub async fn list_requests(
                 "input_tokens": record.input_tokens,
                 "output_tokens": record.output_tokens,
                 "config_version": record.config_version,
+                // 粘性等待与新鲜度单独给出，和普通排队区分开（§6.6、§24.1）。
+                "sticky_wait_ms": record.sticky_wait_ms,
+                "sticky_freshness": record.sticky_freshness,
+                "output_tps": record.output_tps,
+                // Token 细分：缓存读/写与思考。上游没上报就是 null（§11.6）。
+                "cache_read_tokens": record.cache_read_tokens,
+                "cache_write_tokens": record.cache_write_tokens,
+                "reasoning_tokens": record.reasoning_tokens,
+                // 倍率来源、额度状态、候选过滤原因与选中的层（§24.1）。
+                "multiplier_source": record.multiplier_source,
+                "quota_status": record.quota_status,
+                "filter_summary": record.filter_summary,
+                "selected_layer": record.selected_layer,
                 // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
-                "attempts_detail": record.attempts_detail.iter().map(|attempt| json!({
-                    "seq": attempt.seq,
-                    "target_id": attempt.target_id,
-                    "account_id": attempt.account_id,
-                    "upstream_model": attempt.upstream_model,
-                    "endpoint": attempt.endpoint,
-                    "started_at": attempt.started_at,
-                    "duration_ms": attempt.duration_ms,
-                    "outcome": attempt.outcome,
-                    "error_code": attempt.error_code,
-                    "counts_against_budget": attempt.counts_against_budget,
-                })).collect::<Vec<_>>(),
+                "attempts_detail": attempts_detail,
             })
         })
         .collect();
     Ok(Json(json!({ "data": items, "total": total })))
+}
+
+// ---------------------------------------------------------------- 指标
+
+#[derive(Deserialize)]
+pub struct MetricsQuery {
+    /// 起始时间（unix 秒，含）；默认最近 24 小时。
+    pub since: Option<i64>,
+    /// 结束时间（unix 秒，不含）；默认到当前。
+    pub until: Option<i64>,
+    /// 只看某个调度目标。
+    pub target_id: Option<String>,
+}
+
+/// 分钟聚合与目标性能（§7.4、§20.1）。
+///
+/// 数据来自 `performance_buckets`：后台任务每分钟把请求明细滚进去，所以这个
+/// 接口不扫描明细表，历史趋势在明细被保留期清掉之后仍然可用。
+pub async fn metrics(
+    State(state): State<SharedState>,
+    _: Admin,
+    Query(query): Query<MetricsQuery>,
+) -> AdminResult<Json<Value>> {
+    let now = crate::storage::now_unix();
+    let since = query.since.unwrap_or(now - 86_400);
+    let until = query.until.unwrap_or(now + 1);
+    if until <= since {
+        return Err(AdminError::bad_request("until 必须晚于 since"));
+    }
+
+    let buckets = state
+        .store
+        .list_performance_buckets(since, until, trimmed_opt(&query.target_id))
+        .await
+        .map_err(AdminError::internal)?;
+
+    // 按目标汇总整个区间的分维表现（§9.3 的信号维度）。
+    #[derive(Default)]
+    struct TargetAggregate {
+        protocol: String,
+        streaming: bool,
+        requests: i64,
+        success: i64,
+        total_ms_sum: i64,
+        first_token_sum: i64,
+        first_token_count: i64,
+        output_tokens_sum: i64,
+        rate_limited: i64,
+        server_errors: i64,
+        protocol_errors: i64,
+    }
+    let mut per_target: std::collections::BTreeMap<String, TargetAggregate> =
+        std::collections::BTreeMap::new();
+    for bucket in &buckets {
+        let entry = per_target.entry(bucket.target_id.clone()).or_default();
+        entry.protocol = bucket.protocol.as_str().to_string();
+        entry.streaming = bucket.streaming;
+        entry.requests += bucket.requests;
+        entry.success += bucket.success;
+        entry.total_ms_sum += bucket.total_ms_sum;
+        entry.first_token_sum += bucket.first_token_sum;
+        entry.first_token_count += bucket.first_token_count;
+        entry.output_tokens_sum += bucket.output_tokens_sum;
+        entry.rate_limited += bucket.rate_limited;
+        entry.server_errors += bucket.server_errors;
+        entry.protocol_errors += bucket.protocol_errors;
+    }
+
+    // 目标 ID → 可读名字，取自当前配置；已删除的目标标出来而不是隐藏。
+    let config = state.config.current();
+    let mut names: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
+    for group in &config.groups {
+        for model in group.models.values() {
+            for target in &model.targets {
+                names.insert(
+                    target.target.id.clone(),
+                    (
+                        group.group.name.clone(),
+                        target.account.name.clone(),
+                        target.target.upstream_model.clone(),
+                    ),
+                );
+            }
+        }
+    }
+
+    let targets: Vec<Value> = per_target
+        .iter()
+        .map(|(target_id, agg)| {
+            let (group_name, account_name, upstream_model) = names
+                .get(target_id)
+                .map(|(g, a, m)| (Some(g.clone()), Some(a.clone()), Some(m.clone())))
+                .unwrap_or((None, None, None));
+            // 均值为 0 时给 null，绝不虚构数字（§6.8 的同一口径）。
+            let avg_total_ms = (agg.requests > 0).then(|| agg.total_ms_sum / agg.requests);
+            let avg_first_token_ms =
+                (agg.first_token_count > 0).then(|| agg.first_token_sum / agg.first_token_count);
+            // 输出速度要按总耗时算，不能用首字均值。
+            let output_tps = (agg.total_ms_sum > 0)
+                .then(|| agg.output_tokens_sum as f64 / (agg.total_ms_sum as f64 / 1000.0));
+            json!({
+                "target_id": target_id,
+                "group_name": group_name,
+                "account_name": account_name,
+                "upstream_model": upstream_model,
+                "protocol": agg.protocol,
+                "streaming": agg.streaming,
+                "requests": agg.requests,
+                "success": agg.success,
+                "success_rate": (agg.requests > 0)
+                    .then(|| round4(agg.success as f64 / agg.requests as f64)),
+                "avg_total_ms": avg_total_ms,
+                "avg_first_token_ms": avg_first_token_ms,
+                "output_tps": output_tps.map(round4),
+                "total_tokens": agg.output_tokens_sum,
+                "rate_limited": agg.rate_limited,
+                "server_errors": agg.server_errors,
+                "protocol_errors": agg.protocol_errors,
+            })
+        })
+        .collect();
+
+    // 按分钟展开的曲线，供概览/指标页画趋势；缺桶补 0，不跳点。
+    let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
+        std::collections::BTreeMap::new();
+    for bucket in &buckets {
+        let entry = by_bucket.entry(bucket.bucket_start).or_insert((0, 0));
+        entry.0 += bucket.requests;
+        entry.1 += bucket.success;
+    }
+    let mut series = Vec::new();
+    let mut cursor = (since / 60) * 60;
+    let last = (until / 60) * 60;
+    // 上限保护：最多回 24 小时（1440 个点），避免一次请求拉出巨量数据。
+    if cursor < last - 86_400 {
+        cursor = last - 86_400;
+    }
+    while cursor < last {
+        let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
+        series.push(json!({
+            "bucket_start": cursor,
+            "requests": requests,
+            "success": success,
+        }));
+        cursor += 60;
+    }
+
+    Ok(Json(json!({
+        "since": since,
+        "until": until,
+        "bucket_secs": 60,
+        "targets": targets,
+        "series": series,
+    })))
 }
 
 // ---------------------------------------------------------------- 辅助

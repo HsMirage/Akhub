@@ -1072,8 +1072,20 @@ impl StreamEmitter {
 }
 
 /// 流中途出错时的错误帧（§18.2）。
-pub fn error_event(message: &str) -> Value {
-    json!({"error": {"message": message, "type": "api_error"}})
+///
+/// 带上稳定网关错误码与请求 ID：客户端拿到之后能区分"上游坏了"和"被限流"，
+/// 也能在报问题时给出可检索的请求 ID。
+pub fn error_event(
+    code: crate::gateway::error::ErrorCode,
+    message: &str,
+    request_id: Option<&str>,
+) -> Value {
+    json!({"error": {
+        "message": message,
+        "type": code.openai_type_for_stream(),
+        "code": code.as_str(),
+        "request_id": request_id,
+    }})
 }
 
 #[cfg(test)]
