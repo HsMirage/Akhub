@@ -1,10 +1,13 @@
-# 公开仓库的质量门：格式、静态检查、全量测试与前端构建。
-# 前端产物必须在 `cargo` 之前构建：管理后台由 rust-embed 在编译期嵌入。
+# 公开仓库的质量门：格式、静态检查、全量测试、前端构建与容器冒烟。
+# 前端产物必须在 cargo 之前构建：管理后台由 rust-embed 在编译期嵌入。
 name: CI
 
 on:
   push:
   pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -19,9 +22,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: 构建管理后台
+        working-directory: web
         run: |
-          cd web
-          npm ci
+          npm ci --no-audit --no-fund
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable
@@ -38,3 +41,90 @@ jobs:
 
       - name: 全量测试
         run: cargo test --all --no-fail-fast
+
+      # 发布脚本是运维唯一直接执行的东西，语法错误必须在这里拦下，
+      # 而不是等用户在服务器上敲下去才发现。
+      - name: 发布脚本语法
+        run: |
+          for script in install.sh scripts/*.sh deploy/docker-entrypoint.sh; do
+            echo "--- $script"
+            sh -n "$script" || exit 1
+          done
+
+  # 容器冒烟：在空数据目录上首次启动、探测就绪、跑完一次真实 HTTP 请求。
+  # 这是 §28 完成标准里的"Docker 从空数据目录完成首次启动和真实调用"，
+  # 只有真的把镜像跑起来才算数——镜像能不能 build 成功说明不了这一点。
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建运行镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          load: true
+          tags: akhub:ci
+          cache-from: type=gha,scope=akhub-ci
+          cache-to: type=gha,scope=akhub-ci,mode=max
+
+      - name: 容器内首次启动与真实调用
+        run: |
+          set -euo pipefail
+
+          # 空数据目录 + 命名卷，和用户的默认部署完全一致。
+          docker run -d --name akhub-ci \
+            -p 127.0.0.1:18080:8080 \
+            -e RUST_LOG=akhub=info \
+            akhub:ci
+
+          cleanup() { docker logs akhub-ci || true; docker rm -f akhub-ci || true; }
+          trap cleanup EXIT
+
+          echo "==> 等待就绪（首次启动要在空目录里建库、生成主密钥）"
+          ready=false
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/health/ready >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::容器 60 秒内没有就绪"
+            exit 1
+          fi
+
+          echo "==> /health/version"
+          version="$(curl -fsS http://127.0.0.1:18080/health/version)"
+          echo "$version"
+          # 版本必须与 Cargo.toml 一致，否则说明镜像里嵌的是别的构建。
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "$version" | grep -q "\"$crate\"" \
+            || { echo "::error::镜像版本与 Cargo.toml 的 $crate 不一致：$version"; exit 1; }
+
+          echo "==> 管理后台外壳"
+          curl -fsS http://127.0.0.1:18080/admin | grep -qi '<div id="root">' \
+            || { echo "::error::/admin 没有返回 SPA 外壳，前端可能没嵌进去"; exit 1; }
+
+          echo "==> 未鉴权请求必须 401（网关真的在工作）"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{"model":"m","messages":[{"role":"user","content":"hi"}]}')"
+          [[ "$code" == "401" ]] || { echo "::error::期望 401，实际 $code"; exit 1; }
+
+          echo "==> 健康检查子命令（镜像 HEALTHCHECK 用的就是它）"
+          docker exec akhub-ci /usr/local/bin/akhub --healthcheck
+
+          echo "==> 进程不是 root"
+          uid="$(docker exec akhub-ci id -u)"
+          [[ "$uid" == "10001" ]] || { echo "::error::容器内进程 uid=$uid，预期 10001"; exit 1; }
+
+          echo "==> 数据目录内容"
+          docker exec akhub-ci ls -la /data
+
+          echo "全部通过"

@@ -1,0 +1,63 @@
+# Akhub 反代示例（Caddy v2，§25.2）。
+#
+# Caddy 自动申请并续期 Let's Encrypt 证书，是最省事的 HTTPS 终止方案。
+# Akhub 自己不管证书，监听明文 HTTP，由 Caddy 在前面挡一层。
+#
+# 安装（Linux）：
+#   https://caddyserver.com/docs/install
+# 放置：
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# 把下面的域名和邮箱换成你自己的，然后确认 DNS 已经指向这台机器。
+
+{
+	# 换成你的邮箱：Let's Encrypt 到期通知会发到这里。
+	email you@example.com
+}
+
+# ---------------------------------------------------------------- 正式站点
+akhub.example.com {
+	# Akhub 的默认监听地址。如果你的监听端口不是 8080，改这里。
+	reverse_proxy 127.0.0.1:8080 {
+		# Akhub 的优雅关闭宽限期默认 180 秒（§25.3）。Caddy 默认的
+		# 上游超时更短，长流式响应会被它掐断，所以这里要放大。
+		transport http {
+			read_timeout 600s
+			write_timeout 600s
+		}
+	}
+
+	# Caddy 会自动带上 X-Forwarded-Proto；Akhub 用它决定会话 Cookie
+	# 要不要加 Secure（§23.2），所以这一层不能省。
+	#
+	# 请求体上限：Akhub 自己默认 64 MiB（AKHUB_MAX_REQUEST_BYTES），
+	# 反代不能比它更小，否则大图请求会在到达网关前被 413。
+	request_body {
+		max_size 64MB
+	}
+
+	# 日志：把请求日志单独留一份，便于排查"客户端说 429、网关说没收到"。
+	log {
+		output file /var/log/caddy/akhub-access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+
+	# 安全响应头由 Akhub 自己发（§23.2）；HSTS 交给 Caddy，
+	# 因为只有它知道这个域名是纯 HTTPS 的。
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+# ---------------------------------------------------------------- 健康检查入口
+# 有些编排/监控需要有凭据之外的探针地址。可以只暴露健康接口，
+# 不落到 /admin 与 /v1 上。
+http://health.akhub.internal:8081 {
+	@health path /health/live /health/ready /health/version
+	handle @health {
+		reverse_proxy 127.0.0.1:8080
+	}
+	respond 404
+}

@@ -7,8 +7,23 @@ use std::time::Duration;
 use akhub::app::{AppState, Settings};
 use anyhow::{Context, Result};
 
+/// 版本号取自 Cargo.toml，与 `/admin` 接口里上报的是同一个值。
+///
+/// 用 `option_env!` 而不是 `env!`：Windows 资源脚本会在编译期注入同一个值，
+/// 缺少该变量时应当退回 Cargo 的版本，而不是编译失败。
+const VERSION: &str = match option_env!("AKHUB_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 出问题时第一件事就是确认跑的是哪个二进制，所以这个分支要排在
+    // 监听地址解析之前——本机 AKHUB_LISTEN 写坏了也得能 --version。
+    if let Some(code) = handle_early_exit() {
+        std::process::exit(code);
+    }
+
     let addr: SocketAddr = std::env::var("AKHUB_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()
@@ -36,6 +51,48 @@ async fn main() -> Result<()> {
     tracing::info!(data_dir = %data_dir.display(), "数据目录已就绪");
     akhub::server::serve(state, addr).await
 }
+
+/// 处理不需要数据库、不需要监听的早期退出参数。
+///
+/// 返回 `Some(退出码)` 表示「这个参数只要求打印点东西就走」，`None` 表示继续正常启动。
+/// 用 `--flag` 前缀而不是位置参数，避免将来加子命令时把现有调用撞坏。
+fn handle_early_exit() -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
+
+    if has("--version") || has("-V") {
+        // 与管理后台概览页显示的是同一个字符串，便于比对升级是否生效。
+        println!("akhub {VERSION}");
+        return Some(0);
+    }
+    if has("--help") || has("-h") {
+        print!("{HELP}");
+        return Some(0);
+    }
+    None
+}
+
+/// `--help` 的正文。列出的是真正会被解析的参数与最常用的环境变量，
+/// 完整的变量表在 README 里。
+const HELP: &str = concat!(
+    "akhub ",
+    env!("CARGO_PKG_VERSION"),
+    " —— AI 协议网关与组内负载均衡\n\n",
+    "用法：\n",
+    "  akhub                 启动服务（监听 AKHUB_LISTEN，默认 127.0.0.1:8080）\n",
+    "  akhub --healthcheck   探测本机 /health/ready，就绪退出码 0，否则非 0\n",
+    "  akhub --version       打印版本号\n",
+    "  akhub --help          显示本帮助\n",
+    "\n",
+    "常用环境变量：\n",
+    "  AKHUB_LISTEN                 监听地址，默认 127.0.0.1:8080\n",
+    "  AKHUB_DATA_DIR               数据目录，默认 ./data\n",
+    "  AKHUB_MASTER_KEY             32 字节 hex 或 base64 主密钥，优先于数据目录里的密钥文件\n",
+    "  AKHUB_SHUTDOWN_GRACE_SECS    关闭时给在途请求的完成时间，默认 180\n",
+    "  RUST_LOG                     日志级别，默认 akhub=info,warn\n",
+    "\n",
+    "管理后台：http://<监听地址>/admin\n",
+);
 
 /// 探测本机 `/health/ready`。就绪返回 0，其余情况返回非 0。
 async fn healthcheck(addr: SocketAddr) -> Result<()> {

@@ -105,6 +105,8 @@ export interface Account {
   enabled: boolean;
   /** 模型自动同步：全量托管上游模型，忽略选择集（§16.2）。 */
   auto_sync: boolean;
+  /** 账号级"隐藏原始模型"：打开后只暴露设置了"下游模型名"的模型。 */
+  hide_original: boolean;
   /** 上一次托管同步完成的时间戳；null 表示从未同步。 */
   model_synced_at: number | null;
   /** 账号级健康摘要（§6.9）：列表行内徽标用它。 */
@@ -121,16 +123,23 @@ export interface AccountHealth {
   target_total: number;
 }
 
-/** 账号模型目录里的一行（§16.2 的选择集状态）。 */
+/** 账号模型目录里的一行（§16.2 / §16.4）。 */
 export interface AccountModel {
   upstream_model: string;
+  /** 下游模型名；未设置时等于上游模型名。 */
   public_name: string;
+  /** 所属账号的"隐藏原始模型名"开关当前值。 */
+  hide_original: boolean;
+  /** 该行对应的下游模型名（等于 public_name）。 */
+  logical_model_name: string;
+  /** 下游实际可用的全部名称；账号隐藏原始名且未设下游模型名时为空。 */
+  exposed_names: string[];
   selected: boolean;
   /** 上游列表已消失但仍在选择集内：停止新请求（§16.5）。 */
   missing: boolean;
   /** 仅"获取模型"响应里有意义：本次拉取新出现的模型。 */
   is_new: boolean;
-  /** 管理员明确取消过勾选（§16.2）。与"从没出现过"分开。 */
+  /** 管理员明确停用过的模型（§16.2）。与"从没出现过"分开。 */
   excluded: boolean;
 }
 
@@ -140,7 +149,7 @@ export interface AvailableModel {
   accounts: string[];
 }
 
-/** 账号级模型别名：上游真名 → 对外名（§16.4）。 */
+/** 兼容旧接口：上游模型名 → 下游模型名（§16.4）。 */
 export interface Alias {
   upstream_model: string;
   public_name: string;
@@ -192,8 +201,11 @@ export interface DispatchTarget {
   logical_model_id: string;
   account_id: string;
   upstream_model: string;
+  /** 是否隐藏上游原始模型名。 */
+  hide_original: boolean;
+  /** 历史字段，恒为 null；调度目标不再支持独立优先级覆盖。 */
   priority_override: number | null;
-  /** 实际生效的优先级：目标覆盖值优先于账号默认值。 */
+  /** 实际生效的优先级：统一来自账号默认人工优先级。 */
   priority: number;
   limits: Limits;
   /** 账号默认值与目标覆盖合并后的实际限制。 */
@@ -340,7 +352,10 @@ export interface Overview {
   config_version: number;
   groups: number;
   logical_models: number;
+  /** 当前下游可用的模型名数量（一个模型的多个名称会分别计数）。 */
   listable_models: number;
+  /** 零目标、因此没有出现在 /v1/models 里的模型数。 */
+  unlisted_models: number;
   dispatch_targets: number;
   target_status: Partial<Record<TargetStatus, number>>;
   multiplier_stale: MultiplierAlert[];

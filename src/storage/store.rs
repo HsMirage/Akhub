@@ -215,8 +215,8 @@ impl Store {
                 preferred_protocol, adaptive_protocol, default_priority, calibration,
                 multiplier_mode, manual_multiplier, new_api_user_id, new_api_group,
                 limit_rpm, limit_tpm, limit_concurrency, allow_private_network, enabled,
-                auto_sync, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                auto_sync, hide_original, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&account.id)
         .bind(&account.group_id)
@@ -237,6 +237,7 @@ impl Store {
         .bind(account.allow_private_network)
         .bind(account.enabled)
         .bind(account.auto_sync)
+        .bind(account.hide_original)
         .bind(account.created_at.unix_timestamp())
         .execute(&mut *tx)
         .await
@@ -266,7 +267,7 @@ impl Store {
                 preferred_protocol = ?, adaptive_protocol = ?, default_priority = ?,
                 calibration = ?, multiplier_mode = ?, manual_multiplier = ?, new_api_user_id = ?,
                 new_api_group = ?, limit_rpm = ?, limit_tpm = ?, limit_concurrency = ?,
-                allow_private_network = ?, enabled = ?, auto_sync = ?
+                allow_private_network = ?, enabled = ?, auto_sync = ?, hide_original = ?
              WHERE id = ?",
         )
         .bind(&account.group_id)
@@ -287,6 +288,7 @@ impl Store {
         .bind(account.allow_private_network)
         .bind(account.enabled)
         .bind(account.auto_sync)
+        .bind(account.hide_original)
         .bind(&account.id)
         .execute(&mut *tx)
         .await
@@ -619,12 +621,13 @@ impl Store {
         for model in models {
             sqlx::query(
                 "INSERT INTO account_models (account_id, upstream_model, public_name,
-                    selected, missing, discovered_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                    hide_original, selected, missing, discovered_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(account_id)
             .bind(&model.upstream_model)
             .bind(&model.public_name)
+            .bind(model.hide_original)
             .bind(model.selected)
             .bind(model.missing)
             .bind(model.discovered_at)
@@ -666,6 +669,7 @@ impl Store {
                 Ok(AccountModelRow {
                     upstream_model: row.try_get("upstream_model")?,
                     public_name: row.try_get("public_name")?,
+                    hide_original: row.try_get("hide_original")?,
                     selected: row.try_get("selected")?,
                     missing: row.try_get("missing")?,
                     discovered_at: row.try_get("discovered_at")?,
@@ -710,7 +714,58 @@ impl Store {
         Ok(())
     }
 
+    /// 覆盖写入一条目录记录的完整配置（别名、隐藏原始名、选择/消失标记）。
+    ///
+    /// 刷新目录时用 [`replace_account_models`] 整表替换；这里用于管理端的
+    /// 逐行增删改，写入后会由调用方把对应调度目标调和到新配置（§16.2）。
+    pub async fn upsert_account_model(
+        &self,
+        account_id: &str,
+        row: &AccountModelRow,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO account_models (account_id, upstream_model, public_name,
+                hide_original, selected, missing, discovered_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(account_id, upstream_model) DO UPDATE SET
+                public_name = excluded.public_name,
+                hide_original = excluded.hide_original,
+                selected = excluded.selected,
+                missing = excluded.missing",
+        )
+        .bind(account_id)
+        .bind(&row.upstream_model)
+        .bind(&row.public_name)
+        .bind(row.hide_original)
+        .bind(row.selected)
+        .bind(row.missing)
+        .bind(row.discovered_at)
+        .execute(&self.pool)
+        .await
+        .context("写入账号模型目录失败")?;
+        Ok(())
+    }
+
+    /// 删除一条目录记录。调用方负责同时清理调度目标。
+    pub async fn delete_account_model(
+        &self,
+        account_id: &str,
+        upstream_model: &str,
+    ) -> Result<bool> {
+        let affected =
+            sqlx::query("DELETE FROM account_models WHERE account_id = ? AND upstream_model = ?")
+                .bind(account_id)
+                .bind(upstream_model)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        Ok(affected > 0)
+    }
+
     /// 覆盖写入一个账号的模型别名表（§16.4）。
+    ///
+    /// v8 起运行时以 `account_models.public_name` 为准，这里仅为兼容旧备份
+    /// 恢复与旧接口保留。
     pub async fn replace_account_aliases(
         &self,
         account_id: &str,
@@ -834,13 +889,15 @@ impl Store {
     pub async fn insert_target(&self, target: &DispatchTarget) -> Result<()> {
         sqlx::query(
             "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
-                priority_override, limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                hide_original, priority_override, limit_rpm, limit_tpm, limit_concurrency,
+                enabled, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&target.id)
         .bind(&target.logical_model_id)
         .bind(&target.account_id)
         .bind(&target.upstream_model)
+        .bind(target.hide_original)
         .bind(target.priority_override)
         .bind(target.limits.rpm)
         .bind(target.limits.tpm)
@@ -855,11 +912,13 @@ impl Store {
 
     pub async fn update_target(&self, target: &DispatchTarget) -> Result<()> {
         sqlx::query(
-            "UPDATE dispatch_targets SET upstream_model = ?, priority_override = ?, limit_rpm = ?,
-                limit_tpm = ?, limit_concurrency = ?, enabled = ?
-             WHERE id = ?",
+            "UPDATE dispatch_targets SET upstream_model = ?, logical_model_id = ?, hide_original = ?,
+                priority_override = ?, limit_rpm = ?, limit_tpm = ?, limit_concurrency = ?,
+                enabled = ? WHERE id = ?",
         )
         .bind(&target.upstream_model)
+        .bind(&target.logical_model_id)
+        .bind(target.hide_original)
         .bind(target.priority_override)
         .bind(target.limits.rpm)
         .bind(target.limits.tpm)
@@ -1371,6 +1430,7 @@ impl Store {
                         "allow_private_network",
                         "enabled",
                         "auto_sync",
+                        "hide_original",
                         "created_at",
                     ],
                 )
@@ -1432,6 +1492,7 @@ impl Store {
                         "logical_model_id",
                         "account_id",
                         "upstream_model",
+                        "hide_original",
                         "priority_override",
                         "limit_rpm",
                         "limit_tpm",
@@ -1456,6 +1517,7 @@ impl Store {
                         "account_id",
                         "upstream_model",
                         "public_name",
+                        "hide_original",
                         "selected",
                         "missing",
                         "discovered_at",
@@ -1542,8 +1604,8 @@ impl Store {
                     preferred_protocol, adaptive_protocol, default_priority, calibration,
                     multiplier_mode, manual_multiplier, new_api_user_id, new_api_group,
                     limit_rpm, limit_tpm, limit_concurrency, allow_private_network, enabled,
-                    auto_sync, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    auto_sync, hide_original, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(account, "id"))
             .bind(str_field(account, "group_id"))
@@ -1564,6 +1626,7 @@ impl Store {
             .bind(bool_field(account, "allow_private_network"))
             .bind(bool_field(account, "enabled"))
             .bind(bool_field(account, "auto_sync"))
+            .bind(bool_field(account, "hide_original"))
             .bind(int_field(account, "created_at"))
             .execute(&mut *tx)
             .await?;
@@ -1610,13 +1673,15 @@ impl Store {
         for target in &data.dispatch_targets {
             sqlx::query(
                 "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
-                    priority_override, limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    hide_original, priority_override, limit_rpm, limit_tpm, limit_concurrency,
+                    enabled, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(target, "id"))
             .bind(str_field(target, "logical_model_id"))
             .bind(str_field(target, "account_id"))
             .bind(str_field(target, "upstream_model"))
+            .bind(bool_field(target, "hide_original"))
             .bind(int_opt_field(target, "priority_override"))
             .bind(int_opt_field(target, "limit_rpm"))
             .bind(int_opt_field(target, "limit_tpm"))
@@ -1629,12 +1694,13 @@ impl Store {
         for row in &data.account_models {
             sqlx::query(
                 "INSERT INTO account_models (account_id, upstream_model, public_name,
-                    selected, missing, discovered_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                    hide_original, selected, missing, discovered_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(row, "account_id"))
             .bind(str_field(row, "upstream_model"))
             .bind(str_field(row, "public_name"))
+            .bind(bool_field(row, "hide_original"))
             .bind(bool_field(row, "selected"))
             .bind(bool_field(row, "missing"))
             .bind(int_field(row, "discovered_at"))
@@ -1652,6 +1718,24 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        // 旧备份（v8 之前）的别名只存在 account_aliases 里，恢复时回填到
+        // account_models.public_name；新备份两边都有，回填是无害的幂等操作。
+        sqlx::query(
+            "UPDATE account_models
+                SET public_name = (
+                    SELECT aa.public_name FROM account_aliases aa
+                    WHERE aa.account_id = account_models.account_id
+                      AND aa.upstream_model = account_models.upstream_model
+                )
+              WHERE EXISTS (
+                    SELECT 1 FROM account_aliases aa
+                    WHERE aa.account_id = account_models.account_id
+                      AND aa.upstream_model = account_models.upstream_model
+              )",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("恢复账号模型别名失败")?;
 
         // 系统设置：整体替换而不是合并，否则旧备份恢复后会留下一半新一半旧的
         // 设置项。`schema_version` 不动——它由启动时的迁移逻辑管理（§23.5）。
@@ -2391,8 +2475,10 @@ pub struct ResponseStateRow {
 pub struct AccountModelRow {
     /// 上游真名（规范化后，保留大小写）。
     pub upstream_model: String,
-    /// 别名应用后的对外名。
+    /// 对外名；未设置别名时等于上游真名。
     pub public_name: String,
+    /// 别名存在时，是否只暴露对外名、隐藏上游真名。
+    pub hide_original: bool,
     pub selected: bool,
     pub missing: bool,
     pub discovered_at: i64,
@@ -2516,6 +2602,7 @@ fn row_to_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account> {
         allow_private_network: row.try_get("allow_private_network")?,
         enabled: row.try_get("enabled")?,
         auto_sync: row.try_get("auto_sync")?,
+        hide_original: row.try_get("hide_original")?,
         model_synced_at: row.try_get("model_synced_at")?,
         created_at: to_time(row.try_get("created_at")?),
     })
@@ -2540,6 +2627,7 @@ fn row_to_target(row: &sqlx::sqlite::SqliteRow) -> Result<DispatchTarget> {
         logical_model_id: row.try_get("logical_model_id")?,
         account_id: row.try_get("account_id")?,
         upstream_model: row.try_get("upstream_model")?,
+        hide_original: row.try_get("hide_original")?,
         priority_override: row
             .try_get::<Option<i64>, _>("priority_override")?
             .map(|v| v as i32),
@@ -2667,6 +2755,7 @@ mod tests {
             limits: Limits::default(),
             allow_private_network: false,
             enabled: true,
+            hide_original: false,
             auto_sync: false,
             model_synced_at: None,
             created_at: OffsetDateTime::now_utc(),
@@ -2792,6 +2881,7 @@ mod tests {
                 id: ids::target(),
                 logical_model_id: model.id.clone(),
                 account_id: account.id.clone(),
+                hide_original: false,
                 upstream_model: "claude-sonnet-4-5-20250929".into(),
                 priority_override: None,
                 limits: Limits::default(),
@@ -2896,6 +2986,7 @@ mod tests {
             id: ids::target(),
             logical_model_id: model.id.clone(),
             account_id: account.id.clone(),
+            hide_original: false,
             upstream_model: "glm-4.6".into(),
             priority_override: None,
             limits: Limits::default(),
@@ -2952,6 +3043,7 @@ mod tests {
             id: ids::target(),
             logical_model_id: model.id.clone(),
             account_id: account.id.clone(),
+            hide_original: false,
             upstream_model: "glm-4.6".into(),
             priority_override: None,
             limits: Limits::default(),

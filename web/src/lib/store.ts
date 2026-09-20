@@ -31,7 +31,10 @@ export interface DataStore {
    * 列表接口有 1000 条上限；超了要明说，否则管理员会以为配置里就只有这些。
    */
   truncated: string[];
-  refresh: () => Promise<void>;
+  /** 最近一次成功刷新的时间（毫秒）；用于展示"更新于 X 分钟前"。 */
+  lastUpdated: number | null;
+  /** 返回是否成功，便于调用方决定提示成功还是失败。 */
+  refresh: () => Promise<boolean>;
 }
 
 /**
@@ -43,8 +46,9 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState<string[]>([]);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<boolean> => {
     try {
       const [overview, settings, groups, accounts, models, targets, requests] =
         await Promise.all([
@@ -79,12 +83,15 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
           .map(([name, page]) => name + "（" + page.data.length + "/" + page.total + "）"),
       );
       setError(null);
+      setLastUpdated(Date.now());
+      return true;
     } catch (cause) {
       if (cause instanceof ApiError && cause.unauthorized) {
         onUnauthorized();
-        return;
+        return false;
       }
       setError(cause instanceof Error ? cause.message : "加载失败");
+      return false;
     } finally {
       setLoading(false);
     }
@@ -96,7 +103,17 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
     void refresh();
   }, [active, refresh]);
 
-  return { data, loading, error, truncated, refresh };
+  return { data, loading, error, truncated, lastUpdated, refresh };
+}
+
+/** 定时重渲染用的当前时间；用于"更新于 X 分钟前"这类相对时间展示。 */
+export function useNow(intervalMs = 30_000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [intervalMs]);
+  return now;
 }
 
 /** 主题：跟随系统，允许手动覆盖并记住选择。 */
@@ -131,7 +148,9 @@ export function useTheme() {
 function parseHash(hash: string): { route: string; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, "");
   const [path = "", query = ""] = raw.split("?", 2);
-  return { route: path, params: new URLSearchParams(query) };
+  // 旧版「逻辑模型」入口已经并入账号的模型管理：保留旧链接可用（§16 修订）。
+  const route = path === "models" ? "accounts" : path;
+  return { route, params: new URLSearchParams(query) };
 }
 
 export function useRoute<T extends string>(routes: readonly T[], fallback: T) {
@@ -149,8 +168,11 @@ export function useRoute<T extends string>(routes: readonly T[], fallback: T) {
     return () => window.removeEventListener("hashchange", onChange);
   }, [parse]);
 
-  const navigate = useCallback((next: T) => {
-    window.location.hash = `/${next}`;
+  const navigate = useCallback((next: T, params?: Record<string, string>) => {
+    const query = params && Object.keys(params).length > 0
+      ? "?" + new URLSearchParams(params).toString()
+      : "";
+    window.location.hash = `/${next}${query}`;
   }, []);
 
   // 第三个返回值是查询参数，向后兼容：原有的 `const [route, navigate] = ...` 不受影响。

@@ -15,6 +15,14 @@ use serde_json::json;
 use crate::app::SharedState;
 use crate::auth::session;
 
+/// 二进制版本号，取自 Cargo.toml。
+///
+/// `/admin/api/overview` 与 `/health/version` 必须给出同一个字符串：运维用前者
+/// 在界面上确认版本、用后者在编排里做探针，两者一旦分叉，升级核对就没有意义。
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// 会话 Cookie 名。
 const SESSION_COOKIE: &str = "akhub_session";
 /// 写操作必须携带的自定义头。
@@ -263,6 +271,18 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/admin/api/accounts/{id}/models/select",
             post(r::select_account_models),
+        )
+        .route(
+            "/admin/api/accounts/{id}/models/update",
+            post(r::update_account_model),
+        )
+        .route(
+            "/admin/api/accounts/{id}/models/delete",
+            post(r::delete_account_model),
+        )
+        .route(
+            "/admin/api/accounts/{id}/models/merge",
+            post(r::merge_account_models),
         )
         .route(
             "/admin/api/accounts/{id}/models/sync",

@@ -1,5 +1,35 @@
+# 构建上下文瘦身。
+#
+# 构建镜像时 Docker 会把整个上下文打包发给 daemon：这个仓库的 target/ 在
+# 开发机上能到几十 GB，不加这几条的话每次构建都要白传一遍。
+
+# Rust 产物：镜像里从零编译，宿主的 target/ 既不能用也不该传。
 target/
+
+# 运行时数据（SQLite、主密钥、临时文件）绝不能进镜像。
 data/
+
+# 版本控制与工具目录。
 .git/
+.github/
+.playwright-mcp/
+review/
+
+# 前端依赖与产物：web 阶段会在容器里重新 npm ci 与 npm run build，
+# 产物再由 rust-embed 嵌进二进制。传宿主机的 node_modules 只会拖慢构建，
+# 还可能把平台相关的原生模块带进去。
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+
+# 本地发布工件。
+dist/
+
+# 文档：镜像里不需要仓库文档（发行包会单独带上 README/NOTICES/LICENSE）。
 *.md
+!NOTICES.md
 !README.md
+
+# 编辑器与系统垃圾。
+.DS_Store
+*.swp

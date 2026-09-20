@@ -376,6 +376,7 @@ mod tests {
             limits: Limits::default(),
             allow_private_network: false,
             enabled: true,
+            hide_original: false,
             auto_sync: false,
             model_synced_at: None,
             created_at: OffsetDateTime::UNIX_EPOCH,

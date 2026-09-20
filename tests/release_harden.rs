@@ -389,6 +389,18 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .execute(state.store.pool())
         .await
         .unwrap();
+    sqlx::query("ALTER TABLE account_models DROP COLUMN hide_original")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE dispatch_targets DROP COLUMN hide_original")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE upstream_accounts DROP COLUMN hide_original")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
     sqlx::query("DROP TABLE background_tasks")
         .execute(state.store.pool())
         .await
@@ -466,12 +478,27 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     assert_eq!(bucket_tables, 1, "迁移后应存在 performance_buckets 表");
+    // v8/v9：目录行、目标与账号都补上 hide_original。
+    for table in ["account_models", "dispatch_targets", "upstream_accounts"] {
+        let columns: std::collections::HashSet<String> =
+            sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+                .fetch_all(reopened.store.pool())
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+                .collect();
+        assert!(
+            columns.contains("hide_original"),
+            "迁移后 {table} 缺少 hide_original"
+        );
+    }
     let version: String =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "7");
+    assert_eq!(version, "9");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。
@@ -526,4 +553,372 @@ fn third_party_notices_match_the_lockfile() {
         }
     }
     assert!(checked >= 15, "至少应该核对到主要直接依赖，实际 {checked}");
+}
+
+// ------------------------------------------------------------ 发布与部署契约
+//
+// 这些测试盯的不是运行时行为，而是「发版产物与文档是否还说同一件事」。
+// 发版流程的典型失败模式正是文档写着一套、脚本做着另一套，而且只有当用户
+// 照着文档敲下去才会暴露——所以把它钉在 CI 里。
+
+/// 内嵌的管理后台版本号、/health/version 与 Cargo.toml 必须是同一个字符串。
+#[tokio::test]
+async fn the_reported_version_matches_cargo_manifest() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let response = client()
+        .get(format!("{}/health/version", akhub.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "版本端点必须无需凭据即可访问");
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(
+        body["version"],
+        env!("CARGO_PKG_VERSION"),
+        "版本端点与 Cargo.toml 必须一致；对不上就说明升级后跑的还是旧二进制"
+    );
+}
+
+/// 版本端点不能泄露账号、模型或倍率信息。
+#[tokio::test]
+async fn the_version_endpoint_leaks_nothing_but_the_version() {
+    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
+    let body: serde_json::Value = client()
+        .get(format!("{}/health/version", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let object = body.as_object().expect("必须是 JSON 对象");
+    assert_eq!(
+        object.len(),
+        3,
+        "版本端点只能有 object/status/version 三个字段，实际：{object:?}"
+    );
+}
+
+/// CI 与本地发版必须产出同一组平台名，否则安装脚本会去下载不存在的资产。
+///
+/// 平台名同时出现在三个地方：release.yml 的 matrix.name、scripts/release.sh 的
+/// PLATFORMS、以及 install.sh / install.ps1 里拼资产名的那几行。任何一处漂移，
+/// 用户看到的就是 404。
+#[test]
+fn release_platforms_agree_across_workflow_script_and_installers() {
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
+    let release = std::fs::read_to_string("scripts/release.sh").expect("release.sh");
+    let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
+    let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
+
+    for platform in [
+        "linux-x86_64",
+        "linux-aarch64",
+        "linux-x86_64-musl",
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-x86_64",
+    ] {
+        assert!(
+            workflow.contains(&format!("name: {platform}")),
+            "release.yml 的 matrix 缺少平台 {platform}"
+        );
+        assert!(
+            release.contains(&format!("\"{platform}:")),
+            "scripts/release.sh 的 PLATFORMS 缺少 {platform}"
+        );
+    }
+
+    // 安装脚本要能按本机架构拼出资产名。这里不查具体三元组，只确认那段
+    // 拼装逻辑还在——它一旦被改成硬编码，多架构就废了。
+    for needle in ["linux-x86_64-musl", "linux-$", "macos-$"] {
+        assert!(
+            install_sh.contains(needle),
+            "install.sh 里找不到平台拼装片段 {needle}"
+        );
+    }
+    assert!(
+        install_ps1.contains("windows-x86_64"),
+        "install.ps1 必须指定 windows-x86_64 资产"
+    );
+}
+
+/// 安装脚本在**真实平台上**拼出的资产名，必须与发版矩阵声明的平台名逐一对上。
+///
+/// 上面那个测试只检查"拼装片段还在不在"，抓不到映射结果不匹配——真实发生过：
+/// install.sh 把 `arm64` 归一化成 `aarch64`，而发版矩阵当时写的是 `macos-arm64`，
+/// 于是 macOS 用户下载的 URL 必然 404，而字符串检查全绿。
+///
+/// 这里换个做法：伪造 uname 让 install.sh 以为自己在别的平台上跑，实际执行它，
+/// 再从输出里把平台名抠出来比对。测的是行为，不是文本。
+#[cfg(unix)]
+#[test]
+fn installer_resolves_to_platform_names_that_actually_exist() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
+
+    // 发版矩阵真正会产出的平台名。
+    let declared: Vec<String> = workflow
+        .lines()
+        // 只认 matrix.include 里的条目：它们的缩进是 10 个空格，
+        // step 的 name 缩进是 6 个，别把步骤名混进平台集合。
+        .filter_map(|line| line.strip_prefix("          - name: "))
+        .map(|name| name.trim().to_string())
+        .collect();
+    assert!(
+        declared.len() >= 6,
+        "release.yml 里应当解析出至少 6 个平台名，实际 {declared:?}"
+    );
+
+    // 伪造的 uname：只回答 -s 与 -m，值取自环境变量。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let fake_uname = dir.path().join("uname");
+    std::fs::write(
+        &fake_uname,
+        "#!/bin/sh\ncase \"$1\" in\n  -s) echo \"$FAKE_UNAME_S\" ;;\n  -m) echo \"$FAKE_UNAME_M\" ;;\n  *) echo unknown ;;\nesac\n",
+    )
+    .expect("写假 uname");
+    std::fs::set_permissions(&fake_uname, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 覆盖安装脚本里每一个平台分支。
+    let cases = [
+        ("Linux", "x86_64", "linux-x86_64-musl"),
+        ("Linux", "aarch64", "linux-aarch64"),
+        ("Darwin", "arm64", "macos-aarch64"),
+        ("Darwin", "x86_64", "macos-x86_64"),
+    ];
+
+    for (os, machine, expected) in cases {
+        let output = Command::new("sh")
+            .args(["install.sh", "--version", "v1.1.0", "--dry-run"])
+            .env("PATH", &path)
+            .env("FAKE_UNAME_S", os)
+            .env("FAKE_UNAME_M", machine)
+            .output()
+            .expect("执行 install.sh");
+        assert!(
+            output.status.success(),
+            "install.sh 在 {os}/{machine} 上失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.contains("将要下载"))
+            .unwrap_or_else(|| panic!("{os}/{machine} 没有输出下载地址：{stdout}"));
+
+        // 形如 .../v1.1.0/akhub-v1.1.0-<platform>.tar.gz
+        let asset = line.rsplit('/').next().expect("资产名").trim();
+        let platform = asset
+            .strip_prefix("akhub-v1.1.0-")
+            .and_then(|rest| rest.strip_suffix(".tar.gz"))
+            .unwrap_or_else(|| panic!("资产名不符合约定：{asset}"));
+
+        assert_eq!(
+            platform, expected,
+            "{os}/{machine} 解析出的平台名与预期不符"
+        );
+        assert!(
+            declared.iter().any(|name| name == platform),
+            "install.sh 在 {os}/{machine} 上拼出 {platform}，但 release.yml 从不产出这个名字；\
+             用户会拿到 404。矩阵里是：{declared:?}"
+        );
+    }
+
+    // Windows 的脚本没法在这里执行，退而求其次：把它硬编码的平台名抠出来比对。
+    let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
+    let ps1_platform = install_ps1
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("$platform = '"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .expect("install.ps1 里应有平台名赋值");
+    assert!(
+        declared.iter().any(|name| name == ps1_platform),
+        "install.ps1 指定的平台名 {ps1_platform}，release.yml 从不产出"
+    );
+}
+
+/// 镜像路径必须全小写。
+///
+/// GitHub 仓库是 HsMirage/Akhub，直接拿去拼 ghcr.io/<owner>/<repo> 会得到
+/// 含大写的路径，而 Docker 会拒绝这样的 repository 名——用户复制文档里的
+/// docker run 命令只会看到一个和文档内容毫不相干的报错。
+#[test]
+fn container_image_paths_are_lowercase() {
+    let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
+    assert!(
+        install_sh.contains("tr '[:upper:]' '[:lower:]'"),
+        "install.sh 必须把仓库名转成小写再拼镜像路径"
+    );
+
+    for name in ["docker-compose.yml", "deploy/README.md", "README.md"] {
+        let content =
+            std::fs::read_to_string(name).unwrap_or_else(|e| panic!("读不到 {name}：{e}"));
+        for (index, _) in content.match_indices("ghcr.io/") {
+            let after = &content[index + "ghcr.io/".len()..];
+            let end = after
+                .find(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\\')
+                .unwrap_or(after.len());
+            let path = &after[..end];
+            assert_eq!(
+                path,
+                path.to_lowercase(),
+                "{name} 里的镜像路径 {path} 含大写字母，Docker 会拒绝"
+            );
+        }
+    }
+}
+
+/// 发布资产的命名规则必须在打包脚本与安装脚本之间保持一致。
+#[test]
+fn artifact_naming_is_consistent_between_packager_and_installer() {
+    let package = std::fs::read_to_string("scripts/package.sh").expect("package.sh");
+    let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
+    let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
+
+    // 打包侧：akhub-<tag>-<platform>.tar.gz / .zip
+    assert!(
+        package.contains("ASSET=\"akhub-$TAG-$PLATFORM\""),
+        "package.sh 的资产命名变了，安装脚本会找不到文件"
+    );
+    assert!(
+        install_sh.contains("asset=\"akhub-${tag}-${platform}.tar.gz\""),
+        "install.sh 的资产名模板与 package.sh 不一致"
+    );
+    assert!(
+        install_ps1.contains("$asset = \"akhub-$tag-$platform.zip\""),
+        "install.ps1 的资产名模板与 package.sh 不一致"
+    );
+
+    // 发行包必须同时带上两个安装脚本：Windows 文档让用户去运行
+    // install.ps1，包里没有它就会指向一个不存在的文件。
+    assert!(
+        package.contains("deploy install.sh install.ps1"),
+        "package.sh 必须把 install.sh 与 install.ps1 都放进发行包"
+    );
+
+    // 归档内层目录名 == 资产名去掉扩展名，安装脚本按这个规则定位可执行文件。
+    assert!(
+        package.contains("STAGE=\"dist/$ASSET\""),
+        "package.sh 的归档内层目录必须等于资产名"
+    );
+    assert!(
+        install_sh.contains("inner=\"${tmp}/akhub-${tag}-${platform}\""),
+        "install.sh 的内层目录推断与 package.sh 不一致"
+    );
+}
+
+/// 停止宽限期的默认值必须在四处说得一致（§25.3）。
+///
+/// 这个数字只要有一处偏小，后果都是在途的长流式请求被强杀：代码里的默认值、
+/// systemd 的 TimeoutStopSec、Docker 的 stop_grace_period、镜像的 STOPSIGNAL。
+#[test]
+fn the_shutdown_grace_default_is_consistent_everywhere() {
+    let main = std::fs::read_to_string("src/main.rs").expect("main.rs");
+    assert!(
+        main.contains("env_duration(\"AKHUB_SHUTDOWN_GRACE_SECS\", 180)"),
+        "代码里的关闭宽限期默认值被改动，下面三处都要跟着改"
+    );
+
+    let service = std::fs::read_to_string("deploy/akhub.service").expect("akhub.service");
+    assert!(
+        service.contains("TimeoutStopSec=200"),
+        "systemd 的 TimeoutStopSec 必须大于 180 秒的宽限期"
+    );
+
+    let compose = std::fs::read_to_string("docker-compose.yml").expect("docker-compose.yml");
+    assert!(
+        compose.contains("stop_grace_period: 200s"),
+        "compose 的 stop_grace_period 必须大于 180 秒的宽限期"
+    );
+
+    let dockerfile = std::fs::read_to_string("Dockerfile").expect("Dockerfile");
+    assert!(
+        dockerfile.contains("STOPSIGNAL SIGTERM"),
+        "镜像必须显式声明 SIGTERM，否则优雅关闭不会触发"
+    );
+}
+
+/// 部署文档里引用的仓库文件必须真的存在。
+///
+/// 文档链接失效是发版重构最常见的副作用：改了脚本名、忘了改文档，
+/// 而这条路径只有用户会走到。
+#[test]
+fn deployment_docs_only_reference_files_that_exist() {
+    let tick = '\u{60}';
+    let mut checked = 0usize;
+
+    for name in [
+        "deploy/README.md",
+        "deploy/README.windows.md",
+        "README.md",
+        "install.sh",
+        "install.ps1",
+    ] {
+        let content =
+            std::fs::read_to_string(name).unwrap_or_else(|e| panic!("读不到 {name}：{e}"));
+
+        let mut rest = content.as_str();
+        while let Some(start) = rest.find(tick) {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(tick) else { break };
+            let candidate = &after[..end];
+            rest = &after[end + 1..];
+
+            if candidate.contains(char::is_whitespace) || candidate.contains(',') {
+                continue;
+            }
+            // 反斜杠写法（Windows 文档）统一成正斜杠再判断。
+            let path = candidate.replace('\\', "/");
+            let path = path.trim_start_matches("./");
+
+            // 只关心明确像「仓库内相对路径」的引用。
+            let looks_like_path = path.ends_with(".sh")
+                || path.ends_with(".ps1")
+                || path.ends_with(".yml")
+                || path.ends_with(".service")
+                || path.ends_with(".conf")
+                || path.ends_with("Dockerfile")
+                || path == "docker-compose.yml"
+                || path == "Caddyfile"
+                || path == "Caddyfile.windows"
+                || path == "deploy/README.windows.md";
+            if !looks_like_path {
+                continue;
+            }
+            // 绝对路径、盘符路径与环境变量展开出来的路径不在仓库里。
+            if path.starts_with('/')
+                || path.starts_with("C:/")
+                || path.contains('%')
+                || path.contains('$')
+            {
+                continue;
+            }
+            // 发行包内 / Release 附件里的文件名不要求在仓库里存在。
+            if path.contains("akhub-v")
+                || path.starts_with("dist/")
+                || path.ends_with("checksums.txt")
+                || path.ends_with("akhub.exe")
+            {
+                continue;
+            }
+            assert!(
+                std::path::Path::new(path).exists(),
+                "{name} 引用了不存在的文件：{candidate}"
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(checked >= 8, "应当核对到若干仓库内文件引用，实际 {checked}");
 }

@@ -286,7 +286,7 @@ pub fn plan(
     random: &mut impl FnMut() -> f64,
 ) -> Result<Plan, SelectionFailure> {
     // 分组是硬边界：查不到就是查不到，绝不跨组搜索（§7.3）。
-    let Some(model) = group.models.get(model_name) else {
+    let Some(model) = group.find_model(model_name) else {
         return Err(SelectionFailure {
             code: ErrorCode::ModelNotFound,
             message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
@@ -296,6 +296,14 @@ pub fn plan(
         return Err(SelectionFailure {
             code: ErrorCode::ModelNotFound,
             message: format!("逻辑模型 {model_name} 已被停用"),
+        });
+    }
+    // 账号级"隐藏原始模型"可能让一个没有任何下游模型名的目标整体不可达；
+    // 这种模型对下游等同于不存在。
+    if !model.is_exposed() {
+        return Err(SelectionFailure {
+            code: ErrorCode::ModelNotFound,
+            message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
         });
     }
 
@@ -582,6 +590,7 @@ mod tests {
             limits: Limits::default(),
             allow_private_network: false,
             enabled,
+            hide_original: false,
             auto_sync: false,
             model_synced_at: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -602,6 +611,7 @@ mod tests {
                 logical_model_id: "m1".into(),
                 account_id: account.id.clone(),
                 upstream_model: "glm-4.6".into(),
+                hide_original: false,
                 priority_override: Some(priority),
                 limits: Limits::default(),
                 enabled: true,
@@ -649,6 +659,8 @@ mod tests {
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },
                 targets: sorted,
+                exposed: true,
+                aliases: Vec::new(),
             }),
         );
         GroupView {

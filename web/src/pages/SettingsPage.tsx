@@ -3,21 +3,63 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
 import type { Data } from "../lib/store";
 import type { NewApiSite, Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
-import { formatBytes } from "../lib/format";
-import { Button, Card, ConfirmDialog, Field, useToast } from "../components/ui";
+import { formatBytes, humanizeSeconds } from "../lib/format";
+import { MIN_PASSWORD_LENGTH, USERNAME_STORAGE_KEY } from "../lib/policy";
+import { Button, Card, ConfirmDialog, Field, InfoTip, useToast } from "../components/ui";
 
 const SETTING_FIELDS: readonly {
   key: SettingsNumericField;
   label: string;
   unit: string;
+  /** 常用档位：点一下顶替手输原始数字。 */
+  presets: number[];
+  hint?: string;
 }[] = [
-  { key: "request_timeout_secs", label: "请求总超时", unit: "秒" },
-  { key: "max_request_bytes", label: "请求体上限", unit: "bytes" },
-  { key: "retention_days", label: "请求元数据保留", unit: "天" },
-  { key: "response_state_days", label: "Responses 状态保留", unit: "天" },
-  { key: "shutdown_grace_secs", label: "关闭宽限期", unit: "秒" },
-  { key: "multiplier_refresh_secs", label: "自动倍率刷新间隔", unit: "秒" },
-  { key: "model_sync_secs", label: "模型同步间隔", unit: "秒" },
+  {
+    key: "request_timeout_secs",
+    label: "请求总超时",
+    unit: "秒",
+    presets: [300, 600, 1800],
+  },
+  {
+    key: "max_request_bytes",
+    label: "请求体上限",
+    unit: "bytes",
+    presets: [8 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024],
+  },
+  {
+    key: "retention_days",
+    label: "请求元数据保留",
+    unit: "天",
+    presets: [0, 7, 30, 90],
+    hint: "0 = 不保留历史明细",
+  },
+  {
+    key: "response_state_days",
+    label: "Responses 状态保留",
+    unit: "天",
+    presets: [0, 7, 30],
+    hint: "0 = 只存最小定位映射",
+  },
+  {
+    key: "shutdown_grace_secs",
+    label: "关闭服务时的在途等待上限",
+    unit: "秒",
+    presets: [60, 180, 600],
+    hint: "需重启生效",
+  },
+  {
+    key: "multiplier_refresh_secs",
+    label: "自动倍率刷新间隔",
+    unit: "秒",
+    presets: [300, 900, 3600],
+  },
+  {
+    key: "model_sync_secs",
+    label: "模型同步间隔",
+    unit: "秒",
+    presets: [900, 1800, 3600],
+  },
 ];
 
 type SettingsForm = Record<SettingsNumericField, string>;
@@ -40,6 +82,15 @@ function formatSettingValue(key: SettingsNumericField, value: number): string {
   return `${value.toLocaleString()} ${unit}`;
 }
 
+/** 把原始数值翻译成人类可读的档位标签。 */
+function humanizeSetting(key: SettingsNumericField, value: number): string {
+  if (key === "max_request_bytes") return formatBytes(value);
+  if (key === "retention_days" || key === "response_state_days") {
+    return value === 0 ? "不保留" : `${value} 天`;
+  }
+  return humanizeSeconds(value);
+}
+
 function parseSettingNumber(raw: string): number | null {
   const text = raw.trim();
   if (!text) return null;
@@ -56,21 +107,41 @@ function buildSettingsPatch(form: SettingsForm, settings: Settings): SettingsPat
   return values;
 }
 
-export function Settings({ data, refresh }: { data: Data; refresh: () => Promise<void> }) {
+export function Settings({
+  data,
+  refresh,
+}: {
+  data: Data;
+  refresh: () => Promise<unknown>;
+}) {
   const toast = useToast();
   const settings = data.settings;
 
   const [settingsForm, setSettingsForm] = useState<SettingsForm>(() => settingsToForm(settings));
   const [settingsSaving, setSettingsSaving] = useState(false);
-  const [adminUsername, setAdminUsername] = useState("admin");
+  // 后端没有 whoami 接口；登录/首次设置成功时把用户名记在本地，避免显示错误的默认值。
+  const [adminUsername, setAdminUsername] = useState(
+    () => localStorage.getItem(USERNAME_STORAGE_KEY) ?? "admin",
+  );
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordSaving, setPasswordSaving] = useState(false);
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [confirmZero, setConfirmZero] = useState(false);
+  const [pendingRestart, setPendingRestart] = useState<string[]>([]);
 
-  // 备份恢复成功后父级会重新拉取 settings；只有服务端值变化时才重置表单。
+  // 备份恢复或后台刷新会更新服务端 settings。只有用户当前没有改动时才跟随刷新，
+  // 否则静默丢掉正在编辑的内容（自动刷新开启时尤其明显）。
+  const lastServerForm = useRef(settingsToForm(settings));
   useEffect(() => {
-    setSettingsForm(settingsToForm(settings));
+    const next = settingsToForm(settings);
+    const previousServer = lastServerForm.current;
+    lastServerForm.current = next;
+    setSettingsForm((current) =>
+      JSON.stringify(current) === JSON.stringify(previousServer) ? next : current,
+    );
   }, [settings]);
 
   const settingValidation = useMemo(() => {
@@ -95,9 +166,9 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
   const hasSettingsChanges = Object.keys(settingsPatch).length > 0;
   const settingsInvalid = Object.keys(settingValidation).length > 0;
 
-  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (settingsSaving || settingsInvalid || !hasSettingsChanges) return;
+  const resetSettings = () => setSettingsForm(settingsToForm(settings));
+
+  const applySettingsPatch = async () => {
     setSettingsSaving(true);
     try {
       const updated = await api.updateSettings(settingsPatch);
@@ -107,6 +178,7 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
           Object.prototype.hasOwnProperty.call(settingsPatch, field.key) &&
           updated.restart_required.includes(field.key),
       ).map((field) => field.label);
+      setPendingRestart(changedRequiringRestart);
       if (changedRequiringRestart.length > 0) {
         toast.success(`系统设置已保存；${changedRequiringRestart.join("、")}将在下次重启生效`);
       } else {
@@ -120,8 +192,32 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
     }
   };
 
+  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (settingsSaving || settingsInvalid || !hasSettingsChanges) return;
+    // 把保留期改为 0 会停止写入不可逆的历史口径，先要求二次确认。
+    if (settingsPatch.retention_days === 0 || settingsPatch.response_state_days === 0) {
+      setConfirmZero(true);
+      return;
+    }
+    await applySettingsPatch();
+  };
+
+  // 有未保存修改时提醒离开（浏览器刷新/关闭标签页）。
+  useEffect(() => {
+    if (!hasSettingsChanges) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [hasSettingsChanges]);
+
   const newPasswordError =
-    newPassword.length > 0 && newPassword.length < 12 ? "新密码至少需要 12 个字符" : undefined;
+    newPassword.length > 0 && newPassword.length < MIN_PASSWORD_LENGTH
+      ? `新密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`
+      : undefined;
   const confirmPasswordError =
     confirmPassword.length > 0 && confirmPassword !== newPassword
       ? "两次输入的新密码不一致"
@@ -130,8 +226,18 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
     !currentPassword ||
     !newPassword ||
     !confirmPassword ||
-    newPassword.length < 12 ||
+    newPassword.length < MIN_PASSWORD_LENGTH ||
     newPassword !== confirmPassword;
+  const passwordStrength = (() => {
+    let score = 0;
+    if (newPassword.length >= MIN_PASSWORD_LENGTH) score++;
+    if (newPassword.length >= 16) score++;
+    if (/[a-z]/.test(newPassword) && /[A-Z]/.test(newPassword)) score++;
+    if (/\d/.test(newPassword)) score++;
+    if (/[^A-Za-z0-9]/.test(newPassword)) score++;
+    return Math.min(4, score);
+  })();
+  const passwordStrengthLabel = ["太弱", "偏弱", "一般", "较强", "很强"][passwordStrength];
 
   const changePassword = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -158,6 +264,7 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
   const [siteToken, setSiteToken] = useState("");
   const [siteSaving, setSiteSaving] = useState(false);
   const [deletingSite, setDeletingSite] = useState<string | null>(null);
+  const [confirmSite, setConfirmSite] = useState<NewApiSite | null>(null);
 
   const loadSites = async () => {
     try {
@@ -260,71 +367,153 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
 
   return (
     <div className="stack" style={{ gap: 16 }}>
+      {pendingRestart.length > 0 && (
+        <div className="callout callout-warn" role="status">
+          <span style={{ flex: 1 }}>
+            以下修改需要重启 Akhub 才会生效：{pendingRestart.join("、")}。
+          </span>
+        </div>
+      )}
+
       <Card
         title="系统设置"
-        description="修改后立即热生效；关闭宽限期需要下次重启。范围由服务端实时返回。"
+        description="大多数字段保存后立即热生效；标记「需重启」的字段会在下次重启后生效。范围由服务端实时返回。"
         actions={
-          <Button
-            type="submit"
-            form="settings-form"
-            variant="primary"
-            disabled={settingsSaving || settingsInvalid || !hasSettingsChanges}
-          >
-            {settingsSaving && <span className="spinner" aria-hidden="true" />}
-            {settingsSaving ? "保存中…" : "保存"}
-          </Button>
+          <div className="row" style={{ gap: 8 }}>
+            {hasSettingsChanges && <span className="dirty-badge">未保存</span>}
+            <Button
+              size="sm"
+              variant="ghost"
+              type="button"
+              onClick={resetSettings}
+              disabled={!hasSettingsChanges || settingsSaving}
+            >
+              重置更改
+            </Button>
+            <Button
+              type="submit"
+              form="settings-form"
+              variant="primary"
+              size="sm"
+              disabled={settingsSaving || settingsInvalid || !hasSettingsChanges}
+            >
+              {settingsSaving && <span className="spinner spinner-sm" aria-hidden="true" />}
+              {settingsSaving ? "保存中…" : "保存"}
+            </Button>
+          </div>
         }
       >
         <form id="settings-form" className="card-body form-grid" onSubmit={saveSettings}>
           <div className="settings-grid">
             {SETTING_FIELDS.map((field) => {
               const limit = settings.limits[field.key];
+              const current = parseSettingNumber(settingsForm[field.key]);
+              const changed = current !== null && current !== settings[field.key];
               return (
                 <Field
                   key={field.key}
                   label={field.label}
                   error={settingValidation[field.key]}
                   hint={
-                    limit
-                      ? `范围：${formatSettingValue(field.key, limit.min)} 至 ${formatSettingValue(field.key, limit.max)}`
-                      : `单位：${field.unit}`
+                    <span>
+                      {limit
+                        ? `范围：${formatSettingValue(field.key, limit.min)} 至 ${formatSettingValue(field.key, limit.max)}`
+                        : `单位：${field.unit}`}
+                      {current !== null && <> · 当前填写约 {humanizeSetting(field.key, current)}</>}
+                      {field.hint ? ` · ${field.hint}` : ""}
+                      {field.hint === "需重启生效" && (
+                        <InfoTip label="为什么需要重启">
+                          关闭服务时等待在途请求完成的时间只能在启动时读取，因此修改后需要重启 Akhub。
+                        </InfoTip>
+                      )}
+                    </span>
                   }
                 >
                   {(id) => (
-                    <div className="input-with-unit">
-                      <input
-                        id={id}
-                        className="input mono"
-                        type="number"
-                        inputMode="numeric"
-                        min={limit?.min}
-                        max={limit?.max}
-                        step={1}
-                        value={settingsForm[field.key]}
-                        onChange={(event) =>
-                          setSettingsForm((current) => ({
-                            ...current,
-                            [field.key]: event.target.value,
-                          }))
-                        }
-                      />
-                      <span className="input-unit">{field.unit}</span>
+                    <div className="stack" style={{ gap: 6 }}>
+                      <div className="input-with-unit">
+                        <input
+                          id={id}
+                          className="input mono"
+                          type="number"
+                          inputMode="numeric"
+                          min={limit?.min}
+                          max={limit?.max}
+                          step={1}
+                          value={settingsForm[field.key]}
+                          onChange={(event) =>
+                            setSettingsForm((current) => ({
+                              ...current,
+                              [field.key]: event.target.value,
+                            }))
+                          }
+                        />
+                        <span className="input-unit">{field.unit}</span>
+                      </div>
+                      <div className="preset-row">
+                        {field.presets.map((preset) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            className={`preset-chip${String(preset) === settingsForm[field.key] ? " is-active" : ""}`}
+                            onClick={() =>
+                              setSettingsForm((current) => ({
+                                ...current,
+                                [field.key]: String(preset),
+                              }))
+                            }
+                          >
+                            {humanizeSetting(field.key, preset)}
+                          </button>
+                        ))}
+                        {changed && <span className="dirty-badge">已改</span>}
+                      </div>
                     </div>
                   )}
                 </Field>
               );
             })}
           </div>
+          {(parseSettingNumber(settingsForm.retention_days) === 0 ||
+            parseSettingNumber(settingsForm.response_state_days) === 0) && (
+            <div className="callout callout-warn" role="status">
+              <span>
+                保留天数填 0 会停止写入对应历史数据；保存前会再确认一次，且这个口径变化不可逆。
+              </span>
+            </div>
+          )}
           <p className="settings-note">
             请求体上限按 bytes 保存；保留天数填 0 表示关闭对应记录保留。只有发生变化的字段会提交。
           </p>
+          <div className="row" style={{ justifyContent: "flex-end" }}>
+            <Button
+              size="sm"
+              variant="ghost"
+              type="button"
+              onClick={resetSettings}
+              disabled={!hasSettingsChanges || settingsSaving}
+            >
+              重置更改
+            </Button>
+            <Button
+              size="sm"
+              type="submit"
+              variant="primary"
+              disabled={settingsSaving || settingsInvalid || !hasSettingsChanges}
+            >
+              {settingsSaving ? "保存中…" : "保存系统设置"}
+            </Button>
+          </div>
         </form>
       </Card>
 
-      <Card title="管理员账号" description="用户名只读；修改密码成功后当前会话会继续保持有效。">
+      <Card
+        title="管理员账号"
+        description="用户名创建后不可修改；修改密码成功后当前会话会继续保持有效。"
+      >
         <form className="card-body form-grid" onSubmit={changePassword}>
           <div className="form-row-2">
-            <Field label="用户名" hint="当前登录账号">
+            <Field label="用户名" hint="当前登录账号（创建后不可修改）">
               {(id) => (
                 <input
                   id={id}
@@ -337,14 +526,24 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
             </Field>
             <Field label="当前密码">
               {(id) => (
-                <input
-                  id={id}
-                  className="input"
-                  type="password"
-                  value={currentPassword}
-                  autoComplete="current-password"
-                  onChange={(event) => setCurrentPassword(event.target.value)}
-                />
+                <div className="input-affix">
+                  <input
+                    id={id}
+                    className="input"
+                    type={showCurrentPassword ? "text" : "password"}
+                    value={currentPassword}
+                    autoComplete="current-password"
+                    onChange={(event) => setCurrentPassword(event.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="input-affix-button"
+                    aria-label={showCurrentPassword ? "隐藏当前密码" : "显示当前密码"}
+                    onClick={() => setShowCurrentPassword((current) => !current)}
+                  >
+                    {showCurrentPassword ? "隐藏" : "显示"}
+                  </button>
+                </div>
               )}
             </Field>
           </div>
@@ -352,17 +551,40 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
             <Field
               label="新密码"
               error={newPasswordError}
-              hint="至少 12 个字符，并且不能与当前密码相同。"
+              hint={`至少 ${MIN_PASSWORD_LENGTH} 个字符，并且不能与当前密码相同。`}
             >
               {(id) => (
-                <input
-                  id={id}
-                  className="input"
-                  type="password"
-                  value={newPassword}
-                  autoComplete="new-password"
-                  onChange={(event) => setNewPassword(event.target.value)}
-                />
+                <div className="stack" style={{ gap: 6 }}>
+                  <div className="input-affix">
+                    <input
+                      id={id}
+                      className="input"
+                      type={showNewPassword ? "text" : "password"}
+                      value={newPassword}
+                      autoComplete="new-password"
+                      onChange={(event) => setNewPassword(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="input-affix-button"
+                      aria-label={showNewPassword ? "隐藏新密码" : "显示新密码"}
+                      onClick={() => setShowNewPassword((current) => !current)}
+                    >
+                      {showNewPassword ? "隐藏" : "显示"}
+                    </button>
+                  </div>
+                  {newPassword.length > 0 && (
+                    <div className="password-strength" aria-live="polite">
+                      <span className="password-strength-track">
+                        <i
+                          className={`password-strength-fill strength-${passwordStrength}`}
+                          style={{ width: `${(passwordStrength / 4) * 100}%` }}
+                        />
+                      </span>
+                      <span className="text-faint">强度：{passwordStrengthLabel}</span>
+                    </div>
+                  )}
+                </div>
               )}
             </Field>
             <Field label="确认新密码" error={confirmPasswordError}>
@@ -418,7 +640,7 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
                           variant="ghost"
                           size="sm"
                           disabled={deletingSite === site.base_url}
-                          onClick={() => void removeSite(site.base_url)}
+                          onClick={() => setConfirmSite(site)}
                         >
                           {deletingSite === site.base_url ? "删除中…" : "删除"}
                         </Button>
@@ -540,7 +762,7 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
 
       <Card
         title="配置备份"
-        description="备份包含分组、账号（含上游 Key）、模型选择集、别名、逻辑模型与调度目标；不含请求记录与运行日志。备份整体用口令加密。"
+        description="备份包含分组、账号（含上游 Key）、模型选择集与调度目标；不含请求记录与运行日志。备份整体用口令加密。"
       >
         <div className="card-body stack" style={{ gap: 16 }}>
           <div className="form-row-2">
@@ -566,7 +788,7 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
                 </div>
               )}
             </Field>
-            <Field label="恢复：选择备份文件与口令" hint="恢复会原子替换全部配置；成功后需要刷新页面。">
+            <Field label="恢复：选择备份文件与口令" hint="恢复会原子替换全部配置；成功后页面会自动重新加载数据。">
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
                   <input
@@ -601,10 +823,39 @@ export function Settings({ data, refresh }: { data: Data; refresh: () => Promise
       </Card>
 
       <ConfirmDialog
+        open={confirmZero}
+        title="关闭历史数据保留"
+        danger
+        confirmLabel="确认关闭保留"
+        message="把保留天数设为 0 会停止写入对应的历史数据，运行时指标将只覆盖当天且重启后清零。这个口径变化不可逆，确定继续保存吗？"
+        onClose={() => setConfirmZero(false)}
+        onConfirm={() => void applySettingsPatch()}
+      />
+
+      <ConfirmDialog
+        open={confirmSite !== null}
+        title="删除站点凭据"
+        danger
+        confirmLabel="删除"
+        message={
+          <>
+            删除「{confirmSite?.base_url}」后，使用该站点且没有单独填写凭据的账号
+            将无法自动刷新倍率，直到重新配置为止。确定删除吗？
+          </>
+        }
+        onClose={() => setConfirmSite(null)}
+        onConfirm={() => {
+          if (confirmSite) void removeSite(confirmSite.base_url);
+        }}
+      />
+
+      <ConfirmDialog
         open={confirmImport}
         title="恢复配置备份"
         danger
         confirmLabel={importing ? "恢复中…" : "恢复"}
+        requireText="恢复"
+        requireLabel="请输入「恢复」以确认整体替换"
         message={
           <>
             恢复会<b>整体替换</b>当前全部分组、账号、逻辑模型与调度目标，现有配置不可找回。

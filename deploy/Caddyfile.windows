@@ -1,0 +1,47 @@
+# Akhub 反代示例（Caddy for Windows，§25.2）。
+#
+# Caddy 是单个 exe，不需要安装：下载 caddy_windows_amd64.zip 解压后用
+# 管理员 PowerShell 执行：
+#   .\caddy.exe run --config Caddyfile.windows
+#
+# 注册成服务（Caddy 自带）：
+#   .\caddy.exe stop
+#   sc.exe config caddy binPath= "C:\caddy\caddy.exe run --config C:\caddy\Caddyfile.windows"
+#   sc.exe start caddy
+# 或者用 WinSW 包装，写法与 deploy/README.windows.md 里 Akhub 的托管方式一致。
+#
+# 注意：Caddy 需要 80/443 端口，Windows 防火墙要放行；
+# 而 Akhub 自身监听 127.0.0.1:8080，**不需要**开防火墙端口。
+
+{
+	email you@example.com
+	# Windows 上日志默认写到当前目录，显式指定一个固定路径更好排查。
+	log {
+		output file C:\caddy\logs\caddy.log
+	}
+}
+
+akhub.example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		transport http {
+			# 必须大于 AKHUB_SHUTDOWN_GRACE_SECS（默认 180 秒），
+			# 否则在途的长流式响应会被反代先掐断。
+			read_timeout 600s
+			write_timeout 600s
+		}
+	}
+
+	request_body {
+		max_size 64MB
+	}
+
+	log {
+		output file C:\caddy\logs\akhub-access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}

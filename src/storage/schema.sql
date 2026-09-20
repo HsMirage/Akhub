@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS upstream_accounts (
     enabled               INTEGER NOT NULL,
     -- 模型自动同步开关（§16.2）。打开后忽略选择集，全量托管上游模型。
     auto_sync             INTEGER NOT NULL DEFAULT 0,
+    -- 账号级"隐藏原始模型"开关。打开后只暴露设置了"下游模型名"的模型；
+    -- 没有设置下游模型名的模型不会对下游开放（§16.4 修订）。
+    hide_original         INTEGER NOT NULL DEFAULT 0,
     -- 上一次自动同步完成的时间；下一次同步时刻在此基础上加间隔与抖动。
     model_synced_at       INTEGER,
     created_at            INTEGER NOT NULL,
@@ -87,6 +90,11 @@ CREATE TABLE IF NOT EXISTS dispatch_targets (
     logical_model_id  TEXT NOT NULL REFERENCES logical_models(id) ON DELETE CASCADE,
     account_id        TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     upstream_model    TEXT NOT NULL,
+    -- 对外暴露上游原始名：账号模型管理里的"隐藏原始模型"关掉时为 0。
+    -- 同一逻辑模型下的目标各自决定是否暴露自己的上游名（§16.4）。
+    hide_original     INTEGER NOT NULL DEFAULT 0,
+    -- 历史字段：调度目标不再支持独立优先级覆盖，统一继承账号人工优先级。
+    -- 保留列以免影响旧备份恢复；配置装配时忽略它（§9.2 的修订）。
     priority_override INTEGER,
     limit_rpm         INTEGER,
     limit_tpm         INTEGER,
@@ -266,8 +274,10 @@ CREATE TABLE IF NOT EXISTS account_models (
     account_id   TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     -- 上游真名（规范化后，保留大小写）。
     upstream_model TEXT NOT NULL,
-    -- 对外名：别名应用后的名字，通常也是逻辑模型名。
+    -- 对外名：别名应用后的名字，也是逻辑模型名；未设置别名时等于上游真名。
     public_name  TEXT NOT NULL,
+    -- 别名设置后是否只暴露对外名（隐藏原始上游名）。
+    hide_original INTEGER NOT NULL DEFAULT 0,
     -- 选择集成员。排除过的模型保留记录但 selected = 0（§16.2）。
     selected     INTEGER NOT NULL,
     -- 上游列表里已经消失但仍在选择集内：停止新请求，重新出现自动解除（§16.5）。
@@ -276,7 +286,8 @@ CREATE TABLE IF NOT EXISTS account_models (
     PRIMARY KEY (account_id, upstream_model)
 );
 
--- 账号级模型别名表（§16.4）：上游真名 → 对外名，在勾选对话框之前应用。
+-- 旧版的独立别名表（§16.4）。v8 起别名就是 account_models.public_name + hide_original，
+-- 这里保留建表只为兼容旧备份文件的恢复，运行时不再以它为准。
 CREATE TABLE IF NOT EXISTS account_aliases (
     account_id     TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     upstream_model TEXT NOT NULL,

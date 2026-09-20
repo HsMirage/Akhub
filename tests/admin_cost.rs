@@ -464,13 +464,8 @@ async fn copy_creates_an_independent_disabled_clone() {
         .unwrap();
     assert_eq!(models.len(), 1);
     assert!(models[0].selected);
-    let aliases = akhub
-        .state
-        .store
-        .list_account_aliases(&copy_id)
-        .await
-        .unwrap();
-    assert_eq!(aliases.len(), 1);
+    // v8 起别名就是目录行的 public_name，不再写独立的别名表。
+    assert_eq!(models[0].public_name, "glm");
     let targets = akhub.state.store.list_targets().await.unwrap();
     assert_eq!(
         targets.iter().filter(|t| t.account_id == copy_id).count(),

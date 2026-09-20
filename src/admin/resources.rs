@@ -39,6 +39,13 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         .iter()
         .flat_map(|g| g.models.values())
         .filter(|m| m.is_listable())
+        .map(|m| m.exposed_names().len())
+        .sum();
+    let unlisted: usize = config
+        .groups
+        .iter()
+        .flat_map(|g| g.models.values())
+        .filter(|m| !m.is_listable())
         .count();
 
     // 倍率告警（§11.4）：宽限期内黄色，硬停或探针系统性故障红色。
@@ -191,6 +198,7 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         "groups": group_count,
         "logical_models": model_count,
         "listable_models": listable,
+        "unlisted_models": unlisted,
         "dispatch_targets": target_count,
         "target_status": status_counts,
         "multiplier_stale": stale,
@@ -274,7 +282,7 @@ fn settings_json(settings: &crate::app::Settings) -> Value {
         "capability_catalog_revision": crate::capability::builtin().revision().to_string(),
         // 适配器版本（§6.7）：转换规则改动后能力证据会整体失效，得让管理员看得到。
         "adapter_version": crate::protocol::ADAPTER_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": super::version(),
         // 这些字段在进程启动时读取一次，保存后要等下次重启才生效。
         "restart_required": ["shutdown_grace_secs"],
         "limits": serde_json::from_str::<Value>(SETTINGS_LIMITS).unwrap_or(Value::Null),
@@ -716,6 +724,8 @@ pub struct AccountPayload {
     pub enabled: Option<bool>,
     /// 模型自动同步：全量托管上游模型，忽略选择集（§16.2）。
     pub auto_sync: Option<bool>,
+    /// 账号级"隐藏原始模型"：打开后只暴露设置了"下游模型名"的模型。
+    pub hide_original: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -737,6 +747,7 @@ pub struct AccountPatch {
     pub allow_private_network: Option<bool>,
     pub enabled: Option<bool>,
     pub auto_sync: Option<bool>,
+    pub hide_original: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -772,6 +783,8 @@ pub struct AccountDto {
     pub enabled: bool,
     /// 模型自动同步状态。打开时后台任务全量托管（§16.2）。
     pub auto_sync: bool,
+    /// 账号级"隐藏原始模型"开关（§16.4 修订）。
+    pub hide_original: bool,
     /// 上一次模型同步完成的时间。
     pub model_synced_at: Option<i64>,
     /// 账号级健康摘要（§6.9）。账号列表行内徽标直接用它，不必点进目标页。
@@ -852,6 +865,7 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
         allow_private_network: account.allow_private_network,
         enabled: account.enabled,
         auto_sync: account.auto_sync,
+        hide_original: account.hide_original,
         model_synced_at: account.model_synced_at,
         health: account_health(state, account),
     }
@@ -1018,7 +1032,9 @@ pub async fn create_account(
     }
     let allow_private = payload.allow_private_network.unwrap_or(false);
     let base_url = validate_base_url(&payload.base_url, allow_private)?;
-    let priority = validate_priority(payload.default_priority.unwrap_or(50))?;
+    // 人工优先级默认 0：默认所有账号同层，由综合评分决定分配；只有在
+    // 需要"硬保底顺序"时才手动调高某几个账号（§9.2 修订）。
+    let priority = validate_priority(payload.default_priority.unwrap_or(0))?;
     let mode = payload.multiplier_mode.unwrap_or(MultiplierMode::Manual);
     let token = payload
         .new_api_token
@@ -1056,6 +1072,7 @@ pub async fn create_account(
         allow_private_network: allow_private,
         enabled: payload.enabled.unwrap_or(true),
         auto_sync: payload.auto_sync.unwrap_or(false),
+        hide_original: payload.hide_original.unwrap_or(false),
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
     };
@@ -1137,6 +1154,9 @@ pub async fn update_account(
     let was_managed = account.auto_sync;
     if let Some(auto_sync) = patch.auto_sync {
         account.auto_sync = auto_sync;
+    }
+    if let Some(hide_original) = patch.hide_original {
+        account.hide_original = hide_original;
     }
 
     let token = patch
@@ -1630,7 +1650,10 @@ pub struct TargetPayload {
     pub logical_model_id: String,
     pub account_id: String,
     pub upstream_model: String,
+    /// 历史字段：配置装配时忽略；保留以便旧客户端不报错。
     pub priority_override: Option<i32>,
+    #[serde(default)]
+    pub hide_original: Option<bool>,
     #[serde(default)]
     pub limits: Limits,
     pub enabled: Option<bool>,
@@ -1639,7 +1662,10 @@ pub struct TargetPayload {
 #[derive(Deserialize)]
 pub struct TargetPatch {
     pub upstream_model: Option<String>,
+    /// 历史字段：配置装配时忽略。
     pub priority_override: Option<Option<i32>>,
+    #[serde(default)]
+    pub hide_original: Option<bool>,
     pub limits: Option<Limits>,
     pub enabled: Option<bool>,
 }
@@ -1650,8 +1676,11 @@ pub struct TargetDto {
     pub logical_model_id: String,
     pub account_id: String,
     pub upstream_model: String,
+    /// 是否隐藏上游原始模型名。
+    pub hide_original: bool,
+    /// 历史字段，恒为 null；调度目标不再支持独立优先级覆盖。
     pub priority_override: Option<i32>,
-    /// 实际生效的优先级：目标覆盖值优先于账号默认值（§9.2）。
+    /// 实际生效的优先级：统一来自账号默认人工优先级（§9.2 修订）。
     pub priority: i32,
     pub limits: Limits,
     /// 账号默认值与目标覆盖合并后的实际限制。
@@ -1712,7 +1741,7 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
 
     let (priority, effective_limits) = view
         .map(|view| (view.priority, view.limits()))
-        .unwrap_or((50, target.limits));
+        .unwrap_or((0, target.limits));
     // 状态统一走 effective_target_status（§12.2），这里不再单独算一遍健康状态。
     let health = state.runtime.health.target(&target.id);
 
@@ -1721,6 +1750,9 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
         logical_model_id: target.logical_model_id.clone(),
         account_id: target.account_id.clone(),
         upstream_model: target.upstream_model.clone(),
+        hide_original: view
+            .map(|view| view.account.hide_original)
+            .unwrap_or(target.hide_original),
         priority_override: target.priority_override,
         priority,
         limits: target.limits,
@@ -1983,16 +2015,15 @@ pub async fn create_target(
     if payload.upstream_model.trim().is_empty() {
         return Err(AdminError::bad_request("上游模型名不能为空"));
     }
-    if let Some(priority) = payload.priority_override {
-        validate_priority(priority)?;
-    }
 
     let target = DispatchTarget {
         id: ids::target(),
         logical_model_id: model.id,
         account_id: account.id,
         upstream_model: payload.upstream_model.trim().to_string(),
-        priority_override: payload.priority_override,
+        hide_original: payload.hide_original.unwrap_or(false),
+        // 调度目标不再有独立优先级：统一继承账号默认人工优先级（§9.2 修订）。
+        priority_override: None,
         limits: validate_limits(payload.limits)?,
         enabled: payload.enabled.unwrap_or(true),
         created_at: OffsetDateTime::now_utc(),
@@ -2029,11 +2060,12 @@ pub async fn update_target(
         }
         target.upstream_model = model.trim().to_string();
     }
-    if let Some(priority) = patch.priority_override {
-        if let Some(value) = priority {
-            validate_priority(value)?;
-        }
-        target.priority_override = priority;
+    if let Some(hide) = patch.hide_original {
+        target.hide_original = hide;
+    }
+    // 历史字段：接受但忽略，保持旧客户端兼容（§9.2 修订）。
+    if patch.priority_override.is_some() {
+        target.priority_override = None;
     }
     if let Some(limits) = patch.limits {
         target.limits = validate_limits(limits)?;
@@ -2072,28 +2104,91 @@ pub async fn delete_target(
 
 // ------------------------------------------------- 模型目录与选择集（§16）
 
-/// 账号模型目录里的一行，供勾选对话框展示（§16.2）。
+/// 账号模型目录里的一行，供模型管理对话框展示。
 #[derive(Serialize)]
 pub struct AccountModelDto {
     pub upstream_model: String,
+    /// 下游模型名；未设置时等于上游真名。
     pub public_name: String,
+    /// 账号级"隐藏原始模型"开关的当前值。
+    pub hide_original: bool,
+    /// 该行对应的下游模型名（等于 public_name，显式列出便于前端解释）。
+    pub logical_model_name: String,
+    /// 该行最终对下游暴露的全部名字；账号隐藏原始名且未设下游模型名时为空。
+    pub exposed_names: Vec<String>,
     pub selected: bool,
     pub missing: bool,
     /// 仅"获取模型"响应里有意义：本次拉取新出现的模型。
     pub is_new: bool,
-    /// 管理员明确取消过勾选的模型（§16.2）。与"从没出现过"分开。
+    /// 管理员明确停用过的模型。与"从没出现过"分开。
     pub excluded: bool,
 }
 
-fn catalog_entry_dto(entry: &discovery::CatalogEntry) -> AccountModelDto {
+/// 计算一行模型在账号级隐藏开关下的“下游可用名称”。
+fn exposed_names(upstream: &str, public_name: &str, hide_original: bool) -> Vec<String> {
+    let aliased = public_name != upstream;
+    if hide_original {
+        // 打开后只认"下游模型名"；没设置的模型整体不暴露。
+        return if aliased {
+            vec![public_name.to_string()]
+        } else {
+            Vec::new()
+        };
+    }
+    if aliased {
+        vec![public_name.to_string(), upstream.to_string()]
+    } else {
+        vec![upstream.to_string()]
+    }
+}
+
+fn row_account_model_dto(
+    row: &crate::storage::store::AccountModelRow,
+    hide_original: bool,
+) -> AccountModelDto {
+    AccountModelDto {
+        upstream_model: row.upstream_model.clone(),
+        public_name: row.public_name.clone(),
+        hide_original,
+        logical_model_name: row.public_name.clone(),
+        exposed_names: exposed_names(&row.upstream_model, &row.public_name, hide_original),
+        selected: row.selected,
+        missing: row.missing,
+        is_new: false,
+        // 这个接口不带"本次新增"的上下文，但"排除过"是持久状态，照样给。
+        excluded: !row.selected && !row.missing,
+    }
+}
+
+fn catalog_entry_dto(entry: &discovery::CatalogEntry, hide_original: bool) -> AccountModelDto {
     AccountModelDto {
         upstream_model: entry.upstream_model.clone(),
         public_name: entry.public_name.clone(),
+        hide_original,
+        logical_model_name: entry.public_name.clone(),
+        exposed_names: exposed_names(&entry.upstream_model, &entry.public_name, hide_original),
         selected: entry.selected,
         missing: entry.missing,
         is_new: entry.is_new,
         excluded: entry.excluded,
     }
+}
+
+async fn account_models_json(
+    state: &SharedState,
+    account_id: &str,
+) -> AdminResult<Json<Vec<AccountModelDto>>> {
+    let account = find_account(state, account_id).await?;
+    let rows = state
+        .store
+        .list_account_models(account_id)
+        .await
+        .map_err(AdminError::internal)?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| row_account_model_dto(row, account.hide_original))
+            .collect(),
+    ))
 }
 
 /// 当前模型目录。不请求上游，供重新打开对话框或展示选择集使用。
@@ -2103,24 +2198,7 @@ pub async fn list_account_models(
     Path(id): Path<String>,
 ) -> AdminResult<Json<Vec<AccountModelDto>>> {
     find_account(&state, &id).await?;
-    let rows = state
-        .store
-        .list_account_models(&id)
-        .await
-        .map_err(AdminError::internal)?;
-    Ok(Json(
-        rows.iter()
-            .map(|row| AccountModelDto {
-                upstream_model: row.upstream_model.clone(),
-                public_name: row.public_name.clone(),
-                selected: row.selected,
-                missing: row.missing,
-                is_new: false,
-                // 这个接口不带"本次新增"的上下文，但"排除过"是持久状态，照样给。
-                excluded: !row.selected && !row.missing,
-            })
-            .collect(),
-    ))
+    account_models_json(&state, &id).await
 }
 
 /// 拉取上游模型列表，应用别名并与选择集合并（§16.1）。
@@ -2142,19 +2220,118 @@ pub async fn refresh_account_models(
             )
         })?;
     audit(&state, &admin, "refresh_account_models", &id).await;
-    Ok(Json(entries.iter().map(catalog_entry_dto).collect()))
+    Ok(Json(
+        entries
+            .iter()
+            .map(|entry| catalog_entry_dto(entry, account.hide_original))
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAccountModelPayload {
+    pub upstream_model: String,
+    /// 下游模型名。`null` 表示不改；空字符串表示清空、回到上游原名。
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// 启用 / 停用该模型。
+    #[serde(default)]
+    pub selected: Option<bool>,
+}
+
+/// 修改一行目录的下游模型名与启用状态，并立即调和目标（§16.3）。
+pub async fn update_account_model(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateAccountModelPayload>,
+) -> AdminResult<Json<Vec<AccountModelDto>>> {
+    let account = find_account(&state, &id).await?;
+    discovery::update_model(
+        &state,
+        &account,
+        &payload.upstream_model,
+        payload.alias.as_deref(),
+        payload.selected,
+    )
+    .await
+    .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    audit(
+        &state,
+        &admin,
+        "update_account_model",
+        &format!("{id}/{}", payload.upstream_model),
+    )
+    .await;
+    account_models_json(&state, &id).await
+}
+
+#[derive(Deserialize)]
+pub struct DeleteAccountModelPayload {
+    pub upstream_model: String,
+}
+
+/// 从账号目录永久删除一行，同时移除它的调度目标（§16.5）。
+pub async fn delete_account_model(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+    Json(payload): Json<DeleteAccountModelPayload>,
+) -> AdminResult<StatusCode> {
+    let account = find_account(&state, &id).await?;
+    if account.auto_sync {
+        return Err(AdminError::conflict(
+            "该账号已开启模型自动同步，不能单独删除模型；请先关闭自动同步",
+        ));
+    }
+    let removed = discovery::delete_model(&state, &account, &payload.upstream_model)
+        .await
+        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    if !removed {
+        return Err(AdminError::not_found("模型不在当前目录里"));
+    }
+    audit(&state, &admin, "delete_account_model", &id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct MergeAccountModelsPayload {
+    /// 要合并到一起的上游模型名集合。
+    pub upstream_models: Vec<String>,
+    /// 合并后的下游模型名；可从同组已有模型名里直接选。
+    pub public_name: String,
+}
+
+/// 把多行快速合并到同一个下游模型名，解决"同一模型在不同上游叫不同名字"（§16.4）。
+pub async fn merge_account_models(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+    Json(payload): Json<MergeAccountModelsPayload>,
+) -> AdminResult<Json<Vec<AccountModelDto>>> {
+    let account = find_account(&state, &id).await?;
+    discovery::merge_models(
+        &state,
+        &account,
+        &payload.upstream_models,
+        &payload.public_name,
+    )
+    .await
+    .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    audit(&state, &admin, "merge_account_models", &id).await;
+    account_models_json(&state, &id).await
 }
 
 #[derive(Deserialize)]
 pub struct SelectionPayload {
-    /// 期望处于选择集内的上游模型名全集。
+    /// 期望处于启用状态的模型名全集；同时接受上游真名与对外名（兼容旧前端）。
     pub selected: Vec<String>,
-    /// 最近 24 小时有流量的模型被取消勾选时需要二次确认（§16.3）。
+    /// 最近 24 小时有流量的模型被停用时需要二次确认（§16.3）。
     #[serde(default)]
     pub force: bool,
 }
 
-/// 批量应用选择集：勾选自动生成/归并调度目标，取消勾选移除目标（§16.3）。
+/// 批量应用选择集：启用自动生成/归并调度目标，停用移除目标（§16.3）。
 pub async fn select_account_models(
     State(state): State<SharedState>,
     admin: Admin,
@@ -2182,7 +2359,7 @@ pub async fn select_account_models(
         discovery::Selection::NeedsConfirm(warnings) => Ok((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": "以下模型最近 24 小时有流量，取消勾选前请确认",
+                "error": "以下模型最近 24 小时有流量，停用前请确认",
                 "warnings": warnings
                     .iter()
                     .map(|w| json!({"public_name": w.public_name, "calls": w.calls}))
@@ -2210,7 +2387,7 @@ pub async fn sync_account_models(
     let account = find_account(&state, &id).await?;
     if !account.auto_sync {
         return Err(AdminError::bad_request(
-            "该账号未开启模型自动同步，请用“获取模型”和勾选对话框管理",
+            "该账号未开启模型自动同步，请用“获取模型”和模型管理来维护",
         ));
     }
     let managed = discovery::sync_managed(&state, &account)
@@ -2225,7 +2402,8 @@ pub async fn sync_account_models(
 #[derive(Deserialize)]
 pub struct ManualModelPayload {
     pub upstream_model: String,
-    /// 手动指定的对外名；与上游名不同时会一并写入别名表。
+    /// 手动指定的下游模型名；留空表示使用上游原名。
+    #[serde(default)]
     pub public_name: Option<String>,
 }
 
@@ -2266,31 +2444,33 @@ pub async fn list_aliases(
     Path(id): Path<String>,
 ) -> AdminResult<Json<Vec<AliasDto>>> {
     find_account(&state, &id).await?;
-    let aliases = state
+    let rows = state
         .store
-        .list_account_aliases(&id)
+        .list_account_models(&id)
         .await
         .map_err(AdminError::internal)?;
     Ok(Json(
-        aliases
-            .into_iter()
-            .map(|a| AliasDto {
-                upstream_model: a.upstream_model,
-                public_name: a.public_name,
+        rows.into_iter()
+            .filter(|row| row.public_name != row.upstream_model)
+            .map(|row| AliasDto {
+                upstream_model: row.upstream_model,
+                public_name: row.public_name,
             })
             .collect(),
     ))
 }
 
-/// 覆盖写入账号的模型别名表（§16.4）。别名在下一次"获取模型"时生效。
+/// 兼容旧接口：把一批"上游真名 → 对外名"写进目录行并调和目标。
+///
+/// v8 起别名直接落在 `account_models`，不再有独立的别名表；新前端使用
+/// `update_account_model` / `merge_account_models`。
 pub async fn update_aliases(
     State(state): State<SharedState>,
     admin: Admin,
     Path(id): Path<String>,
     Json(payload): Json<AliasPayload>,
 ) -> AdminResult<StatusCode> {
-    find_account(&state, &id).await?;
-    let mut aliases = Vec::with_capacity(payload.aliases.len());
+    let account = find_account(&state, &id).await?;
     let mut seen = HashSet::new();
     for alias in payload.aliases {
         let upstream = alias.upstream_model.trim();
@@ -2298,24 +2478,28 @@ pub async fn update_aliases(
         if upstream.is_empty() || public.is_empty() {
             return Err(AdminError::bad_request("别名两端都不能为空"));
         }
-        if upstream.chars().count() > 256 || public.chars().count() > 100 {
-            return Err(AdminError::bad_request("别名名称过长"));
-        }
         if !seen.insert(upstream.to_string()) {
             return Err(AdminError::bad_request(format!(
                 "上游模型 {upstream} 出现了重复别名"
             )));
         }
-        aliases.push(crate::storage::store::AccountAliasRow {
-            upstream_model: upstream.to_string(),
-            public_name: public.to_string(),
-        });
+        discovery::set_alias(&state, &account, upstream, public)
+            .await
+            .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
     }
-    state
+    // 旧接口语义是"覆盖写入"：本次 payload 里没出现的别名应当被清掉。
+    for row in state
         .store
-        .replace_account_aliases(&id, &aliases)
+        .list_account_models(&id)
         .await
-        .map_err(AdminError::internal)?;
+        .map_err(AdminError::internal)?
+    {
+        if row.public_name != row.upstream_model && !seen.contains(&row.upstream_model) {
+            discovery::update_model(&state, &account, &row.upstream_model, Some(""), None)
+                .await
+                .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+        }
+    }
     audit(&state, &admin, "update_aliases", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2362,6 +2546,7 @@ pub async fn copy_account(
         allow_private_network: account.allow_private_network,
         enabled: false,
         auto_sync: account.auto_sync,
+        hide_original: account.hide_original,
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
     };

@@ -395,6 +395,25 @@ impl AppState {
             refresh: tasks::RefreshHandle::default(),
             data_dir: data_dir.to_path_buf(),
         });
+        // 启动时把账号模型目录与调度目标对齐一次：旧版本可能留下"已启用但无目标"
+        // 或"已停用但目标仍在"的不一致；新版以目录行的启用/别名/隐藏设置为唯一真相。
+        match state.store.list_accounts().await {
+            Ok(accounts) => {
+                for account in &accounts {
+                    if let Err(error) =
+                        crate::discovery::reconcile_account(&state, account, account.auto_sync)
+                            .await
+                    {
+                        tracing::warn!(
+                            account = %account.name,
+                            %error,
+                            "启动时调和账号模型目录失败"
+                        );
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "启动时读取账号列表失败，跳过目录调和"),
+        }
         Ok(state)
     }
 

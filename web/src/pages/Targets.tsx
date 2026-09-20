@@ -1,48 +1,59 @@
 /**
- * 调度目标：分组 + 账号 + 具体上游模型。
+ * 调度视图：只读地展示"分组 + 模型"下每个上游账号的评分、可用性与速度。
  *
- * 这一页按「逻辑模型 → 层」两级组织。层不是配置出来的，而是优先级数字相同的
- * 目标自动构成的——把它画出来，是为了让"高层还有可用目标时绝不使用低层"
- * 这条硬规则一眼可见，而不是藏在一列数字里。
+ * 三级视觉必须能一眼分开：分组区块 → 下游模型卡片 → 账号优先级层。
+ * 卡片头部只讲"下游模型名 + 下游还能用哪些名字"，表格里只有"上游账号 +
+ * 上游模型名"；两者用颜色、字号、前缀明确区分，避免看串。
  *
- * 每一行同时显示动态状态与综合评分：前者决定它此刻能不能被选中，后者决定
- * 它在同层里分到多少流量。权重调错时，靠分维得分就能自我诊断（§6.9）。
+ * 这里不再配置目标：目标由账号的「模型管理」自动生成。人工优先级只存在于
+ * 账号上，数字相同即同层；层内按综合评分加权，跨层仍然严格阶梯。
  */
 import { useEffect, useMemo, useState } from "react";
-import { api } from "../lib/api";
-import { useRouteParams } from "../lib/store";
-import type { Account, DispatchTarget, Limits, LogicalModel } from "../lib/types";
+import type { Account, DispatchTarget, LogicalModel } from "../lib/types";
 import { TARGET_STATUS_LABELS } from "../lib/types";
-import { formatLimits, parseLimit } from "../lib/format";
+import { formatLimits } from "../lib/format";
 import type { Data } from "../lib/store";
+import { useRouteParams } from "../lib/store";
+import type { Route } from "../routes";
 import {
   Badge,
   Button,
   Card,
-  ConfirmDialog,
-  Drawer,
   EmptyState,
-  Field,
+  InfoTip,
   ScoreMeter,
   useToast,
 } from "../components/ui";
-import { IconPlus, IconRoute, IconTrash } from "../components/Icons";
+import { IconRoute, IconSearch, IconSettings } from "../components/Icons";
 
 interface ResolvedTarget {
   target: DispatchTarget;
   account: Account | undefined;
+  /** 同一模型内从高到低排出的层号（1 起）；数字相同为同层。 */
+  layer: number;
+  /** 层内按 score^8 归一化后的预计流量占比。 */
+  share: number;
 }
 
-interface Layer {
-  priority: number;
+interface ModelEntry {
+  model: LogicalModel;
+  groupName: string;
   targets: ResolvedTarget[];
+  /** 下游也能用来调用同一模型的其它名字（未隐藏的上游模型名）。 */
+  aliases: string[];
 }
 
-export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<void> }) {
+export function Targets({
+  data,
+  navigate,
+}: {
+  data: Data;
+  navigate: (route: Route, params?: Record<string, string>) => void;
+}) {
   const toast = useToast();
-  const [editing, setEditing] = useState<DispatchTarget | "new" | null>(null);
-  const [confirm, setConfirm] = useState<DispatchTarget | null>(null);
-  // 从请求记录跳过来时带着 target=<id>：滚动到那一行并高亮一会儿（§6.6）。
+  const [query, setQuery] = useState("");
+  const [groupFilter, setGroupFilter] = useState("all");
+  const [onlyIssues, setOnlyIssues] = useState(false);
   const params = useRouteParams();
   const highlightId = params.get("target");
   const [highlight, setHighlight] = useState<string | null>(highlightId);
@@ -58,7 +69,6 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
       return;
     }
     setHighlight(highlightId);
-    // 等表格渲染完再滚动，避免刚跳过来时目标行还没挂到 DOM 上。
     const scrollTimer = window.setTimeout(() => {
       document
         .querySelector(`tr[data-target-id="${highlightId}"]`)
@@ -69,49 +79,103 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
       window.clearTimeout(scrollTimer);
       window.clearTimeout(clearTimer);
     };
-    // 只在定位参数或目标数量变化时重跑。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [highlightId, data.targets.length]);
 
-  /** 按逻辑模型分组，再把目标按有效优先级折叠成层。 */
-  const grouped = useMemo(() => {
+  const entries = useMemo<ModelEntry[]>(() => {
     const accounts = new Map(data.accounts.map((account) => [account.id, account]));
-    return data.models.map((model) => {
-      const resolved = data.targets
-        .filter((target) => target.logical_model_id === model.id)
-        .map<ResolvedTarget>((target) => ({ target, account: accounts.get(target.account_id) }));
+    const groupNames = new Map(data.groups.map((group) => [group.id, group.name]));
 
-      const byPriority = new Map<number, ResolvedTarget[]>();
-      for (const item of resolved) {
-        const bucket = byPriority.get(item.target.priority) ?? [];
-        bucket.push(item);
-        byPriority.set(item.target.priority, bucket);
-      }
-      const layers: Layer[] = [...byPriority.entries()]
-        .sort(([a], [b]) => b - a)
-        .map(([priority, targets]) => ({
-          priority,
-          // 同层内按综合评分降序，和调度器眼里的"谁更可能被抽中"一致。
-          targets: targets.sort(
-            (a, b) => (b.target.score?.total ?? 0) - (a.target.score?.total ?? 0),
-          ),
+    return data.models
+      .map((model) => {
+        const raw = data.targets
+          .filter((target) => target.logical_model_id === model.id)
+          .map<Omit<ResolvedTarget, "layer" | "share">>((target) => ({
+            target,
+            account: accounts.get(target.account_id),
+          }))
+          .sort((left, right) => {
+            if (right.target.priority !== left.target.priority) {
+              return right.target.priority - left.target.priority;
+            }
+            const leftScore = left.target.score?.total ?? 0;
+            const rightScore = right.target.score?.total ?? 0;
+            return rightScore - leftScore;
+          });
+
+        // 同优先级构成一层；层内权重取 score^8，与调度器的加权随机一致。
+        const layerPriorities = [...new Set(raw.map((item) => item.target.priority))].sort(
+          (a, b) => b - a,
+        );
+        const shares = new Map<number, number>();
+        for (const priority of layerPriorities) {
+          const layer = raw.filter((item) => item.target.priority === priority);
+          const weights = layer.map((item) =>
+            Math.max(item.target.score?.total ?? 1, 0.01) ** 8,
+          );
+          const total = weights.reduce((sum, value) => sum + value, 0) || 1;
+          layer.forEach((item, index) => {
+            shares.set(
+              raw.indexOf(item),
+              (weights[index] ?? 0) / total,
+            );
+          });
+        }
+
+        const resolved: ResolvedTarget[] = raw.map((item, index) => ({
+          ...item,
+          layer: layerPriorities.indexOf(item.target.priority) + 1,
+          share: shares.get(index) ?? 0,
         }));
+        const aliases = [
+          ...new Set(
+            resolved
+              .filter(
+                ({ target, account }) =>
+                  target.enabled &&
+                  account?.enabled !== false &&
+                  account?.hide_original !== true &&
+                  target.upstream_model !== model.name,
+              )
+              .map(({ target }) => target.upstream_model),
+          ),
+        ].sort((a, b) => a.localeCompare(b, "zh-CN"));
 
-      return { model, layers, count: resolved.length };
-    });
+        return {
+          model,
+          groupName: groupNames.get(model.group_id) ?? model.group_id,
+          targets: resolved,
+          aliases,
+        };
+      })
+      .filter((entry) => entry.targets.length > 0);
   }, [data]);
 
-  const remove = async (target: DispatchTarget) => {
-    try {
-      await api.deleteTarget(target.id);
-      await refresh();
-      toast.success("调度目标已移除");
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "删除失败");
-    }
-  };
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return entries.filter((entry) => {
+      if (groupFilter !== "all" && entry.model.group_id !== groupFilter) return false;
+      if (
+        needle &&
+        !entry.model.name.toLowerCase().includes(needle) &&
+        !entry.aliases.some((alias) => alias.toLowerCase().includes(needle)) &&
+        !entry.targets.some(
+          ({ account, target }) =>
+            account?.name.toLowerCase().includes(needle) ||
+            target.upstream_model.toLowerCase().includes(needle),
+        )
+      ) {
+        return false;
+      }
+      if (!onlyIssues) return true;
+      return entry.targets.some(({ target, account }) => targetHasIssue(target, account));
+    });
+  }, [entries, groupFilter, onlyIssues, query]);
 
-  const canCreate = data.models.length > 0 && data.accounts.length > 0;
+  const targetTotal = entries.reduce((sum, entry) => sum + entry.targets.length, 0);
+  const visibleGroups = data.groups.filter((group) =>
+    visible.some((entry) => entry.model.group_id === group.id),
+  );
 
   return (
     <>
@@ -138,87 +202,319 @@ export function Targets({ data, refresh }: { data: Data; refresh: () => Promise<
         </div>
       )}
 
-      {!canCreate && (
-        <Card title="调度目标">
+      <Card
+        title="调度视图"
+        description="按分组与模型查看上游账号的综合评分、可用性与速度。目标是自动生成的；人工优先级只在账号上，数字相同即同层，同层按评分加权。"
+        actions={
+          <Button
+            icon={<IconSettings size={13} />}
+            onClick={() => navigate("accounts")}
+          >
+            去账号配置模型
+          </Button>
+        }
+      >
+        {targetTotal === 0 ? (
           <EmptyState
             icon={<IconRoute size={19} />}
-            title="还差一步"
+            title="还没有可调度的模型"
             description={
               data.accounts.length === 0
-                ? "先创建至少一个上游账号，目标需要知道请求发给谁。"
-                : "先创建至少一个逻辑模型，目标需要知道它对外叫什么。"
+                ? "先创建上游账号，再从账号的「模型管理」里获取或添加模型。"
+                : "打开账号的「模型管理」，获取上游模型并启用，就会自动生成这里的调度目标。"
+            }
+            action={
+              <Button
+                variant="primary"
+                icon={<IconSettings size={13} />}
+                onClick={() => navigate("accounts")}
+              >
+                去账号模型管理
+              </Button>
             }
           />
-        </Card>
-      )}
-
-      {canCreate && (
-        <Card
-          title="调度目标"
-          description="优先级相同的目标构成一层。高层只要还有可用目标，就绝不会使用低层；同层内按综合评分加权分配。"
-          actions={
-            <Button variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
-              添加目标
-            </Button>
-          }
-        >
-          {data.targets.length === 0 ? (
-            <EmptyState
-              icon={<IconRoute size={19} />}
-              title="还没有调度目标"
-              description="把逻辑模型接到「账号 + 具体上游模型」上。绑定完成后，该模型就会出现在 /v1/models 中。"
-              action={
-                <Button variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
-                  添加目标
-                </Button>
-              }
-            />
-          ) : (
-            <div>
-              {grouped
-                .filter((entry) => entry.count > 0)
-                .map((entry) => (
-                  <ModelBlock
-                    key={entry.model.id}
-                    model={entry.model}
-                    layers={entry.layers}
-                    highlight={highlight}
-                    onEdit={setEditing}
-                    onDelete={setConfirm}
-                  />
+        ) : (
+          <>
+            <div className="list-toolbar">
+              <div className="input-with-icon list-search">
+                <IconSearch size={14} />
+                <input
+                  className="input"
+                  value={query}
+                  placeholder="搜索模型名或账号名"
+                  aria-label="搜索调度视图"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+              <select
+                className="select toolbar-select"
+                value={groupFilter}
+                aria-label="按分组筛选"
+                onChange={(event) => setGroupFilter(event.target.value)}
+              >
+                <option value="all">全部分组</option>
+                {data.groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
                 ))}
+              </select>
+              <label className="filter-toggle">
+                <input
+                  type="checkbox"
+                  checked={onlyIssues}
+                  onChange={(event) => setOnlyIssues(event.target.checked)}
+                />
+                只看异常
+              </label>
+              <span className="spacer" />
+              <span className="table-filter-summary tabular">
+                {visible.length} / {entries.length} 个模型 · {targetTotal} 个目标
+              </span>
             </div>
-          )}
-        </Card>
-      )}
 
-      <TargetDrawer
-        key={editing === "new" ? "new" : (editing?.id ?? "closed")}
-        data={data}
-        target={editing === "new" ? null : editing}
-        open={editing !== null}
-        onClose={() => setEditing(null)}
-        onSaved={async () => {
-          setEditing(null);
-          await refresh();
-        }}
-      />
-
-      <ConfirmDialog
-        open={confirm !== null}
-        title="移除调度目标"
-        danger
-        confirmLabel="移除"
-        message="移除后该目标不再参与调度，在途请求会正常完成。"
-        onClose={() => setConfirm(null)}
-        onConfirm={() => void remove(confirm!)}
-      />
+            {visible.length === 0 ? (
+              <div className="table-empty">没有符合条件的模型</div>
+            ) : (
+              visibleGroups.map((group) => (
+                <section key={group.id} className="routing-group-block">
+                  <header className="routing-group-head">
+                    <span className="routing-group-mark" aria-hidden="true" />
+                    <span className="routing-group-label">分组</span>
+                    <span className="routing-group-name">{group.name}</span>
+                    <span className="text-faint">
+                      {
+                        visible.filter((entry) => entry.model.group_id === group.id).length
+                      }{" "}
+                      个模型
+                    </span>
+                  </header>
+                  <div className="routing-model-list">
+                    {visible
+                      .filter((entry) => entry.model.group_id === group.id)
+                      .map((entry) => (
+                        <ModelBlock
+                          key={entry.model.id}
+                          entry={entry}
+                          highlight={highlight}
+                          navigate={navigate}
+                        />
+                      ))}
+                  </div>
+                </section>
+              ))
+            )}
+          </>
+        )}
+      </Card>
     </>
   );
 }
 
-/** 动态状态徽标（§12.2）。 */
-function StatusBadge({ target, account }: { target: DispatchTarget; account?: Account }) {
+function targetHasIssue(target: DispatchTarget, account: Account | undefined): boolean {
+  return (
+    !target.enabled ||
+    account?.enabled === false ||
+    target.status !== "active" ||
+    account?.multiplier_status !== "known" ||
+    target.pause_reason !== null
+  );
+}
+
+function ModelBlock({
+  entry,
+  highlight,
+  navigate,
+}: {
+  entry: ModelEntry;
+  highlight: string | null;
+  navigate: (route: Route, params?: Record<string, string>) => void;
+}) {
+  const { model, aliases, targets } = entry;
+  const issueCount = targets.filter(({ target, account }) => targetHasIssue(target, account)).length;
+  const layers = [...new Set(targets.map((item) => item.layer))]
+    .sort((a, b) => a - b)
+    .map((layer) => ({
+      layer,
+      priority: targets.find((item) => item.layer === layer)?.target.priority ?? 0,
+      targets: targets.filter((item) => item.layer === layer),
+    }));
+
+  return (
+    <section className="routing-model-block">
+      <header className="routing-model-head">
+        <div className="routing-model-headline">
+          <span className="routing-model-kicker">下游模型名</span>
+          <span className="routing-model-name mono" title={model.name}>
+            {model.name}
+          </span>
+          <Badge tone={model.listed ? "success" : "warn"}>
+            {model.listed ? "已上架" : "未上架"}
+          </Badge>
+          {issueCount > 0 && <Badge tone="warn">{issueCount} 个异常</Badge>}
+        </div>
+        {aliases.length > 0 && (
+          <div className="routing-model-alias-row">
+            <span className="routing-model-kicker">下游也能用这些名字</span>
+            {aliases.map((alias) => (
+              <span key={alias} className="model-exposed-chip mono" title={`下游也可用：${alias}`}>
+                {alias}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="spacer" />
+        <div className="routing-model-stats">
+          <span className="routing-model-stat">
+            <b>{layers.length}</b>
+            <span>层</span>
+          </span>
+          <span className="routing-model-stat">
+            <b>{targets.length}</b>
+            <span>个上游账号</span>
+          </span>
+        </div>
+      </header>
+
+      <div className="routing-layers">
+        {layers.map((layer, index) => (
+          <div className="routing-layer" key={layer.layer}>
+            <div className={`routing-layer-head${index === 0 ? " is-primary" : ""}`}>
+              <span className="routing-layer-index">第 {layer.layer} 层</span>
+              <span className="routing-layer-priority">账号优先级 {layer.priority}</span>
+              <span className="routing-layer-note">
+                {index === 0
+                  ? "日常流量都走这一层；同一层内按综合评分分配"
+                  : "上一层全部不可用（停用 / 冷却 / 额度耗尽）时才会使用"}
+              </span>
+            </div>
+            <div className="table-wrap">
+              <table className="data routing-table" style={{ tableLayout: "fixed" }}>
+                <colgroup>
+                  <col style={{ width: "26%" }} />
+                  <col style={{ width: "9%" }} />
+                  <col style={{ width: "19%" }} />
+                  <col style={{ width: "14%" }} />
+                  <col style={{ width: "13%" }} />
+                  <col style={{ width: "11%" }} />
+                  <col style={{ width: "8%" }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>上游账号 / 上游模型名</th>
+                    <th>有效倍率</th>
+                    <th>综合评分</th>
+                    <th>可用性</th>
+                    <th>首字 / 速度</th>
+                    <th>在途 / 限制</th>
+                    <th>预计分配</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {layer.targets.map(({ target, account, share }) => (
+                    <tr
+                      key={target.id}
+                      data-target-id={target.id}
+                      className={highlight === target.id ? "is-highlighted" : undefined}
+                    >
+                      <td title={`${account?.name ?? "账号已删除"} / ${target.upstream_model}`}>
+                        <div className="routing-account-cell">
+                          {account ? (
+                            <button
+                              type="button"
+                              className="link-button routing-account-name cell-truncate"
+                              title={`打开「${account.name}」的模型管理`}
+                              onClick={() =>
+                                navigate("accounts", { account: account.id, manage: "1" })
+                              }
+                            >
+                              {account.name}
+                            </button>
+                          ) : (
+                            <span className="routing-account-name">账号已删除</span>
+                          )}
+                          <span
+                            className="routing-upstream-model mono cell-truncate"
+                            title={`上游模型名：${target.upstream_model}`}
+                          >
+                            {target.upstream_model}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="mono">{account?.effective_multiplier ?? "—"}</td>
+                      <td>
+                        {target.score ? (
+                          <span className="row" style={{ gap: 4 }}>
+                            <ScoreMeter score={target.score} />
+                            <InfoTip label={`查看「${account?.name ?? ""}」的评分明细`}>
+                              <span className="stack" style={{ gap: 4 }}>
+                                <span>倍率 {target.score.multiplier.toFixed(2)}</span>
+                                <span>可靠性 {target.score.reliability.toFixed(2)}</span>
+                                <span>首字延迟 {target.score.first_token.toFixed(2)}</span>
+                                <span>输出速度 {target.score.throughput.toFixed(2)}</span>
+                                <span>
+                                  综合 {target.score.total.toFixed(2)} · 样本 {target.score.samples}/20
+                                  {target.score.warm ? "" : "（冷启动）"}
+                                </span>
+                              </span>
+                            </InfoTip>
+                          </span>
+                        ) : (
+                          <span className="text-faint">—</span>
+                        )}
+                      </td>
+                      <td>
+                        <TargetStatusBadge target={target} account={account} />
+                        {target.pause_reason && (
+                          <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
+                            {target.pause_reason}
+                          </div>
+                        )}
+                      </td>
+                      <td className="mono cell-dim" style={{ fontSize: 12 }}>
+                        {target.first_token_ms == null && target.output_tps == null ? (
+                          "—"
+                        ) : (
+                          <>
+                            <div>
+                              {target.first_token_ms == null
+                                ? "—"
+                                : `${Math.round(target.first_token_ms)} ms`}
+                            </div>
+                            <div className="text-faint" style={{ fontSize: 11 }}>
+                              {target.output_tps == null
+                                ? "—"
+                                : `${target.output_tps.toFixed(1)} tok/s`}
+                            </div>
+                          </>
+                        )}
+                      </td>
+                      <td className="mono cell-dim" style={{ fontSize: 12 }}>
+                        <div>{formatLimits(target.effective_limits)}</div>
+                        <div className="text-faint" style={{ fontSize: 11 }}>
+                          在途 {target.inflight}
+                        </div>
+                      </td>
+                      <td className="tabular">{Math.round(share * 100)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function TargetStatusBadge({
+  target,
+  account,
+}: {
+  target: DispatchTarget;
+  account?: Account;
+}) {
   if (!target.enabled || account?.enabled === false) {
     return (
       <Badge tone="neutral" dot>
@@ -237,7 +533,7 @@ function StatusBadge({ target, account }: { target: DispatchTarget; account?: Ac
     case "active":
       return (
         <Badge tone={account?.multiplier_status === "multiplier_stale" ? "warn" : "success"} dot>
-          {account?.multiplier_status === "multiplier_stale" ? "可用 · 倍率过期" : "正常"}
+          {account?.multiplier_status === "multiplier_stale" ? "可用 · 倍率过期" : "可用"}
         </Badge>
       );
     case "cooldown":
@@ -260,436 +556,4 @@ function StatusBadge({ target, account }: { target: DispatchTarget; account?: Ac
         </Badge>
       );
   }
-}
-
-function ModelBlock({
-  model,
-  layers,
-  highlight,
-  onEdit,
-  onDelete,
-}: {
-  model: LogicalModel;
-  layers: Layer[];
-  /** 从请求记录定位过来的目标 ID；命中时该行高亮。 */
-  highlight: string | null;
-  onEdit: (target: DispatchTarget) => void;
-  onDelete: (target: DispatchTarget) => void;
-}) {
-  return (
-    <div style={{ borderBottom: "1px solid var(--border)" }}>
-      <div
-        className="row"
-        style={{ padding: "12px 24px", background: "var(--surface-hover)" }}
-      >
-        <span className="mono cell-strong">{model.name}</span>
-        <Badge tone={model.listed ? "success" : "warn"}>
-          {model.listed ? "已上架" : "未上架"}
-        </Badge>
-        <span className="spacer" />
-        <span className="text-faint" style={{ fontSize: 12 }}>
-          {layers.length} 层 · {layers.reduce((sum, l) => sum + l.targets.length, 0)} 个目标
-        </span>
-      </div>
-
-      {layers.map((layer, index) => (
-        <div className="layer" key={layer.priority}>
-          <div className="layer-head">
-            <Badge tone={index === 0 ? "accent" : "neutral"}>第 {index + 1} 层</Badge>
-            <span className="layer-rank">优先级 {layer.priority}</span>
-            <span className="layer-note">
-              {index === 0
-                ? layer.targets.length > 1
-                  ? "同层，按综合评分加权分配；全忙时在本层排队，不降层"
-                  : "日常流量都走这里"
-                : "上一层全部不可用时才会用到"}
-            </span>
-          </div>
-
-          <div className="table-wrap">
-            <table className="data" style={{ tableLayout: "fixed" }}>
-              {/* 每一层是独立的表格，列宽必须显式固定，否则各层的列对不齐。 */}
-              <colgroup>
-                <col style={{ width: "30%" }} />
-                <col style={{ width: "10%" }} />
-                <col style={{ width: "22%" }} />
-                <col style={{ width: "16%" }} />
-                <col style={{ width: "6%" }} />
-                <col style={{ width: "10%" }} />
-                <col style={{ width: 120 }} />
-              </colgroup>
-              <thead>
-                <tr>
-                  <th>目标</th>
-                  <th>有效倍率</th>
-                  <th>综合评分</th>
-                  <th>首字 / 速度</th>
-                  <th>限制</th>
-                  <th>在途</th>
-                  <th>状态</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {layer.targets.map(({ target, account }) => (
-                  <tr
-                    key={target.id}
-                    data-target-id={target.id}
-                    className={highlight === target.id ? "is-highlighted" : undefined}
-                  >
-                    <td
-                      style={{ overflow: "hidden", textOverflow: "ellipsis" }}
-                      title={`${account?.name ?? "账号已删除"} / ${target.upstream_model}`}
-                    >
-                      <span className="chain">
-                        <span className="cell-strong">{account?.name ?? "账号已删除"}</span>
-                        <span className="chain-arrow">/</span>
-                        <span className="mono cell-dim">{target.upstream_model}</span>
-                      </span>
-                      {target.priority_override !== null && (
-                        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
-                          优先级已覆盖（账号默认 {account?.default_priority ?? "—"}）
-                        </div>
-                      )}
-                    </td>
-                    <td className="mono">{account?.effective_multiplier ?? "—"}</td>
-                    <td>
-                      {target.score ? (
-                        <ScoreMeter score={target.score} />
-                      ) : (
-                        <span className="text-faint">—</span>
-                      )}
-                    </td>
-                    <td className="mono cell-dim" style={{ fontSize: 12 }}>
-                      {/* 冷启动时给 "—" 而不是 0：0 会被读成"很快"（§6.5）。 */}
-                      {target.first_token_ms == null && target.output_tps == null ? (
-                        "—"
-                      ) : (
-                        <>
-                          <div>
-                            {target.first_token_ms == null
-                              ? "—"
-                              : Math.round(target.first_token_ms) + " ms"}
-                          </div>
-                          <div className="text-faint" style={{ fontSize: 11 }}>
-                            {target.output_tps == null
-                              ? "—"
-                              : target.output_tps.toFixed(1) + " tok/s"}
-                          </div>
-                        </>
-                      )}
-                    </td>
-                    <td className="cell-dim" style={{ fontSize: 12 }}>
-                      {formatLimits(target.effective_limits)}
-                    </td>
-                    <td className="mono cell-dim">{target.inflight}</td>
-                    <td>
-                      <StatusBadge target={target} account={account} />
-                      {/* 暂停原因：具体差哪个环节，而不是只说"不可用"（§6.5）。 */}
-                      {target.pause_reason && (
-                        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
-                          {target.pause_reason}
-                        </div>
-                      )}
-                    </td>
-                    <td>
-                      <div className="cell-actions">
-                        <Button size="sm" onClick={() => onEdit(target)}>
-                          编辑
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          icon={<IconTrash size={13} />}
-                          title="移除目标"
-                          onClick={() => onDelete(target)}
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function TargetDrawer({
-  data,
-  target,
-  open,
-  onClose,
-  onSaved,
-}: {
-  data: Data;
-  target: DispatchTarget | null;
-  open: boolean;
-  onClose: () => void;
-  onSaved: () => void | Promise<void>;
-}) {
-  const toast = useToast();
-  const editing = target !== null;
-  const [modelId, setModelId] = useState(target?.logical_model_id ?? data.models[0]?.id ?? "");
-  const [accountId, setAccountId] = useState(target?.account_id ?? "");
-  const [upstreamModel, setUpstreamModel] = useState(target?.upstream_model ?? "");
-  const [override, setOverride] = useState(target?.priority_override?.toString() ?? "");
-  const [enabled, setEnabled] = useState(target?.enabled ?? true);
-  const [limitsForm, setLimitsForm] = useState({
-    rpm: target?.limits.rpm?.toString() ?? "",
-    tpm: target?.limits.tpm?.toString() ?? "",
-    max_concurrency: target?.limits.max_concurrency?.toString() ?? "",
-  });
-  const [busy, setBusy] = useState(false);
-
-  const model = data.models.find((item) => item.id === modelId);
-  /** 分组是硬边界：只列出与所选逻辑模型同组的账号。 */
-  const candidates = data.accounts.filter(
-    (account) => account.group_id === model?.group_id,
-  );
-  const account =
-    candidates.find((item) => item.id === accountId) ?? candidates[0];
-
-  const overrideValue = override.trim() === "" ? null : Number(override);
-  const overrideError =
-    overrideValue === null ||
-    (Number.isInteger(overrideValue) && overrideValue >= 0 && overrideValue <= 100)
-      ? null
-      : "必须是 0 到 100 之间的整数";
-
-  const limits: Limits = {
-    rpm: parseLimit(limitsForm.rpm) ?? null,
-    tpm: parseLimit(limitsForm.tpm) ?? null,
-    max_concurrency: parseLimit(limitsForm.max_concurrency) ?? null,
-  };
-  const limitsInvalid = (Object.keys(limitsForm) as (keyof typeof limitsForm)[]).some(
-    (key) => parseLimit(limitsForm[key]) === undefined,
-  );
-
-  const duplicate =
-    !editing &&
-    data.targets.some(
-      (item) =>
-        item.logical_model_id === modelId &&
-        item.account_id === account?.id &&
-        item.upstream_model === upstreamModel.trim(),
-    );
-
-  const submit = async () => {
-    if (!account) return;
-    setBusy(true);
-    try {
-      if (editing) {
-        await api.updateTarget(target.id, {
-          upstream_model: upstreamModel.trim(),
-          priority_override: overrideValue,
-          limits,
-          enabled,
-        });
-        toast.success("调度目标已更新");
-      } else {
-        await api.createTarget({
-          logical_model_id: modelId,
-          account_id: account.id,
-          upstream_model: upstreamModel.trim(),
-          priority_override: overrideValue,
-          limits,
-        });
-        toast.success("调度目标已添加");
-      }
-      await onSaved();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "保存失败");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const effectivePriority = overrideValue ?? account?.default_priority ?? 50;
-  const effectiveLimits: Limits = account
-    ? {
-        rpm: limits.rpm ?? account.limits.rpm,
-        tpm: limits.tpm ?? account.limits.tpm,
-        max_concurrency: limits.max_concurrency ?? account.limits.max_concurrency,
-      }
-    : limits;
-
-  return (
-    <Drawer
-      open={open}
-      onClose={onClose}
-      title={editing ? "编辑调度目标" : "添加调度目标"}
-      description="目标是「分组 + 账号 + 具体上游模型」的确定组合。"
-      footer={
-        <>
-          <Button onClick={onClose}>取消</Button>
-          <Button
-            variant="primary"
-            onClick={submit}
-            disabled={
-              busy ||
-              !account ||
-              !upstreamModel.trim() ||
-              !!overrideError ||
-              limitsInvalid ||
-              duplicate
-            }
-          >
-            {busy ? "保存中…" : editing ? "保存" : "添加"}
-          </Button>
-        </>
-      }
-    >
-      <div className="stack">
-        <Field label="逻辑模型">
-          {(id) => (
-            <select
-              id={id}
-              className="select"
-              value={modelId}
-              disabled={editing}
-              onChange={(e) => {
-                setModelId(e.target.value);
-                setAccountId("");
-              }}
-            >
-              {data.models.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-
-        <Field
-          label="上游账号"
-          hint={
-            candidates.length === 0
-              ? "该逻辑模型所在的分组下还没有账号。分组是硬边界，不允许跨组绑定。"
-              : undefined
-          }
-        >
-          {(id) => (
-            <select
-              id={id}
-              className="select"
-              value={account?.id ?? ""}
-              disabled={candidates.length === 0 || editing}
-              onChange={(e) => setAccountId(e.target.value)}
-            >
-              {candidates.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}（优先级 {item.default_priority}）
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-
-        <Field
-          label="上游真实模型名"
-          error={duplicate ? "该账号与模型的组合已经是调度目标" : undefined}
-          hint="上游站点实际接受的名字，例如 claude-sonnet-4-5-20250929。它不会暴露给下游。"
-        >
-          {(id) => (
-            <input
-              id={id}
-              className="input mono"
-              value={upstreamModel}
-              onChange={(e) => setUpstreamModel(e.target.value)}
-              placeholder="claude-sonnet-4-5-20250929"
-            />
-          )}
-        </Field>
-
-        <Field
-          label="优先级覆盖（可选）"
-          error={overrideError ?? undefined}
-          hint="留空则继承账号默认值。想让两个目标自动分担流量，就把它们设成同一个数字。"
-        >
-          {(id) => (
-            <input
-              id={id}
-              className="input"
-              type="number"
-              min={0}
-              max={100}
-              value={override}
-              onChange={(e) => setOverride(e.target.value)}
-              placeholder={`继承账号：${account?.default_priority ?? 50}`}
-            />
-          )}
-        </Field>
-
-        <Field
-          label="限制覆盖（可选）"
-          hint={`留空的项继承账号默认值。实际生效：${formatLimits(effectiveLimits)}。`}
-        >
-          {() => (
-            <div className="weights" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
-              {(
-                [
-                  ["rpm", "RPM"],
-                  ["tpm", "TPM"],
-                  ["max_concurrency", "最大并发"],
-                ] as const
-              ).map(([key, label]) => (
-                <label key={key} className="stack" style={{ gap: 4 }}>
-                  <span
-                    className={
-                      parseLimit(limitsForm[key]) === undefined ? "field-error" : "text-faint"
-                    }
-                    style={{ fontSize: 11.5 }}
-                  >
-                    {label}
-                  </span>
-                  <input
-                    className="input mono"
-                    inputMode="numeric"
-                    value={limitsForm[key]}
-                    onChange={(e) =>
-                      setLimitsForm((current) => ({ ...current, [key]: e.target.value }))
-                    }
-                    placeholder={
-                      account?.limits[key] !== null && account?.limits[key] !== undefined
-                        ? `账号 ${account.limits[key]}`
-                        : "不限"
-                    }
-                  />
-                </label>
-              ))}
-            </div>
-          )}
-        </Field>
-
-        {editing && (
-          <Field label="状态">
-            {(id) => (
-              <select
-                id={id}
-                className="select"
-                value={enabled ? "on" : "off"}
-                onChange={(e) => setEnabled(e.target.value === "on")}
-              >
-                <option value="on">启用</option>
-                <option value="off">停用（不参与调度，粘性绑定会被清除）</option>
-              </select>
-            )}
-          </Field>
-        )}
-
-        {account && (
-          <div className="callout callout-info">
-            <span>
-              该目标的有效优先级为 <strong>{effectivePriority}</strong>。
-              分组内所有优先级为 {effectivePriority} 的目标同属一层。
-            </span>
-          </div>
-        )}
-      </div>
-    </Drawer>
-  );
 }

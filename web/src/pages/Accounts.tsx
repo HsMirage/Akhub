@@ -4,6 +4,7 @@ import { api, type AccountInput } from "../lib/api";
 import type {
   Account,
   AccountHealth,
+  BatchMultiplierRefreshResult,
   Limits,
   MultiplierMode,
   Protocol,
@@ -33,12 +34,16 @@ import {
   Drawer,
   EmptyState,
   Field,
+  FormSection,
+  InfoTip,
+  Menu,
+  Modal,
   Switch,
   useToast,
 } from "../components/ui";
 import { ModelSelectionDialog } from "../components/ModelSelectionDialog";
 import { CalibrationDialog } from "../components/CalibrationDialog";
-import { IconPlus, IconRefresh, IconServer, IconTrash } from "../components/Icons";
+import { IconPlus, IconRefresh, IconSearch, IconServer } from "../components/Icons";
 
 type AccountStatusFilter = "all" | "enabled" | "disabled";
 type AccountUpstreamFilter = "all" | UpstreamType;
@@ -48,11 +53,13 @@ export function Accounts({
   refresh,
 }: {
   data: Data;
-  refresh: () => Promise<void>;
+  refresh: () => Promise<unknown>;
 }) {
   const toast = useToast();
   const [editing, setEditing] = useState<Account | "new" | null>(null);
   const [confirm, setConfirm] = useState<Account | null>(null);
+  /** 新建成功后询问是否立刻测试连接，避免"保存→回列表→找按钮"的来回。 */
+  const [createdAccount, setCreatedAccount] = useState<Account | null>(null);
   // 从请求记录跳过来时带着 account=<id>：定位并高亮该账号（§6.6）。
   const params = useRouteParams();
   const highlightId = params.get("account");
@@ -82,6 +89,28 @@ export function Accounts({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [highlightId, data.accounts.length]);
   const [selecting, setSelecting] = useState<Account | null>(null);
+  /** 已处理过的 `manage=1&account=...` 深链，避免关闭弹窗后被 effect 再次打开。 */
+  const [manageHandled, setManageHandled] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!params.get("manage")) return;
+    const accountId = params.get("account");
+    if (!accountId || accountId === manageHandled) return;
+    const target = data.accounts.find((account) => account.id === accountId);
+    if (!target) return;
+    setManageHandled(accountId);
+    setSelecting(target);
+  }, [params, data.accounts, manageHandled]);
+
+  // 全局数据刷新后同步弹窗里的账号对象，避免刚保存的"隐藏原始模型"等
+  // 开关在重新打开弹窗时又退回旧值。
+  useEffect(() => {
+    setSelecting((current) =>
+      current
+        ? (data.accounts.find((account) => account.id === current.id) ?? current)
+        : null,
+    );
+  }, [data.accounts]);
   const [calibrating, setCalibrating] = useState<Account | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [refreshingMultiplierId, setRefreshingMultiplierId] = useState<string | null>(null);
@@ -91,6 +120,11 @@ export function Accounts({
   const [groupFilter, setGroupFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
   const [upstreamFilter, setUpstreamFilter] = useState<AccountUpstreamFilter>("all");
+  const [search, setSearch] = useState("");
+  /** 批量刷新倍率的结果面板；null 表示未展示。 */
+  const [refreshReport, setRefreshReport] = useState<BatchMultiplierRefreshResult | null>(
+    null,
+  );
 
   const upstreamTypes = useMemo(
     () =>
@@ -104,13 +138,18 @@ export function Accounts({
   const filteredAccounts = useMemo(
     () =>
       data.accounts.filter((account) => {
+        const needle = search.trim().toLowerCase();
+        if (needle) {
+          const haystack = `${account.name} ${account.base_url}`.toLowerCase();
+          if (!haystack.includes(needle)) return false;
+        }
         if (groupFilter !== "all" && account.group_id !== groupFilter) return false;
         if (statusFilter === "enabled" && !account.enabled) return false;
         if (statusFilter === "disabled" && account.enabled) return false;
         if (upstreamFilter !== "all" && account.upstream_type !== upstreamFilter) return false;
         return true;
       }),
-    [data.accounts, groupFilter, statusFilter, upstreamFilter],
+    [data.accounts, groupFilter, statusFilter, upstreamFilter, search],
   );
 
   const groupName = (id: string) =>
@@ -156,6 +195,7 @@ export function Accounts({
     try {
       const result = await api.refreshAllMultipliers();
       await refresh();
+      setRefreshReport(result);
       if (result.failed > 0) {
         // 部分失败要如实说清楚是哪几个，不能只报"完成"（§11.3）。
         const names = result.errors.map((item) => item.name).join("、");
@@ -189,9 +229,10 @@ export function Accounts({
   const copy = async (account: Account) => {
     setBusyId(account.id);
     try {
-      const copy = await api.copyAccount(account.id);
+      const created = await api.copyAccount(account.id);
       await refresh();
-      toast.success(`已创建停用状态的「${copy.name}」，请编辑后启用`);
+      setEditing(created);
+      toast.success(`已创建停用状态的「${created.name}」，请修改后启用`);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "复制失败");
     } finally {
@@ -262,7 +303,21 @@ export function Accounts({
         ) : (
           <>
             <div className="table-filters account-filters">
-              <div className="table-filter-fields">
+              <div className="table-filter-fields account-filters">
+              <Field label="搜索">
+                {(id) => (
+                  <div className="input-with-icon">
+                    <IconSearch size={14} />
+                    <input
+                      id={id}
+                      className="input"
+                      value={search}
+                        placeholder="按名称或 Base URL 搜索"
+                        onChange={(event) => setSearch(event.target.value)}
+                      />
+                    </div>
+                  )}
+                </Field>
                 <Field label="分组">
                   {(id) => (
                     <select
@@ -319,6 +374,24 @@ export function Accounts({
               <div className="table-filter-summary tabular">
                 共 {data.accounts.length} 个账号（筛选后 {filteredAccounts.length} 个）
               </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={
+                  !search &&
+                  groupFilter === "all" &&
+                  statusFilter === "all" &&
+                  upstreamFilter === "all"
+                }
+                onClick={() => {
+                  setSearch("");
+                  setGroupFilter("all");
+                  setStatusFilter("all");
+                  setUpstreamFilter("all");
+                }}
+              >
+                清除筛选
+              </Button>
             </div>
             <div className="model-sync-meta">
               <span>上次同步：</span>
@@ -413,50 +486,52 @@ export function Accounts({
                           <div className="cell-actions">
                             <Button
                               size="sm"
-                              disabled={syncingModelId === account.id}
-                              title={account.auto_sync ? "立即执行托管同步" : "拉取并刷新上游模型目录"}
-                              onClick={() => void syncModels(account)}
+                              variant="primary"
+                              onClick={() => setSelecting(account)}
                             >
-                              {syncingModelId === account.id && (
-                                <span className="spinner spinner-sm" aria-hidden="true" />
-                              )}
-                              {syncingModelId === account.id ? "同步中…" : "同步模型"}
-                            </Button>
-                            <Button size="sm" onClick={() => setSelecting(account)}>
-                              模型
-                            </Button>
-                            <Button
-                              size="sm"
-                              onClick={() => setCalibrating(account)}
-                              title="按单模型对账反算校准系数"
-                            >
-                              校准
+                              模型管理
                             </Button>
                             <Button size="sm" onClick={() => setEditing(account)}>
                               编辑
                             </Button>
-                            <Button
-                              size="sm"
-                              disabled={busyId === account.id}
-                              title="一键独立复制（停用状态）"
-                              onClick={() => void copy(account)}
-                            >
-                              复制
-                            </Button>
-                            <Button
-                              size="sm"
-                              disabled={busyId === account.id}
-                              title="发送一次真实 hi 测试连接"
-                              onClick={() => void test(account)}
-                            >
-                              测试
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="danger"
-                              icon={<IconTrash size={13} />}
-                              title="删除账号"
-                              onClick={() => setConfirm(account)}
+                            <Menu
+                              label={`更多操作：${account.name}`}
+                              items={[
+                                ...(account.auto_sync
+                                  ? [
+                                      {
+                                        label:
+                                          syncingModelId === account.id
+                                            ? "同步中…"
+                                            : "立即同步模型",
+                                        disabled: syncingModelId === account.id,
+                                        onSelect: () => void syncModels(account),
+                                      },
+                                    ]
+                                  : []),
+                                {
+                                  label: "校准倍率",
+                                  hint: "按单模型对账反算校准系数",
+                                  onSelect: () => setCalibrating(account),
+                                },
+                                {
+                                  label: "复制账号",
+                                  hint: "生成一个停用状态的副本",
+                                  disabled: busyId === account.id,
+                                  onSelect: () => void copy(account),
+                                },
+                                {
+                                  label: "测试连接",
+                                  hint: "发送一次真实 hi 测试连接",
+                                  disabled: busyId === account.id,
+                                  onSelect: () => void test(account),
+                                },
+                                {
+                                  label: "删除账号",
+                                  danger: true,
+                                  onSelect: () => setConfirm(account),
+                                },
+                              ]}
                             />
                           </div>
                         </td>
@@ -476,19 +551,19 @@ export function Accounts({
         account={editing === "new" ? null : editing}
         open={editing !== null}
         onClose={() => setEditing(null)}
-        onSaved={async () => {
+        onSaved={async (created) => {
           setEditing(null);
+          if (created) setCreatedAccount(created);
           await refresh();
         }}
       />
 
       <ModelSelectionDialog
         account={selecting}
+        data={data}
         open={selecting !== null}
-        onClose={async () => {
-          setSelecting(null);
-          await refresh();
-        }}
+        onClose={() => setSelecting(null)}
+        onChanged={refresh}
       />
 
       <CalibrationDialog
@@ -503,6 +578,8 @@ export function Accounts({
         title="删除账号"
         danger
         confirmLabel="删除"
+        requireText={confirm?.name}
+        requireLabel={`请输入账号名「${confirm?.name ?? ""}」以确认删除`}
         message={
           <>
             删除「{confirm?.name}」会同时移除它承担的全部调度目标。
@@ -512,6 +589,77 @@ export function Accounts({
         onClose={() => setConfirm(null)}
         onConfirm={() => void remove(confirm!)}
       />
+
+      <Modal
+        open={createdAccount !== null}
+        onClose={() => setCreatedAccount(null)}
+        title="账号已创建"
+        footer={
+          <>
+            <Button onClick={() => setCreatedAccount(null)}>稍后再说</Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                const target = createdAccount;
+                setCreatedAccount(null);
+                if (target) void test(target);
+              }}
+            >
+              立即测试连接
+            </Button>
+          </>
+        }
+      >
+        <div className="stack" style={{ gap: 10 }}>
+          <p style={{ margin: 0 }}>
+            账号「{createdAccount?.name}」已保存。现在发送一次真实
+            <code> hi </code>测试请求验证连接吗？
+          </p>
+          <p className="field-hint" style={{ margin: 0 }}>
+            测试不会参与统计，也不会影响该账号的调度状态；失败时会给出具体错误原因。
+          </p>
+        </div>
+      </Modal>
+
+      <Modal
+        open={refreshReport !== null}
+        onClose={() => setRefreshReport(null)}
+        title="批量刷新倍率结果"
+        footer={
+          <Button variant="primary" onClick={() => setRefreshReport(null)}>
+            知道了
+          </Button>
+        }
+      >
+        <div className="stack" style={{ gap: 12 }}>
+          <p style={{ margin: 0 }}>
+            共 {refreshReport?.total ?? 0} 个自动倍率账号，成功{" "}
+            {refreshReport?.refreshed ?? 0} 个，失败 {refreshReport?.failed ?? 0} 个。
+          </p>
+          {refreshReport && refreshReport.errors.length > 0 ? (
+            <div className="table-wrap" style={{ maxHeight: 280, overflowY: "auto" }}>
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>失败原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {refreshReport.errors.map((item) => (
+                    <tr key={item.name}>
+                      <td className="cell-strong">{item.name}</td>
+                      <td className="cell-dim">{item.error}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="callout callout-info">全部账号刷新成功。</div>
+          )}
+        </div>
+      </Modal>
     </>
   );
 }
@@ -644,7 +792,7 @@ function AccountDrawer({
   account: Account | null;
   open: boolean;
   onClose: () => void;
-  onSaved: () => void | Promise<void>;
+  onSaved: (created?: Account) => void | Promise<void>;
 }) {
   const toast = useToast();
   const editing = account !== null;
@@ -683,7 +831,7 @@ function AccountDrawer({
     base_url: account?.base_url ?? "",
     api_key: "",
     preferred_protocol: account?.preferred_protocol ?? ("openai_chat" as Protocol),
-    default_priority: String(account?.default_priority ?? 50),
+    default_priority: String(account?.default_priority ?? 0),
     multiplier_mode: account?.multiplier_mode ?? ("manual" as MultiplierMode),
     manual_multiplier: account?.manual_multiplier ?? "1",
     calibration: account?.calibration ?? "1",
@@ -695,9 +843,14 @@ function AccountDrawer({
     max_concurrency: account?.limits.max_concurrency?.toString() ?? "",
     allow_private_network: account?.allow_private_network ?? false,
     auto_sync: account?.auto_sync ?? false,
+    hide_original: account?.hide_original ?? false,
     adaptive_protocol: account?.adaptive_protocol ?? true,
   });
   const [busy, setBusy] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [initialSnapshot] = useState(() => JSON.stringify(form));
+  const dirty = JSON.stringify(form) !== initialSnapshot;
 
   const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) =>
     setForm((current) => ({ ...current, [key]: value }));
@@ -775,6 +928,21 @@ function AccountDrawer({
     needsNewApiToken ||
     needsNewApiUser;
 
+  /** 编辑态下用已保存的凭据发一次真实请求；新建时必须先保存。 */
+  const testConnection = async () => {
+    if (!account || testing) return;
+    setTesting(true);
+    try {
+      const result = await api.testAccount(account.id);
+      if (result.ok) toast.success(`「${account.name}」${result.message}`);
+      else toast.error(`「${account.name}」${result.message}`);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "测试失败");
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const submit = async () => {
     if (invalid) return;
     setBusy(true);
@@ -795,6 +963,7 @@ function AccountDrawer({
         limits,
         allow_private_network: form.allow_private_network,
         auto_sync: form.auto_sync,
+        hide_original: form.hide_original,
         adaptive_protocol: form.adaptive_protocol,
       };
       if (form.new_api_token.trim()) payload.new_api_token = form.new_api_token.trim();
@@ -802,11 +971,13 @@ function AccountDrawer({
         // api_key 留空表示保持原有凭据；后台不提供读取完整 Key 的接口。
         const { group_id: _group, api_key, ...rest } = payload;
         await api.updateAccount(account.id, api_key ? { ...rest, api_key } : rest);
+        toast.success("账号已更新");
+        await onSaved();
       } else {
-        await api.createAccount(payload);
+        const created = await api.createAccount(payload);
+        toast.success("账号已创建");
+        await onSaved(created);
       }
-      toast.success(editing ? "账号已更新" : "账号已创建");
-      await onSaved();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "保存失败");
     } finally {
@@ -818,6 +989,7 @@ function AccountDrawer({
     <Drawer
       open={open}
       onClose={onClose}
+      dirty={dirty}
       title={editing ? `编辑「${account.name}」` : "新建上游账号"}
       description="不需要填写上下文长度、多模态、工具或思考等模型能力字段。"
       footer={
@@ -849,6 +1021,23 @@ function AccountDrawer({
           </Field>
         )}
 
+        <FormSection title="基本信息" description="账号身份、归属与上游地址。">
+        {editing && account && (
+          <Field label="所属分组" hint="账号归属分组后不可迁移，改分组请新建。">
+            {(id) => (
+              <input
+                id={id}
+                className="input"
+                value={
+                  data.groups.find((group) => group.id === account.group_id)?.name ??
+                  account.group_id
+                }
+                readOnly
+                aria-readonly="true"
+              />
+            )}
+          </Field>
+        )}
         <Field label="名称">
           {(id) => (
             <input
@@ -914,25 +1103,50 @@ function AccountDrawer({
 
         <Field
           label={editing ? "API Key（留空则不变）" : "API Key"}
-          hint="加密保存。后台不提供读取完整 Key 的接口，只能覆盖更新。"
+          hint="加密保存。已保存的 Key 无法查看或回显；如需更换，直接粘贴新的 Key 覆盖。"
         >
           {(id) => (
-            <input
-              id={id}
-              className="input mono"
-              type="password"
-              value={form.api_key}
-              onChange={(e) => set("api_key", e.target.value)}
-              placeholder={editing ? "保持原有凭据" : "sk-…"}
-              autoComplete="new-password"
-            />
+            <>
+              <div className="input-affix">
+                <input
+                  id={id}
+                  className="input mono"
+                  type={showApiKey ? "text" : "password"}
+                  value={form.api_key}
+                  onChange={(e) => set("api_key", e.target.value)}
+                  placeholder={editing ? "保持原有凭据" : "sk-…"}
+                  autoComplete="new-password"
+                />
+                <button
+                  type="button"
+                  className="input-affix-button"
+                  aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}
+                  aria-pressed={showApiKey}
+                  onClick={() => setShowApiKey((current) => !current)}
+                >
+                  {showApiKey ? "隐藏" : "显示"}
+                </button>
+              </div>
+              <div className="row" style={{ justifyContent: "flex-end", marginTop: 6 }}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!editing || testing}
+                  title={editing ? "用已保存的凭据发送一次真实测试请求" : "保存账号后即可测试连接"}
+                  onClick={() => void testConnection()}
+                >
+                  {testing && <span className="spinner spinner-sm" aria-hidden="true" />}
+                  {testing ? "测试中…" : editing ? "测试连接" : "保存后可测试"}
+                </Button>
+              </div>
+            </>
           )}
         </Field>
 
         <Field
           label="默认人工优先级"
           error={priorityError ?? undefined}
-          hint="0–100，越大越优先。数字相同的目标属于同一层，只有高层全部不可用时才会降到低层。"
+          hint="账号级人工优先级，默认 0。相同数字同属一层，层内完全按综合评分分配；只有需要「硬保底顺序」时才把某几个账号调高。"
         >
           {(id) => (
             <input
@@ -947,6 +1161,9 @@ function AccountDrawer({
           )}
         </Field>
 
+        </FormSection>
+
+        <FormSection title="倍率与校准" description="有效倍率由上游倍率与校准系数共同决定。">
         <Field
           label="倍率来源"
           hint={
@@ -1093,8 +1310,19 @@ function AccountDrawer({
         <p className="field-hint" style={{ marginTop: -8 }}>
           有效倍率 = 上游倍率 × 校准系数，必须不高于分组上限。校准系数用来编码
           「站 A 的 x1 大约相当于站 B 的 x0.7」这类跨站点差异。
+          <InfoTip label="什么是校准系数">
+            倍率是上游的计费折扣；校准系数把不同站点的口径对齐到同一把尺子上。
+          </InfoTip>
         </p>
 
+        </FormSection>
+
+        <FormSection
+          title="限制与运行时"
+          description="账号级默认限制与运行时适配；不确定时保持默认即可。"
+          collapsible
+          defaultOpen={false}
+        >
         <Field
           label="限制（账号默认值）"
           hint="留空表示不限。最大并发与额度由同一把 Key 下的所有模型共享；调度目标可以逐项覆盖得更严。TPM 按请求体保守估算，是「估算限流」。"
@@ -1158,11 +1386,22 @@ function AccountDrawer({
               : "开启后忽略模型选择集，按设置页的同步间隔（默认 30 分钟）全量托管上游模型。"
           }
         />
+        <Switch
+          checked={form.hide_original}
+          onChange={(value) => set("hide_original", value)}
+          label="隐藏原始模型名"
+          hint={
+            form.hide_original
+              ? "只暴露在「模型管理」里填写了下游模型名的模型；没填的模型下游无法获取。"
+              : "下游既能用下游模型名，也能用上游原模型名。"
+          }
+        />
         {editing && form.auto_sync && account?.model_synced_at != null && (
           <p className="field-hint" style={{ marginTop: -6 }}>
             上次同步：{new Date(account.model_synced_at * 1000).toLocaleString()}
           </p>
         )}
+        </FormSection>
       </div>
     </Drawer>
   );

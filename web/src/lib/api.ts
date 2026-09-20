@@ -113,6 +113,11 @@ async function request<T>(
       (body && typeof body === "object" && "error" in body
         ? String((body as { error: unknown }).error)
         : null) ?? `请求失败（HTTP ${response.status}）`;
+    // 并发编辑冲突交给全局处理：用户需要的是"重新加载"的明确路径，
+    // 而不是 toast 里一行 config_conflict（§7.4）。
+    if (response.status === 409 && message.includes("config_conflict")) {
+      window.dispatchEvent(new CustomEvent("akhub-config-conflict"));
+    }
     throw new ApiError(message, response.status, body);
   }
   return body as T;
@@ -162,6 +167,8 @@ export interface AccountInput {
   enabled?: boolean;
   /** 开启后全量托管上游模型，忽略选择集（§16.2）。 */
   auto_sync?: boolean;
+  /** 账号级隐藏原始模型；打开后没设置下游模型名的模型不对外暴露。 */
+  hide_original?: boolean;
 }
 
 export interface TargetInput {
@@ -256,6 +263,25 @@ export const api = {
     post<void>(`/accounts/${id}/models`, {
       upstream_model: upstreamModel,
       public_name: publicName || undefined,
+    }),
+  /** 修改一行模型目录的下游模型名 / 启用状态（§16.3）。 */
+  updateAccountModel: (
+    id: string,
+    payload: {
+      upstream_model: string;
+      /** null 表示不改；空字符串表示清空下游模型名。 */
+      alias?: string | null;
+      selected?: boolean;
+    },
+  ) => post<AccountModel[]>(`/accounts/${id}/models/update`, payload),
+  /** 从账号目录永久删除一行并移除其目标（§16.5）。 */
+  deleteAccountModel: (id: string, upstreamModel: string) =>
+    post<void>(`/accounts/${id}/models/delete`, { upstream_model: upstreamModel }),
+  /** 把多行合并到同一个下游模型名（§16.4）。 */
+  mergeAccountModels: (id: string, upstreamModels: string[], publicName: string) =>
+    post<AccountModel[]>(`/accounts/${id}/models/merge`, {
+      upstream_models: upstreamModels,
+      public_name: publicName,
     }),
   /** 批量应用选择集。409 时返回二次确认数据而不是抛错（§16.3）。 */
   selectAccountModels: async (

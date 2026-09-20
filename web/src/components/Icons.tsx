@@ -160,3 +160,64 @@ export const IconAlert = (p: IconProps) => (
     <circle cx="12" cy="12" r="9" />
   </Icon>
 );
+
+export const IconSettings = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.3a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.7 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.7 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06A2 2 0 1 1 7.13 4.14l.06.06A1.7 1.7 0 0 0 9 4.54 1.7 1.7 0 0 0 10 3V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.09a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03Z" />
+  </Icon>
+);
+
+export const IconMenu = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 6h16M4 12h16M4 18h16" />
+  </Icon>
+);
+
+export const IconSearch = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
+  </Icon>
+);
+
+export const IconInfo = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 11v5M12 8h.01" />
+  </Icon>
+);
+
+export const IconDownload = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 3v12M7.5 10.5 12 15l4.5-4.5" />
+    <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+  </Icon>
+);
+
+export const IconMore = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="5" cy="12" r="1" fill="currentColor" />
+    <circle cx="12" cy="12" r="1" fill="currentColor" />
+    <circle cx="19" cy="12" r="1" fill="currentColor" />
+  </Icon>
+);
+
+export const IconChevronDown = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m6 9 6 6 6-6" />
+  </Icon>
+);
+
+export const IconChevronRight = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m9 6 6 6-6 6" />
+  </Icon>
+);
+
+export const IconBook = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5v-15Z" />
+    <path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20" />
+  </Icon>
+);

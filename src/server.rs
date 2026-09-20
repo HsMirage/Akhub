@@ -22,6 +22,10 @@ pub fn router(state: SharedState) -> Router {
             .route("/health/live", get(live))
             .route("/health/ready", get(ready))
             .route("/", get(|| async { Redirect::temporary("/admin") }))
+            // 版本端点：容器编排、CI 冒烟与前向代理的健康探针都想在不带
+            // 任何凭据的前提下确认"跑的是哪个版本、是否就绪"（§25.1）。
+            // 只暴露版本号本身，不含账号、模型或配置细节。
+            .route("/health/version", get(version))
             .fallback(not_found),
         state,
     )
@@ -52,6 +56,19 @@ fn assemble(router: Router<SharedState>, state: SharedState) -> Router {
             state,
             crate::admin::attach_config_version,
         ))
+}
+
+/// 版本端点：不需要凭据，只回一个能让运维确认部署是否生效的版本号。
+async fn version() -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!(
+            "{{\"object\":\"health\",\"status\":\"ok\",\"version\":\"{}\"}}",
+            crate::admin::version()
+        ),
+    )
+        .into_response()
 }
 
 /// 给所有响应补上最小安全响应头（§23.2）。

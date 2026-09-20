@@ -61,9 +61,11 @@ Responses 状态链与模型发现（选择集、别名、自动同步、能力�
   把该端点当作候选；配置变更立即清空。概览页会提示这类"端点缺失"证据。
 - **未知字段透传**：本网关不认识的顶层字段原样带给原生协议的上游，跨协议
   时才明确拒绝。
-- 嵌入二进制的 React + TypeScript 管理后台（`/admin`）：分层视图带综合评分与
-  分维得分、运行状态、倍率告警、调度权重编辑、降级筛选与端点转换标记、
-  分组的"允许降级"开关与端点缺失告警。
+- 嵌入二进制的 React + TypeScript 管理后台（`/admin`）：账号内的模型管理
+  （获取/手动添加/逐行启用停用/删除，别名归并，隐藏原始模型）、只读调度视图
+  （按分组与模型展示综合评分、可用性、倍率、首字延迟、速度与预计分配）、
+  倍率告警、调度权重编辑、降级筛选与端点转换标记、分组的"允许降级"开关与
+  端点缺失告警。账号人工优先级默认 0，同层由评分决定分配。
 - Docker 与 Linux 部署示例。
 
 阶段 4–5 已有 Responses 状态链、模型发现与选择集、别名与自动归并、成本视图、
@@ -79,15 +81,33 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
 | 能力 | 计划阶段 |
 |---|---|
 | §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、连接复用率与每请求分配量） | 阶段 6 |
-| Docker 容器内"空数据目录首次启动 + 真实调用"的落地验收（镜像与工件已产出，缺容器内实跑记录） | 阶段 6 |
+| Docker 容器内"空数据目录首次启动 + 真实调用"的**本地**实跑记录（CI 已用 `docker` 作业在每次推送时覆盖这条，见 `.github/workflows/ci.yml`） | 阶段 6 |
 | 真实上游上的跨账号故障切换实测（现有测试 Key 下同一逻辑模型只有一个可用目标） | 阶段 6 |
 
 已完成（本轮校正）：
 
-- **Docker 与多架构发布**：`Dockerfile`（非 root、`/data` 唯一持久卷、健康检查、
-  `STOPSIGNAL`）、`docker-compose.yml`（`restart: unless-stopped`、`stop_grace_period: 200s`）、
-  `.github/workflows/release.yml`（x86_64/aarch64 二进制 + buildx amd64/arm64 推 GHCR）、
-  `scripts/release.sh`，以及 `dist/` 下的双架构工件。
+- **发布流程与部署方式**（2026-09-20 重做）：
+  - **六个平台的二进制**：`linux-x86_64`、`linux-aarch64`、`linux-x86_64-musl`、
+    `macos-aarch64`、`macos-x86_64`、`windows-x86_64`。全部在 **各自平台的原生 runner**
+    上构建（`ubuntu-24.04-arm` 跑 arm64），不走 QEMU，也不用 `actions-rust-cross`；
+    Release 附带 `checksums.txt`。
+  - **多架构镜像**：每个架构在自己或原生 runner 上构建、先推 `<tag>-<arch>`，
+    再由 `docker-manifest` 用 `buildx imagetools create` 合成 manifest——
+    两个架构推同一 tag 会互相覆盖，这一步不能省。
+  - **一键安装**：`install.sh`（Linux/macOS，支持 `--service` 直接装 systemd 单元）
+    与 `install.ps1`（Windows）。两者都校验 sha256，升级前自动备份旧二进制，
+    支持 `AKHUB_BASE_URL` 指向自建镜像。
+  - **打包规则单一来源**：`scripts/package.sh` 同时被 CI 与 `scripts/release.sh` 调用，
+    资产命名与归档布局不会两边分叉。
+  - **容器**：`Dockerfile` 改用 `tini` 转发信号 + entrypoint 纠正数据目录属主后
+    `gosu` 降权，`cmake` 补齐 `aws-lc-sys` 的构建依赖；`docker-compose.yml` 支持
+    `AKHUB_IMAGE` 拉预构建镜像，并补了日志轮转与 `no-new-privileges`。
+  - **可运维性**：新增 `/health/version` 与 `akhub --version` / `--help`；
+    CI 增加容器冒烟作业，在**空数据目录**上跑通首次启动、真实 HTTP 调用与
+    非 root 校验（§28 完成标准里的那一条）。
+  - **部署文档**：`deploy/README.md` 覆盖 Docker / 一键脚本 / systemd / 升级回滚 /
+    反代，并新增 `deploy/Caddyfile`、`deploy/Caddyfile.windows`、`deploy/nginx.conf`
+    与 `deploy/README.windows.md`。
 - **关闭信号取消排队请求**（§25.3 第 2 步）：`src/app/mod.rs:239 begin_shutdown`、
   `src/routing/queue.rs:130-152`、`src/gateway/passthrough.rs:480-484` 返回可重试的
   `queue_timeout`，并有回归测试 `src/routing/queue.rs:262,291`。
@@ -139,13 +159,19 @@ cargo run --release
 
 ### 配置一条可用链路
 
-在 `/admin` 中依次完成四步：
+在 `/admin` 中依次完成三步：
 
 1. **建分组**，记下只显示一次的下游 Key（形如 `akh-...`）。
 2. **建账号**：填 Base URL、上游 API Key 与首选协议。不需要填写上下文长度、
    多模态、工具或思考等模型能力字段。
-3. **建逻辑模型**：填对外暴露的模型名，例如 `claude-sonnet-4-5`。
-4. **建调度目标**：把逻辑模型接到"账号 + 具体上游模型名"上。
+3. **配置模型**：打开账号的「模型管理」，点「获取上游模型」并启用要用的模型。
+   每行的**对外名**就是下游看到的模型名；留空则跟随上游真名。把不同上游站的
+   同一模型设成相同对外名即可自动归并，调度视图里能按模型查看账号评分、
+   可用性与速度。
+
+设置别名后，默认会同时暴露别名与原始上游名；勾选「隐藏原始模型」后下游只会
+看到别名。模型启用后会自动生成调度目标，不再需要单独创建逻辑模型或手工绑定
+目标。
 
 然后就可以直接用了：
 
@@ -220,14 +246,64 @@ Vite 会把 `/admin/api` 与 `/v1` 代理到 `127.0.0.1:8080`。
 端到端测试会拉起一个假上游站点和一台完整的 Akhub，覆盖鉴权、模型改写、
 故障切换、双形状模型列表、后台 CRUD 与静态资源服务。
 
+## 安装与部署
+
+详细步骤见 [`deploy/README.md`](deploy/README.md)，下面是最短的路径。
+
+**Docker（推荐）**
+
+```bash
+docker compose up -d
+# 指定版本
+AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.0 docker compose up -d
+```
+
+镜像在 GHCR 上，多架构（amd64 / arm64）、非 root 运行、只暴露 `/data` 一个持久卷。
+**容器侧必须给足停止宽限**（compose 的 `stop_grace_period` 或 `docker run` 的
+`--stop-timeout` ≥ 200 秒），否则 Docker 默认的 10 秒会强杀在途的长流式请求。
+
+**一键脚本（Linux / macOS）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
+```
+
+自动探测平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
+`/usr/local/bin`。`--service` 会顺带装好 systemd 单元。Windows 用
+[`install.ps1`](install.ps1)，细节见 [`deploy/README.windows.md`](deploy/README.windows.md)。
+
+**验证部署**
+
+| 端点 | 含义 |
+|---|---|
+| `/health/live` | 进程事件循环正常 |
+| `/health/ready` | 数据库、配置与主密钥已就绪 |
+| `/health/version` | 当前版本号，用于确认升级是否生效 |
+
+`akhub --healthcheck`、`akhub --version`、`akhub --help` 三个子命令不依赖配置文件，
+可以直接在服务器上敲。
+
 ## 发布
 
-`scripts/release.sh` 一次完成：前端构建 → fmt/clippy/全量测试 →
-Linux 双架构（x86_64 / aarch64）二进制（依赖 [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)）→
-输出 Docker 多架构镜像构建命令。
+推 `v*` tag 触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，
+在**各平台原生 runner** 上构建 6 个平台的单文件二进制：
 
-- **Linux 原生部署**：见 [`deploy/README.md`](deploy/README.md) 与
-  [`deploy/akhub.service`](deploy/akhub.service)。
+| 资产 | 说明 |
+|---|---|
+| `akhub-v1.1.0-linux-x86_64-musl.tar.gz` | 静态链接，跨发行版直接用（推荐） |
+| `akhub-v1.1.0-linux-x86_64.tar.gz` | glibc 版 |
+| `akhub-v1.1.0-linux-aarch64.tar.gz` | ARM64 服务器 |
+| `akhub-v1.1.0-macos-aarch64.tar.gz` / `-macos-x86_64` | Apple Silicon / Intel |
+| `akhub-v1.1.0-windows-x86_64.zip` | Windows 原生 |
+| `checksums.txt` | 上面所有资产的 sha256 |
+
+同一轮还会在原生 arm64 runner 上构建 `linux/amd64` 与 `linux/arm64` 镜像，
+合成多架构 manifest 后推送到 GHCR。
+
+本地发版用 `scripts/release.sh`（前端构建 → fmt/clippy/全量测试 → 交叉编译 →
+打包 → 生成校验和），打包规则由 [`scripts/package.sh`](scripts/package.sh)
+统一定义，与 CI 共用，所以资产命名与目录布局不会两边分叉。
+
 - **升级检查**：用旧版本二进制打开新版本写出的数据库会被拒绝并提示升级，
   不会写坏数据。
 - **许可证与第三方声明**：见 [`LICENSE`](LICENSE) 与 [`NOTICES.md`](NOTICES.md)。

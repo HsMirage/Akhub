@@ -1,7 +1,9 @@
 /** 通用 UI 原语。全部无状态、无副作用，样式来自 components.css。 */
 import type { Score } from "../lib/types";
 import {
+  cloneElement,
   createContext,
+  isValidElement,
   useCallback,
   useContext,
   useEffect,
@@ -9,11 +11,72 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactElement,
   type ReactNode,
 } from "react";
-import { IconCheck, IconCopy, IconX } from "./Icons";
+import { createPortal } from "react-dom";
+import { IconCheck, IconChevronDown, IconCopy, IconInfo, IconMore, IconX } from "./Icons";
 
 /* ---------------------------------------------------------------- 按钮 */
+
+/**
+ * 把浮层挂到 `document.body` 上并计算 fixed 坐标。
+ *
+ * 表格容器为了横向滚动设了 `overflow-x: auto`，任何绝对定位的子浮层都会
+ * 被裁掉一截，首列/操作列的 sticky 层级也会盖到浮层上。挂 body 之后
+ * 既不受裁剪影响，也不参与表格的层叠上下文。
+ */
+type PopoverSide = "top" | "bottom";
+
+function usePopoverPosition(
+  open: boolean,
+  trigger: React.RefObject<HTMLElement | null>,
+  popup: React.RefObject<HTMLElement | null>,
+  side: PopoverSide,
+  revision = 0,
+) {
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    if (!open || !trigger.current) {
+      setPosition(null);
+      return;
+    }
+    const update = () => {
+      const rect = trigger.current?.getBoundingClientRect();
+      const popupEl = popup.current;
+      if (!rect || !popupEl) return;
+      const width = popupEl.offsetWidth || 200;
+      const height = popupEl.offsetHeight || 120;
+      const margin = 8;
+      let top: number;
+      if (side === "top") {
+        top = rect.top - height - 6;
+        if (top < margin) top = rect.bottom + 6;
+      } else {
+        top = rect.bottom + 6;
+        if (top + height > window.innerHeight - margin) {
+          top = Math.max(margin, rect.top - height - 6);
+        }
+      }
+      const left = Math.max(
+        margin,
+        Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - margin),
+      );
+      setPosition({ top, left });
+    };
+    const frame = window.requestAnimationFrame(update);
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [open, trigger, popup, side, revision]);
+
+  return position;
+}
 
 type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 
@@ -22,15 +85,19 @@ export function Button({
   size,
   icon,
   children,
+  className,
   ...props
 }: {
   variant?: ButtonVariant;
   size?: "sm";
   icon?: ReactNode;
+  className?: string;
 } & React.ButtonHTMLAttributes<HTMLButtonElement>) {
   const classes = ["btn", `btn-${variant}`];
   if (size === "sm") classes.push("btn-sm");
   if (!children) classes.push("btn-icon");
+  // 传入的 className 参与合并，而不是覆盖组件自己的类名。
+  if (className) classes.push(className);
   return (
     <button type="button" {...props} className={classes.join(" ")}>
       {icon}
@@ -103,14 +170,27 @@ export function Field({
   children: (id: string) => ReactNode;
 }) {
   const id = useId();
+  const errorId = id + "-error";
+  const control = children(id);
+  // 错误必须和控件建立可访问性关联：否则屏幕阅读器只看到一段红色文字，
+  // 却不知道是哪个字段出错。
+  const enhanced =
+    error && isValidElement(control)
+      ? cloneElement(control as ReactElement<Record<string, unknown>>, {
+          "aria-invalid": true,
+          "aria-describedby": errorId,
+        })
+      : control;
   return (
     <div className="field">
       <label className="field-label" htmlFor={id}>
         {label}
       </label>
-      {children(id)}
+      {enhanced}
       {error ? (
-        <span className="field-error">{error}</span>
+        <span className="field-error" id={errorId} role="alert">
+          {error}
+        </span>
       ) : (
         hint && <span className="field-hint">{hint}</span>
       )}
@@ -151,21 +231,80 @@ export function Switch({
 
 /* ------------------------------------------------------------ 抽屉/弹窗 */
 
-/** Esc 关闭 + 打开时锁定背景滚动。抽屉与弹窗共用。 */
-function useDismissable(open: boolean, onClose: () => void) {
+/**
+ * Esc 关闭 + 背景滚动锁定 + 焦点陷阱 + 关闭后焦点归还。
+ *
+ * 焦点管理是弹层最基本的可用性要求：少了它，键盘用户 Tab 会穿到遮罩后面，
+ * 关闭后又要从页面顶部重新找触发按钮。
+ */
+function useDismissable(
+  open: boolean,
+  onClose: () => void,
+  container: React.RefObject<HTMLElement | null>,
+) {
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    const focusables = () =>
+      Array.from(
+        container.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const list = focusables();
+      if (list.length === 0) {
+        event.preventDefault();
+        container.current?.focus();
+        return;
+      }
+      const first = list[0] as HTMLElement;
+      const last = list[list.length - 1] as HTMLElement;
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey && (active === first || !container.current?.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !container.current?.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    document.addEventListener("keydown", onKey);
-    const previous = document.body.style.overflow;
+
+    document.addEventListener("keydown", onKey, true);
+    const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = previous;
+      document.removeEventListener("keydown", onKey, true);
+      document.body.style.overflow = previousOverflow;
+      // 关闭时把焦点还给触发按钮；找不到目标时退回原处，不影响后续 Tab。
+      previouslyFocused?.focus?.({ preventScroll: true });
     };
-  }, [open, onClose]);
+  }, [open, container]);
+}
+
+/** 有未保存修改时，关闭动作先走确认，避免整屏表单被一次误点丢掉。 */
+function useCloseGuard(open: boolean, dirty: boolean | undefined, onClose: () => void) {
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => {
+    if (!open) setConfirming(false);
+  }, [open]);
+  const requestClose = useCallback(() => {
+    if (dirty) setConfirming(true);
+    else onClose();
+  }, [dirty, onClose]);
+  return { confirming, setConfirming, requestClose };
 }
 
 export function Drawer({
@@ -175,6 +314,9 @@ export function Drawer({
   description,
   footer,
   children,
+  closeOnOverlay = true,
+  dirty,
+  size,
 }: {
   open: boolean;
   onClose: () => void;
@@ -182,9 +324,16 @@ export function Drawer({
   description?: ReactNode;
   footer?: ReactNode;
   children: ReactNode;
+  /** Key 展示等不可恢复场景禁止点遮罩关闭，避免误触丢信息。 */
+  closeOnOverlay?: boolean;
+  /** 有未保存修改时，关闭前弹确认。 */
+  dirty?: boolean;
+  size?: "lg";
 }) {
-  useDismissable(open, onClose);
+  const dialogRef = useRef<HTMLElement>(null);
   const firstField = useRef<HTMLDivElement>(null);
+  const { confirming, setConfirming, requestClose } = useCloseGuard(open, dirty, onClose);
+  useDismissable(open && !confirming, requestClose, dialogRef);
 
   useEffect(() => {
     if (!open) return;
@@ -195,21 +344,42 @@ export function Drawer({
   if (!open) return null;
   return (
     <>
-      <div className="overlay" onClick={onClose} />
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label={title}>
+      <div
+        className="overlay"
+        onClick={closeOnOverlay ? requestClose : undefined}
+      />
+      <aside
+        className={size === "lg" ? "drawer drawer-lg" : "drawer"}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        ref={dialogRef}
+      >
         <header className="drawer-head">
           <div>
             <h2 className="card-title">{title}</h2>
             {description && <p className="card-desc">{description}</p>}
           </div>
           <div className="spacer" />
-          <Button variant="ghost" icon={<IconX />} onClick={onClose} aria-label="关闭" />
+          <Button variant="ghost" icon={<IconX />} onClick={requestClose} aria-label="关闭" />
         </header>
         <div className="drawer-body" ref={firstField}>
           {children}
         </div>
         {footer && <footer className="drawer-foot">{footer}</footer>}
       </aside>
+      <ConfirmDialog
+        open={confirming}
+        title="放弃未保存的修改？"
+        message="关闭后当前填写的内容不会保存。"
+        confirmLabel="放弃修改"
+        danger
+        onClose={() => setConfirming(false)}
+        onConfirm={() => {
+          setConfirming(false);
+          onClose();
+        }}
+      />
     </>
   );
 }
@@ -221,6 +391,9 @@ export function Modal({
   className,
   footer,
   children,
+  dirty,
+  size,
+  closeOnOverlay = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -228,26 +401,49 @@ export function Modal({
   className?: string;
   footer?: ReactNode;
   children: ReactNode;
+  /** 有未保存修改时，关闭前弹确认。 */
+  dirty?: boolean;
+  size?: "lg";
+  /** Key 展示等不可恢复场景禁止点遮罩关闭。 */
+  closeOnOverlay?: boolean;
 }) {
-  useDismissable(open, onClose);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const { confirming, setConfirming, requestClose } = useCloseGuard(open, dirty, onClose);
+  useDismissable(open && !confirming, requestClose, dialogRef);
+
   if (!open) return null;
   return (
     <>
-      <div className="overlay" onClick={onClose} />
+      <div className="overlay" onClick={closeOnOverlay ? requestClose : undefined} />
       <div
-        className={className ? `modal ${className}` : "modal"}
+        className={["modal", size === "lg" ? "modal-lg" : "", className ?? ""]
+          .filter(Boolean)
+          .join(" ")}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        ref={dialogRef}
       >
         <header className="modal-head">
           <h2 className="card-title">{title}</h2>
           <div className="spacer" />
-          <Button variant="ghost" icon={<IconX />} onClick={onClose} aria-label="关闭" />
+          <Button variant="ghost" icon={<IconX />} onClick={requestClose} aria-label="关闭" />
         </header>
         <div className="modal-body">{children}</div>
         {footer && <footer className="modal-foot">{footer}</footer>}
       </div>
+      <ConfirmDialog
+        open={confirming}
+        title="放弃未保存的修改？"
+        message="关闭后当前修改不会保存。"
+        confirmLabel="放弃修改"
+        danger
+        onClose={() => setConfirming(false)}
+        onConfirm={() => {
+          setConfirming(false);
+          onClose();
+        }}
+      />
     </>
   );
 }
@@ -259,6 +455,8 @@ export function ConfirmDialog({
   message,
   confirmLabel = "确认",
   danger,
+  requireText,
+  requireLabel,
   onConfirm,
   onClose,
 }: {
@@ -267,9 +465,24 @@ export function ConfirmDialog({
   message: ReactNode;
   confirmLabel?: string;
   danger?: boolean;
+  /** 需要用户原样输入这段文字才能继续（删除分组、恢复备份等不可逆操作）。 */
+  requireText?: string;
+  requireLabel?: string;
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const [text, setText] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const inputId = useId();
+  useEffect(() => {
+    if (!open) setText("");
+    else if (requireText) {
+      // 弹窗打开后把焦点放到确认输入框，键盘用户不必再找。
+      window.setTimeout(() => inputRef.current?.focus(), 30);
+    }
+  }, [open, requireText]);
+  const allowed = !requireText || text.trim() === requireText;
+
   return (
     <Modal
       open={open}
@@ -280,7 +493,9 @@ export function ConfirmDialog({
           <Button onClick={onClose}>取消</Button>
           <Button
             variant={danger ? "danger" : "primary"}
+            disabled={!allowed}
             onClick={() => {
+              if (!allowed) return;
               onConfirm();
               onClose();
             }}
@@ -290,7 +505,24 @@ export function ConfirmDialog({
         </>
       }
     >
-      <p style={{ margin: 0, lineHeight: 1.7 }}>{message}</p>
+      <div className="stack" style={{ gap: 12 }}>
+        <p style={{ margin: 0, lineHeight: 1.7 }}>{message}</p>
+        {requireText && (
+          <div className="field">
+            <label className="field-label" htmlFor={inputId}>
+              {requireLabel ?? `请输入「${requireText}」以确认`}
+            </label>
+            <input
+              id={inputId}
+              ref={inputRef}
+              className="input mono"
+              value={text}
+              autoComplete="off"
+              onChange={(event) => setText(event.target.value)}
+            />
+          </div>
+        )}
+      </div>
     </Modal>
   );
 }
@@ -326,7 +558,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {children}
       <div className="toasts" role="status" aria-live="polite">
         {toasts.map((toast) => (
-          <div key={toast.id} className={`toast toast-${toast.tone}`}>
+          <div
+            key={toast.id}
+            className={`toast toast-${toast.tone}`}
+            role={toast.tone === "error" ? "alert" : "status"}
+          >
             <span style={{ marginTop: 2, flexShrink: 0 }}>
               {toast.tone === "success" ? <IconCheck size={14} /> : <IconX size={14} />}
             </span>
@@ -351,7 +587,19 @@ export function useToast() {
 
 /* ------------------------------------------------------------ 复制按钮 */
 
-export function CopyButton({ value, label }: { value: string; label?: string }) {
+export function CopyButton({
+  value,
+  label,
+  iconOnly,
+  onCopied,
+}: {
+  value: string;
+  label?: string;
+  /** 只显示图标：用于表格单元格等空间紧张的位置。 */
+  iconOnly?: boolean;
+  /** 复制成功后的回调，用于联动"我已保存"等确认状态。 */
+  onCopied?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
   const toast = useToast();
 
@@ -359,6 +607,7 @@ export function CopyButton({ value, label }: { value: string; label?: string }) 
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
+      onCopied?.();
       setTimeout(() => setCopied(false), 1600);
     } catch {
       // 非 HTTPS 环境下剪贴板 API 不可用，明确告知而不是静默失败。
@@ -371,9 +620,256 @@ export function CopyButton({ value, label }: { value: string; label?: string }) 
       size="sm"
       icon={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
       onClick={copy}
+      title={iconOnly ? (label ?? "复制") : undefined}
+      aria-label={iconOnly ? (label ?? "复制") : undefined}
     >
-      {copied ? "已复制" : (label ?? "复制")}
+      {iconOnly ? null : copied ? "已复制" : (label ?? "复制")}
     </Button>
+  );
+}
+
+/* ------------------------------------------------------- 说明提示/菜单/分段 */
+
+/**
+ * 可点击、可聚焦的说明提示。关键解释不能只放在 title 里：触屏与键盘用户看不到。
+ */
+export function InfoTip({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLSpanElement>(null);
+  const pop = useRef<HTMLSpanElement>(null);
+  const id = useId();
+  const position = usePopoverPosition(open, root, pop, "top");
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!root.current?.contains(target) && !pop.current?.contains(target)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <span className={className ? `info-tip ${className}` : "info-tip"} ref={root}>
+      <button
+        type="button"
+        className="info-tip-button"
+        aria-label={label}
+        aria-expanded={open}
+        aria-describedby={open ? id : undefined}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <IconInfo size={13} />
+      </button>
+      {open &&
+        createPortal(
+          <span
+            role="tooltip"
+            id={id}
+            ref={pop}
+            className="info-tip-pop is-portal"
+            style={position ? { top: position.top, left: position.left } : undefined}
+          >
+            {children}
+          </span>,
+          document.body,
+        )}
+    </span>
+  );
+}
+
+export interface MenuItem {
+  label: string;
+  onSelect: () => void;
+  icon?: ReactNode;
+  danger?: boolean;
+  disabled?: boolean;
+  hint?: string;
+}
+
+/**
+ * 行内"更多操作"菜单。列表页把低频操作收进来，既减少横向占用，
+ * 也让每个操作有完整的文字标签，不必只靠图标猜。
+ */
+export function Menu({
+  label,
+  items,
+  disabled,
+}: {
+  label: string;
+  items: MenuItem[];
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const pop = useRef<HTMLDivElement>(null);
+  const position = usePopoverPosition(open, trigger, pop, "bottom", items.length);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!root.current?.contains(target) && !pop.current?.contains(target)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        trigger.current?.focus();
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="menu" ref={root}>
+      <button
+        ref={trigger}
+        type="button"
+        className="btn btn-secondary btn-sm btn-icon"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <IconMore size={15} />
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={pop}
+            className="menu-pop is-portal"
+            role="menu"
+            aria-label={label}
+            style={position ? { top: position.top, left: position.left } : undefined}
+          >
+            {items.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                role="menuitem"
+                className={`menu-item${item.danger ? " is-danger" : ""}`}
+                disabled={item.disabled}
+                title={item.hint}
+                onClick={() => {
+                  setOpen(false);
+                  item.onSelect();
+                }}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+/** 分段控件：替代用 primary/ghost 按钮模拟的选中态。 */
+export function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+  disabled,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (value: T) => void;
+  label: string;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="segmented" role="tablist" aria-label={label}>
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="tab"
+          aria-selected={option.value === value}
+          className={`segmented-item${option.value === value ? " is-active" : ""}`}
+          disabled={disabled}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** 抽屉/长表单里的分区。高级配置默认折叠，降低新用户的首屏压力。 */
+export function FormSection({
+  title,
+  description,
+  children,
+  collapsible = false,
+  defaultOpen = true,
+  badge,
+}: {
+  title: string;
+  description?: ReactNode;
+  children: ReactNode;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+  badge?: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="form-section">
+      {collapsible ? (
+        <button
+          type="button"
+          className="form-section-head is-button"
+          aria-expanded={open}
+          onClick={() => setOpen((current) => !current)}
+        >
+          <span className="form-section-title">{title}</span>
+          {badge}
+          <span className="spacer" />
+          <IconChevronDown size={14} className={open ? "chevron is-open" : "chevron"} />
+        </button>
+      ) : (
+        <div className="form-section-head">
+          <span className="form-section-title">{title}</span>
+          {badge}
+        </div>
+      )}
+      {open && (
+        <div className="form-section-body">
+          {description && <p className="form-section-desc">{description}</p>}
+          {children}
+        </div>
+      )}
+    </section>
   );
 }
 

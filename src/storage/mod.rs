@@ -28,7 +28,12 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v6：请求记录补粘性等待/新鲜度、输出速度、倍率来源、额度状态、
 /// 候选过滤原因与选中层（§6.6、§24.1）。
 /// v7：请求记录补 Token 细分：缓存读/写与思考 Token（§11.6）。
-const SCHEMA_VERSION: i64 = 7;
+/// v8：模型别名的唯一真相移入 `account_models.public_name`，并新增
+/// `account_models.hide_original` 与 `dispatch_targets.hide_original`；
+/// 同一模型的不同上游名可以按对外名归并，并按需隐藏原始名。
+/// v9：把"隐藏原始模型"提升为账号级 `upstream_accounts.hide_original`；
+/// 打开后只暴露设置了下游模型名的模型。
+const SCHEMA_VERSION: i64 = 9;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -238,6 +243,81 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                     .with_context(|| format!("迁移 request_records.{column} 失败"))?;
             }
         }
+    }
+    if from < 8 {
+        // v8：别名与"隐藏原始模型"的落点改为账号模型目录；旧别名表的数据
+        // 在迁移时合并进来，之后运行时不再依赖 account_aliases。
+        let model_columns = table_columns(pool, "account_models").await?;
+        if !model_columns.contains("hide_original") {
+            sqlx::query(
+                "ALTER TABLE account_models ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 account_models.hide_original 失败")?;
+        }
+        let target_columns = table_columns(pool, "dispatch_targets").await?;
+        if !target_columns.contains("hide_original") {
+            sqlx::query(
+                "ALTER TABLE dispatch_targets ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 dispatch_targets.hide_original 失败")?;
+        }
+        // 人工优先级的旧默认值是 50；新版默认 0，让同组账号默认同层、由
+        // 评分决定分配。把历史默认值归零，显式设置过其它值的账号不动。
+        sqlx::query(
+            "UPDATE upstream_accounts SET default_priority = 0 WHERE default_priority = 50",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 upstream_accounts.default_priority 失败")?;
+        // 老版弹窗只写别名表，目录快照里还是上游真名。把已保存的别名
+        // 回填到目录行，这样升级后不会丢历史别名。
+        sqlx::query(
+            "UPDATE account_models
+                SET public_name = (
+                    SELECT aa.public_name FROM account_aliases aa
+                    WHERE aa.account_id = account_models.account_id
+                      AND aa.upstream_model = account_models.upstream_model
+                )
+              WHERE EXISTS (
+                    SELECT 1 FROM account_aliases aa
+                    WHERE aa.account_id = account_models.account_id
+                      AND aa.upstream_model = account_models.upstream_model
+              )",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 account_aliases 到 account_models 失败")?;
+    }
+    if from < 9 {
+        // v9：隐藏原始模型从"每行/每目标"提升为账号级开关。旧库如果任一
+        // 目录行或目标勾过隐藏，账号级开关也置 1，保持升级后的可见性不扩大。
+        let account_columns = table_columns(pool, "upstream_accounts").await?;
+        if !account_columns.contains("hide_original") {
+            sqlx::query(
+                "ALTER TABLE upstream_accounts ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 upstream_accounts.hide_original 失败")?;
+        }
+        sqlx::query(
+            "UPDATE upstream_accounts
+                SET hide_original = 1
+              WHERE EXISTS (
+                    SELECT 1 FROM account_models am
+                    WHERE am.account_id = upstream_accounts.id AND am.hide_original != 0
+              ) OR EXISTS (
+                    SELECT 1 FROM dispatch_targets dt
+                    WHERE dt.account_id = upstream_accounts.id AND dt.hide_original != 0
+              )",
+        )
+        .execute(pool)
+        .await
+        .context("迁移账号级 hide_original 失败")?;
     }
     if from < 5 {
         // v5：分钟级性能聚合表。老库需要补建；新库已由 schema.sql 建好，

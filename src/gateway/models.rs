@@ -52,8 +52,7 @@ pub async fn get(
     }
 
     let created = group
-        .models
-        .get(&model)
+        .find_model(&model)
         .map(|m| m.model.created_at.unix_timestamp())
         .unwrap_or_default();
 
@@ -82,12 +81,15 @@ fn resolve(
 /// 目标全部不健康时模型仍然保留：否则客户端会因为一次瞬时故障缓存下一份
 /// 缺模型的列表（§7.3）。真正被排除的只有"零目标"。
 fn listable_models(group: &GroupView) -> Vec<String> {
-    group
+    let mut names: Vec<String> = group
         .models
         .values()
         .filter(|model| model.is_listable())
-        .map(|model| model.model.name.clone())
-        .collect()
+        .flat_map(|model| model.exposed_names())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn openai_entry(name: &str, created: i64) -> Value {
@@ -132,8 +134,7 @@ fn anthropic_list(names: &[String], group: &GroupView) -> Value {
 
 fn created_at(group: &GroupView, name: &str) -> i64 {
     group
-        .models
-        .get(name)
+        .find_model(name)
         .map(|m| m.model.created_at.unix_timestamp())
         .unwrap_or_default()
 }
@@ -177,6 +178,7 @@ mod tests {
             limits: crate::domain::Limits::default(),
             allow_private_network: false,
             enabled: true,
+            hide_original: false,
             auto_sync: false,
             model_synced_at: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -189,6 +191,7 @@ mod tests {
                         logical_model_id: name.into(),
                         account_id: "a1".into(),
                         upstream_model: format!("{name}-真名"),
+                        hide_original: false,
                         priority_override: None,
                         limits: crate::domain::Limits::default(),
                         enabled: true,
@@ -209,6 +212,8 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
             targets,
+            exposed: true,
+            aliases: Vec::new(),
         })
     }
 

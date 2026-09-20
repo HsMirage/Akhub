@@ -254,6 +254,11 @@ pub struct Account {
     pub enabled: bool,
     /// 模型自动同步：打开后忽略选择集，全量托管上游模型（§16.2）。
     pub auto_sync: bool,
+    /// 账号级隐藏原始模型开关（§16.4 修订）。
+    ///
+    /// 打开后只暴露目录里设置了"下游模型名"的模型；没有设置下游模型名的
+    /// 目录行不会对下游开放。
+    pub hide_original: bool,
     /// 上一次模型同步完成的时间；`None` 表示从未同步过。
     pub model_synced_at: Option<i64>,
     pub created_at: OffsetDateTime,
@@ -287,7 +292,13 @@ pub struct DispatchTarget {
     pub logical_model_id: String,
     pub account_id: String,
     pub upstream_model: String,
-    /// 覆盖账号默认优先级；为空时继承账号值。
+    /// 是否隐藏这个目标的上游原始模型名。
+    ///
+    /// 为 false 时，除了逻辑模型的对外名，客户端还可以直接用上游真名请求，
+    /// 这样同一模型在不同站点的不同命名都能被同一组目标接住（§16.4）。
+    pub hide_original: bool,
+    /// 历史字段：调度目标不再支持独立优先级覆盖，统一继承账号人工优先级。
+    /// 保留在数据结构里是为了兼容旧备份；配置装配与界面都不再使用它（§9.2 修订）。
     pub priority_override: Option<i32>,
     /// 逐项覆盖账号的 RPM / TPM / 最大并发（§17.1）。
     pub limits: Limits,

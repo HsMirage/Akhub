@@ -1,6 +1,13 @@
-# 公开发版：推 v* tag 时产出 Linux 双架构二进制与多架构 Docker 镜像。
+# 公开发版：推 v* tag 时产出 6 个平台的单文件二进制 + 多架构 Docker 镜像。
 #
-# 二进制走 GitHub Release，镜像推送到 GHCR（ghcr.io/<owner>/<repo>）。
+# 平台矩阵（全原生构建，不用 QEMU，也不用 actions-rust-cross）：
+#   linux-x86_64 / linux-aarch64 / linux-x86_64-musl
+#   macos-aarch64 / macos-x86_64
+#   windows-x86_64
+#
+# 二进制直接挂在 GitHub Release 下，并附带 checksums.txt；
+# 镜像推送到 GHCR（ghcr.io/<owner>/<repo>），配置了 Docker Hub 变量时再镜像一份过去。
+#
 # 管理后台必须在 cargo 之前构建：rust-embed 在编译期把它嵌进二进制。
 name: Release
 
@@ -8,21 +15,45 @@ on:
   push:
     tags:
       - "v*"
+  # 手动触发只跑构建，不发 Release（下面的 release job 判断了 ref 必须是 tag）。
+  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+env:
+  CARGO_TERM_COLOR: always
+  # npm ci 比 npm install 慢一点，但可复现；发布链路不能容忍依赖漂移。
+  NPM_CONFIG_FUND: "false"
+
 jobs:
-  binaries:
-    name: Linux ${{ matrix.target }}
+  # ---------------------------------------------------------------- 前置校验
+  verify:
+    name: 版本一致性
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tag 必须与 Cargo.toml 的版本一致
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            echo "非 tag 触发（${GITHUB_REF}），跳过版本校验"
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag=$tag crate=$crate"
+          if [[ "$tag" != "$crate" ]]; then
+            echo "::error::tag v$tag 与 Cargo.toml 的 $crate 不一致；二进制里的 /admin 版本号和 --version 都会对不上"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- 前端产物
+  web:
+    name: 管理后台
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,57 +63,296 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: 构建管理后台
+      - name: 构建
+        working-directory: web
         run: |
-          cd web
           npm ci
           npm run build
 
-      - name: 交叉编译
-        uses: houseabsolute/actions-rust-cross@v1
+      # 六个平台共用同一份前端产物：各平台分别 npm ci 会拖慢发版，也可能
+      # 因为 registry 抖动产出版本不同的壳子。
+      - uses: actions/upload-artifact@v4
         with:
-          command: build
-          target: ${{ matrix.target }}
-          args: "--release --locked"
+          name: akhub-web-dist
+          path: web/dist
+          retention-days: 7
+          if-no-files-found: error
 
+  # ---------------------------------------------------------------- 二进制
+  binaries:
+    name: ${{ matrix.name }}
+    needs: [web, verify]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # musl：静态链接，装完即用，不挑发行版的 glibc 版本。
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          # macOS 的 x86_64 直接从 arm64 runner 上交叉编译（SDK 本身是三架构的），
+          # 比钉死某个即将退役的 Intel runner 标签稳。
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: akhub-web-dist
+          path: web/dist
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # aws-lc-sys 走 cmake/cc 编译 C 代码：musl 目标要把 musl-gcc 装上，
+      # 否则 cc 会落到 glibc 的 gcc 上并链出错误的产物。
+      - name: 安装 musl 工具链
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: 编译
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 打包规则只在 scripts/package.sh 里定义一次：CI 与本地发版共用同一份
+      # 实现，资产命名（akhub-<tag>-<platform>）与归档内层目录才不可能分叉。
+      # Windows 上用 Git Bash 跑它：scripts/package.sh 里有 zip 分支，
+      # GitHub 的 windows runner 自带 zip 与 tar。
       - name: 打包
+        shell: bash
         run: |
-          tar -czf "akhub-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" akhub
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          TAG="${GITHUB_REF_NAME:-v$VERSION}"
+          BINARY="target/${{ matrix.target }}/release/akhub"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then BINARY="$BINARY.exe"; fi
+          AKHUB_TAG="$TAG" ./scripts/package.sh \
+            "${{ matrix.target }}" "${{ matrix.name }}" "$BINARY"
+          ls -l dist
 
-      - name: 上传到 Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: akhub-${{ matrix.target }}.tar.gz
+          name: akhub-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
 
-  docker:
-    name: Docker 多架构镜像
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: 生成 Release
+    needs: [binaries]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: akhub-*
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          # 校验和文件本身不能被算进去。
+          rm -f checksums.txt
+          sha256sum ./*.tar.gz ./*.zip > checksums.txt
+          cat checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
+  # ---------------------------------------------------------------- 容器镜像
+  # 每个架构在自己的原生 runner 上构建，再合成 manifest list。
+  # 用 QEMU 模拟 arm64 跑 Rust + aws-lc-sys 的 C 编译会慢一个数量级，还容易超时。
+  #
+  # 单架构阶段先推 <tag>-<arch>，两个架构互不覆盖；多架构 tag 由后面的
+  docker:
+    name: 镜像 linux/${{ matrix.arch }}
+    needs: [web]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # `ubuntu-24.04-arm` 是 GitHub 的 arm64 托管 runner，公开仓库免费。
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # 就地带上前端产物：Dockerfile 里的 node 阶段仍会重建一次，
+      # 但这样 `docker build .` 这条本地路径和 CI 才完全同构。
+      - uses: actions/download-artifact@v4
+        with:
+          name: akhub-web-dist
+          path: web/dist
+
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # 用脚本而不是 `if: secrets.X != ''`：GitHub 明确不建议在表达式里
+      # 引用 secret，空值判断在 shell 里做既可靠又不会把值打进日志。
+      - name: 取镜像仓库列表
+        id: repos
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "ghcr.io/${{ github.repository }}"
+            if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
+              echo "${DOCKERHUB_USERNAME}/akhub"
+            fi
+          } > "$RUNNER_TEMP/repos.txt"
+          {
+            echo "list<<AKHUB_EOF"
+            cat "$RUNNER_TEMP/repos.txt"
+            echo "AKHUB_EOF"
+          } >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/repos.txt"
+
+      - name: 登录镜像仓库
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          else
+            echo "未配置 DOCKERHUB_TOKEN，只推 GHCR"
+          fi
 
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.repos.outputs.list }}
+          flavor: |
+            latest=auto
+            suffix=-${{ matrix.arch }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
-      - uses: docker/build-push-action@v6
+      - name: 构建并推送单架构镜像
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=akhub-${{ matrix.arch }}
+          cache-to: type=gha,scope=akhub-${{ matrix.arch }},mode=max
+
+  # 把两个架构的单架构镜像合成多架构 manifest。
+  docker-manifest:
+    name: 合成多架构 manifest
+    needs: [docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 取镜像仓库列表
+        id: repos
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "ghcr.io/${{ github.repository }}"
+            if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
+              echo "${DOCKERHUB_USERNAME}/akhub"
+            fi
+          } > "$RUNNER_TEMP/repos.txt"
+          {
+            echo "list<<AKHUB_EOF"
+            cat "$RUNNER_TEMP/repos.txt"
+            echo "AKHUB_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 登录镜像仓库
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if [[ -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          fi
+
+      # 不带 suffix 地再算一次 tag 列表：这一步算出来的就是最终的多架构 tag。
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.repos.outputs.list }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: 合成多架构 manifest
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            echo "==> $tag"
+            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: 复核最终 manifest
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            echo "===== $tag"
+            docker buildx imagetools inspect "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"

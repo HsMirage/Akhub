@@ -157,6 +157,7 @@ async fn wire_target(
         // 假上游监听在 127.0.0.1，必须显式开启内网访问才能通过 SSRF 检查。
         allow_private_network: true,
         enabled: true,
+        hide_original: false,
         auto_sync: false,
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
@@ -198,6 +199,7 @@ async fn wire_target(
             logical_model_id: model_id,
             account_id: account.id,
             upstream_model: upstream_model.into(),
+            hide_original: false,
             priority_override: None,
             limits: Limits::default(),
             enabled: true,
@@ -436,6 +438,7 @@ async fn models_endpoint_switches_shape_by_authentication_header() {
     )
     .await;
 
+    // 默认不隐藏原始模型：对外名与上游真名都会出现在列表里。
     let anthropic: Value = client()
         .get(format!("{akhub}/v1/models"))
         .header("x-api-key", &key)
@@ -447,6 +450,10 @@ async fn models_endpoint_switches_shape_by_authentication_header() {
         .unwrap();
     assert_eq!(anthropic["data"][0]["type"], "model");
     assert_eq!(anthropic["data"][0]["display_name"], "claude-sonnet-4-5");
+    assert_eq!(
+        anthropic["data"][1]["display_name"],
+        "claude-sonnet-4-5-20250929"
+    );
     assert_eq!(anthropic["has_more"], false);
 
     let openai: Value = client()
@@ -460,15 +467,35 @@ async fn models_endpoint_switches_shape_by_authentication_header() {
         .unwrap();
     assert_eq!(openai["object"], "list");
     assert_eq!(openai["data"][0]["id"], "claude-sonnet-4-5");
+    assert_eq!(openai["data"][1]["id"], "claude-sonnet-4-5-20250929");
     assert_eq!(openai["data"][0]["owned_by"], "akhub");
 
-    // 真实上游模型名不能出现在任何一种形状里。
-    for body in [anthropic, openai] {
-        assert!(
-            !body.to_string().contains("20250929"),
-            "上游模型名泄漏：{body}"
+    // 两个名字都指向同一个逻辑模型，只是列表里的两个入口。
+    for body in [&anthropic, &openai] {
+        let names: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]
         );
     }
+
+    // 用上游真名（别名）发请求也必须落在同一个逻辑模型上。
+    let response = client()
+        .post(format!("{akhub}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .json(&json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
 }
 
 #[tokio::test]

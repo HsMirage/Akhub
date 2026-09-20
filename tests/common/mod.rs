@@ -601,6 +601,7 @@ pub async fn wire_target(akhub: &Akhub, spec: TargetSpec<'_>) -> Wired {
         // 假上游监听在 127.0.0.1，必须显式开启内网访问才能通过 SSRF 检查。
         allow_private_network: true,
         enabled: true,
+        hide_original: false,
         auto_sync: false,
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
@@ -661,6 +662,7 @@ pub async fn wire_extra_target(
         logical_model_id: model_id,
         account_id: account_id.into(),
         upstream_model: upstream_model.into(),
+        hide_original: false,
         priority_override: None,
         limits: Limits::default(),
         enabled: true,

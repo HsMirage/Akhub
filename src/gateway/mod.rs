@@ -198,10 +198,16 @@ async fn handle(
         (body, request_bytes, None)
     };
 
-    let logical_model = match passthrough::extract_model(&body, protocol) {
+    let requested_model = match passthrough::extract_model(&body, protocol) {
         Ok(model) => model,
         Err(error) => return error.with_request_id(request_id).into_response(),
     };
+    // 下游可以用别名请求同一个逻辑模型；记录、成本与粘性统一落到主名，
+    // 避免同一模型因为入口名字不同被拆成多份（§16.4 修订）。
+    let logical_model = group
+        .find_model(&requested_model)
+        .map(|model| model.model.name.clone())
+        .unwrap_or(requested_model);
 
     // Responses 状态链在入口一次性处理：准备原生续链与可重放合并体、或
     // 立即报过期（§15.2）。请求体保持客户端原样；合并体挂在计划里，由

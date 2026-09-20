@@ -4,11 +4,19 @@
  * 倍率是折扣不是价格——跨模型相加会被模型组合严重扭曲。全局区域只显示
  * 不失真的请求总数与账号占比；每个模型卡片再展开该模型内部的倍率口径。
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Data } from "../lib/store";
 import { api } from "../lib/api";
 import type { CostModel, CostView } from "../lib/types";
-import { Badge, Button, Card, EmptyState, Skeleton } from "../components/ui";
+import {
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  InfoTip,
+  Segmented,
+  Skeleton,
+} from "../components/ui";
 import { IconGauge, IconRefresh } from "../components/Icons";
 
 const PERIODS: { value: "day" | "month"; label: string }[] = [
@@ -16,17 +24,33 @@ const PERIODS: { value: "day" | "month"; label: string }[] = [
   { value: "month", label: "本月" },
 ];
 
-export function Cost({ data }: { data: Data }) {
+export function Cost({
+  data,
+  navigate,
+}: {
+  data: Data;
+  navigate: (
+    route: "accounts" | "requests",
+    params?: Record<string, string>,
+  ) => void;
+}) {
   const [period, setPeriod] = useState<"day" | "month">("day");
   const [view, setView] = useState<CostView | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  // 用 ref 读取"是否已有数据"，避免 load 依赖 view 造成循环。
+  const hasView = useRef(false);
+  hasView.current = view !== null;
 
   const load = useCallback(async () => {
-    setLoading(true);
+    if (hasView.current) setRefreshing(true);
+    else setLoading(true);
     try {
-      setView(await api.cost(period));
+      const next = await api.cost(period);
+      setView(next);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, [period]);
 
@@ -42,22 +66,24 @@ export function Cost({ data }: { data: Data }) {
       description="倍率 × 用量只在同一个逻辑模型内部与真实花销成正比，所以这里不做跨模型加总。"
       actions={
         <div className="row" style={{ gap: 6 }}>
-          {PERIODS.map((option) => (
-            <button
-              key={option.value}
-              className={`btn btn-sm ${period === option.value ? "btn-primary" : "btn-ghost"}`}
-              onClick={() => setPeriod(option.value)}
-              disabled={loading && period === option.value}
-            >
-              {option.label}
-            </button>
-          ))}
+          <Segmented
+            value={period}
+            options={PERIODS}
+            onChange={setPeriod}
+            label="统计周期"
+          />
           <Button
             size="sm"
             variant="ghost"
-            icon={loading ? <span className="spinner spinner-sm" /> : <IconRefresh size={14} />}
+            icon={
+              refreshing ? (
+                <span className="spinner spinner-sm" />
+              ) : (
+                <IconRefresh size={14} />
+              )
+            }
             onClick={() => void load()}
-            disabled={loading}
+            disabled={refreshing}
             title="刷新成本数据"
           >
             刷新
@@ -71,11 +97,30 @@ export function Cost({ data }: { data: Data }) {
         <EmptyState
           icon={<IconGauge size={19} />}
           title="区间内没有成功请求"
-          description="成本页只统计成功请求：失败请求没有产生上游消耗。跑一些真实流量后再来看。"
+          description="成本页只统计成功请求：失败请求没有产生上游消耗，因此不会出现在这里。跑一些真实流量后再来看，或先到请求记录页确认请求是否成功。"
+          action={
+            <Button variant="secondary" onClick={() => navigate("requests")}>
+              查看请求记录
+            </Button>
+          }
         />
       ) : (
         <div className="cost-content">
-          <CostOverview view={view} />
+          <div className="callout callout-info">
+            <span style={{ flex: 1 }}>
+              倍率是上游的计费折扣系数，不是价格；不同模型的倍率口径不同，
+              所以这里不做跨模型加总。「可再省比例」表示：如果该模型的请求全部走最便宜目标，大约还能省多少。
+            </span>
+            <InfoTip label="成本口径说明">
+              加权均倍率按本逻辑模型内的请求占比计算；跨模型相加会被模型组合严重扭曲，因此全局区域只显示请求数与账号占比。
+            </InfoTip>
+          </div>
+          {refreshing && (
+            <div className="inline-loading" role="status">
+              <span className="spinner spinner-sm" aria-hidden="true" /> 正在更新数据…
+            </div>
+          )}
+          <CostOverview view={view} navigate={navigate} />
           {view.retention_off && (
             <div className="callout callout-warn">
               保留天数当前为 0：成本口径来自内存汇总，<b>只统计当天</b>；
@@ -98,7 +143,13 @@ export function Cost({ data }: { data: Data }) {
   );
 }
 
-function CostOverview({ view }: { view: CostView }) {
+function CostOverview({
+  view,
+  navigate,
+}: {
+  view: CostView;
+  navigate: (route: "accounts", params?: Record<string, string>) => void;
+}) {
   const shareLabel = view.share_basis === "tokens" ? "Token 占比" : "请求占比";
   return (
     <div className="cost-overview">
@@ -118,15 +169,17 @@ function CostOverview({ view }: { view: CostView }) {
         <div className="cost-label">各账号 · {shareLabel}</div>
         <div className="cost-share-chips">
           {view.account_shares.map((share) => (
-            <span
+            <button
               key={share.account_id}
+              type="button"
               className="cost-share-chip"
-              title={`${share.name} ${shareLabel} ${(share.share * 100).toFixed(1)}%`}
+              title={`${share.name} ${shareLabel} ${(share.share * 100).toFixed(1)}%，点击去上游账号页定位`}
+              onClick={() => navigate("accounts", { account: share.account_id })}
             >
               <span>{share.name}</span>
               <span className="mono">{(share.share * 100).toFixed(1)}%</span>
               <span className="cost-chip-count mono">{share.requests.toLocaleString()} 次</span>
-            </span>
+            </button>
           ))}
         </div>
       </div>

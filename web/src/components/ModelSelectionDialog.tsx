@@ -1,462 +1,770 @@
 /**
- * 模型选择与别名编辑对话框（§16）：拉取目录、批量选择、一次提交生成调度目标。
- * 选择集和别名分别保存，避免用户在筛选列表里逐条点击时产生半成品配置。
+ * 账号模型管理对话框。
+ *
+ * 这是“下游能看到什么模型”的唯一配置入口：
+ * - 「下游模型名」留空 = 使用上游原名；
+ * - 填写后 = 下游用这个名称调用；
+ * - 多个账号填成同一个名称，会自动合并为一个模型；
+ * - 账号级「隐藏原始模型名」打开后，只暴露填写了下游模型名的模型。
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
-import type { Account, AccountModel, Alias, SelectionWarning } from "../lib/types";
-import { Badge, Button, ConfirmDialog, Modal, useToast } from "./ui";
-import { IconPlus, IconRefresh } from "./Icons";
+import type { Account, AccountModel, DispatchTarget } from "../lib/types";
+import { Badge, Button, ConfirmDialog, Modal, Switch, useToast } from "./ui";
+import {
+  IconCheck,
+  IconEdit,
+  IconPlus,
+  IconRefresh,
+  IconSearch,
+  IconTrash,
+  IconX,
+} from "./Icons";
+
+interface ModelManagerData {
+  targets: DispatchTarget[];
+}
+
+/** 把模型名压成骨架，用来提示“这两个名字很可能是同一个模型”。 */
+function modelFingerprint(name: string): string {
+  let value = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  for (const suffix of ["openai", "anthropic", "official", "latest"]) {
+    if (value.endsWith(suffix) && value.length > suffix.length + 3) {
+      value = value.slice(0, -suffix.length);
+    }
+  }
+  return value;
+}
+
+function hasDownstreamName(row: AccountModel): boolean {
+  return row.public_name !== row.upstream_model;
+}
+
+/** 与后端保持一致：一行模型在账号级隐藏开关下，下游实际能用的名称。 */
+function exposedNames(row: AccountModel, hideOriginal: boolean): string[] {
+  if (hideOriginal) {
+    return hasDownstreamName(row) ? [row.public_name] : [];
+  }
+  return hasDownstreamName(row)
+    ? [row.public_name, row.upstream_model]
+    : [row.upstream_model];
+}
 
 export function ModelSelectionDialog({
   account,
+  data,
   open,
   onClose,
+  onChanged,
 }: {
   account: Account | null;
+  data: ModelManagerData;
   open: boolean;
   onClose: () => void;
+  onChanged: () => Promise<unknown>;
 }) {
   const toast = useToast();
-  const [models, setModels] = useState<AccountModel[]>([]);
-  const [aliases, setAliases] = useState<Alias[]>([]);
-  const [aliasDraft, setAliasDraft] = useState<Record<string, string>>({});
-  const [checked, setChecked] = useState<Set<string>>(new Set());
-  const [onlyNew, setOnlyNew] = useState(false);
-  const [query, setQuery] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [fetching, setFetching] = useState(false);
-  const [aliasBusy, setAliasBusy] = useState(false);
-  const [manual, setManual] = useState("");
-  const [pendingRemove, setPendingRemove] = useState<SelectionWarning[] | null>(null);
-  const [clearAliasesConfirm, setClearAliasesConfirm] = useState(false);
-
-  const accountId = account?.id;
+  const accountId = account?.id ?? "";
   const managed = account?.auto_sync ?? false;
 
-  const hydrate = useCallback((catalog: AccountModel[], aliasRows: Alias[]) => {
-    const aliasByUpstream = new Map(
-      aliasRows.map((alias) => [alias.upstream_model, alias.public_name]),
-    );
-    setModels(catalog);
-    setAliases(aliasRows);
-    setAliasDraft(
-      Object.fromEntries(
-        catalog.map((model) => [
-          model.upstream_model,
-          aliasByUpstream.get(model.upstream_model) ?? "",
-        ]),
-      ),
-    );
-    setChecked(new Set(catalog.filter((model) => model.selected).map((model) => model.public_name)));
-  }, []);
+  const [rows, setRows] = useState<AccountModel[]>([]);
+  const [groupModels, setGroupModels] = useState<{ public_name: string; accounts: string[] }[]>([]);
+  const [hideOriginal, setHideOriginal] = useState(account?.hide_original ?? false);
+  const [loading, setLoading] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [onlyEnabled, setOnlyEnabled] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const [editing, setEditing] = useState<string | null>(null);
+  const [editAlias, setEditAlias] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [newUpstream, setNewUpstream] = useState("");
+  const [newAlias, setNewAlias] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<AccountModel | null>(null);
 
   const load = useCallback(async () => {
     if (!accountId) return;
+    setLoading(true);
     try {
-      const [catalog, aliasRows] = await Promise.all([
-        api.accountModels(accountId),
-        api.aliases(accountId),
-      ]);
-      hydrate(catalog, aliasRows);
+      const list = await api.accountModels(accountId);
+      setRows(list);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "读取模型目录失败");
+    } finally {
+      setLoading(false);
     }
-  }, [accountId, hydrate, toast]);
+  }, [accountId, toast]);
+
+  const loadGroupNames = useCallback(async () => {
+    if (!account) return;
+    try {
+      const result = await api.availableGroupModels(account.group_id);
+      setGroupModels(result.models);
+    } catch {
+      setGroupModels([]);
+    }
+  }, [account]);
 
   useEffect(() => {
     if (!open) return;
     setQuery("");
-    setOnlyNew(false);
-    setPendingRemove(null);
+    setOnlyEnabled(false);
+    setEditing(null);
+    setAdding(false);
+    setNotice(null);
+    setHideOriginal(account?.hide_original ?? false);
     void load();
-  }, [open, load]);
+    void loadGroupNames();
+  }, [open, account, load, loadGroupNames]);
+
+  const existingNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const item of groupModels) names.add(item.public_name);
+    for (const row of rows) names.add(row.public_name);
+    return [...names].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  }, [groupModels, rows]);
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return models.filter((model) => {
-      if (onlyNew && !model.is_new) return false;
-      if (!needle) return true;
-      return (
-        model.upstream_model.toLowerCase().includes(needle) ||
-        model.public_name.toLowerCase().includes(needle)
-      );
-    });
-  }, [models, onlyNew, query]);
-
-  const applyVisible = (mode: "all" | "none" | "new") => {
-    setChecked((current) => {
-      const next = new Set(current);
-      visible.forEach((model) => {
-        if (model.missing) {
-          next.delete(model.public_name);
-        } else if (mode === "all" || (mode === "new" && model.is_new)) {
-          next.add(model.public_name);
-        } else {
-          next.delete(model.public_name);
-        }
+    return [...rows]
+      .sort((a, b) => a.public_name.localeCompare(b.public_name, "zh-CN"))
+      .filter((row) => {
+        if (onlyEnabled && !row.selected) return false;
+        if (!needle) return true;
+        return (
+          row.upstream_model.toLowerCase().includes(needle) ||
+          row.public_name.toLowerCase().includes(needle)
+        );
       });
-      return next;
-    });
+  }, [rows, onlyEnabled, query]);
+
+  const mergeSuggestions = useMemo(() => {
+    if (!editing) return [];
+    const row = rows.find((item) => item.upstream_model === editing);
+    if (!row) return [];
+    const fingerprint = modelFingerprint(row.upstream_model);
+    return existingNames.filter(
+      (name) => name !== row.public_name && modelFingerprint(name) === fingerprint,
+    );
+  }, [editing, rows, existingNames]);
+
+  const enabledCount = rows.filter((row) => row.selected).length;
+  const renamedCount = rows.filter(hasDownstreamName).length;
+  const blockedCount = hideOriginal ? rows.filter((row) => !hasDownstreamName(row)).length : 0;
+  const deleteTargets = pendingDelete
+    ? data.targets.filter(
+        (target) =>
+          target.account_id === account?.id &&
+          target.upstream_model === pendingDelete.upstream_model,
+      ).length
+    : 0;
+
+  const beginEdit = (row: AccountModel) => {
+    setEditing(row.upstream_model);
+    setEditAlias(hasDownstreamName(row) ? row.public_name : "");
   };
 
-  const apply = async (force: boolean) => {
-    if (!accountId) return;
-    setBusy(true);
+  const cancelEdit = () => {
+    setEditing(null);
+    setEditAlias("");
+  };
+
+  const saveEdit = async () => {
+    if (!account || !editing) return;
+    const row = rows.find((item) => item.upstream_model === editing);
+    if (!row) return;
+    const alias = editAlias.trim();
+    setBusy(`save:${editing}`);
     try {
-      const result = await api.selectAccountModels(accountId, [...checked], force);
-      if ("needs_confirm" in result) {
-        setPendingRemove(result.needs_confirm);
-        return;
-      }
-      toast.success(
-        `已更新：新建 ${result.created_targets} 个目标，移除 ${result.removed_targets} 个`,
+      const updated = await api.updateAccountModel(account.id, {
+        upstream_model: editing,
+        alias,
+      });
+      setRows(updated);
+      cancelEdit();
+      setNotice(
+        alias
+          ? `已保存：下游用「${alias}」调用这个模型。`
+          : "已清空下游模型名，这个模型会使用上游原名。",
       );
-      setPendingRemove(null);
-      await load();
+      toast.success("模型名称已保存");
+      await onChanged();
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "应用选择失败");
+      toast.error(cause instanceof Error ? cause.message : "保存失败");
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
-  const fetchUpstream = async () => {
-    if (!accountId) return;
-    setFetching(true);
+  const saveHideOriginal = async (next: boolean) => {
+    if (!account) return;
+    setBusy("hide");
     try {
-      const [catalog, aliasRows] = await Promise.all([
-        api.refreshAccountModels(accountId),
-        api.aliases(accountId),
-      ]);
-      hydrate(catalog, aliasRows);
-      setOnlyNew(true);
-      toast.success(`拉取到 ${catalog.length} 个模型`);
+      await api.updateAccount(account.id, { hide_original: next });
+      setHideOriginal(next);
+      await load();
+      toast.success(next ? "已打开：只暴露设置了下游模型名的模型" : "已关闭：允许下游使用原模型名");
+      await onChanged();
     } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "拉取失败，已保留原列表");
+      toast.error(cause instanceof Error ? cause.message : "保存失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const toggleRow = async (row: AccountModel, selected: boolean) => {
+    if (!account) return;
+    setBusy(`toggle:${row.upstream_model}`);
+    try {
+      const updated = await api.updateAccountModel(account.id, {
+        upstream_model: row.upstream_model,
+        selected,
+      });
+      setRows(updated);
+      toast.success(selected ? "模型已启用" : "模型已停用");
+      await onChanged();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "操作失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeRow = async (row: AccountModel) => {
+    if (!account) return;
+    setBusy(`delete:${row.upstream_model}`);
+    try {
+      await api.deleteAccountModel(account.id, row.upstream_model);
+      setPendingDelete(null);
+      await load();
+      toast.success(`已删除 ${row.upstream_model}`);
+      await onChanged();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "删除失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const refreshUpstream = async () => {
+    if (!account) return;
+    setFetching(true);
+    setNotice(null);
+    try {
+      const list = await api.refreshAccountModels(account.id);
+      setRows(list);
+      const created = list.filter((row) => row.is_new).length;
+      const missing = list.filter((row) => row.missing).length;
+      setNotice(
+        `已从上游拉取 ${list.length} 个模型${created > 0 ? `，其中 ${created} 个是新增` : ""}${
+          missing > 0 ? `；${missing} 个已从上游消失` : ""
+        }。`,
+      );
+      toast.success(`已同步 ${list.length} 个模型`);
+      await onChanged();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "拉取失败，已保留原目录");
     } finally {
       setFetching(false);
     }
   };
 
-  const addManual = async () => {
-    if (!accountId || !manual.trim()) return;
-    setBusy(true);
+  const addModel = async () => {
+    if (!account || !newUpstream.trim()) return;
+    setBusy("add");
     try {
-      await api.addManualModel(accountId, manual.trim());
-      setManual("");
-      toast.success("手动模型已加入调度");
+      await api.addManualModel(account.id, newUpstream.trim(), newAlias.trim());
+      setNewUpstream("");
+      setNewAlias("");
+      setAdding(false);
       await load();
+      toast.success("模型已加入");
+      await onChanged();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "添加失败");
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
   const syncManaged = async () => {
-    if (!accountId) return;
-    setBusy(true);
+    if (!account) return;
+    setBusy("sync");
     try {
-      const result = await api.syncAccountModels(accountId);
-      toast.success(`已托管 ${result.managed_models} 个模型`);
+      const result = await api.syncAccountModels(account.id);
       await load();
+      toast.success(`已托管 ${result.managed_models} 个模型`);
+      await onChanged();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "同步失败");
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
-
-  const saveAliases = async () => {
-    if (!accountId) return;
-    setAliasBusy(true);
-    try {
-      const rows: Alias[] = models
-        .map((model) => ({
-          upstream_model: model.upstream_model,
-          public_name: (aliasDraft[model.upstream_model] ?? "").trim(),
-        }))
-        .filter((alias) => alias.public_name.length > 0 && alias.public_name !== alias.upstream_model);
-      await api.updateAliases(accountId, rows);
-      toast.success(`已保存 ${rows.length} 个别名`);
-      await load();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "别名保存失败");
-    } finally {
-      setAliasBusy(false);
-    }
-  };
-
-  const clearAliases = () => {
-    setAliasDraft((current) =>
-      Object.fromEntries(Object.keys(current).map((key) => [key, ""])),
-    );
-  };
-
-  const selectedCount = checked.size;
 
   return (
     <>
       <Modal
         open={open}
         onClose={onClose}
-        title={account ? `模型 · ${account.name}` : "模型"}
+        title={account ? `模型管理 · ${account.name}` : "模型管理"}
         className="model-selection-modal"
         footer={
-          managed ? undefined : (
-            <>
-              <span className="text-faint tabular" style={{ fontSize: 12 }}>
-                已选 {selectedCount} / 共 {models.length}
-              </span>
-              <div className="spacer" />
-              <Button onClick={onClose}>取消</Button>
-              <Button variant="primary" onClick={() => void apply(false)} disabled={busy}>
-                {busy ? <><span className="spinner spinner-sm" aria-hidden="true" /> 应用中…</> : "应用选择"}
-              </Button>
-            </>
-          )
-        }
-      >
-        <div className="stack model-dialog-content">
-          {managed ? (
-            <div className="callout callout-info">
-              该账号已开启模型自动同步，全部上游模型由后台托管，忽略选择集。
-            </div>
-          ) : (
-            <>
-              <div className="model-toolbar">
-                <Button
-                  variant="primary"
-                  icon={fetching ? <span className="spinner spinner-sm" aria-hidden="true" /> : <IconRefresh size={13} />}
-                  onClick={() => void fetchUpstream()}
-                  disabled={fetching}
-                >
-                  {fetching ? "拉取中…" : "获取模型"}
-                </Button>
-                <input
-                  className="input model-search"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="搜索 upstream_model / public_name"
-                  aria-label="搜索模型"
-                />
-                <label className="row model-new-filter">
-                  <input
-                    type="checkbox"
-                    checked={onlyNew}
-                    onChange={(e) => setOnlyNew(e.target.checked)}
-                    disabled={models.every((model) => !model.is_new)}
-                  />
-                  只看新增
-                </label>
-              </div>
-              <div className="model-bulk-actions">
-                <div className="row" style={{ gap: 6 }}>
-                  <Button size="sm" onClick={() => applyVisible("all")} disabled={visible.length === 0}>
-                    全选
-                  </Button>
-                  <Button size="sm" onClick={() => applyVisible("none")} disabled={visible.length === 0}>
-                    全不选
-                  </Button>
-                  <Button size="sm" onClick={() => applyVisible("new")} disabled={visible.length === 0}>
-                    只选新增
-                  </Button>
-                </div>
-                <span className="text-faint tabular">已选 {selectedCount} / 共 {models.length}</span>
-              </div>
-
-              {models.length === 0 ? (
-                <p className="text-faint model-empty-copy">
-                  还没有模型目录。点击「获取模型」从上游拉取，或手动输入上游模型名。
-                </p>
-              ) : (
-                <div className="table-wrap model-selection-table-wrap">
-                  <table className="data model-selection-table">
-                    <thead>
-                      <tr>
-                        <th aria-label="选择" />
-                        <th>上游模型 / 对外名</th>
-                        <th>状态</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visible.length === 0 ? (
-                        <tr><td colSpan={3} className="table-empty-cell">没有匹配的模型</td></tr>
-                      ) : visible.map((model) => {
-                        const aliased = model.upstream_model !== model.public_name;
-                        return (
-                          <tr key={model.upstream_model} className={model.missing ? "is-missing" : undefined}>
-                            <td className="model-checkbox-cell">
-                              <input
-                                type="checkbox"
-                                checked={checked.has(model.public_name)}
-                                disabled={model.missing}
-                                title={model.missing ? "上游已消失" : undefined}
-                                aria-label={`选择 ${model.public_name}`}
-                                onChange={(e) => {
-                                  setChecked((current) => {
-                                    const next = new Set(current);
-                                    if (e.target.checked) next.add(model.public_name);
-                                    else next.delete(model.public_name);
-                                    return next;
-                                  });
-                                }}
-                              />
-                            </td>
-                            <td>
-                              <div className="mono model-upstream-name" title={model.upstream_model}>
-                                {model.upstream_model}
-                              </div>
-                              <div className={`mono model-public-name${aliased ? " is-aliased" : ""}`} title={model.public_name}>
-                                {aliased ? `对外名：${model.public_name}` : model.public_name}
-                              </div>
-                            </td>
-                            <td>
-                              <div className="row model-state-badges">
-                                {model.is_new && <Badge tone="info">新增</Badge>}
-                {/* "你排除过"（§16.2）：和"从没出现过"分开。没有这一条，
-                    管理员会以为之前的取消勾选没生效，于是再点一次。 */}
-                {model.excluded && !model.selected && <Badge tone="warn">你排除过</Badge>}
-                                {model.missing && <Badge tone="danger">上游已消失</Badge>}
-                                {!model.is_new && !model.missing && model.selected && <Badge tone="success">已在用</Badge>}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              <div className="row model-manual-add">
-                <input
-                  className="input mono"
-                  style={{ flex: 1 }}
-                  value={manual}
-                  placeholder="手动输入上游模型名（上游列表接口不可用时）"
-                  onChange={(e) => setManual(e.target.value)}
-                />
-                <Button
-                  icon={<IconPlus size={13} />}
-                  onClick={() => void addManual()}
-                  disabled={busy || !manual.trim()}
-                >
-                  手动添加
-                </Button>
-              </div>
-            </>
-          )}
-
-          {managed && (
-            <Button
-              variant="primary"
-              icon={busy ? <span className="spinner spinner-sm" aria-hidden="true" /> : <IconRefresh size={13} />}
-              onClick={() => void syncManaged()}
-              disabled={busy}
-            >
-              {busy ? "同步中…" : "立即同步"}
-            </Button>
-          )}
-
-          <section className="alias-editor">
-            <div className="alias-editor-head">
-              <div>
-                <h3 className="card-title">模型别名</h3>
-                <p className="card-desc">留空表示跟随上游真名；一次保存当前目录里的全部改动。</p>
-              </div>
-              <Button
-                size="sm"
-                variant="danger"
-                onClick={() => setClearAliasesConfirm(true)}
-                disabled={models.length === 0 || aliasBusy}
-              >
-                清空所有别名
-              </Button>
-            </div>
-            {models.length === 0 ? (
-              <p className="text-faint">先获取或同步模型目录，再设置对外名。</p>
-            ) : (
-              <div className="table-wrap alias-table-wrap">
-                <table className="data alias-table">
-                  <thead>
-                    <tr><th>上游真名</th><th>对外名</th><th>状态</th></tr>
-                  </thead>
-                  <tbody>
-                    {models.map((model) => {
-                      const value = aliasDraft[model.upstream_model] ?? "";
-                      const changed = value.trim().length > 0 && value.trim() !== model.upstream_model;
-                      return (
-                        <tr key={model.upstream_model}>
-                          <td className="mono cell-truncate" title={model.upstream_model}>{model.upstream_model}</td>
-                          <td>
-                            <input
-                              className="input mono alias-input"
-                              value={value}
-                              placeholder={model.upstream_model}
-                              maxLength={100}
-                              onChange={(e) =>
-                                setAliasDraft((current) => ({
-                                  ...current,
-                                  [model.upstream_model]: e.target.value,
-                                }))
-                              }
-                            />
-                          </td>
-                          <td>{changed ? <Badge tone="accent">已改</Badge> : <span className="text-faint">跟随上游</span>}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            <div className="alias-editor-foot">
-              <span className="text-faint">当前已加载 {aliases.length} 个已保存别名</span>
-              <Button variant="secondary" onClick={() => void saveAliases()} disabled={aliasBusy || models.length === 0}>
-                {aliasBusy ? <><span className="spinner spinner-sm" aria-hidden="true" /> 保存中…</> : "保存别名"}
-              </Button>
-            </div>
-          </section>
-        </div>
-      </Modal>
-
-      <Modal
-        open={pendingRemove !== null}
-        onClose={() => setPendingRemove(null)}
-        title="这些模型最近 24 小时有流量"
-        footer={
           <>
-            <Button onClick={() => setPendingRemove(null)}>取消</Button>
-            <Button variant="danger" onClick={() => void apply(true)} disabled={busy}>
-              仍要移除
-            </Button>
+            <span className="text-faint tabular" style={{ fontSize: 12 }}>
+              {loading
+                ? "加载中…"
+                : `${rows.length} 个模型 · ${enabledCount} 个启用 · ${renamedCount} 个已设下游名`}
+              {blockedCount > 0 && ` · ${blockedCount} 个未设下游名且被隐藏`}
+            </span>
+            <div className="spacer" />
+            <Button onClick={onClose}>关闭</Button>
           </>
         }
       >
-        <div className="stack" style={{ gap: 6 }}>
-          <p style={{ margin: 0, lineHeight: 1.7 }}>
-            取消勾选会移除对应的调度目标，在途请求不受影响。以下模型最近 24 小时仍有调用：
-          </p>
-          {(pendingRemove ?? []).map((warning) => (
-            <div key={warning.public_name} className="row" style={{ gap: 8 }}>
-              <span className="mono cell-strong">{warning.public_name}</span>
-              <Badge tone="warn">{warning.calls} 次</Badge>
+        <div className="stack model-dialog-content">
+          {managed && (
+            <div className="callout callout-info">
+              该账号已开启模型自动同步：上游全部模型由后台托管，删除 / 停用 /
+              改名暂不可用。关闭自动同步后可回到手动选择集。
             </div>
-          ))}
+          )}
+
+          <div className="model-help">
+            <strong>下游模型名怎么填？</strong>
+            <span>
+              留空就是使用上游原名；填写后，下游用这个名字调用。多个账号把同一个模型填成
+              同一个名字，系统会自动合并成一个模型。
+            </span>
+          </div>
+
+          <Switch
+            checked={hideOriginal}
+            onChange={(next) => void saveHideOriginal(next)}
+            label="隐藏原始模型名（整个账号）"
+            hint={
+              hideOriginal
+                ? "已打开：只暴露填写了下游模型名的模型；没填的模型下游无法获取。"
+                : "关闭时：下游既能用下游模型名，也能用上游原模型名。"
+            }
+          />
+
+          {notice && (
+            <div className="callout callout-info" role="status">
+              <span style={{ flex: 1 }}>{notice}</span>
+              <button type="button" className="link-button" onClick={() => setNotice(null)}>
+                知道了
+              </button>
+            </div>
+          )}
+
+          <div className="model-manager-toolbar">
+            <div className="input-with-icon list-search">
+              <IconSearch size={14} />
+              <input
+                className="input"
+                value={query}
+                placeholder="搜索模型名"
+                aria-label="搜索模型"
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            </div>
+            <label className="filter-toggle">
+              <input
+                type="checkbox"
+                checked={onlyEnabled}
+                onChange={(event) => setOnlyEnabled(event.target.checked)}
+              />
+              只看已启用
+            </label>
+            <span className="spacer" />
+            {!managed && (
+              <Button
+                icon={<IconPlus size={13} />}
+                onClick={() => setAdding((current) => !current)}
+                disabled={adding || busy !== null}
+              >
+                添加模型
+              </Button>
+            )}
+            <Button
+              variant="primary"
+              icon={
+                fetching ? (
+                  <span className="spinner spinner-sm" aria-hidden="true" />
+                ) : (
+                  <IconRefresh size={13} />
+                )
+              }
+              onClick={() => void refreshUpstream()}
+              disabled={fetching || busy !== null}
+            >
+              {fetching ? "拉取中…" : "获取上游模型"}
+            </Button>
+            {managed && (
+              <Button
+                variant="primary"
+                icon={
+                  busy === "sync" ? (
+                    <span className="spinner spinner-sm" aria-hidden="true" />
+                  ) : (
+                    <IconRefresh size={13} />
+                  )
+                }
+                onClick={() => void syncManaged()}
+                disabled={busy !== null}
+              >
+                {busy === "sync" ? "同步中…" : "立即同步"}
+              </Button>
+            )}
+          </div>
+
+          {adding && !managed && (
+            <div className="model-add-row model-add-row-plain">
+              <input
+                className="input mono"
+                value={newUpstream}
+                placeholder="上游模型名，例如 gpt-5.6-sol-openai"
+                aria-label="上游模型名"
+                onChange={(event) => setNewUpstream(event.target.value)}
+              />
+              <input
+                className="input mono"
+                value={newAlias}
+                placeholder="下游模型名（可留空）"
+                aria-label="下游模型名"
+                list="akhub-group-model-names"
+                onChange={(event) => setNewAlias(event.target.value)}
+              />
+              <Button
+                variant="primary"
+                icon={
+                  busy === "add" ? (
+                    <span className="spinner spinner-sm" aria-hidden="true" />
+                  ) : (
+                    <IconPlus size={13} />
+                  )
+                }
+                onClick={() => void addModel()}
+                disabled={busy !== null || !newUpstream.trim()}
+              >
+                添加
+              </Button>
+              <Button variant="ghost" onClick={() => setAdding(false)}>
+                取消
+              </Button>
+            </div>
+          )}
+
+          <datalist id="akhub-group-model-names">
+            {existingNames.map((name) => (
+              <option key={name} value={name} />
+            ))}
+          </datalist>
+
+          {rows.length === 0 ? (
+            <div className="empty" style={{ padding: 24 }}>
+              <div className="empty-title">还没有模型</div>
+              <p className="empty-desc">
+                点「获取上游模型」从站点拉取；接口不可用时也可以手动添加上游模型名。
+              </p>
+              {!managed && (
+                <Button variant="primary" icon={<IconPlus size={13} />} onClick={() => setAdding(true)}>
+                  手动添加
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="table-wrap model-manager-wrap">
+              <table className="data model-manager-table model-manager-table-wide">
+                <thead>
+                  <tr>
+                    <th aria-label="启用" />
+                    <th>上游模型名</th>
+                    <th>下游模型名</th>
+                    <th>下游可用名称</th>
+                    <th>状态</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="table-empty-cell">
+                        没有符合条件的模型
+                      </td>
+                    </tr>
+                  ) : (
+                    visible.map((row) => {
+                      const renamed = hasDownstreamName(row);
+                      const names = exposedNames(row, hideOriginal);
+                      const isEditing = editing === row.upstream_model;
+                      const rowBusy =
+                        busy === `toggle:${row.upstream_model}` ||
+                        busy === `save:${row.upstream_model}` ||
+                        busy === `delete:${row.upstream_model}`;
+                      return (
+                        <FragmentRow
+                          key={row.upstream_model}
+                          row={row}
+                          renamed={renamed}
+                          names={names}
+                          hiddenWithoutName={hideOriginal && !renamed}
+                          hideOriginal={hideOriginal}
+                          isEditing={isEditing}
+                          rowBusy={rowBusy}
+                          managed={managed}
+                          editAlias={editAlias}
+                          mergeSuggestions={mergeSuggestions}
+                          existingNames={existingNames}
+                          onEdit={() => beginEdit(row)}
+                          onCancelEdit={cancelEdit}
+                          onAliasChange={setEditAlias}
+                          onSave={() => void saveEdit()}
+                          onToggle={(selected) => void toggleRow(row, selected)}
+                          onDelete={() => setPendingDelete(row)}
+                        />
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </Modal>
 
       <ConfirmDialog
-        open={clearAliasesConfirm}
-        title="清空所有别名"
+        open={pendingDelete !== null}
+        title="删除模型"
         danger
-        confirmLabel="清空"
-        message="这会把当前目录里的所有对外名恢复为上游真名。确认后还需要点击「保存别名」才会提交。"
-        onClose={() => setClearAliasesConfirm(false)}
-        onConfirm={clearAliases}
+        confirmLabel="删除"
+        message={
+          pendingDelete ? (
+            <>
+              删除「{pendingDelete.upstream_model}」会移除它对应的 {deleteTargets} 个调度目标，
+              下游将无法再用这个模型请求，在途请求会正常完成。
+            </>
+          ) : null
+        }
+        onClose={() => setPendingDelete(null)}
+        onConfirm={() => pendingDelete && void removeRow(pendingDelete)}
       />
+    </>
+  );
+}
+
+function FragmentRow({
+  row,
+  renamed,
+  names,
+  hiddenWithoutName,
+  hideOriginal,
+  isEditing,
+  rowBusy,
+  managed,
+  editAlias,
+  mergeSuggestions,
+  existingNames,
+  onEdit,
+  onCancelEdit,
+  onAliasChange,
+  onSave,
+  onToggle,
+  onDelete,
+}: {
+  row: AccountModel;
+  renamed: boolean;
+  names: string[];
+  hiddenWithoutName: boolean;
+  hideOriginal: boolean;
+  isEditing: boolean;
+  rowBusy: boolean;
+  managed: boolean;
+  editAlias: string;
+  mergeSuggestions: string[];
+  existingNames: string[];
+  onEdit: () => void;
+  onCancelEdit: () => void;
+  onAliasChange: (value: string) => void;
+  onSave: () => void;
+  onToggle: (selected: boolean) => void;
+  onDelete: () => void;
+}) {
+  return (
+    <>
+      <tr className={row.missing ? "is-missing" : undefined}>
+        <td className="model-checkbox-cell">
+          <input
+            type="checkbox"
+            checked={row.selected}
+            disabled={managed || row.missing || rowBusy}
+            aria-label={`启用 ${row.upstream_model}`}
+            title={row.missing ? "上游已消失，重新出现后会自动恢复" : "启用 / 停用该模型"}
+            onChange={(event) => onToggle(event.target.checked)}
+          />
+        </td>
+        <td>
+          <div className="mono cell-strong cell-truncate" title={row.upstream_model}>
+            {row.upstream_model}
+          </div>
+          <div className="row model-row-badges">
+            {row.is_new && <Badge tone="info">本次新增</Badge>}
+          </div>
+        </td>
+        <td>
+          {renamed ? (
+            <div className="mono cell-strong cell-truncate" title={row.public_name}>
+              {row.public_name}
+            </div>
+          ) : (
+            <span className="text-faint">未设置（使用上游原名）</span>
+          )}
+        </td>
+        <td>
+          {names.length === 0 ? (
+            <Badge tone="warn">下游不可获取</Badge>
+          ) : (
+            <div className="model-exposed-names">
+              {names.map((name) => (
+                <span key={name} className="model-exposed-chip mono" title={`下游可用：${name}`}>
+                  {name}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="field-hint" style={{ marginTop: 4 }}>
+            {hiddenWithoutName
+              ? "没有填写下游模型名，且账号已打开“隐藏原始模型名”。"
+              : hideOriginal
+                ? "只暴露下游模型名。"
+                : renamed
+                  ? "下游模型名 + 上游原名都能用。"
+                  : "下游使用上游原名。"}
+          </div>
+        </td>
+        <td>
+          <div className="row model-state-badges">
+            {row.missing ? (
+              <Badge tone="danger" dot>
+                上游已消失
+              </Badge>
+            ) : row.selected ? (
+              <Badge tone="success" dot>
+                已启用
+              </Badge>
+            ) : (
+              <Badge tone="neutral" dot>
+                已停用
+              </Badge>
+            )}
+            {row.excluded && !row.missing && <Badge tone="warn">你停用过</Badge>}
+          </div>
+        </td>
+        <td>
+          <div className="cell-actions">
+            <Button
+              size="sm"
+              icon={<IconEdit size={13} />}
+              onClick={onEdit}
+              disabled={managed || rowBusy}
+            >
+              改名
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              icon={<IconTrash size={13} />}
+              title="从目录删除并移除目标"
+              aria-label={`删除模型 ${row.upstream_model}`}
+              onClick={onDelete}
+              disabled={managed || rowBusy}
+            />
+          </div>
+        </td>
+      </tr>
+      {isEditing && (
+        <tr className="model-edit-row">
+          <td />
+          <td colSpan={5}>
+            <div className="model-edit-form model-edit-form-plain">
+              <div className="model-edit-field">
+                <label className="field-label" htmlFor={`alias-${row.upstream_model}`}>
+                  下游模型名
+                </label>
+                <input
+                  id={`alias-${row.upstream_model}`}
+                  className="input mono"
+                  value={editAlias}
+                  list="akhub-group-model-names"
+                  placeholder={row.upstream_model}
+                  maxLength={100}
+                  onChange={(event) => onAliasChange(event.target.value)}
+                />
+                {existingNames.some((name) => name !== row.public_name) && (
+                  <select
+                    className="select"
+                    value=""
+                    aria-label="合并到已有模型"
+                    onChange={(event) => {
+                      if (event.target.value) onAliasChange(event.target.value);
+                    }}
+                  >
+                    <option value="">合并到已有模型…</option>
+                    {existingNames
+                      .filter((name) => name !== row.public_name)
+                      .map((name) => (
+                        <option key={name} value={name}>
+                          {name}
+                        </option>
+                      ))}
+                  </select>
+                )}
+                <span className="field-hint">
+                  留空 = 使用上游原名；填写后下游用这个名字调用。多个账号填成同一个名字会自动合并。
+                </span>
+              </div>
+              <div className="model-edit-actions">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  icon={
+                    rowBusy ? (
+                      <span className="spinner spinner-sm" aria-hidden="true" />
+                    ) : (
+                      <IconCheck size={13} />
+                    )
+                  }
+                  onClick={onSave}
+                  disabled={rowBusy}
+                >
+                  保存
+                </Button>
+                <Button size="sm" icon={<IconX size={13} />} onClick={onCancelEdit} disabled={rowBusy}>
+                  取消
+                </Button>
+              </div>
+            </div>
+            {mergeSuggestions.length > 0 && (
+              <div className="model-merge-suggestions">
+                <span className="text-faint">可以合并到已有模型：</span>
+                {mergeSuggestions.map((name) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="model-suggestion"
+                    onClick={() => onAliasChange(name)}
+                  >
+                    用「{name}」
+                  </button>
+                ))}
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
     </>
   );
 }

@@ -179,7 +179,7 @@ async fn fetching_models_then_selecting_builds_merged_dispatch_targets() {
     assert_eq!(sonnet.len(), 1);
     assert!(!models.contains_key("gpt-4o"), "没勾的不建目标");
 
-    // 目标优先级继承账号默认人工优先级（§16.3）：账号默认 50。
+    // 目标优先级继承账号默认人工优先级（§16.3）：默认 0。
     let targets = akhub.state.store.list_targets().await.unwrap();
     assert!(targets.iter().all(|t| t.priority_override.is_none()));
     let config = akhub.state.config.current();
@@ -192,7 +192,7 @@ async fn fetching_models_then_selecting_builds_merged_dispatch_targets() {
         .get("glm-4.6")
         .unwrap();
     assert_eq!(view.targets.len(), 2);
-    assert!(view.targets.iter().all(|t| t.priority == 50));
+    assert!(view.targets.iter().all(|t| t.priority == 0));
 }
 
 #[tokio::test]
@@ -267,7 +267,218 @@ async fn aliases_merge_the_same_model_from_different_sites() {
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert_eq!(names, vec!["claude-sonnet-4-5"]);
+    // 默认不隐藏原始模型：对外名与两个上游真名都能请求到同一组目标。
+    assert_eq!(
+        names,
+        vec![
+            "anthropic/claude-sonnet-4.5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn model_manager_merges_aliases_and_toggles_original_exposure() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [
+            {"id": "gpt-5.6-sol-openai"},
+            {"id": "gpt-5.6-sol-old"}
+        ]
+    })));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account_id).await;
+
+    // 两个上游真名一键归并到同一个下游模型名。
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/merge",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({
+            "upstream_models": ["gpt-5.6-sol-openai", "gpt-5.6-sol-old"],
+            "public_name": "gpt-5.6-sol"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let rows: Vec<Value> = response.json().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["public_name"] == "gpt-5.6-sol"));
+    assert!(
+        rows.iter()
+            .all(|row| row["exposed_names"] == json!(["gpt-5.6-sol", row["upstream_model"]]))
+    );
+
+    let merged = logical_models(&akhub).await;
+    assert_eq!(merged.get("gpt-5.6-sol").map(Vec::len), Some(2));
+
+    // 打开账号级"隐藏原始模型名"：两个上游真名同时从 /v1/models 消失。
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"hide_original": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let rows: Vec<Value> = client
+        .get(format!(
+            "{}/admin/api/accounts/{account_id}/models",
+            akhub.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|row| row["hide_original"] == true));
+    assert!(
+        rows.iter()
+            .all(|row| row["exposed_names"] == json!(["gpt-5.6-sol"]))
+    );
+
+    let body: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hidden_names: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect();
+    assert_eq!(hidden_names, vec!["gpt-5.6-sol"]);
+
+    // 关闭后，两个上游真名重新出现在 /v1/models 里。
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"hide_original": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let body: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["gpt-5.6-sol", "gpt-5.6-sol-old", "gpt-5.6-sol-openai"]
+    );
+
+    // 删除其中一行，只移除它自己的目标。
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/delete",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"upstream_model": "gpt-5.6-sol-old"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(
+        logical_models(&akhub)
+            .await
+            .get("gpt-5.6-sol")
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn account_hide_original_blocks_models_without_downstream_name() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "plain-model"}]})));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account_id).await;
+    select(&client, &akhub, &account_id, &["plain-model"], false).await;
+
+    // 默认没有隐藏原始名：模型可见、可请求。
+    let listed: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"][0]["id"], "plain-model");
+
+    // 打开账号级隐藏后，这个没有下游模型名的模型整体不可见、不可请求。
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"hide_original": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let listed: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(0));
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "plain-model", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
 }
 
 #[tokio::test]

@@ -857,7 +857,10 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .json()
     .await
     .unwrap();
-    assert_eq!(target["priority"], 80, "覆盖值优先于账号默认值");
+    // 目标不再有独立优先级：payload 里的旧字段被忽略，统一继承账号默认 0。
+    assert_eq!(target["priority"], 0, "目标优先级统一来自账号默认值");
+    assert_eq!(target["priority_override"], Value::Null);
+    assert_eq!(target["hide_original"], false);
     assert_eq!(target["status"], "active");
     assert_eq!(target["inflight"], 0);
     // 目标覆盖并发，其余继承账号。

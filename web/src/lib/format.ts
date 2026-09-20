@@ -100,3 +100,76 @@ export function parseLimit(raw: string): number | null | undefined {
   if (!Number.isInteger(value) || value <= 0) return undefined;
   return value;
 }
+
+/** 审计动作 → 中文标签。未知动作原样返回，新增动作时不会丢信息。 */
+const CHANGE_ACTION_LABELS: Record<string, string> = {
+  update_settings: "修改系统设置",
+  change_password: "修改管理员密码",
+  create_group: "新建分组",
+  update_group: "更新分组",
+  delete_group: "删除分组",
+  regenerate_group_key: "重置分组 Key",
+  create_account: "新建上游账号",
+  update_account: "更新上游账号",
+  delete_account: "删除上游账号",
+  copy_account: "复制上游账号",
+  test_account: "测试上游账号",
+  refresh_multiplier: "刷新单个账号倍率",
+  refresh_all_multipliers: "批量刷新倍率",
+  save_new_api_site: "保存站点凭据",
+  delete_new_api_site: "删除站点凭据",
+  create_logical_model: "新建逻辑模型",
+  update_logical_model: "更新逻辑模型",
+  delete_logical_model: "删除逻辑模型",
+  create_target: "添加调度目标",
+  update_target: "更新调度目标",
+  delete_target: "移除调度目标",
+  refresh_account_models: "刷新模型目录",
+  select_account_models: "更新模型选择集",
+  sync_account_models: "执行托管同步",
+  add_manual_model: "手动添加模型",
+  update_aliases: "更新模型名",
+  calibrate_account: "校准倍率",
+  backup_export: "导出配置备份",
+  backup_import: "恢复配置备份",
+};
+
+export function formatChangeAction(action: string): string {
+  return CHANGE_ACTION_LABELS[action] ?? action;
+}
+
+export function formatChangeResult(result: string): string {
+  if (result === "ok" || result === "success") return "成功";
+  if (result === "failed" || result === "error") return "失败";
+  return result;
+}
+
+/** 尝试结果枚举 → 中文标签。 */
+export function formatAttemptOutcome(outcome: string): string {
+  const labels: Record<string, string> = {
+    ok: "成功",
+    failed: "失败",
+    missing_endpoint: "端点不存在",
+  };
+  return labels[outcome] ?? outcome;
+}
+
+/** 秒 → 人类可读时长。用于设置项旁的换算提示。 */
+export function humanizeSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "—";
+  if (seconds === 0) return "0";
+  if (seconds % 86_400 === 0) return `${seconds / 86_400} 天`;
+  if (seconds % 3_600 === 0) return `${seconds / 3_600} 小时`;
+  if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+  return `${seconds} 秒`;
+}
+
+/** "更新于 X 分钟前"。 */
+export function formatUpdatedAgo(lastUpdated: number | null, now: number): string {
+  if (lastUpdated === null) return "尚未成功加载";
+  const delta = Math.max(0, Math.floor((now - lastUpdated) / 1000));
+  if (delta < 20) return "刚刚更新";
+  if (delta < 3600) return `${Math.floor(delta / 60)} 分钟前更新`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)} 小时前更新`;
+  return `${Math.floor(delta / 86400)} 天前更新`;
+}

@@ -1,13 +1,13 @@
 /**
  * 概览页。
  *
- * 配置链是 分组 → 账号 → 逻辑模型 → 调度目标，缺任何一环都无法对外服务，
- * 而错误只会在真实调用时以 503 的形式暴露。所以配置未完成时，这一页的主体
- * 是一份引导清单：直接告诉你缺哪一步、点哪里补。
+ * 配置链是 分组 → 账号 → 账号里的模型目录（自动生成调度目标），缺任何一环
+ * 都无法对外服务，而错误只会在真实调用时以 503 的形式暴露。所以配置未完成时，
+ * 这一页的主体是一份引导清单：直接告诉你缺哪一步、点哪里补。
  */
 import type { Data } from "../lib/store";
 import type { Route } from "../routes";
-import { Badge, Button, Card, EmptyState } from "../components/ui";
+import { Badge, Button, Card, CopyButton, EmptyState, InfoTip } from "../components/ui";
 import { TrendChart } from "../components/TrendChart";
 import {
   IconAlert,
@@ -21,6 +21,8 @@ import {
   IconServer,
 } from "../components/Icons";
 import {
+  formatChangeAction,
+  formatChangeResult,
   formatDuration,
   formatRelative,
   formatStaleFor,
@@ -29,13 +31,14 @@ import {
 } from "../lib/format";
 import { TARGET_STATUS_LABELS } from "../lib/types";
 import type { TargetStatus } from "../lib/types";
+import { errorCodeInfo } from "../lib/error-codes";
 
 export function Overview({
   data,
   navigate,
 }: {
   data: Data;
-  navigate: (route: Route) => void;
+  navigate: (route: Route, params?: Record<string, string>) => void;
 }) {
   const { overview, groups, accounts, models, targets, requests } = data;
 
@@ -53,14 +56,14 @@ export function Overview({
       route: "accounts" as const,
     },
     {
-      title: "定义逻辑模型",
-      desc: "下游看到的模型名，隐藏真实上游与账号",
+      title: "配置模型名",
+      desc: "在账号的模型管理里获取模型；把同一个模型填成相同的下游模型名，就会合并显示",
       done: models.length > 0,
-      route: "models" as const,
+      route: "accounts" as const,
     },
     {
-      title: "绑定调度目标",
-      desc: "把逻辑模型接到「账号 + 具体上游模型」上",
+      title: "启用调度",
+      desc: "启用模型后自动生成调度目标，按账号评分与可用性自动分配",
       done: targets.length > 0,
       route: "targets" as const,
     },
@@ -83,83 +86,136 @@ export function Overview({
 
       {/* 保留期为 0 时明细不落库，统计只覆盖当日——不说清楚会被误读成"没数据"（§24.2）。 */}
       {overview.retention_off && (
-        <div className="callout callout-warn">
-          请求元数据保留天数当前为 0：明细不落库，这里的运行指标来自内存汇总，
-          <b>只覆盖当天</b>，重启后清零。要保留历史请在「设置」里调大保留天数。
+        <div className="callout callout-warn" role="status">
+          <span style={{ flex: 1 }}>
+            请求元数据保留天数当前为 0：明细不落库，这里的运行指标来自内存汇总，
+            <b>只覆盖当天</b>，重启后清零。
+          </span>
+          <Button size="sm" variant="secondary" onClick={() => navigate("settings")}>
+            去设置
+          </Button>
         </div>
       )}
 
-      <div className="stat-grid">
-        <Stat
-          icon={<IconKey size={13} />}
-          label="分组"
-          value={overview.groups}
-          hint={`${accounts.length} 个上游账号`}
-        />
-        <Stat
-          icon={<IconCube size={13} />}
-          label="对外可用模型"
-          value={overview.listable_models}
-          hint={
-            overview.logical_models > overview.listable_models
-              ? `${overview.logical_models - overview.listable_models} 个因零目标未上架`
-              : "全部已上架"
-          }
-        />
-        <Stat
-          icon={<IconRoute size={13} />}
-          label="调度目标"
-          value={overview.dispatch_targets}
-          hint={
-            unhealthy.length === 0
-              ? overview.dispatch_targets > 0
-                ? `全部正常 · ${overview.sticky_bindings} 个粘性绑定`
-                : undefined
-              : unhealthy.map(([status, count]) => `${count} 个${TARGET_STATUS_LABELS[status]}`).join("，")
-          }
-        />
-        <Stat
-          icon={<IconInbox size={13} />}
-          label="窗口内请求数"
-          value={formatMetricNumber(overview.requests)}
-          hint={`${windowLabel}窗口 · 按开始时间统计`}
-        />
-        <Stat
-          icon={<IconCheck size={13} />}
-          label="成功率"
-          value={formatSuccessRate(overview.success_rate)}
-          hint={`${windowLabel}窗口`}
-        />
-        <Stat
-          icon={<IconGauge size={13} />}
-          label="平均延迟"
-          value={formatMetricDuration(overview.avg_latency_ms)}
-          hint={`P50 ${formatMetricDuration(overview.p50_latency_ms)}`}
-        />
-        <Stat
-          icon={<IconGauge size={13} />}
-          label="P95 延迟"
-          value={formatMetricDuration(overview.p95_latency_ms)}
-          hint={`${windowLabel}窗口`}
-        />
-        <Stat
-          icon={<IconRoute size={13} />}
-          label="当前在途"
-          value={formatMetricNumber(overview.in_flight)}
-          hint="流式请求在连接结束后扣除"
-        />
-        <Stat
-          icon={<IconInbox size={13} />}
-          label="当前排队"
-          value={formatMetricNumber(overview.queued)}
-          hint="正在等待调度的请求"
-        />
-        <Stat
-          icon={<IconAlert size={13} />}
-          label="队列超时数"
-          value={formatMetricNumber(overview.queue_timeouts)}
-          hint={`${windowLabel}窗口`}
-        />
+      <div className="stat-sections">
+        <section className="stat-section">
+          <div className="stat-section-head">
+            <h2 className="stat-section-title">配置规模</h2>
+            <span className="stat-section-desc">
+              这条链路缺任何一环，请求都会以 503 失败
+            </span>
+          </div>
+          <div className="stat-grid">
+            <Stat
+              icon={<IconKey size={13} />}
+              label="分组"
+              value={overview.groups}
+              hint="调度的硬边界"
+              onClick={() => navigate("groups")}
+            />
+            <Stat
+              icon={<IconServer size={13} />}
+              label="上游账号"
+              value={accounts.length}
+              hint={`${overview.groups} 个分组内`}
+              onClick={() => navigate("accounts")}
+            />
+            <Stat
+              icon={<IconCube size={13} />}
+              label="对外可用模型"
+              value={overview.listable_models}
+              hint={
+                overview.unlisted_models > 0
+                  ? `${overview.unlisted_models} 个逻辑模型因零目标未上架`
+                  : `${overview.logical_models} 个逻辑模型全部已上架`
+              }
+              onClick={() => navigate("targets")}
+            />
+            <Stat
+              icon={<IconRoute size={13} />}
+              label="调度目标"
+              value={overview.dispatch_targets}
+              hint={
+                unhealthy.length === 0
+                  ? overview.dispatch_targets > 0
+                    ? `全部正常 · ${overview.sticky_bindings} 个粘性绑定`
+                    : "还没有目标"
+                  : unhealthy
+                      .map(([status, count]) => `${count} 个${TARGET_STATUS_LABELS[status]}`)
+                      .join("，")
+              }
+              tone={unhealthy.length > 0 ? "warn" : undefined}
+              onClick={() => navigate("targets")}
+            />
+          </div>
+        </section>
+
+        <section className="stat-section">
+          <div className="stat-section-head">
+            <h2 className="stat-section-title">流量健康</h2>
+            <span className="stat-section-desc">{windowLabel}窗口 · 按开始时间统计</span>
+          </div>
+          <div className="stat-grid">
+            <Stat
+              icon={<IconInbox size={13} />}
+              label="窗口内请求数"
+              value={formatMetricNumber(overview.requests)}
+              hint="点击查看请求明细"
+              onClick={() => navigate("requests")}
+            />
+            <Stat
+              icon={<IconCheck size={13} />}
+              label="成功率"
+              value={formatSuccessRate(overview.success_rate)}
+              hint={`${windowLabel}窗口`}
+              tone={
+                overview.success_rate !== null && overview.success_rate < 0.95
+                  ? "warn"
+                  : undefined
+              }
+            />
+            <Stat
+              icon={<IconGauge size={13} />}
+              label="平均延迟"
+              value={formatMetricDuration(overview.avg_latency_ms)}
+              hint={`P50 ${formatMetricDuration(overview.p50_latency_ms)}`}
+            />
+            <Stat
+              icon={<IconGauge size={13} />}
+              label="P95 延迟"
+              value={formatMetricDuration(overview.p95_latency_ms)}
+              hint={`${windowLabel}窗口尾部延迟`}
+            />
+          </div>
+        </section>
+
+        <section className="stat-section">
+          <div className="stat-section-head">
+            <h2 className="stat-section-title">队列与并发</h2>
+            <span className="stat-section-desc">实时值，随调度变化即时更新</span>
+          </div>
+          <div className="stat-grid">
+            <Stat
+              icon={<IconRoute size={13} />}
+              label="当前在途"
+              value={formatMetricNumber(overview.in_flight)}
+              hint="流式请求在连接结束后扣除"
+            />
+            <Stat
+              icon={<IconInbox size={13} />}
+              label="当前排队"
+              value={formatMetricNumber(overview.queued)}
+              hint="正在等待调度的请求"
+            />
+            <Stat
+              icon={<IconAlert size={13} />}
+              label="队列超时数"
+              value={formatMetricNumber(overview.queue_timeouts)}
+              hint={`${windowLabel}窗口`}
+              tone={overview.queue_timeouts > 0 ? "warn" : undefined}
+            />
+          </div>
+        </section>
       </div>
 
       <Card
@@ -180,7 +236,17 @@ export function Overview({
             {steps.map((step, index) => (
               <div
                 key={step.title}
-                className={`step ${step.done ? "step-done" : index === currentStep ? "step-current" : ""}`}
+                className={`step is-clickable ${step.done ? "step-done" : index === currentStep ? "step-current" : ""}`}
+                role="button"
+                tabIndex={0}
+                title={`前往「${step.title}」`}
+                onClick={() => navigate(step.route)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    navigate(step.route);
+                  }
+                }}
               >
                 <div className="step-num">
                   {step.done ? <IconCheck size={13} /> : index + 1}
@@ -189,30 +255,44 @@ export function Overview({
                   <div className="step-title">{step.title}</div>
                   <div className="step-desc">{step.desc}</div>
                 </div>
-                {index === currentStep && (
-                  <div className="step-action">
+                <div className="step-action">
+                  {index === currentStep ? (
                     <Button
                       variant="primary"
                       size="sm"
-                      onClick={() => navigate(step.route)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        navigate(step.route);
+                      }}
                       icon={<IconArrowRight size={13} />}
                     >
                       去配置
                     </Button>
-                  </div>
-                )}
+                  ) : step.done ? (
+                    <span className="step-link">
+                      查看 <IconArrowRight size={12} />
+                    </span>
+                  ) : null}
+                </div>
               </div>
             ))}
           </div>
         </Card>
       )}
 
-      {ready && <ReadyPanel data={data} />}
+      {ready && <ReadyPanel data={data} navigate={navigate} />}
 
       <div className="overview-list-grid">
         <Card
           title="最近错误"
-          description={`${windowLabel}窗口内最近 5 条失败请求。`}
+          description={`${windowLabel}窗口内最近 5 条失败请求。点击行可查看调度明细。`}
+          actions={
+            overview.recent_errors.length > 0 && (
+              <Button size="sm" onClick={() => navigate("requests", { status: "error" })}>
+                查看全部失败
+              </Button>
+            )
+          }
         >
           {overview.recent_errors.length === 0 ? (
             <div className="table-empty">窗口内没有失败请求</div>
@@ -230,15 +310,31 @@ export function Overview({
                 </thead>
                 <tbody>
                   {overview.recent_errors.slice(0, 5).map((error) => (
-                    <tr key={error.request_id}>
+                    <tr
+                      key={error.request_id}
+                      className="is-clickable"
+                      title="点击查看该请求的调度明细"
+                      onClick={() =>
+                        navigate("requests", { request_id: error.request_id })
+                      }
+                    >
                       <td className="cell-dim">{formatTime(error.started_at)}</td>
                       <td>
-                        <div
-                          className="mono cell-dim cell-truncate"
-                          style={{ maxWidth: 190 }}
-                          title={error.request_id}
-                        >
-                          {error.request_id}
+                        <div className="row" style={{ gap: 6 }}>
+                          <div
+                            className="mono cell-dim cell-truncate"
+                            style={{ maxWidth: 150 }}
+                            title={error.request_id}
+                          >
+                            {error.request_id}
+                          </div>
+                          <span onClick={(event) => event.stopPropagation()}>
+                            <CopyButton
+                              value={error.request_id}
+                              iconOnly
+                              label="复制请求 ID"
+                            />
+                          </span>
                         </div>
                       </td>
                       <td className="mono">{error.logical_model ?? "—"}</td>
@@ -247,7 +343,20 @@ export function Overview({
                           {error.http_status}
                         </Badge>
                       </td>
-                      <td className="mono text-faint">{error.error_code ?? "—"}</td>
+                      <td className="mono text-faint" title={error.error_code ?? undefined}>
+                        <span className="row" style={{ gap: 4 }}>
+                          {error.error_code ?? "—"}
+                          {errorCodeInfo(error.error_code) && (
+                            <InfoTip
+                              label={`错误码说明：${errorCodeInfo(error.error_code)?.label ?? ""}`}
+                            >
+                              <b>{errorCodeInfo(error.error_code)?.label}</b>
+                              <br />
+                              {errorCodeInfo(error.error_code)?.hint}
+                            </InfoTip>
+                          )}
+                        </span>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -278,7 +387,7 @@ export function Overview({
                     <tr key={`${change.occurred_at}-${change.action}-${index}`}>
                       <td className="cell-dim">{formatTime(change.occurred_at)}</td>
                       <td>
-                        <div>{change.action}</div>
+                        <div>{formatChangeAction(change.action)}</div>
                         <div className="text-faint" style={{ fontSize: 11 }}>
                           {change.actor}
                         </div>
@@ -292,7 +401,9 @@ export function Overview({
                           {change.object}
                         </div>
                       </td>
-                      <td className="mono cell-dim">{change.result}</td>
+                      <td className="mono cell-dim">
+                        {formatChangeResult(change.result)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -435,9 +546,29 @@ function Alerts({
 }
 
 /** 配置就绪后展示接入方式，省得用户去翻文档。 */
-function ReadyPanel({ data }: { data: Data }) {
+function ReadyPanel({
+  data,
+  navigate,
+}: {
+  data: Data;
+  navigate: (route: Route, params?: Record<string, string>) => void;
+}) {
   const firstGroup = data.groups[0];
   const sample = data.models.find((model) => model.listed);
+  const origin = window.location.origin;
+  const keyPlaceholder = "<YOUR_GROUP_KEY>";
+  const modelName = sample?.name ?? "你的逻辑模型";
+  const anthropicCmd = [
+    "# Claude Code / Anthropic SDK",
+    `export ANTHROPIC_BASE_URL=${origin}`,
+    `export ANTHROPIC_AUTH_TOKEN=${keyPlaceholder}`,
+  ].join("\n");
+  const openaiCmd = [
+    "# OpenAI 客户端",
+    `curl ${origin}/v1/chat/completions \\`,
+    `  -H "Authorization: Bearer ${keyPlaceholder}" \\`,
+    `  -d '{"model":"${modelName}","messages":[]}'`,
+  ].join("\n");
 
   return (
     <Card
@@ -453,19 +584,41 @@ function ReadyPanel({ data }: { data: Data }) {
             <code>/v1/models</code> 返回 Anthropic 形状。
           </span>
         </div>
-        <pre
-          className="key-reveal"
-          style={{ display: "block", margin: 0, whiteSpace: "pre-wrap" }}
-        >
-{`# Claude Code / Anthropic SDK
-export ANTHROPIC_BASE_URL=${window.location.origin}
-export ANTHROPIC_AUTH_TOKEN=${firstGroup?.key_prefix ?? "akh-"}…
 
-# OpenAI 客户端
-curl ${window.location.origin}/v1/chat/completions \\
-  -H "Authorization: Bearer ${firstGroup?.key_prefix ?? "akh-"}…" \\
-  -d '{"model":"${sample?.name ?? "你的逻辑模型"}","messages":[]}'`}
-        </pre>
+        <div className="callout callout-warn">
+          <IconAlert size={15} />
+          <span style={{ flex: 1 }}>
+            完整分组 Key 只在创建或重置时显示一次，之后无法找回。如果还没有保存，
+            请到「分组」页重置一把新 Key。
+          </span>
+          <Button size="sm" variant="secondary" onClick={() => navigate("groups")}>
+            去分组页
+          </Button>
+        </div>
+
+        <div className="code-block">
+          <div className="code-block-head">
+            <span>Claude Code / Anthropic SDK</span>
+            <CopyButton value={anthropicCmd} label="复制命令" />
+          </div>
+          <pre>{anthropicCmd}</pre>
+        </div>
+
+        <div className="code-block">
+          <div className="code-block-head">
+            <span>OpenAI 客户端</span>
+            <CopyButton value={openaiCmd} label="复制命令" />
+          </div>
+          <pre>{openaiCmd}</pre>
+        </div>
+
+        {firstGroup && (
+          <p className="field-hint" style={{ margin: 0 }}>
+            当前示例使用第一个分组「{firstGroup.name}」（Key 前缀{" "}
+            <span className="mono">{firstGroup.key_prefix}…</span>）。
+          </p>
+        )}
+
         {data.overview.dropped_request_records > 0 && (
           <div className="callout callout-warn">
             <IconAlert size={15} />
@@ -485,22 +638,42 @@ function Stat({
   label,
   value,
   hint,
+  onClick,
+  tone,
 }: {
   icon: React.ReactNode;
   label: string;
   value: React.ReactNode;
   hint?: string;
+  /** 传入后整张卡片可点击，用于下钻到对应页面。 */
+  onClick?: () => void;
+  tone?: "warn";
 }) {
-  return (
-    <div className="stat">
+  const className = [
+    "stat",
+    onClick ? "is-clickable" : "",
+    tone === "warn" ? "stat-warn" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const content = (
+    <>
       <div className="stat-label">
         {icon}
         {label}
       </div>
       <div className="stat-value tabular">{value}</div>
       {hint && <div className="stat-hint">{hint}</div>}
-    </div>
+    </>
   );
+  if (onClick) {
+    return (
+      <button type="button" className={className} onClick={onClick}>
+        {content}
+      </button>
+    );
+  }
+  return <div className={className}>{content}</div>;
 }
 
 export const OverviewIcon = IconServer;
