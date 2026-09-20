@@ -697,9 +697,12 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
         ("Darwin", "x86_64", "macos-x86_64"),
     ];
 
+    // 用 Cargo.toml 的版本构造 tag，避免测试里钉死一个会过期的版本号。
+    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+
     for (os, machine, expected) in cases {
         let output = Command::new("sh")
-            .args(["install.sh", "--version", "v1.1.0", "--dry-run"])
+            .args(["install.sh", "--version", &tag, "--dry-run"])
             .env("PATH", &path)
             .env("FAKE_UNAME_S", os)
             .env("FAKE_UNAME_M", machine)
@@ -717,10 +720,11 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
             .find(|line| line.contains("将要下载"))
             .unwrap_or_else(|| panic!("{os}/{machine} 没有输出下载地址：{stdout}"));
 
-        // 形如 .../v1.1.0/akhub-v1.1.0-<platform>.tar.gz
+        // 形如 .../v1.1.2/akhub-v1.1.2-<platform>.tar.gz
         let asset = line.rsplit('/').next().expect("资产名").trim();
+        let prefix = format!("akhub-{tag}-");
         let platform = asset
-            .strip_prefix("akhub-v1.1.0-")
+            .strip_prefix(prefix.as_str())
             .and_then(|rest| rest.strip_suffix(".tar.gz"))
             .unwrap_or_else(|| panic!("资产名不符合约定：{asset}"));
 
@@ -745,6 +749,51 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
     assert!(
         declared.iter().any(|name| name == ps1_platform),
         "install.ps1 指定的平台名 {ps1_platform}，release.yml 从不产出"
+    );
+}
+
+/// Windows 必须同时给出裸 exe 与捆绑 zip，且两者都在校验和里。
+///
+/// Unix 那边必须打包：可执行权限靠文件模式的 +x 位，浏览器下载会丢掉它，
+/// 裸传 ELF 用户拿到的是「权限不足」。Windows 没有这个问题——能不能跑只看
+/// 扩展名——所以「必须打包」的理由在这里不成立，剩下的只是压缩收益
+/// （17 MB -> 6 MB）和顺带捎上文档。让用户为这两点被迫多走
+/// 「解压 -> 进一层目录 -> 运行」并不划算，所以两个都给。
+#[test]
+fn windows_ships_both_a_bare_exe_and_a_bundle() {
+    let package = std::fs::read_to_string("scripts/package.sh").expect("package.sh");
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
+    let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
+
+    // 打包侧要产出裸 exe。
+    assert!(
+        package.contains(r#"cp "$STAGE/akhub.exe" "dist/$ASSET.exe""#),
+        "package.sh 必须为 Windows 额外产出一个裸 exe"
+    );
+    assert!(
+        package.contains(r#"ARTIFACT="$ASSET.zip $ASSET.exe""#),
+        "package.sh 的 Windows 分支必须同时声明 zip 与 exe 两个产物"
+    );
+
+    // 流水线要把 exe 一起上传，并且**算进校验和**——否则用户没法校验
+    // 那个他直接下载的文件，而校验和的意义就在于覆盖每一个可下载的产物。
+    assert!(
+        workflow.matches("dist/*.exe").count() >= 2,
+        "release.yml 必须在上传与发布两处都包含 dist/*.exe"
+    );
+    let checksum_line = workflow
+        .lines()
+        .find(|line| line.contains("sha256sum ./*.tar.gz"))
+        .expect("release.yml 里应有校验和生成命令");
+    assert!(
+        checksum_line.contains("./*.exe"),
+        "校验和必须覆盖裸 exe，实际命令：{checksum_line}"
+    );
+
+    // 安装脚本仍然按 zip 装（包里才有 install.ps1 与文档），这一点不能被打乱。
+    assert!(
+        install_ps1.contains(r#"$asset = "akhub-$tag-$platform.zip""#),
+        "install.ps1 应当继续下载 zip 包，而不是裸 exe"
     );
 }
 

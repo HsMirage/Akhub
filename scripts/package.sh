@@ -92,14 +92,22 @@ shutil.make_archive(asset, "zip", ".", asset)
 
 case "$TARGET" in
     *windows*)
-        # Windows 用 zip：解压后直接能在资源管理器里双击运行。
         # 二进制重新命名成 .exe，安装脚本按这个名字去找。
         mv "$STAGE/akhub" "$STAGE/akhub.exe"
         # zip 是增量写入的：同名旧归档还在的话，上一次的内容会被原样保留，
         # 于是发出来的包里混着两个版本的二进制。必须先删干净。
         rm -f "dist/$ASSET.zip"
         make_zip "$ASSET"
-        ARTIFACT="$ASSET.zip"
+
+        # 同时单独放一个裸 exe。
+        #
+        # Unix 那边必须打包：可执行权限靠文件模式的 +x 位，浏览器下载会丢掉它，
+        # 裸传 ELF 用户拿到的是「权限不足」。Windows 没有这个问题——能不能跑
+        # 只看扩展名——所以「必须打包」的理由在这里不成立，剩下的只是压缩
+        # （17 MB -> 6 MB）和顺带捎上文档。让用户为这两点被迫多走
+        # 「解压 → 进一层目录 → 运行」三步并不划算，两个都给最省事。
+        cp "$STAGE/akhub.exe" "dist/$ASSET.exe"
+        ARTIFACT="$ASSET.zip $ASSET.exe"
         ;;
     *)
         tar -czf "dist/$ASSET.tar.gz" -C dist "$ASSET"
@@ -107,4 +115,7 @@ case "$TARGET" in
         ;;
 esac
 
-echo "dist/$ARTIFACT"
+# 可能产出多个文件（Windows 同时给 zip 与裸 exe），逐个打印便于调用方解析。
+for artifact in $ARTIFACT; do
+    echo "dist/$artifact"
+done

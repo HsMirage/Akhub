@@ -294,11 +294,12 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 
 | 资产 | 说明 |
 |---|---|
-| `akhub-v1.1.0-linux-x86_64-musl.tar.gz` | 静态链接，跨发行版直接用（推荐） |
-| `akhub-v1.1.0-linux-x86_64.tar.gz` | glibc 版 |
-| `akhub-v1.1.0-linux-aarch64.tar.gz` | ARM64 服务器 |
-| `akhub-v1.1.0-macos-aarch64.tar.gz` / `-macos-x86_64` | Apple Silicon / Intel |
-| `akhub-v1.1.0-windows-x86_64.zip` | Windows 原生 |
+| `akhub-v1.1.2-linux-x86_64-musl.tar.gz` | 静态链接，跨发行版直接用（推荐） |
+| `akhub-v1.1.2-linux-x86_64.tar.gz` | glibc 版 |
+| `akhub-v1.1.2-linux-aarch64.tar.gz` | ARM64 服务器 |
+| `akhub-v1.1.2-macos-aarch64.tar.gz` / `-macos-x86_64` | Apple Silicon / Intel |
+| `akhub-v1.1.2-windows-x86_64.exe` | Windows 原生，**下载双击即可运行**（不用解压） |
+| `akhub-v1.1.2-windows-x86_64.zip` | 同上，另含文档与 `install.ps1`，体积约三分之一 |
 | `checksums.txt` | 上面所有资产的 sha256 |
 
 同一轮还会在原生 arm64 runner 上构建 `linux/amd64` 与 `linux/arm64` 镜像，

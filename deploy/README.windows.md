@@ -10,10 +10,23 @@ Akhub 的 Windows 原生部署（§25.2）：**一个 `akhub.exe` 加一个数�
 
 ## 1. 下载与校验
 
-Release 资产名与 `checksums.txt` 里的文件名完全一致，文件名里的版本号是 **Release 标签（带 `v`）**，例如 `akhub-v1.1.0-windows-x86_64.zip`。
+每个 Release 提供**两种** Windows 资产，按需要挑一个：
+
+| 资产 | 大小 | 适合 |
+|---|---|---|
+| `akhub-<Tag>-windows-x86_64.exe` | 约 18 MB | **只想跑起来**：下载双击即可，不用解压 |
+| `akhub-<Tag>-windows-x86_64.zip` | 约 7 MB | **要文档和一键脚本**：内含本文、`install.ps1`、`deploy\` 示例 |
+
+两者里的 `akhub.exe` **完全同一个文件**，只是 zip 压过、另外捎上了文档，所以体积只有三分之一。
+功能没有任何差别，随便挑；想省流量就下 zip，想省事就下 exe。
+
+下面按 zip 写（本文的路由、注册服务等章节都在包里）。只下了 exe 的话，
+把「解压」那一步跳过即可，其余命令把路径换成 exe 所在位置。
+
+Release 资产名与 `checksums.txt` 里的文件名完全一致，文件名里的版本号是 **Release 标签（带 `v`）**，例如 `akhub-v1.1.2-windows-x86_64.zip`。
 
 ```
-$Tag   = 'v1.1.0'                 # Release 标签，带 v
+$Tag   = 'v1.1.2'                 # Release 标签，带 v
 $Repo  = 'HsMirage/Akhub'
 $Asset = "akhub-$Tag-windows-x86_64.zip"
 $Base  = "https://github.com/$Repo/releases/download/$Tag"
@@ -25,6 +38,9 @@ Set-Location $Work
 Invoke-WebRequest -UseBasicParsing -Uri "$Base/$Asset"        -OutFile $Asset
 Invoke-WebRequest -UseBasicParsing -Uri "$Base/checksums.txt" -OutFile checksums.txt
 ```
+
+> 只想要裸 exe 的话，把上面两行的 `$Asset` 换成
+> `"akhub-$Tag-windows-x86_64.exe"`，并跳过下面的 `Expand-Archive`。
 
 对照 `checksums.txt` 校验 SHA256（`sha256sum` 格式是 `<hash>` 加两个空格再加 `./<文件名>`，所以取每行的第一段）：
 
@@ -53,11 +69,11 @@ Get-ChildItem ".\akhub-$Tag-windows-x86_64" | Select-Object Name, Length
 ```
 # 先下看一眼再跑（推荐）
 Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/HsMirage/Akhub/master/install.ps1' -OutFile install.ps1
-.\install.ps1 -Version v1.1.0 -AddToPath
+.\install.ps1 -Version v1.1.2 -AddToPath
 
 # 指定版本、自定义安装目录、只演练不落地
-.\install.ps1 -Version v1.1.0 -Dir 'C:\Program Files\Akhub'   # 指定安装目录
-.\install.ps1 -Version v1.1.0 -DryRun
+.\install.ps1 -Version v1.1.2 -Dir 'C:\Program Files\Akhub'   # 指定安装目录
+.\install.ps1 -Version v1.1.2 -DryRun
 ```
 
 脚本参数：`-Version`（默认取最新 Release）、`-Dir`（默认 `%LOCALAPPDATA%\Programs\Akhub`）、`-Repo`、`-NoVerify`（跳过 sha256，不推荐）、`-AddToPath`、`-DryRun`。它默认装到用户目录，本手册下面统一按 `C:\Program Files\Akhub` 写，两者取其一即可；用脚本装完照样可以继续按本文配服务。
@@ -435,7 +451,7 @@ New-NetFirewallRule -DisplayName 'Caddy HTTP/HTTPS' -Direction Inbound -Action A
 原则：**停服务之后再备份**。SQLite 在 WAL 模式下，运行中复制出来的 `akhub.sqlite` 可能是不一致快照，别把这种备份当救生圈。
 
 ```
-$Tag   = 'v1.1.0'
+$Tag   = 'v1.1.2'
 $Bin   = 'C:\Program Files\Akhub\akhub.exe'
 $Data  = 'C:\ProgramData\Akhub'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
