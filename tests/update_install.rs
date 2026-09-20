@@ -66,11 +66,29 @@ async fn a_verified_release_replaces_the_binary_and_keeps_a_backup() {
     );
 }
 
+/// 跨国链路上资产下载偶发中断是常态：一次失败不能直接判定"更新失败"。
+#[tokio::test]
+async fn a_transient_download_failure_is_retried() {
+    let archive = make_release_archive("9.9.9", NEW_BINARY);
+    let github = FakeGithub::spawn_with_transient_failures("v9.9.9", archive, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_old_binary(dir.path());
+
+    let registry = Registry::new(github.base_url.clone(), false).with_deploy(Deploy::Binary);
+    let outcome = registry
+        .install(&target, None)
+        .await
+        .expect("第一次下载失败应当被重试，第二次成功");
+    assert_eq!(outcome.to, "9.9.9");
+    assert_eq!(std::fs::read(&target).unwrap(), NEW_BINARY);
+    assert!(leftovers(dir.path()).is_empty());
+}
+
 #[tokio::test]
 async fn a_bad_checksum_stops_the_update_before_anything_is_written() {
     let archive = make_release_archive("9.9.9", NEW_BINARY);
     // 形状合法但内容必然对不上的哈希：验证的是"校验不过就停"，而不是"清单里没有这一行"。
-    let github = FakeGithub::spawn_with_checksum("v9.9.9", archive, &"0".repeat(64)).await;
+    let github = FakeGithub::spawn_with_checksum("v9.9.9", archive, &"0".repeat(64), 0).await;
     let dir = tempfile::tempdir().unwrap();
     let target = write_old_binary(dir.path());
 

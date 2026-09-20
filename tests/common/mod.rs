@@ -784,20 +784,41 @@ struct GithubState {
     archive: Arc<Vec<u8>>,
     checksums: String,
     hits: Arc<Mutex<usize>>,
+    /// 还需要失败几次资产下载：模拟跨国链路上的偶发中断。
+    asset_failures: Arc<Mutex<usize>>,
 }
 
 impl FakeGithub {
     /// 起一台假 GitHub。archive 是 Release 资产字节，checksums.txt 按它现算。
     pub async fn spawn(tag: &str, archive: Vec<u8>) -> Self {
-        Self::spawn_inner(tag, archive, None).await
+        Self::spawn_inner(tag, archive, None, 0).await
     }
 
     /// 指定 checksums.txt 里那个哈希：传一个错的来验证「校验不过就拒绝更新」。
-    pub async fn spawn_with_checksum(tag: &str, archive: Vec<u8>, checksum: &str) -> Self {
-        Self::spawn_inner(tag, archive, Some(checksum.to_string())).await
+    pub async fn spawn_with_checksum(
+        tag: &str,
+        archive: Vec<u8>,
+        checksum: &str,
+        asset_failures: usize,
+    ) -> Self {
+        Self::spawn_inner(tag, archive, Some(checksum.to_string()), asset_failures).await
     }
 
-    async fn spawn_inner(tag: &str, archive: Vec<u8>, checksum: Option<String>) -> Self {
+    /// 前 `failures` 次资产下载返回 500：验证下载会重试而不是一次失败就放弃。
+    pub async fn spawn_with_transient_failures(
+        tag: &str,
+        archive: Vec<u8>,
+        failures: usize,
+    ) -> Self {
+        Self::spawn_inner(tag, archive, None, failures).await
+    }
+
+    async fn spawn_inner(
+        tag: &str,
+        archive: Vec<u8>,
+        checksum: Option<String>,
+        asset_failures: usize,
+    ) -> Self {
         async fn latest(State(state): State<GithubState>) -> axum::Json<Value> {
             *state.hits.lock().unwrap() += 1;
             axum::Json(release_json(&state.tag, &state.base))
@@ -806,6 +827,14 @@ impl FakeGithub {
             axum::Json(release_json(&state.tag, &state.base))
         }
         async fn asset(State(state): State<GithubState>) -> Response {
+            {
+                let mut remaining = state.asset_failures.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return (axum::http::StatusCode::BAD_GATEWAY, "upstream cdn hiccup")
+                        .into_response();
+                }
+            }
             (
                 [(axum::http::header::CONTENT_TYPE, "application/gzip")],
                 state.archive.as_ref().clone(),
@@ -840,6 +869,7 @@ impl FakeGithub {
             archive: Arc::new(archive),
             checksums: checksums.clone(),
             hits: Arc::clone(&hits),
+            asset_failures: Arc::new(Mutex::new(asset_failures)),
         };
         let app = Router::new()
             .route("/releases/latest", get(latest))

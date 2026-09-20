@@ -47,9 +47,15 @@ pub async fn update_status(
 /// 只对原生二进制部署有效；容器、源码构建与 Windows 会带着明确的替代命令报错。
 pub async fn run_update(State(state): State<SharedState>, _: Admin) -> AdminResult<Json<Value>> {
     let target = crate::update::exe_path();
-    match state.runtime.update.install(&target, None).await {
-        Ok(outcome) => Ok(Json(json!({ "outcome": outcome }))),
-        Err(message) => Err(AdminError::bad_request(message)),
+    // 放到独立任务里跑：管理员关掉页面、反向代理掐断连接都会让请求 future 被丢弃，
+    // 不能因此中断已经下了一半的更新。任务本身不随请求取消，结果即使没人接，
+    // 也会以 pending_version 的形式留在状态里，下一次打开面板就能看到。
+    let updater = Arc::clone(&state);
+    let handle = tokio::spawn(async move { updater.runtime.update.install(&target, None).await });
+    match handle.await {
+        Ok(Ok(outcome)) => Ok(Json(json!({ "outcome": outcome }))),
+        Ok(Err(message)) => Err(AdminError::bad_request(message)),
+        Err(error) => Err(AdminError::internal(format!("更新任务异常结束：{error}"))),
     }
 }
 

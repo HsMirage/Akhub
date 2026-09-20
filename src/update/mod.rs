@@ -37,6 +37,17 @@ const FAILURE_TTL: Duration = Duration::from_secs(60);
 const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
 /// 检查请求的超时。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+/// 下载发行包的总超时。
+///
+/// 18 MB 在国际链路上可能要几分钟，卡得太紧会变成"点一下没反应"；这里给足，
+/// 由下面的读超时负责发现"彻底卡住"。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+/// 读超时：连续这么久一个字节都没读到，就当链路断了并重试。
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// 建立连接的超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 下载失败的重试次数。GitHub 资产走 CDN，跨国链路上偶发中断是常态。
+const DOWNLOAD_ATTEMPTS: usize = 3;
 
 /// 当前进程的版本号，与 `--version`、`/health/version` 是同一个字符串。
 pub fn current() -> &'static str {
@@ -275,7 +286,9 @@ impl Registry {
         Self {
             client: reqwest::Client::builder()
                 .user_agent(USER_AGENT)
-                .timeout(Duration::from_secs(300))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .timeout(DOWNLOAD_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             api: Mutex::new(api.into()),
@@ -477,16 +490,24 @@ impl Registry {
             .map_err(|error| format!("解析 Release 响应失败：{error}"))
     }
 
+    /// 占住"更新中"这个坑。
+    ///
+    /// 返回的守卫在**被丢弃**时复位标志：管理员关掉页面、反向代理掐断连接都会让
+    /// 请求 future 被丢弃。早期实现把复位写在 await 之后，于是中断一次就永久卡在
+    /// "已经有一个更新在进行中"，只能重启服务——守卫让中断也能正确收尾。
+    fn acquire(&self) -> Result<BusyGuard<'_>, String> {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err("已经有一个更新在进行中，请稍候。".to_string());
+        }
+        Ok(BusyGuard(&self.busy))
+    }
+
     /// 把 `target` 指向的二进制换成最新版（或指定版本）。
     ///
     /// 整个过程只有最后一步 rename 会改动现场，之前的失败都只是白下载一次。
     pub async fn install(&self, target: &Path, version: Option<&str>) -> Result<Outcome, String> {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            return Err("已经有一个更新在进行中，请稍候。".to_string());
-        }
-        let result = self.install_inner(target, version).await;
-        self.busy.store(false, Ordering::SeqCst);
-        result
+        let _guard = self.acquire()?;
+        self.install_inner(target, version).await
     }
 
     async fn install_inner(&self, target: &Path, version: Option<&str>) -> Result<Outcome, String> {
@@ -604,6 +625,15 @@ impl Registry {
     }
 }
 
+/// "更新中"标志的守卫：正常返回、报错、future 被丢弃都会复位。
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 替换成功后的结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct Outcome {
@@ -712,7 +742,30 @@ fn pick_asset<'a>(assets: &'a [Asset], version: &str) -> Option<&'a Asset> {
 
 // ------------------------------------------------------------------ 下载与校验
 
+/// 下载发行包；跨国链路上的偶发中断重试几次再放弃。
+///
+/// 不区分错误类型一律重试：404 这类"地址就是不对"的错误多试两次的代价只是几秒钟，
+/// 而把偶发中断当成最终失败，用户看到的就是"更新失败"四个字。
 async fn download(client: &reqwest::Client, url: &str, path: &Path) -> Result<u64, String> {
+    let mut last = String::new();
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match download_once(client, url, path).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                tracing::warn!(attempt, %error, "下载发行包失败");
+                last = error;
+                if attempt < DOWNLOAD_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(attempt as u64 * 2)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{last}（已重试 {DOWNLOAD_ATTEMPTS} 次；可稍后再试，或在服务器上执行 sudo akhub --update）"
+    ))
+}
+
+async fn download_once(client: &reqwest::Client, url: &str, path: &Path) -> Result<u64, String> {
     use futures::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -997,6 +1050,20 @@ mod tests {
                 .unwrap_or_default()
                 .contains("docker compose")
         );
+    }
+
+    /// 请求 future 被丢弃（客户端断开、刷新页面）时，busy 必须跟着复位。
+    ///
+    /// 早期实现把复位写在 await 之后：中断一次就永久卡在"已经有一个更新在进行中"，
+    /// 只能重启服务才能再更新。
+    #[test]
+    fn the_busy_flag_is_released_when_the_update_is_interrupted() {
+        let registry = Registry::new("http://127.0.0.1:1", false);
+        {
+            let _guard = registry.acquire().expect("第一次应当拿到坑位");
+            assert!(registry.acquire().is_err(), "更新中不该被第二次占坑");
+        }
+        assert!(registry.acquire().is_ok(), "守卫被丢弃后必须能再次更新");
     }
 
     #[test]

@@ -41,7 +41,6 @@ export function VersionDialog({
   const [updating, setUpdating] = useState(false);
   const [outcome, setOutcome] = useState<UpdateOutcome | null>(null);
   const [restarting, setRestarting] = useState(false);
-  const [pendingRestart, setPendingRestart] = useState(false);
   /** 轮询用的定时器：关闭面板或卸载时必须清掉，否则后台会一直打接口。 */
   const pollTimer = useRef<number | null>(null);
 
@@ -63,7 +62,6 @@ export function VersionDialog({
   useEffect(() => {
     if (!open) return;
     setOutcome(null);
-    setPendingRestart(false);
     void check(false);
   }, [open, check]);
 
@@ -79,7 +77,6 @@ export function VersionDialog({
     try {
       const result = await api.runUpdate();
       setOutcome(result.outcome);
-      setPendingRestart(true);
       toast.success("已更新到 v" + result.outcome.to + "，重启服务后生效");
       // 版本号在「设置」里也跟着变，让外层重新拉一次。
       onUpdated();
@@ -122,6 +119,13 @@ export function VersionDialog({
 
   const hasUpdate = status?.has_update ?? false;
   const backupNote = outcome?.backup ? "（旧版本备份在 " + outcome.backup + "）" : "";
+  /**
+   * 已落盘、等重启生效的版本。
+   *
+   * 除了本次请求的结果，也读服务端状态里的 pending_version：更新期间刷新过
+   * 页面、或者请求被浏览器掐断时，进度不会丢——重新打开面板就能接着重启。
+   */
+  const pendingVersion = outcome?.to ?? status?.pending_version ?? null;
 
   return (
     <Modal open={open} onClose={onClose} title="版本与更新">
@@ -142,11 +146,17 @@ export function VersionDialog({
           ) : null}
         </div>
 
-        {pendingRestart && outcome && (
+        {pendingVersion && (
           <div className="callout callout-info" role="status">
             <span style={{ flex: 1 }}>
-              已把 v{outcome.to} 写进 <span className="mono">{outcome.path}</span>
-              {backupNote}。当前进程仍是 v{outcome.from}，重启服务后才生效。
+              {outcome ? (
+                <>
+                  已把 v{outcome.to} 写进 <span className="mono">{outcome.path}</span>
+                  {backupNote}。当前进程仍是 v{outcome.from}，重启服务后才生效。
+                </>
+              ) : (
+                <>服务端已经把 v{pendingVersion} 写进磁盘，重启服务后生效。</>
+              )}
             </span>
           </div>
         )}
@@ -225,7 +235,7 @@ export function VersionDialog({
           >
             重新检查
           </Button>
-          {hasUpdate && status?.can_self_update && !pendingRestart && (
+          {hasUpdate && status?.can_self_update && !pendingVersion && (
             <Button
               size="sm"
               variant="primary"
@@ -242,7 +252,7 @@ export function VersionDialog({
               {updating ? "更新中…" : "立即更新"}
             </Button>
           )}
-          {pendingRestart && status?.can_restart && (
+          {pendingVersion && status?.can_restart && (
             <Button
               size="sm"
               variant="primary"
@@ -271,7 +281,7 @@ export function VersionDialog({
           )}
         </div>
 
-        {pendingRestart && status && !status.can_restart && (
+        {pendingVersion && status && !status.can_restart && (
           <p className="card-desc">
             没检测到会自动拉起服务的监督进程，请手工重启：
             <span className="mono">

@@ -76,17 +76,25 @@ async fn a_newer_release_is_reported_and_the_answer_is_cached() {
         "https://example.invalid/releases/v9.9.9"
     );
 
-    // 这个测试进程跑在 target/ 下，只可能是源码构建：任何情况下都不该出现
-    // 「立即更新」入口，取而代之的是 git pull 提示。
-    assert_eq!(status["deploy"], "source");
-    assert_eq!(status["can_self_update"], false);
-    assert!(
-        status["update_command"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("git pull"),
-        "源码构建要给出可复制的升级命令：{status}"
-    );
+    // 部署形态取决于测试进程所在路径：默认的 target/ 下判成源码构建，
+    // CARGO_TARGET_DIR 指到别处时可能判成原生二进制。两种形态都必须给出可复制的
+    // 升级命令；至于"点了会不会真的替换测试二进制"，由下面那条带守卫的用例负责
+    // 拦住——它一旦发现进程被判成二进制部署就直接跳过。
+    let deploy = status["deploy"].as_str().unwrap_or_default().to_string();
+    let command = status["update_command"].as_str().unwrap_or_default();
+    match deploy.as_str() {
+        "source" => {
+            assert_eq!(
+                status["can_self_update"], false,
+                "源码构建不该出现自更新入口：{status}"
+            );
+            assert!(command.contains("git pull"), "源码构建要给出升级命令：{status}");
+        }
+        _ => assert!(
+            command.contains("sudo akhub --update"),
+            "二进制部署要给出升级命令：{status}"
+        ),
+    }
 
     // 第二次必须是缓存命中：GitHub 匿名限流只有 60 次/小时，不能任人连点。
     let again = status_of(&base, &client, "").await;
