@@ -81,7 +81,6 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
 | 能力 | 计划阶段 |
 |---|---|
 | §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、连接复用率与每请求分配量） | 阶段 6 |
-| Docker 容器内"空数据目录首次启动 + 真实调用"的**本地**实跑记录（CI 已用 `docker` 作业在每次推送时覆盖这条，见 `.github/workflows/ci.yml`） | 阶段 6 |
 | 真实上游上的跨账号故障切换实测（现有测试 Key 下同一逻辑模型只有一个可用目标） | 阶段 6 |
 
 已完成（本轮校正）：
@@ -108,6 +107,11 @@ TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些
   - **部署文档**：`deploy/README.md` 覆盖 Docker / 一键脚本 / systemd / 升级回滚 /
     反代，并新增 `deploy/Caddyfile`、`deploy/Caddyfile.windows`、`deploy/nginx.conf`
     与 `deploy/README.windows.md`。
+  - **容器落地验收已完成**（§28 完成标准里那条）：在空数据目录 + 命名卷上首次启动
+    4 秒就绪，`/health/version` 报 `1.1.0`，`/admin` 返回 SPA 外壳，未鉴权请求
+    401，`--healthcheck` 退出码 0；`docker top` 确认 PID 1 是 tini（root）、
+    `akhub` 服务进程 uid 10001，数据目录里 `master.key` 为 0600、属主 akhub。
+    同一套断言已固化进 CI 的 `docker` 作业。
 - **关闭信号取消排队请求**（§25.3 第 2 步）：`src/app/mod.rs:239 begin_shutdown`、
   `src/routing/queue.rs:130-152`、`src/gateway/passthrough.rs:480-484` 返回可重试的
   `queue_timeout`，并有回归测试 `src/routing/queue.rs:262,291`。

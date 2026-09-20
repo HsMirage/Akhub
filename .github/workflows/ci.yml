@@ -120,9 +120,15 @@ jobs:
           echo "==> 健康检查子命令（镜像 HEALTHCHECK 用的就是它）"
           docker exec akhub-ci /usr/local/bin/akhub --healthcheck
 
-          echo "==> 进程不是 root"
-          uid="$(docker exec akhub-ci id -u)"
-          [[ "$uid" == "10001" ]] || { echo "::error::容器内进程 uid=$uid，预期 10001"; exit 1; }
+          echo "==> 服务进程不是 root"
+          # 注意查的是 akhub 进程**自己**的 uid，不是 docker exec 的。
+          # entrypoint 以 root 起步（为了能纠正 bind mount 的数据目录属主），
+          # 随后用 gosu 降权；PID 1 是负责转发信号的 tini，它保持 root 是正常的。
+          # 直接 `docker exec id -u` 拿到的是 exec 的 uid（沿用镜像 USER），
+          # 那衡量不了服务进程以什么身份在跑。
+          uids="$(docker exec akhub-ci sh -c 'for d in /proc/[0-9]*; do if [ "$(cat "$d/comm" 2>/dev/null)" = "akhub" ]; then awk "/^Uid:/{print \$2}" "$d/status"; fi; done' | sort -u)"
+          echo "    akhub 进程 uid: ${uids:-（未找到）}"
+          [[ "$uids" == "10001" ]] || { echo "::error::akhub 服务进程 uid=$uids，预期 10001"; exit 1; }
 
           echo "==> 数据目录内容"
           docker exec akhub-ci ls -la /data

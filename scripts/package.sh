@@ -56,6 +56,40 @@ for entry in deploy install.sh install.ps1; do
     fi
 done
 
+# 生成 zip 归档。
+#
+# 不能直接假定有 `zip`：GitHub 的 Windows runner 上 Git Bash 只带 tar/unzip，
+# 没有 zip 命令，会在发版当天以 "zip: command not found" 失败。这里按可用性
+# 依次回退到 python（三个平台都预装），保证同一份打包逻辑到处能跑。
+make_zip() {
+    local asset="$1"
+    if command -v zip >/dev/null 2>&1; then
+        (cd dist && zip -qr "$asset.zip" "$asset")
+        return
+    fi
+
+    local python=""
+    if command -v python3 >/dev/null 2>&1; then
+        python="python3"
+    elif command -v python >/dev/null 2>&1; then
+        python="python"
+    fi
+    if [[ -n "$python" ]]; then
+        # 用环境变量传参，避免把资产名拼进 python 源码里做引号体操。
+        ASSET="$asset" "$python" -c '
+import os, shutil
+asset = os.environ["ASSET"]
+os.chdir("dist")
+shutil.make_archive(asset, "zip", ".", asset)
+'
+        return
+    fi
+
+    echo "找不到 zip 也找不到 python，无法生成 $asset.zip" >&2
+    echo "装一个 zip（Debian: apt install zip / macOS 自带）后重试" >&2
+    return 1
+}
+
 case "$TARGET" in
     *windows*)
         # Windows 用 zip：解压后直接能在资源管理器里双击运行。
@@ -64,7 +98,7 @@ case "$TARGET" in
         # zip 是增量写入的：同名旧归档还在的话，上一次的内容会被原样保留，
         # 于是发出来的包里混着两个版本的二进制。必须先删干净。
         rm -f "dist/$ASSET.zip"
-        (cd dist && zip -qr "$ASSET.zip" "$ASSET")
+        make_zip "$ASSET"
         ARTIFACT="$ASSET.zip"
         ;;
     *)
