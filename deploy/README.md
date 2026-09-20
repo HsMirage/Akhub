@@ -46,7 +46,7 @@
 ```bash
 docker compose up -d
 # 或指定版本
-AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.0 docker compose up -d
+AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.3 docker compose up -d
 ```
 
 没有 compose 时用裸 `docker run`：
@@ -139,7 +139,7 @@ docker exec akhub /usr/local/bin/akhub --healthcheck        # 手动跑一次
 |---|---|---|
 | `/health/live` | 进程事件循环正常 | liveness 探针 |
 | `/health/ready` | 数据库、配置与主密钥已就绪 | readiness 探针、升级后的验收点 |
-| `/health/version` | `{"status":"ok","version":"1.1.0"}` | 确认部署的是哪个版本 |
+| `/health/version` | `{"status":"ok","version":"1.1.3"}` | 确认部署的是哪个版本 |
 
 三个端点都不需要凭据，也不暴露账号、模型或倍率信息。
 
@@ -158,7 +158,7 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh
 less install.sh
-sh install.sh --version v1.1.0 --service
+sh install.sh --version v1.1.3 --service
 ```
 
 脚本做这些事：探测平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 →
@@ -251,8 +251,8 @@ irm https://raw.githubusercontent.com/HsMirage/Akhub/master/install.ps1 | iex
 
 ```bash
 # 1. 二进制
-tar -xzf akhub-v1.1.0-linux-x86_64-musl.tar.gz
-sudo install -m755 akhub-v1.1.0-linux-x86_64-musl/akhub /usr/local/bin/akhub
+tar -xzf akhub-v1.1.3-linux-x86_64-musl.tar.gz
+sudo install -m755 akhub-v1.1.3-linux-x86_64-musl/akhub /usr/local/bin/akhub
 
 # 2. 系统用户（单元里写死了 User=akhub）
 sudo useradd --system --home-dir /var/lib/akhub --create-home akhub
@@ -340,7 +340,7 @@ sudo systemctl start akhub
 ```bash
 docker compose pull && docker compose up -d
 # 指定版本
-AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.0 docker compose up -d
+AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.3 docker compose up -d
 ```
 
 回滚就是换回旧 tag。数据卷不动，SQLite 结构会在需要时自动迁移。
