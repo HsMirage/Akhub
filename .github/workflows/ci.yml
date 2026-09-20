@@ -140,4 +140,12 @@ jobs:
           echo "==> 数据目录内容"
           docker exec akhub-ci ls -la /data
 
+          # 用户很自然会写 `docker run <镜像> --version`。命令行参数会覆盖
+          # 镜像的 CMD，靠 entrypoint 把 "-" 开头的首个参数补成 akhub 的路径；
+          # 少这一段就会变成 gosu 拿 "--version" 当可执行文件名去找。
+          echo "==> 直接追加参数也能用"
+          got="$(docker run --rm akhub:ci --version)"
+          echo "    docker run akhub:ci --version => $got"
+          [[ "$got" == akhub\ * ]] || { echo "::error::docker run --version 没有返回版本号：$got"; exit 1; }
+
           echo "全部通过"

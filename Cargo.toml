@@ -1,6 +1,6 @@
 [package]
 name = "akhub"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 license-file = "LICENSE"
 description = "AI 协议网关与组内负载均衡工具：同协议透传、跨协议互转、严格优先级调度"

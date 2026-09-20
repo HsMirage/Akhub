@@ -8,6 +8,17 @@ set -eu
 
 DATA_DIR="${AKHUB_DATA_DIR:-/data}"
 
+# 允许 `docker run <镜像> --version` 这种写法。
+#
+# 镜像的 CMD 是 `/usr/local/bin/akhub`，但用户在命令行追加参数时会**覆盖**
+# CMD——于是 `docker run <镜像> --version` 交给本脚本的是 "--version"，
+# 后面 gosu 会把它当成可执行文件名去找，报
+# `exec: "--version": executable file not found in $PATH`。
+# 第一个参数以 - 开头时说明用户要跑的就是 akhub 自己，补上路径即可。
+case "${1:-}" in
+    -*) set -- /usr/local/bin/akhub "$@" ;;
+esac
+
 if [ "$(id -u)" = "0" ]; then
     mkdir -p "$DATA_DIR"
     # 只改目录本身的属主，不动里面的文件：容器内的 akhub 会自己按 0600/0700
