@@ -88,7 +88,10 @@ async fn a_newer_release_is_reported_and_the_answer_is_cached() {
                 status["can_self_update"], false,
                 "源码构建不该出现自更新入口：{status}"
             );
-            assert!(command.contains("git pull"), "源码构建要给出升级命令：{status}");
+            assert!(
+                command.contains("git pull"),
+                "源码构建要给出升级命令：{status}"
+            );
         }
         _ => assert!(
             command.contains("sudo akhub --update"),
