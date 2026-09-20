@@ -209,6 +209,8 @@ pub struct Runtime {
     pub background: crate::gateway::background::RunningTasks,
     /// 保留期为 0 时的内存实时汇总（§3、§24.2）。与请求记录器共享同一个实例。
     pub live: Arc<live_stats::LiveStats>,
+    /// 版本检查与自更新的缓存/互斥状态（后台顶部的版本号点开时用）。
+    pub update: crate::update::Registry,
 }
 
 /// 在途计数守卫：随响应体一起析构，客户端断开也会准确 -1。
@@ -234,6 +236,7 @@ impl Default for Runtime {
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             background: crate::gateway::background::RunningTasks::new(),
             live: Arc::new(live_stats::LiveStats::new()),
+            update: crate::update::Registry::default(),
         }
     }
 }

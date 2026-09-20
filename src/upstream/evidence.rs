@@ -83,19 +83,35 @@ impl Evidence {
         }
     }
 
-    /// 当前有效的证据条数（两类合计），供后台展示。
+    /// 当前有效的证据条数（两类合计）。
     pub fn len(&self, now: Instant) -> usize {
-        let count = |map: &RwLock<HashMap<(String, Endpoint), Instant>>| {
-            map.read()
-                .map(|map| map.values().filter(|expires| **expires > now).count())
-                .unwrap_or(0)
-        };
-        count(&self.unsupported) + count(&self.supported)
+        self.unsupported_len(now) + self.supported_len(now)
+    }
+
+    /// 「已证实不存在」的条数。
+    ///
+    /// 概览页的告警只该看这个数：supported 是"真的成功过一次"的记录，把它
+    /// 一起算进来，一台健康运转的网关会一直挂着"上游没有这个端点"的提示——
+    /// 那是把正常工作的证据当成了故障。
+    pub fn unsupported_len(&self, now: Instant) -> usize {
+        count_live(&self.unsupported, now)
+    }
+
+    /// 「已确认可用」的条数。
+    pub fn supported_len(&self, now: Instant) -> usize {
+        count_live(&self.supported, now)
     }
 
     pub fn is_empty(&self, now: Instant) -> bool {
         self.len(now) == 0
     }
+}
+
+/// 数一个表里还没过期的条目。
+fn count_live(map: &RwLock<HashMap<(String, Endpoint), Instant>>, now: Instant) -> usize {
+    map.read()
+        .map(|map| map.values().filter(|expires| **expires > now).count())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -135,6 +151,23 @@ mod tests {
         evidence.note_unsupported("acc", Endpoint::Responses, now);
         evidence.clear();
         assert!(evidence.is_empty(now));
+    }
+
+    /// 概览页的"上游没有这个端点"只能数不支持的证据。
+    ///
+    /// 支持证据是成功过的记录；混在一起会让健康部署一直显示告警。
+    #[test]
+    fn only_unsupported_evidence_counts_as_a_missing_endpoint() {
+        let now = Instant::now();
+        let evidence = Evidence::new();
+        evidence.note_supported("a", Endpoint::ChatCompletions, now);
+        evidence.note_supported("b", Endpoint::Messages, now);
+        assert_eq!(evidence.unsupported_len(now), 0, "成功不算缺失");
+        assert_eq!(evidence.supported_len(now), 2);
+
+        evidence.note_unsupported("c", Endpoint::Responses, now);
+        assert_eq!(evidence.unsupported_len(now), 1);
+        assert_eq!(evidence.len(now), 3, "合计仍然是两类之和");
     }
 
     /// 配置变化要同时清掉支持与不支持的证据（§16.7）。

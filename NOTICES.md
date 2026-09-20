@@ -15,6 +15,7 @@ Akhub 直接依赖的第三方库及其许可证。运行 `cargo generate-lockfi
 | axum | 0.8.9 | MIT |
 | base64 | 0.23.1 | MIT OR Apache-2.0 |
 | chacha20poly1305 | 0.11.0 | MIT OR Apache-2.0 |
+| flate2 | 1.1.10 | MIT OR Apache-2.0 |
 | futures | 0.3.34 | MIT OR Apache-2.0 |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | hex | 0.4.3 | MIT OR Apache-2.0 |
@@ -26,6 +27,7 @@ Akhub 直接依赖的第三方库及其许可证。运行 `cargo generate-lockfi
 | serde / serde_json | 1.0.229 / 1.0.151 | MIT OR Apache-2.0 |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 |
 | sqlx | 0.9.0 | MIT OR Apache-2.0 |
+| tar | 0.4.46 | MIT OR Apache-2.0 |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | time | 0.3.55 | MIT OR Apache-2.0 |

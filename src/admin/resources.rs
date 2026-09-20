@@ -207,7 +207,10 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
         "sticky_bindings": state.runtime.sticky.len(),
         // 已证实不存在的上游端点条数。不为零说明有账号的首选协议填错了，
         // 或者上游确实只有一条路（§14.2）。
-        "missing_endpoints": state.runtime.evidence.len(std::time::Instant::now()),
+        "missing_endpoints": state
+            .runtime
+            .evidence
+            .unsupported_len(std::time::Instant::now()),
         "dropped_request_records": state.recorder.dropped(),
         "master_key_from_env": state.master_key_from_env,
         // 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里，排查时要能一眼看到。

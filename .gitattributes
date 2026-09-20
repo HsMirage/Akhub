@@ -1,0 +1,18 @@
+# 换行与文本判定。
+#
+# 仓库内统一 LF：Windows 上贡献代码时不会因为编辑器写 CRLF 而产生整文件 diff，
+# 也不会让 shell 脚本在容器里因为 \r 而报 "bad interpreter"。
+* text=auto eol=lf
+
+# 二进制资产不做任何文本处理（少了这几行，git 会在 diff 与合并时损坏它们）。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.exe binary
+*.woff2 binary
+*.sqlite binary

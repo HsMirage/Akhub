@@ -345,6 +345,30 @@ AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.0 docker compose up -d
 
 回滚就是换回旧 tag。数据卷不动，SQLite 结构会在需要时自动迁移。
 
+### 4.4 后台一键升级与 `akhub --update`
+
+后台左上角的版本号点开就是「版本与更新」面板：它比对 GitHub Release，显示当前版本、
+最新版本与这台机器的部署方式，并在有新版本时给出升级入口。
+
+- **原生二进制部署**点「立即更新」：服务端下载对应平台的资产 → 用 `checksums.txt` 校验
+  sha256 → 把旧二进制备份成 `akhub.bak-<时间戳>` → 原子替换；随后点「重启服务」生效
+  （重启按钮只在检测到 systemd 之类的监督进程时出现）。
+- **systemd 加固部署**（单元里有 `ProtectSystem=strict`）通常没有写 `/usr/local/bin` 的权限，
+  面板会给出等价的命令行版本：
+
+```bash
+sudo akhub --update                    # 升到最新 Release
+sudo akhub --update --version v1.1.2   # 装指定版本（也是回退手段）
+sudo systemctl restart akhub
+```
+
+`--update` 不读数据目录、不碰数据库，也不依赖 `curl`：适合只装了二进制、手边没有
+`install.sh` 的机器。校验不过（sha256 不匹配、Release 里没有对应平台的资产）时它会
+明确报错并保持原二进制不动。
+
+容器部署请在宿主机换镜像 tag；Windows 下运行中的 exe 无法自我覆盖，请下载新版或重跑
+`install.ps1`。不想让服务端访问 GitHub 时，设 `AKHUB_UPDATE_DISABLED=1` 关闭检查。
+
 ---
 
 ## 5. 反向代理终止 HTTPS（§25.2）

@@ -24,6 +24,8 @@ import type {
   TestResult,
   MultiplierRefreshResult,
   BatchMultiplierRefreshResult,
+  UpdateStatus,
+  UpdateOutcome,
 } from "./types";
 
 const BASE = "/admin/api";
@@ -354,6 +356,14 @@ export const api = {
     const query = params.toString();
     return request<RequestPage>(`/requests${query ? `?${query}` : ""}`);
   },
+
+  /** 版本检查：默认走服务端 30 分钟缓存，refresh 表示用户手动重查。 */
+  updateStatus: (refresh = false) =>
+    request<UpdateStatus>(`/system/update${refresh ? "?refresh=1" : ""}`),
+  /** 立即更新：下载 → 校验 sha256 → 原子替换二进制，重启后生效。 */
+  runUpdate: () => post<{ outcome: UpdateOutcome }>("/system/update"),
+  /** 重启服务：优雅关闭自己，交给 systemd 拉起新版本。 */
+  restartService: () => post<{ restarting: boolean }>("/system/restart"),
 
   /** 只提交发生变化的系统设置；后端会立即热生效。 */
   updateSettings: (values: SettingsPatch) => patch<Settings>("/settings", values),

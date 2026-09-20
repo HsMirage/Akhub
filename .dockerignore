@@ -14,6 +14,7 @@ data/
 .github/
 .playwright-mcp/
 review/
+.claude/
 
 # 前端依赖与产物：web 阶段会在容器里重新 npm ci 与 npm run build，
 # 产物再由 rust-embed 嵌进二进制。传宿主机的 node_modules 只会拖慢构建，

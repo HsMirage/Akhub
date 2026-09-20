@@ -18,6 +18,17 @@ const VERSION: &str = match option_env!("AKHUB_BUILD_VERSION") {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 自更新必须排在 --version / --help 之前：`akhub --update --version v1.1.2`
+    // 里的 --version 是"装哪个版本"，不是"打印版本号"。
+    //
+    // 也刻意排在打开数据库之前：升级路径上数据目录可能还是旧结构，换个二进制
+    // 不该先动数据（结构迁移留给新版本启动时做）。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--update") {
+        init_tracing();
+        std::process::exit(akhub::update::cli_update(&args).await);
+    }
+
     // 出问题时第一件事就是确认跑的是哪个二进制，所以这个分支要排在
     // 监听地址解析之前——本机 AKHUB_LISTEN 写坏了也得能 --version。
     if let Some(code) = handle_early_exit() {
@@ -82,6 +93,7 @@ const HELP: &str = concat!(
     "  akhub                 启动服务（监听 AKHUB_LISTEN，默认 127.0.0.1:8080）\n",
     "  akhub --healthcheck   探测本机 /health/ready，就绪退出码 0，否则非 0\n",
     "  akhub --version       打印版本号\n",
+    "  akhub --update        从 GitHub Release 下载并替换本二进制（需要写权限）\n",
     "  akhub --help          显示本帮助\n",
     "\n",
     "常用环境变量：\n",

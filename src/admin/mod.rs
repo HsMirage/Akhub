@@ -1,6 +1,7 @@
 //! 管理后台 REST API 与会话（§7.4）。
 
 pub mod resources;
+pub mod system;
 pub mod ui;
 
 use axum::Router;
@@ -310,6 +311,12 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/admin/api/requests", get(r::list_requests))
         .route("/admin/api/metrics", get(r::metrics))
+        // 版本检查与自更新（顶部版本号点开的面板）。
+        .route(
+            "/admin/api/system/update",
+            get(system::update_status).post(system::run_update),
+        )
+        .route("/admin/api/system/restart", post(system::restart))
         .route(
             "/admin/api/settings",
             get(r::get_settings).patch(r::update_settings),

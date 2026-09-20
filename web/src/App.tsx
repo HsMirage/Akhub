@@ -5,6 +5,7 @@ import { ROUTES, ROUTE_META, type Route } from "./routes";
 import { Button, ConfirmDialog, Skeleton, ToastProvider, useToast } from "./components/ui";
 import { CommandPalette } from "./components/CommandPalette";
 import { GlossaryDialog } from "./components/GlossaryDialog";
+import { VersionDialog } from "./components/VersionDialog";
 import {
   IconBook,
   IconGauge,
@@ -21,6 +22,7 @@ import {
   IconSettings,
   IconSun,
 } from "./components/Icons";
+import type { UpdateStatus } from "./lib/types";
 import { formatUpdatedAgo } from "./lib/format";
 import { Gate } from "./pages/Gate";
 import { Overview } from "./pages/Overview";
@@ -158,6 +160,10 @@ function Console({
   const [refreshing, setRefreshing] = useState(false);
   /** 自动刷新间隔（秒）；0 表示关闭。 */
   const [autoRefreshSecs, setAutoRefreshSecs] = useState(0);
+  /** 版本与更新面板。 */
+  const [versionOpen, setVersionOpen] = useState(false);
+  /** 版本检查结果：侧边栏拿它决定版本号上要不要亮"有新版本"的小圆点。 */
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
 
   const meta = ROUTE_META[route];
 
@@ -172,6 +178,21 @@ function Console({
     const onConflict = () => setConflictOpen(true);
     window.addEventListener("akhub-config-conflict", onConflict);
     return () => window.removeEventListener("akhub-config-conflict", onConflict);
+  }, []);
+
+  // 进入控制台时查一次版本。服务端缓存 30 分钟，开销可以忽略；失败也不打扰
+  // 用户：面板里会把失败原因原样写出来。
+  useEffect(() => {
+    let alive = true;
+    api
+      .updateStatus()
+      .then((status) => {
+        if (alive) setUpdateStatus(status);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // 全局搜索快捷键。
@@ -235,7 +256,22 @@ function Console({
           <div className="brand-mark">A</div>
           <div>
             <div className="brand-name">Akhub</div>
-            <div className="brand-version">v{data?.settings.version ?? "…"}</div>
+            <button
+              type="button"
+              className={`brand-version${updateStatus?.has_update ? " has-update" : ""}`}
+              onClick={() => setVersionOpen(true)}
+              aria-label="版本与更新"
+              title={
+                updateStatus?.has_update
+                  ? `有新版本 v${updateStatus.latest}，点开查看如何升级`
+                  : "版本与更新"
+              }
+            >
+              v{data?.settings.version ?? "…"}
+              {updateStatus?.has_update && (
+                <span className="brand-version-dot" aria-hidden="true" />
+              )}
+            </button>
           </div>
           <button
             type="button"
@@ -267,6 +303,17 @@ function Console({
         </nav>
 
         <div className="sidebar-footer">
+          <a
+            className="repo-link"
+            href="https://ai.hsnb.fun/"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span className="repo-link-mark repo-link-mark-accent" aria-hidden="true">
+              ✦
+            </span>
+            幻境MirageAI
+          </a>
           <a
             className="repo-link"
             href="https://github.com/HsMirage/Akhub"
@@ -427,6 +474,13 @@ function Console({
         />
       )}
       <GlossaryDialog open={glossaryOpen} onClose={() => setGlossaryOpen(false)} />
+      <VersionDialog
+        open={versionOpen}
+        onClose={() => setVersionOpen(false)}
+        status={updateStatus}
+        onStatus={setUpdateStatus}
+        onUpdated={() => void refresh()}
+      />
       <ConfirmDialog
         open={conflictOpen}
         title="配置已被其他会话修改"

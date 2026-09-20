@@ -1,158 +1,116 @@
 # Akhub
 
-一个简单、可靠、高性能的 AI 协议网关与组内负载均衡工具。
+**一个简单、可靠、高性能的 AI 协议网关与组内负载均衡工具。**
 
-> 许可证说明：本项目为源码公开、非商业许可项目，不是 OSI 定义的“开源软件”。
-> 非商业使用必须保留署名；商业使用需事先取得书面授权，并明确注明 Akhub、HsMirage
-> 及源码仓库来源。详见 [LICENSE](LICENSE)。
+[![最新版本](https://img.shields.io/github/v/release/HsMirage/Akhub?label=release&color=7c6cff)](https://github.com/HsMirage/Akhub/releases)
+[![CI](https://github.com/HsMirage/Akhub/actions/workflows/ci.yml/badge.svg)](https://github.com/HsMirage/Akhub/actions/workflows/ci.yml)
+[![许可](https://img.shields.io/badge/license-%E9%9D%9E%E5%95%86%E4%B8%9A%E7%BD%B2%E5%90%8D%E8%AE%B8%E5%8F%AF-orange.svg)](#许可与来源)
 
-完整的产品与技术方案见 [`计划.md`](计划.md)。本文件只描述**当前已实现的部分**。
+把 Claude Code、Codex CLI 和任意 OpenAI 客户端接到 Akhub 上，由它统一分发到多个
+上游账号：**同协议原样透传，跨协议自动互转，组内按严格优先级与实时评分分流，
+失败时在不重复浪费的前提下换一个账号**。
 
-## 当前状态：核心链路可运行，功能完整性与发布验证尚未完成
+- 单文件二进制或一个容器就能跑，不需要额外的数据库、队列或 Redis。
+- 管理后台内嵌在二进制里，打开 `/admin` 设置管理员密码即可开始用。
+- 上游凭据加密落库、日志脱敏、请求正文不落盘，默认拒绝访问内网与云元数据地址。
 
-阶段 1 的目标是"三个入口能真实干活"——同协议原生透传，让 Claude Code、Codex CLI
-和 OpenAI Chat 客户端都能通过 Akhub 完成真实工作。阶段 2 的目标是"可靠组内路由"：
-多目标之间按严格优先级阶梯与层内评分调度，失败时在不重复浪费的前提下切换。
-阶段 3 的目标是"跨协议互转"：一个分组里只有 Messages 端点、而客户端说的是
-Chat Completions 时，请求照样能送达，且丢什么能力事先说了算。阶段 4 加入
-Responses 状态链与模型发现（选择集、别名、自动同步、能力学习）。阶段 5 加入
-成本视图、校准助手、账号复制/测试与配置备份恢复。
+![管理后台概览](docs/images/overview.png)
 
-已实现：
+---
 
-- Rust 服务、SQLite（WAL）、主密钥与首次管理员设置。
-- 分组、下游 Key、上游账号、逻辑模型与调度目标。
-- 三个入口的**同协议原生透传**，普通与 SSE：
-  - `POST /v1/chat/completions`
-  - `POST /v1/messages`
-  - `POST /v1/messages/count_tokens`
-  - `POST /v1/responses`
-  - `POST /v1/images/generations` 与 `POST /v1/images/edits`（仅原生 OpenAI 兼容上游）
-- `GET /v1/models` 与 `/v1/models/{model}`，响应形状按鉴权头双形态切换。
-- 请求 ID、稳定错误码、§18.3 的 HTTP 状态码映射、上游凭据加密与日志脱敏。
-- **严格优先级阶梯**：优先级数字相同的目标构成一层，高层只要还有合格目标就
-  优先使用高层；常规路径层内全忙时在本层排队，不降层。普通粘性绑定也只在
-  当前最高合格层内查找，低层绑定不会绕过已恢复的高层（曾有的缺陷已于
-  2026-09-06 修复，回归用例见 `review/2026-09-06/gateway_probes.rs`）。
-- **层内四维评分**（倍率 / 可靠性 / 首字延迟 / 输出速度）：比值归一化、分组级
-  可调权重、`score^k` 加权随机分配；性能用 EWMA 统计，样本不足时取中性分。
-- **会话粘性**：Responses 状态链 → 显式会话头 → `prompt_cache_key` → 稳定前缀
-  哈希（system prompt + 工具定义，不含用户消息，`/compact` 不断链）；按请求体
-  体积 × 缓存新鲜度计算等待预算；带 `Retry-After` 的 429 在预算内原地等待。
-- **熔断与限流**：60 秒窗口内连续或高比例故障进入指数冷却，冷却后只放行一个
-  半开试运行请求；401/403 停整个账号，429 只停"账号 + 模型"；RPM / TPM / 最大
-  并发按账号默认、目标覆盖。
-- **故障切换边界**：廉价失败不计入任何次数上限；流式响应在第一个有语义的事件
-  之前仍可切换，之后禁止拼接第二个上游；慢请求与总超时不重放。
-- **自动倍率**：Sub2API 与 New API 探针、抖动刷新与退避、按风险余量的宽限期、
-  探针系统性故障保护、手动倍率不受影响。
-- **重启恢复**：粘性绑定与性能 EWMA 每 60 秒落盘，重启后恢复；超过 24 小时的
-  快照丢弃。
-- **跨协议转换**：Chat Completions ↔ Responses ↔ Messages 六个方向全部可用。
-  请求先解析成统一的中间格式再发到目标协议；工具调用、思考块、图像输入、
-  结构化输出与 usage（含缓存读写）在三个协议之间往返。入口与端点协议相同
-  时直接原生透传，不付解析与重排的代价。
-- **能力降级白名单**：白名单外的能力（工具、结构化输出、图像/文件、角色语义）
-  在目标端点无法表达时明确返回 400，绝不静默丢失；白名单内只有思考与协议
-  特有的采样参数（`top_k` 等）可以丢，且仅发生在故障切换里——同一层内先试
-  无损候选，全部失败才轮到降级候选。发生降级的请求带 `X-Akhub-Degraded`
-  响应头，请求记录标红，可按"仅降级"筛选。
-- **端点证据**：某账号的上游没有某端点（404/405）时记下来，24 小时内不再
-  把该端点当作候选；配置变更立即清空。概览页会提示这类"端点缺失"证据。
-- **未知字段透传**：本网关不认识的顶层字段原样带给原生协议的上游，跨协议
-  时才明确拒绝。
-- 嵌入二进制的 React + TypeScript 管理后台（`/admin`）：账号内的模型管理
-  （获取/手动添加/逐行启用停用/删除，别名归并，隐藏原始模型）、只读调度视图
-  （按分组与模型展示综合评分、可用性、倍率、首字延迟、速度与预计分配）、
-  倍率告警、调度权重编辑、降级筛选与端点转换标记、分组的"允许降级"开关与
-  端点缺失告警。账号人工优先级默认 0，同层由评分决定分配。
-- Docker 与 Linux 部署示例。
+## 目录
 
-阶段 4–5 已有 Responses 状态链、模型发现与选择集、别名与自动归并、成本视图、
-校准助手、账号复制/测试、备份恢复和管理员审计的实现及基础测试，但不能据此视为完整验收。
+- [核心能力](#核心能力)
+- [快速开始](#快速开始)
+- [客户端接入](#客户端接入)
+- [支持的接口](#支持的接口)
+- [版本检查与升级](#版本检查与升级)
+- [环境变量](#环境变量)
+- [必须知道的行为](#必须知道的行为)
+- [开发](#开发)
+- [部署](#部署)
+- [许可与来源](#许可与来源)
 
-2026-09-06 的功能审查曾复现四项问题：账号总并发未跨模型共享、低优先级粘性绑定绕过已恢复的高层、
-TPM 结算漏算输入 Token、Responses 故障切换丢失工具返回；这些问题已在当前工作区修复并由定向复现回归验证。
-随后的加固轮次又补上了流式结算、Responses 生命周期、内存上限、SSRF 解析与关闭宽限期，
-详见 `2026-09-06_功能审查-Akhub-report.md` 与本节的"已补齐"清单。
+---
 
-**仍待完成**（发布硬化与真实环境验收）：
+## 核心能力
 
-| 能力 | 计划阶段 |
-|---|---|
-| §26.9 完整性能验收（固定硬件、64 KB/8 MB/64 MB 请求体、连接复用率与每请求分配量） | 阶段 6 |
-| 真实上游上的跨账号故障切换实测（现有测试 Key 下同一逻辑模型只有一个可用目标） | 阶段 6 |
+### 三个协议入口，同协议零改动透传
 
-已完成（本轮校正）：
+`POST /v1/chat/completions`、`POST /v1/messages` 与 `POST /v1/responses`
+各走各的原生通路：请求体、SSE 事件、错误对象都按上游原本的形状收发，不解析、
+不重排、不补齐，因此不会因为"网关多懂了一点"而丢字段。
 
-- **发布流程与部署方式**（2026-09-20 重做）：
-  - **六个平台的二进制**：`linux-x86_64`、`linux-aarch64`、`linux-x86_64-musl`、
-    `macos-aarch64`、`macos-x86_64`、`windows-x86_64`。全部在 **各自平台的原生 runner**
-    上构建（`ubuntu-24.04-arm` 跑 arm64），不走 QEMU，也不用 `actions-rust-cross`；
-    Release 附带 `checksums.txt`。
-  - **多架构镜像**：每个架构在自己或原生 runner 上构建、先推 `<tag>-<arch>`，
-    再由 `docker-manifest` 用 `buildx imagetools create` 合成 manifest——
-    两个架构推同一 tag 会互相覆盖，这一步不能省。
-  - **一键安装**：`install.sh`（Linux/macOS，支持 `--service` 直接装 systemd 单元）
-    与 `install.ps1`（Windows）。两者都校验 sha256，升级前自动备份旧二进制，
-    支持 `AKHUB_BASE_URL` 指向自建镜像。
-  - **打包规则单一来源**：`scripts/package.sh` 同时被 CI 与 `scripts/release.sh` 调用，
-    资产命名与归档布局不会两边分叉。
-  - **容器**：`Dockerfile` 改用 `tini` 转发信号 + entrypoint 纠正数据目录属主后
-    `gosu` 降权，`cmake` 补齐 `aws-lc-sys` 的构建依赖；`docker-compose.yml` 支持
-    `AKHUB_IMAGE` 拉预构建镜像，并补了日志轮转与 `no-new-privileges`。
-  - **可运维性**：新增 `/health/version` 与 `akhub --version` / `--help`；
-    CI 增加容器冒烟作业，在**空数据目录**上跑通首次启动、真实 HTTP 调用与
-    非 root 校验（§28 完成标准里的那一条）。
-  - **部署文档**：`deploy/README.md` 覆盖 Docker / 一键脚本 / systemd / 升级回滚 /
-    反代，并新增 `deploy/Caddyfile`、`deploy/Caddyfile.windows`、`deploy/nginx.conf`
-    与 `deploy/README.windows.md`。
-  - **容器落地验收已完成**（§28 完成标准里那条）：在空数据目录 + 命名卷上首次启动
-    4 秒就绪，`/health/version` 报 `1.1.0`，`/admin` 返回 SPA 外壳，未鉴权请求
-    401，`--healthcheck` 退出码 0；`docker top` 确认 PID 1 是 tini（root）、
-    `akhub` 服务进程 uid 10001，数据目录里 `master.key` 为 0600、属主 akhub。
-    同一套断言已固化进 CI 的 `docker` 作业。
-- **关闭信号取消排队请求**（§25.3 第 2 步）：`src/app/mod.rs:239 begin_shutdown`、
-  `src/routing/queue.rs:130-152`、`src/gateway/passthrough.rs:480-484` 返回可重试的
-  `queue_timeout`，并有回归测试 `src/routing/queue.rs:262,291`。
+### 跨协议六方向互转
 
-已补齐（本轮）：
+一个分组里只有 Messages 端点、而客户端说的是 Chat Completions 时，请求照样送得到：
+请求先解析成统一的中间格式再发往目标协议，工具调用、思考块、图像输入、结构化输出
+与 usage（含缓存读写）在三个协议之间往返。入口与端点协议相同时仍然直通，不付转换代价。
 
-- 流式结算：按流内真实 usage 回补 TPM；拿不到 usage 时保持保守预留；
-  性能 EWMA 改用真实流结束时间，流内错误不再伪装成成功记录。
-- 流式 Responses：结束时用 `response.completed` 的最终对象补写完整输出项；
-  流失败或客户端中断时删除状态链，后续引用得到明确的 `response_state_expired`。
-- 跨协议进入 Responses 同样使用网关 ID 并登记状态链。
-- 查询/取消/删除/输入项：有原生映射时转发给原账号；没有时查询回放真实响应
-  对象，取消则明确拒绝，绝不伪报成功。
-- `POST /v1/responses/compact` 与 `/v1/responses/input_tokens` 接入完整调度链路
-  后原生转发给 Responses 上游；上游没有该路由时返回明确的不支持（不重试、不估算）。
-- 图片接口 `POST /v1/images/generations` 与 `POST /v1/images/edits`：仅原生转发到
-  OpenAI 兼容上游，不做跨协议转换与 provider 适配；edits 保留 multipart 文件字节。
-- 官方 SDK 黑盒验收（§26.2）：已用官方 `openai` / `anthropic` SDK 对真实上游
-  跑通 14/14（Chat/Responses/Messages 的流式与非流式、工具往返、查询与续链、
-  错误对象、401），并完成真实生图与图生图；脚本在 `tests/sdk/acceptance.py`。
-- 真实上游接入与探针现场字段：Sub2API 计费探针已兼容现场 `sub2api.key_billing`
-  形状（自动识别 effective 倍率），newapi 走 OpenAI 兼容 + Anthropic 端点；
-  过程记录见 `review/2026-09-15-真实上游验收.md`。
-- 请求体超过 8 MiB 落数据目录临时文件（自动清理 + 启动清理），非流式上游
-  响应体施加 64 MiB 硬上限。
-- SSRF 校验移入 DNS 解析器：连接使用的地址就是校验过的地址，消除 DNS
-  Rebinding 的二次解析窗口。
-- 锁毒化恢复、内置与容器优雅关闭宽限期、数据库文件权限 0600、安全响应头、
-  NOTICES 版本与 Cargo.lock 对齐（并有测试钉住）。
+**能力降级是白名单制**：工具、结构化输出、图像/文件、角色语义在目标端点无法表达时
+明确返回 400，绝不静默丢弃；只有思考与协议特有的采样参数（`top_k` 等）允许丢，
+且仅发生在故障切换里——同一层内先试无损候选，全部失败才轮到降级候选。发生降级的请求
+带 `X-Akhub-Degraded` 响应头，记录里也会标出来。
 
-常规自动化测试在本地已通过，但不能以测试数量替代完整验收：上面的剩余能力缺口
-与真实环境验收仍需在具备 Docker 和测试账号的机器上执行。
+### 严格优先级阶梯 + 层内四维评分
+
+优先级数字相同的目标构成一层：**高层只要还有合格目标就优先使用，层内全忙时在本层排队，
+不降层**。"忙"不等于"坏"——想让两个账号自动分担流量，把它们设成同一个优先级。
+
+层内按四个维度打分后加权随机分配：倍率、可靠性、首字延迟、输出速度。倍率用比值归一化，
+性能用 EWMA 统计（样本不足时取中性分），分组级权重可调。
+
+![调度视图](docs/images/targets.png)
+
+### 会话粘性
+
+Responses 状态链 → 显式会话头 → `prompt_cache_key` → 稳定前缀哈希（system prompt +
+工具定义，不含用户消息，`/compact` 不断链）。等待预算按请求体体积与缓存新鲜度计算，
+带 `Retry-After` 的 429 会在预算内原地等待，而不是立刻换账号丢掉缓存。
+
+### 熔断、限流与故障切换边界
+
+- 60 秒窗口内连续或高比例故障进入指数冷却，冷却后只放行一个半开试运行请求。
+- 401/403 停整个账号；429 只停"账号 + 模型"；RPM / TPM / 最大并发按账号默认、目标可覆盖。
+- 廉价失败（连接失败、明确的 4xx）不计入任何次数上限；流式响应在第一个有语义的事件
+  之前仍可切换，之后**禁止拼接第二个上游**；慢请求与总超时不重放。
+
+### 模型发现、别名与自动倍率
+
+账号模型页可以拉取上游模型列表、手动补充、逐行启用停用、把不同上游的同一个模型归并成
+一个对外名，也可以交给自动同步全量托管。倍率支持手动填写，或由 Sub2API / New API 探针
+周期刷新（带抖动、退避与风险余量宽限期；探针失败不会立刻停用账号）。
+
+### 内嵌管理后台
+
+React + TypeScript 写的单页后台在编译期嵌进二进制，不需要单独部署前端：
+概览指标与请求趋势、分组与下游 Key、上游账号与模型目录、只读调度视图、请求记录
+（只存元数据，可按状态/错误码/模型/账号筛选）、成本视图、系统设置与配置备份。
+
+![上游账号](docs/images/accounts.png)
+
+![请求记录](docs/images/requests.png)
+
+---
 
 ## 快速开始
 
-### Docker
+### Docker（推荐）
 
 ```bash
 docker compose up -d
 # 打开 http://127.0.0.1:8080/admin 设置管理员密码
 ```
+
+### 一键脚本（Linux / macOS）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
+```
+
+脚本会自动识别平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
+`/usr/local/bin`；`--service` 会顺带装好 systemd 单元。Windows 用
+[`install.ps1`](install.ps1)，细节见 [deploy/README.windows.md](deploy/README.windows.md)。
 
 ### 本地运行
 
@@ -163,33 +121,79 @@ cargo run --release
 
 ### 配置一条可用链路
 
-在 `/admin` 中依次完成三步：
+在 `/admin` 里依次做三步：
 
 1. **建分组**，记下只显示一次的下游 Key（形如 `akh-...`）。
-2. **建账号**：填 Base URL、上游 API Key 与首选协议。不需要填写上下文长度、
-   多模态、工具或思考等模型能力字段。
+2. **建账号**：填 Base URL、上游 API Key 与首选协议，按需设置优先级与限流。
 3. **配置模型**：打开账号的「模型管理」，点「获取上游模型」并启用要用的模型。
-   每行的**对外名**就是下游看到的模型名；留空则跟随上游真名。把不同上游站的
-   同一模型设成相同对外名即可自动归并，调度视图里能按模型查看账号评分、
-   可用性与速度。
+   每行的**对外名**就是下游看到的模型名，留空则跟随上游真名；把不同上游站的同一个模型
+   设成相同对外名即可自动归并。模型启用后会自动生成调度目标，不需要手工绑定。
 
-设置别名后，默认会同时暴露别名与原始上游名；勾选「隐藏原始模型」后下游只会
-看到别名。模型启用后会自动生成调度目标，不再需要单独创建逻辑模型或手工绑定
-目标。
+---
 
-然后就可以直接用了：
+## 客户端接入
+
+下游 Key 是分组级的，三个协议共用同一把：
 
 ```bash
 # Claude Code / Anthropic SDK
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_AUTH_TOKEN=akh-你的分组Key
 
-# OpenAI 客户端
+# Codex CLI / OpenAI SDK
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=akh-你的分组Key
+
+# 直接 curl
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer akh-你的分组Key" \
   -H "content-type: application/json" \
   -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+`GET /v1/models` 的响应形状会按鉴权头自动切换：`Authorization` 得到 OpenAI 形状，
+`x-api-key` 得到 Anthropic 形状，同一份模型目录两种客户端都能读。
+
+---
+
+## 支持的接口
+
+| 接口 | 说明 |
+|---|---|
+| `POST /v1/chat/completions` | Chat Completions，普通与 SSE |
+| `POST /v1/messages` | Anthropic Messages，普通与 SSE |
+| `POST /v1/messages/count_tokens` | Token 计数，原生转发 |
+| `POST /v1/responses` | Responses，含状态链、`previous_response_id` 续链 |
+| `POST /v1/responses/compact` · `/input_tokens` | 原生转发，上游没有该路由时明确返回不支持 |
+| `GET /v1/responses/{id}` · `DELETE` · `/cancel` · `/input_items` | 有原生映射就转发，没有则回放或明确拒绝 |
+| `POST /v1/images/generations` · `/v1/images/edits` | 仅原生转发到 OpenAI 兼容上游，不做跨协议转换 |
+| `GET /v1/models` · `GET /v1/models/{model}` | 双形状模型目录 |
+| `GET /health/live` · `/health/ready` · `/health/version` | 运维探针，无需凭据 |
+
+未知的顶层字段会原样带给原生协议的上游，只有跨协议时才明确拒绝。
+
+---
+
+## 版本检查与升级
+
+管理后台左上角的版本号可以点开：它会读取 GitHub Release，告诉你**当前版本、最新版本、
+这台机器的部署方式**，并在有新版本时给出升级入口。
+
+![版本与更新](docs/images/version.png)
+
+- **原生二进制部署**（`install.sh` / systemd）：点「立即更新」即可。服务端会下载对应平台的
+  资产、用 `checksums.txt` 校验 sha256、把旧二进制备份成 `akhub.bak-<时间戳>`，
+  再原子替换；随后点「重启服务」生效（重启按钮只在检测到 systemd 之类的监督进程时出现）。
+- **systemd 加固部署**：服务进程按 `ProtectSystem=strict` 运行，通常没有写 `/usr/local/bin` 的
+  权限，这时面板会给出 `sudo akhub --update`——同一个二进制自带更新能力，不需要 curl 管道。
+- **容器部署**：升级的是镜像，面板会给出带目标版本的重建命令，形如
+  `AKHUB_IMAGE=ghcr.io/hsmirage/akhub:<tag> docker compose up -d`。
+- **Windows / 源码构建**：分别给出 `install.ps1` 与 `git pull && cargo build --release`。
+
+更新检查在服务端缓存 30 分钟，不会频繁打扰 GitHub；需要完全关闭时设
+`AKHUB_UPDATE_DISABLED=1`。
+
+---
 
 ## 环境变量
 
@@ -201,31 +205,41 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `AKHUB_REQUEST_TIMEOUT_SECS` | `600` | 请求总超时 |
 | `AKHUB_MAX_REQUEST_BYTES` | `67108864` | 单请求体上限，超过返回 413 |
 | `AKHUB_SHUTDOWN_GRACE_SECS` | `180` | 关闭时给在途请求的完成时间 |
-| `AKHUB_MULTIPLIER_REFRESH_SECS` | `300` | 自动倍率的刷新间隔，各账号叠加 0–25% 抖动 |
+| `AKHUB_MULTIPLIER_REFRESH_SECS` | `300` | 自动倍率刷新间隔，各账号叠加 0–25% 抖动 |
 | `AKHUB_RETENTION_DAYS` | `30` | 请求元数据保留天数，0 表示不新增历史明细 |
-| `AKHUB_RESPONSE_STATE_DAYS` | `30` | Responses 可重放状态保留天数，0 表示只存最小定位映射 |
+| `AKHUB_RESPONSE_STATE_DAYS` | `30` | Responses 可重放状态的保留天数 |
 | `AKHUB_MODEL_SYNC_SECS` | `1800` | 模型自动同步间隔，各账号叠加 ±10% 抖动 |
+| `AKHUB_UPDATE_DISABLED` | 无 | 设为 `1` 关闭版本检查 |
+| `AKHUB_UPDATE_API` | GitHub API | 自建镜像或离线环境可指向另一个 Release 接口 |
+| `AKHUB_DEPLOY` | 自动判定 | `binary` / `docker` / `source`，用于纠正部署形态判断 |
+| `AKHUB_ALLOW_RESTART` | 无 | 设为 `1` 允许后台"重启服务"（默认只在 systemd 下开放） |
 | `RUST_LOG` | `akhub=info,warn` | 日志级别 |
 
-## 几个必须知道的行为
+命令行：`akhub --version`、`akhub --healthcheck`、`akhub --update [--version vX.Y.Z]`、
+`akhub --help`，都不需要配置文件。
 
-- **主密钥丢失后，数据库中的上游 Key 无法恢复。** 备份数据目录时务必包含
-  `master.key`，或改用 `AKHUB_MASTER_KEY` 自行托管。
+---
+
+## 必须知道的行为
+
+- **主密钥丢失后，数据库里的上游 Key 无法恢复。** 备份数据目录时务必包含 `master.key`，
+  或改用 `AKHUB_MASTER_KEY` 自行托管。
 - **下游 Key 只在创建与重新生成时完整显示一次**，之后只保留 HMAC 摘要与前缀。
-- **默认阻止访问环回、内网与云元数据地址。** 上游确实在内网时，需要为该账号
-  显式开启"允许内网访问"。
+- **默认阻止访问环回、内网与云元数据地址。** 上游确实在内网时，需要为该账号显式开启
+  「允许内网访问」。
 - **Base URL 以 `/v1` 结尾时会被识别为已含版本段**，不会拼出 `/v1/v1/messages`。
 - **普通请求的正文不落日志**，请求记录只保存元数据。
 - **不做下游计费、多租户与跨分组调度。** 分组是调度的硬边界。
-- **"忙"不是"坏"。** 高优先级层全部满载时，请求在该层排队而不是降到下一层；
-  想让两个账号自动分担流量，把它们设成同一个优先级。
-- **自动倍率刷新失败不会立刻停用账号。** 最后已知值保留并进入宽限期：有效倍率
-  不超过分组上限的 60% 时宽限 60 分钟，60%–90% 时 15 分钟，超过 90% 立即硬停。
-  New API 探针需要在个人设置页生成的访问令牌与用户 ID，推理用的 `sk-xxx` 不被
-  分组接口接受。
-- **Sub2API 计费接口的字段名取自方案 §11.2**（`object` / `version` / `scope` /
-  `effective_multiplier` / `observed_at` / 峰值字段）。接入真实站点前请用它的
-  实际响应核对一次；校验不过时探针只会报错，不会退回默认倍率。
+- **新库不能被旧二进制打开**：数据目录里的结构版本比当前二进制新时会拒绝启动并提示升级，
+  不会写坏数据。
+- **自动倍率刷新失败不会立刻停用账号**：最后已知值保留并进入宽限期（有效倍率不超过分组上限
+  的 60% 时宽限 60 分钟，60%–90% 时 15 分钟，超过 90% 立即硬停）。New API 探针需要个人
+  设置页生成的访问令牌与用户 ID，推理用的 `sk-xxx` 不被分组接口接受。
+- **Sub2API 计费接口的字段名取自公开文档**（`object` / `version` / `scope` /
+  `effective_multiplier` / `observed_at`），已兼容现场 `sub2api.key_billing` 形状；
+  接入新站点前建议用它的实际响应核对一次——校验不过时探针只报错，不会退回默认倍率。
+
+---
 
 ## 开发
 
@@ -241,83 +255,68 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
-跳过第 1 步也能 `cargo build`：`build.rs` 会放一个占位页面，`/v1` 网关接口
-不受影响，只是 `/admin` 会提示你先构建前端。
+跳过第 1 步也能 `cargo build`：`build.rs` 会放一个占位页面，`/v1` 网关接口不受影响，
+只是 `/admin` 会提示你先构建前端。前端热更新开发时，先在一个终端跑 `cargo run`，
+另一个终端跑 `cd web && npm run dev`，Vite 会把 `/admin/api` 与 `/v1` 代理到 `127.0.0.1:8080`。
 
-前端热更新开发时，先在一个终端跑 `cargo run`，另一个终端跑 `cd web && npm run dev`，
-Vite 会把 `/admin/api` 与 `/v1` 代理到 `127.0.0.1:8080`。
+端到端测试会拉起一个假上游站点和一台完整的 Akhub，覆盖鉴权、模型改写、故障切换、
+跨协议矩阵、流式结算、Responses 生命周期、后台 CRUD 与静态资源服务。
 
-端到端测试会拉起一个假上游站点和一台完整的 Akhub，覆盖鉴权、模型改写、
-故障切换、双形状模型列表、后台 CRUD 与静态资源服务。
+---
 
-## 安装与部署
+## 部署
 
-详细步骤见 [`deploy/README.md`](deploy/README.md)，下面是最短的路径。
-
-**Docker（推荐）**
-
-```bash
-docker compose up -d
-# 指定版本
-AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.0 docker compose up -d
-```
-
-镜像在 GHCR 上，多架构（amd64 / arm64）、非 root 运行、只暴露 `/data` 一个持久卷。
-**容器侧必须给足停止宽限**（compose 的 `stop_grace_period` 或 `docker run` 的
-`--stop-timeout` ≥ 200 秒），否则 Docker 默认的 10 秒会强杀在途的长流式请求。
-
-**一键脚本（Linux / macOS）**
+四种部署方式（Docker / 一键脚本 / systemd / Windows）的完整步骤、升级回滚与反向代理
+示例见 **[deploy/README.md](deploy/README.md)**。最短路径：
 
 ```bash
+docker compose up -d                       # 或
 curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
 ```
 
-自动探测平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
-`/usr/local/bin`。`--service` 会顺带装好 systemd 单元。Windows 用
-[`install.ps1`](install.ps1)，细节见 [`deploy/README.windows.md`](deploy/README.windows.md)。
+每个 `v*` 标签会触发 [release.yml](.github/workflows/release.yml)，在各自平台的原生 runner 上
+构建 6 个平台的单文件二进制（`linux-x86_64-musl`、`linux-x86_64`、`linux-aarch64`、
+`macos-aarch64`、`macos-x86_64`、`windows-x86_64`，Windows 另附免解压的裸 `.exe`），
+并合成多架构镜像推送到 GHCR，附 `checksums.txt`。本地发版用 `scripts/release.sh`，打包规则由
+[scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
 
-**验证部署**
+容器侧记得给足停止宽限（compose 的 `stop_grace_period` 或 `docker run --stop-timeout` ≥ 200 秒），
+否则 Docker 默认的 10 秒会强杀在途的长流式请求。
 
-| 端点 | 含义 |
-|---|---|
-| `/health/live` | 进程事件循环正常 |
-| `/health/ready` | 数据库、配置与主密钥已就绪 |
-| `/health/version` | 当前版本号，用于确认升级是否生效 |
-
-`akhub --healthcheck`、`akhub --version`、`akhub --help` 三个子命令不依赖配置文件，
-可以直接在服务器上敲。
-
-## 发布
-
-推 `v*` tag 触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，
-在**各平台原生 runner** 上构建 6 个平台的单文件二进制：
-
-| 资产 | 说明 |
-|---|---|
-| `akhub-v1.1.2-linux-x86_64-musl.tar.gz` | 静态链接，跨发行版直接用（推荐） |
-| `akhub-v1.1.2-linux-x86_64.tar.gz` | glibc 版 |
-| `akhub-v1.1.2-linux-aarch64.tar.gz` | ARM64 服务器 |
-| `akhub-v1.1.2-macos-aarch64.tar.gz` / `-macos-x86_64` | Apple Silicon / Intel |
-| `akhub-v1.1.2-windows-x86_64.exe` | Windows 原生，**下载双击即可运行**（不用解压） |
-| `akhub-v1.1.2-windows-x86_64.zip` | 同上，另含文档与 `install.ps1`，体积约三分之一 |
-| `checksums.txt` | 上面所有资产的 sha256 |
-
-同一轮还会在原生 arm64 runner 上构建 `linux/amd64` 与 `linux/arm64` 镜像，
-合成多架构 manifest 后推送到 GHCR。
-
-本地发版用 `scripts/release.sh`（前端构建 → fmt/clippy/全量测试 → 交叉编译 →
-打包 → 生成校验和），打包规则由 [`scripts/package.sh`](scripts/package.sh)
-统一定义，与 CI 共用，所以资产命名与目录布局不会两边分叉。
-
-- **升级检查**：用旧版本二进制打开新版本写出的数据库会被拒绝并提示升级，
-  不会写坏数据。
-- **许可证与第三方声明**：见 [`LICENSE`](LICENSE) 与 [`NOTICES.md`](NOTICES.md)。
+---
 
 ## 许可与来源
 
-本项目以 **Akhub 非商业署名许可**发布，不是 OSI 定义的"开源软件"：非商业使用
-必须保留署名，商业使用需事先取得书面授权。完整条款见 [`LICENSE`](LICENSE)，
-第三方依赖清单见 [`NOTICES.md`](NOTICES.md)。
+本项目以 **Akhub 非商业署名许可**发布，属于源码公开（source-available）而非 OSI 定义的
+"开源软件"：非商业使用必须保留署名，商业使用需事先取得书面授权，并明确注明 Akhub、
+HsMirage 及源码仓库来源。完整条款见 [LICENSE](LICENSE)，第三方依赖清单见 [NOTICES.md](NOTICES.md)。
 
 协议适配部分为干净实现，行为参考了 New API（AGPL-3.0）、Sub2API（LGPL-3.0）、
 AxonHub（Apache-2.0 / LGPL-3.0）与 LiteLLM（MIT），未直接复制其实现代码。
+
+### 贡献与反馈
+
+- **问题与建议**走 [Issues](https://github.com/HsMirage/Akhub/issues)：请附上版本号（后台左上角的版本号，
+  或 `akhub --version`）、部署方式与复现步骤，能省掉一轮来回。
+- **提交代码前请先开 Issue 沟通**：本项目采用的不是 OSI 开源许可，未经沟通直接合并外部 PR
+  会让授权边界变复杂，因此默认不接受直接投递的 PR。
+- **安全问题上请不要公开提交**：优先使用 GitHub 仓库的 Security → Advisories →
+  「Report a vulnerability」私下报告；该入口不可用时，先开一个不含细节的 Issue 说明希望私下联系。
+
+---
+
+## English
+
+**Akhub** is a small, reliable gateway and in-group load balancer for AI APIs: it accepts
+Chat Completions, Anthropic Messages and Responses traffic, forwards it natively when the
+protocol matches, translates between the three protocols when it does not, and picks an
+upstream account by strict priority layers with four-dimension scoring inside a layer.
+Session stickiness, circuit breaking, rate limits, automatic multiplier probes, model
+aliasing and an embedded admin console (`/admin`) are included. It ships as a single
+binary or a container, and SQLite is the only state.
+
+Quick start: `docker compose up -d`, or
+`curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh`.
+Deployment guide: [deploy/README.md](deploy/README.md) (Chinese).
+
+License: source-available, non-commercial with attribution — see [LICENSE](LICENSE).

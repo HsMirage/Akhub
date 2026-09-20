@@ -1,15 +1,24 @@
+# ---------------------------------------------------------------- 构建产物
 /target
-/web/dist/
-/web/tsconfig.tsbuildinfo
-/.playwright-mcp/
+/dist
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
 
-# 运行时数据目录：SQLite、主密钥与临时文件
-/data/
+# ---------------------------------------------------------- 运行时数据目录
+# SQLite、主密钥与临时文件都在这里。
+/data
 
-# Playwright MCP 的临时快照
-/.playwright-mcp/
-web/node_modules/
-web/dist/
+# ------------------------------------------------ 内部文档（不随仓库发布）
+# 规划、审查与偏差核对记录只在本机保留：公开仓库里不该混进这些过程材料。
+/计划.md
+/计划.md.bak
+/规划文档符合度检查报告.md
+/*_功能审查-Akhub-report.md
+/review
 
-# 发布工件（scripts/release.sh 输出）
-/dist/
+# ---------------------------------------------------------------- 本地文件
+# 浏览器自动化快照与本地编辑器/代理配置。
+/.playwright-mcp
+/.claude
+.DS_Store

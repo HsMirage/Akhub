@@ -19,4 +19,5 @@ pub mod security;
 pub mod server;
 pub mod storage;
 pub mod sync;
+pub mod update;
 pub mod upstream;

@@ -123,9 +123,31 @@ async fn not_found() -> Response {
 }
 
 /// 启动 HTTP 服务并阻塞到收到停止信号。
+///
+/// 两条路径都会触发关闭：操作系统的 SIGTERM / Ctrl-C，以及后台"重启服务"
+/// 按钮置位的 [`crate::app::Runtime::begin_shutdown`]。后者存在的意义是让
+/// 自更新之后的进程能自己退出去，交给 systemd 拉起新二进制。
 pub async fn serve(state: SharedState, addr: SocketAddr) -> Result<()> {
     let grace = state.settings.get().shutdown_grace;
-    serve_with_shutdown(state, addr, shutdown_signal(grace)).await
+    let mut requested = state.runtime.subscribe_shutdown();
+    let requested = async move {
+        loop {
+            if *requested.borrow() {
+                break;
+            }
+            if requested.changed().await.is_err() {
+                // 发送端没了（正常情况下不会发生）：永远等下去，不影响信号路径。
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    serve_with_shutdown(state, addr, async move {
+        tokio::select! {
+            _ = shutdown_signal(grace) => {}
+            _ = requested => tracing::info!("收到后台重启请求，开始优雅关闭"),
+        }
+    })
+    .await
 }
 
 /// 用外部注入的停止信号启动服务；`serve` 的可测试形态。

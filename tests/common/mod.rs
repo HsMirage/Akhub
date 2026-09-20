@@ -764,3 +764,148 @@ pub fn bulky_chat_body(system: &str, user: &str) -> Value {
         ],
     })
 }
+
+// ------------------------------------------------------------------ 假 GitHub Release
+
+/// 假的 GitHub Release API：给版本检查与自更新测试用。
+///
+/// 只实现真实存在的三个路由：`/releases/latest`、`/releases/tags/{tag}` 与资产下载。
+/// 资产 URL 指向这台假服务器，被测代码不会真的去打扰 github.com。
+pub struct FakeGithub {
+    pub base_url: String,
+    /// `/releases/latest` 被请求的次数：用来验证缓存确实生效。
+    hits: Arc<Mutex<usize>>,
+}
+
+#[derive(Clone)]
+struct GithubState {
+    tag: String,
+    base: String,
+    archive: Arc<Vec<u8>>,
+    checksums: String,
+    hits: Arc<Mutex<usize>>,
+}
+
+impl FakeGithub {
+    /// 起一台假 GitHub。archive 是 Release 资产字节，checksums.txt 按它现算。
+    pub async fn spawn(tag: &str, archive: Vec<u8>) -> Self {
+        Self::spawn_inner(tag, archive, None).await
+    }
+
+    /// 指定 checksums.txt 里那个哈希：传一个错的来验证「校验不过就拒绝更新」。
+    pub async fn spawn_with_checksum(tag: &str, archive: Vec<u8>, checksum: &str) -> Self {
+        Self::spawn_inner(tag, archive, Some(checksum.to_string())).await
+    }
+
+    async fn spawn_inner(tag: &str, archive: Vec<u8>, checksum: Option<String>) -> Self {
+        async fn latest(State(state): State<GithubState>) -> axum::Json<Value> {
+            *state.hits.lock().unwrap() += 1;
+            axum::Json(release_json(&state.tag, &state.base))
+        }
+        async fn by_tag(State(state): State<GithubState>) -> axum::Json<Value> {
+            axum::Json(release_json(&state.tag, &state.base))
+        }
+        async fn asset(State(state): State<GithubState>) -> Response {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/gzip")],
+                state.archive.as_ref().clone(),
+            )
+                .into_response()
+        }
+        async fn checksums(State(state): State<GithubState>) -> Response {
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                state.checksums.clone(),
+            )
+                .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let version = tag.trim_start_matches('v');
+        let suffix = akhub::update::asset_suffix().expect("测试平台必须在发行矩阵内");
+        let checksums = {
+            let hash = checksum.unwrap_or_else(|| {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(&archive))
+            });
+            format!("{hash}  akhub-v{version}-{suffix}.tar.gz\n")
+        };
+
+        let hits = Arc::new(Mutex::new(0));
+        let state = GithubState {
+            tag: tag.to_string(),
+            base,
+            archive: Arc::new(archive),
+            checksums: checksums.clone(),
+            hits: Arc::clone(&hits),
+        };
+        let app = Router::new()
+            .route("/releases/latest", get(latest))
+            .route("/releases/tags/{tag}", get(by_tag))
+            .route("/asset", get(asset))
+            .route("/checksums.txt", get(checksums))
+            .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            hits,
+        }
+    }
+
+    /// `/releases/latest` 被请求过几次。
+    pub fn hits(&self) -> usize {
+        *self.hits.lock().unwrap()
+    }
+}
+
+/// 一台 Release 的 JSON：资产覆盖全部发行平台，下载地址都指向假服务器。
+fn release_json(tag: &str, base: &str) -> Value {
+    let version = tag.trim_start_matches('v');
+    let mut assets: Vec<Value> = [
+        "linux-x86_64-musl",
+        "linux-x86_64",
+        "linux-aarch64",
+        "macos-aarch64",
+        "macos-x86_64",
+    ]
+    .iter()
+    .map(|suffix| {
+        json!({
+            "name": format!("akhub-v{version}-{suffix}.tar.gz"),
+            "browser_download_url": format!("{base}/asset"),
+        })
+    })
+    .collect();
+    assets.push(json!({
+        "name": "checksums.txt",
+        "browser_download_url": format!("{base}/checksums.txt"),
+    }));
+    json!({
+        "tag_name": tag,
+        "name": tag,
+        "html_url": format!("https://example.invalid/releases/{tag}"),
+        "published_at": "2026-09-20T11:10:55Z",
+        "body": "本轮发布说明",
+        "assets": assets,
+    })
+}
+
+/// 造一个与真实发行包同构的归档：内层目录 == 资产名去掉扩展名，里面是 `akhub`。
+pub fn make_release_archive(version: &str, binary: &[u8]) -> Vec<u8> {
+    let suffix = akhub::update::asset_suffix().expect("测试平台必须在发行矩阵内");
+    let stem = format!("akhub-v{version}-{suffix}");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(binary.len() as u64);
+    header.set_mode(0o755);
+    builder
+        .append_data(&mut header, format!("{stem}/akhub"), binary)
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
+}

@@ -44,10 +44,72 @@
   letter-spacing: -0.02em;
 }
 
+/* 版本号同时是「版本与更新」的入口：默认低调，有新版本时自己亮起来。 */
 .brand-version {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
   font-size: 11px;
   color: var(--text-faint);
   font-family: var(--font-mono);
+  cursor: pointer;
+  transition: color var(--transition);
+}
+
+.brand-version:hover {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.brand-version.has-update {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.brand-version.has-update:hover {
+  color: var(--warn);
+}
+
+/* 有新版本时的呼吸圆点：静态页面里唯一会动的元素，不抢别处的注意力。 */
+.brand-version-dot {
+  position: relative;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.brand-version-dot::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  color: var(--warn);
+  animation: version-ping 1.8s ease-out infinite;
+}
+
+@keyframes version-ping {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  70%,
+  100% {
+    transform: scale(1.5);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-version-dot::after {
+    animation: none;
+    opacity: 0;
+  }
 }
 
 .nav {
@@ -137,6 +199,104 @@
   border-radius: 50%;
   font-size: 11px;
   line-height: 1;
+}
+
+/* 幻境 MirageAI：与仓库链接同一行样式，只把标记点成强调色以便区分。 */
+.repo-link-mark-accent {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ------------------------------------------------------- 版本与更新面板 */
+
+.version-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.version-headline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.version-number {
+  font-size: 26px;
+  font-weight: 660;
+  letter-spacing: -0.01em;
+}
+
+.version-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.version-facts dt {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.version-facts dd {
+  margin: 2px 0 0;
+  font-size: 13px;
+}
+
+.version-cached {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 0 6px;
+  font-family: var(--font-sans);
+}
+
+.version-notes summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.version-notes pre {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-3);
+  max-height: 200px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 升级命令：等宽 + 可整行选中，旁边配复制按钮。 */
+.version-command {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.version-command code {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  word-break: break-all;
+  user-select: all;
 }
 
 /* 行内链接也要有不小于 24px 的触达高度：16px 的行高在触屏上点不准。 */

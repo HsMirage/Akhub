@@ -587,6 +587,49 @@ export const UPSTREAM_LABELS: Record<UpstreamType, string> = {
   sub2api: "Sub2API",
 };
 
+/** 部署形态：决定「立即更新」是否可用、该给哪条升级命令。 */
+export type DeployKind = "binary" | "docker" | "source" | "windows";
+
+/** 一次版本检查的结果（GET /admin/api/system/update）。 */
+export interface UpdateStatus {
+  /** 是否启用了更新检查（服务端可用 AKHUB_UPDATE_DISABLED 关闭）。 */
+  enabled: boolean;
+  /** 当前进程的版本。 */
+  current: string;
+  /** 上游最新版本；查询失败时为 null。 */
+  latest: string | null;
+  has_update: boolean;
+  release_url: string | null;
+  release_name: string | null;
+  published_at: string | null;
+  /** Release 说明的摘要。 */
+  notes: string | null;
+  checked_at: number;
+  /** 这次结果是否来自服务端缓存。 */
+  cached: boolean;
+  /** 查询失败的原因：拿不到 GitHub 时明确说，而不是假装已是最新。 */
+  error: string | null;
+  deploy: DeployKind;
+  can_self_update: boolean;
+  can_restart: boolean;
+  update_hint: string | null;
+  update_command: string | null;
+  /** 已落盘但还没重启生效的版本。 */
+  pending_version: string | null;
+}
+
+/** 自更新成功后的结果（POST /admin/api/system/update）。 */
+export interface UpdateOutcome {
+  from: string;
+  to: string;
+  path: string;
+  /** 旧二进制的备份路径。 */
+  backup: string | null;
+  need_restart: boolean;
+  can_restart: boolean;
+  restart_command: string;
+}
+
 /** 各上游类型的默认端点建议，用于新建账号时预填。 */
 export const UPSTREAM_DEFAULTS: Record<
   UpstreamType,
