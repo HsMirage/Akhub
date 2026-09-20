@@ -46,9 +46,16 @@ jobs:
       # 而不是等用户在服务器上敲下去才发现。
       - name: 发布脚本语法
         run: |
+          set -euo pipefail
           for script in install.sh scripts/*.sh deploy/docker-entrypoint.sh; do
-            echo "--- $script"
-            sh -n "$script" || exit 1
+            # 按 shebang 选解释器。Ubuntu 上 sh 是 dash：对 #!/bin/sh 的脚本
+            # 这才算真正验证了 POSIX 兼容性（否则 bash 专有语法要等用户在
+            # dash 环境下执行时才会以 "Syntax error" 暴露）；反过来，
+            # bash 脚本必须用 bash -n，用 dash 去解析只会误报。
+            case "$(head -n1 "$script")" in
+              *bash*) echo "--- $script (bash)"; bash -n "$script" ;;
+              *)      echo "--- $script (sh)";   sh -n "$script" ;;
+            esac
           done
 
   # 容器冒烟：在空数据目录上首次启动、探测就绪、跑完一次真实 HTTP 请求。
