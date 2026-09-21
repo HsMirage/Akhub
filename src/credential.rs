@@ -541,7 +541,7 @@ mod tests {
             id: "a1".into(),
             group_id: "g1".into(),
             name: "测试账号".into(),
-            upstream_type: crate::domain::UpstreamType::OpenAiCompatible,
+
             base_url: "https://api.example.com".into(),
             preferred_protocol: crate::domain::Protocol::OpenAiChat,
             adaptive_protocol: true,

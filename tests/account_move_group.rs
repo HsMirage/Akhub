@@ -87,7 +87,6 @@ async fn create_account(
     .json(&json!({
         "group_id": group_id,
         "name": name,
-        "upstream_type": "openai_compatible",
         "base_url": "https://upstream.example.com",
         "api_key": "sk-test",
         "preferred_protocol": "openai_chat",

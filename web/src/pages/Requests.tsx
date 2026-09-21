@@ -141,8 +141,10 @@ export function Requests({
   const toast = useToast();
   const [filters, setFilters] = useState<RequestFilterForm>(() => ({ ...EMPTY_FILTERS }));
   const [appliedFilters, setAppliedFilters] = useState<RequestFilters>({});
-  const [records, setRecords] = useState<RequestRecord[]>(data.requests);
-  const [total, setTotal] = useState(data.requests.length);
+  // 请求记录不再进全局刷新（它对其他页面毫无用处，却是全量刷新里最贵的一项），
+  // 所以这里从空开始，由下面的 effect 按当前筛选与页码拉取。
+  const [records, setRecords] = useState<RequestRecord[]>([]);
+  const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [loading, setLoading] = useState(true);
@@ -225,7 +227,7 @@ export function Requests({
     return () => {
       active = false;
     };
-  }, [appliedFilters, data.requests, page, pageSize, toast]);
+  }, [appliedFilters, page, pageSize, toast]);
 
   useEffect(() => {
     setPageInput(String(page));

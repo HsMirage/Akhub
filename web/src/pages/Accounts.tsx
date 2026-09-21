@@ -9,13 +9,10 @@ import type {
   MultiplierMode,
   Protocol,
   TestResult,
-  UpstreamType,
 } from "../lib/types";
 import {
   MULTIPLIER_MODE_LABELS,
   PROTOCOL_LABELS,
-  UPSTREAM_DEFAULTS,
-  UPSTREAM_LABELS,
 } from "../lib/types";
 import {
   formatLimits,
@@ -54,7 +51,6 @@ import { CalibrationDialog } from "../components/CalibrationDialog";
 import { IconPlus, IconRefresh, IconSearch, IconServer } from "../components/Icons";
 
 type AccountStatusFilter = "all" | "enabled" | "disabled";
-type AccountUpstreamFilter = "all" | UpstreamType;
 
 export function Accounts({
   data,
@@ -127,20 +123,10 @@ export function Accounts({
   const [syncingModelId, setSyncingModelId] = useState<string | null>(null);
   const [groupFilter, setGroupFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
-  const [upstreamFilter, setUpstreamFilter] = useState<AccountUpstreamFilter>("all");
   const [search, setSearch] = useState("");
   /** 批量刷新倍率的结果面板；null 表示未展示。 */
   const [refreshReport, setRefreshReport] = useState<BatchMultiplierRefreshResult | null>(
     null,
-  );
-
-  const upstreamTypes = useMemo(
-    () =>
-      Array.from(new Set(data.accounts.map((account) => account.upstream_type))).sort(
-        (left, right) =>
-          UPSTREAM_LABELS[left].localeCompare(UPSTREAM_LABELS[right], "zh-CN"),
-      ),
-    [data.accounts],
   );
 
   const filteredAccounts = useMemo(
@@ -154,10 +140,9 @@ export function Accounts({
         if (groupFilter !== "all" && account.group_id !== groupFilter) return false;
         if (statusFilter === "enabled" && !account.enabled) return false;
         if (statusFilter === "disabled" && account.enabled) return false;
-        if (upstreamFilter !== "all" && account.upstream_type !== upstreamFilter) return false;
         return true;
       }),
-    [data.accounts, groupFilter, statusFilter, upstreamFilter, search],
+    [data.accounts, groupFilter, statusFilter, search],
   );
 
   const groupName = (id: string) =>
@@ -359,25 +344,6 @@ export function Accounts({
                     </select>
                   )}
                 </Field>
-                <Field label="上游类型">
-                  {(id) => (
-                    <select
-                      id={id}
-                      className="select"
-                      value={upstreamFilter}
-                      onChange={(event) =>
-                        setUpstreamFilter(event.target.value as AccountUpstreamFilter)
-                      }
-                    >
-                      <option value="all">全部类型</option>
-                      {upstreamTypes.map((upstreamType) => (
-                        <option key={upstreamType} value={upstreamType}>
-                          {UPSTREAM_LABELS[upstreamType]}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </Field>
               </div>
               <div className="table-filter-summary tabular">
                 共 {data.accounts.length} 个账号（筛选后 {filteredAccounts.length} 个）
@@ -388,14 +354,12 @@ export function Accounts({
                 disabled={
                   !search &&
                   groupFilter === "all" &&
-                  statusFilter === "all" &&
-                  upstreamFilter === "all"
+                  statusFilter === "all"
                 }
                 onClick={() => {
                   setSearch("");
                   setGroupFilter("all");
                   setStatusFilter("all");
-                  setUpstreamFilter("all");
                 }}
               >
                 清除筛选
@@ -451,7 +415,6 @@ export function Accounts({
                         <td>
                           <div className="cell-strong">{account.name}</div>
                           <div className="text-faint" style={{ fontSize: 12 }}>
-                            {UPSTREAM_LABELS[account.upstream_type]} ·{" "}
                             {PROTOCOL_LABELS[account.preferred_protocol]}
                           </div>
                         </td>
@@ -871,13 +834,14 @@ function AccountDrawer({
   const [form, setForm] = useState({
     group_id: account?.group_id ?? data.groups[0]?.id ?? "",
     name: account?.name ?? "",
-    upstream_type: account?.upstream_type ?? ("openai_compatible" as UpstreamType),
     base_url: account?.base_url ?? "",
     api_key: "",
     preferred_protocol: account?.preferred_protocol ?? ("openai_chat" as Protocol),
     default_priority: String(account?.default_priority ?? 0),
+    // 不预填 1：手动倍率会直接参与"有效倍率 ≤ 分组上限"的门控（§11.1），
+    // 一个凭空出现的 x1 会被读成"已知价格"，而这个值恰恰是要管理员填的东西。
     multiplier_mode: account?.multiplier_mode ?? ("manual" as MultiplierMode),
-    manual_multiplier: account?.manual_multiplier ?? "1",
+    manual_multiplier: account?.manual_multiplier ?? "",
     calibration: account?.calibration ?? "1",
     new_api_token: "",
     new_api_user_id: account?.new_api_user_id ?? "",
@@ -892,6 +856,7 @@ function AccountDrawer({
   });
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [detecting, setDetecting] = useState(false);
   /** 改分组待确认时暂存的提交内容（§4.2.2）。 */
   const [pendingMove, setPendingMove] = useState<AccountInput | null>(null);
   const groupName = (id: string) => data.groups.find((group) => group.id === id)?.name ?? id;
@@ -924,20 +889,13 @@ function AccountDrawer({
   const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) =>
     setForm((current) => ({ ...current, [key]: value }));
 
-  /** 换上游类型时顺带填好该类型的常见 Base URL、协议与倍率来源，减少手输。 */
-  const changeUpstreamType = (type: UpstreamType) => {
-    const preset = UPSTREAM_DEFAULTS[type];
-    setForm((current) => ({
-      ...current,
-      upstream_type: type,
-      base_url: current.base_url || preset.base_url,
-      preferred_protocol: preset.protocol,
-      multiplier_mode:
-        type === "sub2api" ? "sub2api" : type === "new_api" ? "new_api" : current.multiplier_mode,
-    }));
-  };
-
-  const multiplierError = validateMultiplier(form.manual_multiplier);
+  // 手动倍率是真正参与"有效倍率 ≤ 分组上限"门控的数字（§11.1），不能为空；
+  // 自动来源下的这个值只是首次探测成功前的占位，留空就按 1 处理——宽限期
+  // 从第一轮刷新就开始计，不需要管理员先编一个数出来。
+  const multiplierError =
+    form.multiplier_mode === "manual"
+      ? validateMultiplier(form.manual_multiplier)
+      : validateMultiplier(form.manual_multiplier.trim() || "1");
   const calibrationError = validateMultiplier(form.calibration);
   const priority = Number(form.default_priority);
   const priorityError =
@@ -999,6 +957,30 @@ function AccountDrawer({
     needsNewApiToken ||
     needsNewApiUser;
 
+  /**
+   * 识别倍率来源（§11.2）：让后台去问这个站到底认哪个接口，然后把结论写回账号。
+   *
+   * 只在编辑态可用——识别要打真实请求，新建时凭据还在草稿里没落库。
+   */
+  const detectSource = async () => {
+    if (!account || detecting) return;
+    setDetecting(true);
+    try {
+      const result = await api.detectMultiplierSource(account.id);
+      set("multiplier_mode", result.multiplier_mode);
+      // 识别已经落库，本地表单跟着对齐即可；刷新结果由父组件拉回来。
+      toast.success(result.notice);
+      if (result.probe_error) {
+        toast.error(`来源已写回，但首次取倍率失败：${result.probe_error}`);
+      }
+      await onSaved();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "识别失败");
+    } finally {
+      setDetecting(false);
+    }
+  };
+
   /** 编辑态下用已保存的凭据发一次真实请求；新建时必须先保存。 */
   const testConnection = async () => {
     if (!account || testing) return;
@@ -1059,13 +1041,12 @@ function AccountDrawer({
     const payload: AccountInput = {
       group_id: form.group_id,
       name: form.name.trim(),
-      upstream_type: form.upstream_type,
       base_url: form.base_url.trim(),
       keys: draftsToInputs(keyDrafts),
       preferred_protocol: form.preferred_protocol,
       default_priority: priority,
       multiplier_mode: form.multiplier_mode,
-      manual_multiplier: form.manual_multiplier.trim(),
+      manual_multiplier: form.manual_multiplier.trim() || "1",
       calibration: form.calibration.trim(),
       new_api_user_id: form.new_api_user_id.trim() || undefined,
       new_api_group: form.new_api_group.trim() || undefined,
@@ -1140,23 +1121,6 @@ function AccountDrawer({
         </Field>
 
         <div className="form-row-2">
-          <Field label="上游类型">
-            {(id) => (
-              <select
-                id={id}
-                className="select"
-                value={form.upstream_type}
-                onChange={(e) => changeUpstreamType(e.target.value as UpstreamType)}
-              >
-                {Object.entries(UPSTREAM_LABELS).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
-
           <Field label="首选协议">
             {(id) => (
               <select
@@ -1220,6 +1184,7 @@ function AccountDrawer({
         </FormSection>
 
         <FormSection title="倍率与校准" description="有效倍率由上游倍率与校准系数共同决定。">
+        <div className="form-row-2">
         <Field
           label="倍率来源"
           hint={
@@ -1245,6 +1210,24 @@ function AccountDrawer({
             </select>
           )}
         </Field>
+
+        <Field
+          label="不知道这个站是哪一种？"
+          hint="先探测 /v1/sub2api/billing（只要一把 API Key），被 404 拒了再试 /api/user/self/groups（需要访问令牌与用户 ID）。命中哪个就把倍率来源写成哪个；网络或鉴权失败会如实报错，不擅自改来源。"
+        >
+          {(id) => (
+            <button
+              id={id}
+              type="button"
+              className="btn"
+              disabled={!editing || detecting}
+              onClick={() => void detectSource()}
+            >
+              {detecting ? "识别中…" : "识别倍率来源"}
+            </button>
+          )}
+        </Field>
+        </div>
 
         {form.multiplier_mode === "new_api" && (
           <>
@@ -1339,8 +1322,8 @@ function AccountDrawer({
             error={multiplierError ?? undefined}
             hint={
               form.multiplier_mode === "manual"
-                ? undefined
-                : "首次自动刷新成功前先用这个值顶着，同时立即开始计宽限期。"
+                ? "这把 Key 在上游的折扣档，直接参与调度门控；不知道就先去问站点，别随手填 1。"
+                : "首次自动刷新成功前先用这个值顶着，同时立即开始计宽限期。留空按 1 处理。"
             }
           >
             {(id) => (
@@ -1349,6 +1332,7 @@ function AccountDrawer({
                 className="input mono"
                 value={form.manual_multiplier}
                 onChange={(e) => set("manual_multiplier", e.target.value)}
+                placeholder={form.multiplier_mode === "manual" ? "例如 1.0" : "留空按 1"}
               />
             )}
           </Field>

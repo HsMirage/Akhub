@@ -245,7 +245,6 @@ async fn a_site_credential_lets_accounts_skip_their_own_token() {
             .json(&json!({
                 "group_id": akhub.group_id,
                 "name": "站点凭据账号",
-                "upstream_type": "openai_compatible",
                 "base_url": upstream.base_url,
                 "api_key": "sk-abc",
                 "preferred_protocol": "openai_chat",

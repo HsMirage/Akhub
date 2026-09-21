@@ -157,7 +157,7 @@ mod tests {
     use crate::config::{LogicalModelView, TargetView};
     use crate::domain::{
         Account, DispatchTarget, Group, LogicalModel, ModelOrigin, Multiplier, Protocol,
-        SchedulingWeights, UpstreamType,
+        SchedulingWeights,
     };
 
     fn model_view(name: &str, enabled: bool, target_count: usize) -> Arc<LogicalModelView> {
@@ -165,7 +165,6 @@ mod tests {
             id: "a1".into(),
             group_id: "g1".into(),
             name: "账号A".into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,
             adaptive_protocol: true,

@@ -252,10 +252,9 @@ pub async fn refresh_account_now(
 
 /// 按账号配置的来源发起探测。
 async fn probe_account(context: &Context, account: &Account) -> Result<probe::Reading> {
-    let api_key = decrypt(
-        context,
-        context.store.account_sealed_key(&account.id).await?,
-    )?;
+    let api_key = account_api_key(context, account)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("账号缺少 Sub2API 探针所需的 API Key"))?;
     match account.multiplier_mode {
         MultiplierMode::Manual => anyhow::bail!("手动倍率不需要探测"),
         MultiplierMode::Sub2Api => {
@@ -285,6 +284,35 @@ async fn probe_account(context: &Context, account: &Account) -> Result<probe::Re
             .await
         }
     }
+}
+
+/// 读取账号用于探测的那把 Key：Key 池的**第一把**（§4.2.1 的镜像）。
+///
+/// 已知限制：Sub2API 是 Key 级计费，多 Key 账号里每把 Key 的倍率未必相同，
+/// 而探测只看第一把。返回 `None` 表示账号还没有凭据。
+pub(crate) async fn account_api_key(
+    context: &Context,
+    account: &Account,
+) -> Result<Option<String>> {
+    // 先看 Key 池。`upstream_secrets.api_key` 只是第一把 Key 的镜像，而建号与
+    // 写池是两步：只有旧二进制或旧备份恢复路径才可能留下"池里有、镜像没有"
+    // 的账号，但那种账号照样得能探测。
+    let pool = context.store.list_account_key_rows(&account.id).await?;
+    if let Some(row) = pool.iter().find(|row| row.enabled) {
+        let plaintext = context.cipher.open(&row.sealed_key)?;
+        let key = String::from_utf8(plaintext.to_vec())?;
+        return Ok((!key.trim().is_empty()).then_some(key));
+    }
+    let Some(sealed) = context.store.account_sealed_key(&account.id).await? else {
+        return Ok(None);
+    };
+    // 建号时"暂时没有凭据"会把镜像写成空串：那是没 Key，不是信封坏了。
+    if sealed.is_empty() {
+        return Ok(None);
+    }
+    let plaintext = context.cipher.open(&sealed)?;
+    let key = String::from_utf8(plaintext.to_vec())?;
+    Ok((!key.trim().is_empty()).then_some(key))
 }
 
 /// 解析 New API 的（访问令牌, 用户 ID）：账号凭据优先，其次站点级凭据。
@@ -354,16 +382,14 @@ async fn persist(context: &Context, account: &Account, entry: &Entry, status: St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Limits, Multiplier, Protocol};
     use time::OffsetDateTime;
-
-    use crate::domain::{Limits, Multiplier, Protocol, UpstreamType};
 
     fn account(id: &str, mode: MultiplierMode) -> Account {
         Account {
             id: id.into(),
             group_id: "g1".into(),
             name: id.into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,
             adaptive_protocol: true,

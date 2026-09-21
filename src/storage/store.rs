@@ -6,10 +6,18 @@ use sqlx::{Row, SqlitePool};
 use time::OffsetDateTime;
 
 use super::now_unix;
+
 use crate::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights, UpstreamType,
+    Protocol, SchedulingWeights,
 };
+
+/// 历史列 upstream_accounts.upstream_type 的写占位值（§4.2）。
+///
+/// v12 之前它存的是官方/中转/New API/Sub2API，但它不参与任何路由或倍率决策，
+/// 于是整个删掉。列本身留着：老库上的 NOT NULL 约束拿不掉，直接删列还会破坏
+/// 不认识新结构的旧二进制。空串即“这台实例已经不管理这一列”。
+const LEGACY_UPSTREAM_TYPE: &str = "";
 /// 一个账号的全部加密凭据信封。
 ///
 /// 更新时 `None` 表示"保持原值"——后台不提供读取完整 Key 的接口（§23.2），
@@ -392,7 +400,7 @@ impl Store {
         .bind(&account.id)
         .bind(&account.group_id)
         .bind(&account.name)
-        .bind(account.upstream_type.as_str())
+        .bind(LEGACY_UPSTREAM_TYPE)
         .bind(&account.base_url)
         .bind(account.preferred_protocol.as_str())
         .bind(account.adaptive_protocol)
@@ -460,7 +468,7 @@ impl Store {
         )
         .bind(&account.group_id)
         .bind(&account.name)
-        .bind(account.upstream_type.as_str())
+        .bind(LEGACY_UPSTREAM_TYPE)
         .bind(&account.base_url)
         .bind(account.preferred_protocol.as_str())
         .bind(account.adaptive_protocol)
@@ -1889,7 +1897,6 @@ impl Store {
                         "id",
                         "group_id",
                         "name",
-                        "upstream_type",
                         "base_url",
                         "preferred_protocol",
                         "adaptive_protocol",
@@ -2117,7 +2124,8 @@ impl Store {
             .bind(str_field(account, "id"))
             .bind(str_field(account, "group_id"))
             .bind(str_field(account, "name"))
-            .bind(str_field(account, "upstream_type"))
+            // 同 insert_account：历史列写占位值（§4.2）。
+            .bind(LEGACY_UPSTREAM_TYPE)
             .bind(str_field(account, "base_url"))
             .bind(str_field(account, "preferred_protocol"))
             .bind(bool_field(account, "adaptive_protocol"))
@@ -3106,15 +3114,14 @@ fn row_to_limits(row: &sqlx::sqlite::SqliteRow) -> Result<Limits> {
 }
 
 fn row_to_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account> {
-    let upstream_type: String = row.try_get("upstream_type")?;
     let protocol: String = row.try_get("preferred_protocol")?;
     let mode: String = row.try_get("multiplier_mode")?;
     Ok(Account {
         id: row.try_get("id")?,
         group_id: row.try_get("group_id")?,
         name: row.try_get("name")?,
-        upstream_type: UpstreamType::parse(&upstream_type)
-            .with_context(|| format!("数据库中的上游类型无法识别：{upstream_type}"))?,
+        // upstream_type 是历史列：v12 起既不写也不用（§4.2）。库里留着它，
+        // 只是为了让不认识新结构的旧二进制仍能启动；读取一律忽略。
         base_url: row.try_get("base_url")?,
         preferred_protocol: Protocol::parse(&protocol)
             .with_context(|| format!("数据库中的协议无法识别：{protocol}"))?,
@@ -3274,7 +3281,6 @@ mod tests {
             id: ids::account(),
             group_id: group_id.into(),
             name: "账号A".into(),
-            upstream_type: UpstreamType::Anthropic,
             base_url: "https://api.anthropic.com".into(),
             preferred_protocol: Protocol::AnthropicMessages,
             adaptive_protocol: true,

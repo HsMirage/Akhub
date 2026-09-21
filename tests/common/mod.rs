@@ -13,7 +13,7 @@ use std::time::Duration;
 use akhub::app::{AppState, Settings, SharedState};
 use akhub::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights, UpstreamType,
+    Protocol, SchedulingWeights,
 };
 use akhub::storage::store::{AccountSecrets, ids};
 use axum::Router;
@@ -69,6 +69,12 @@ pub struct FakeUpstream {
     billing: Arc<Mutex<Option<Value>>>,
     /// `/api/user/self/groups` 的响应体；`None` 时返回 500。
     groups: Arc<Mutex<Option<Value>>>,
+    /// 两个管理接口是否"不存在"（404）。识别动作只认这一类失败为"不是这个站"。
+    billing_absent: Arc<Mutex<bool>>,
+    groups_absent: Arc<Mutex<bool>>,
+    /// 两个管理接口是否要求鉴权（403）。识别动作必须把它当"说不准"。
+    billing_locked: Arc<Mutex<bool>>,
+    groups_locked: Arc<Mutex<bool>>,
     /// `/v1/models` 的响应体；`None` 时返回 500（§16.1）。
     models: Arc<Mutex<Option<Value>>>,
 }
@@ -86,6 +92,10 @@ impl FakeUpstream {
             billing: Arc::new(Mutex::new(None)),
             groups: Arc::new(Mutex::new(None)),
             models: Arc::new(Mutex::new(None)),
+            billing_absent: Arc::new(Mutex::new(false)),
+            groups_absent: Arc::new(Mutex::new(false)),
+            billing_locked: Arc::new(Mutex::new(false)),
+            groups_locked: Arc::new(Mutex::new(false)),
         };
         let app = Router::new()
             .route("/v1/messages", post(inference))
@@ -133,6 +143,24 @@ impl FakeUpstream {
 
     pub fn set_models(&self, body: Option<Value>) {
         *self.models.lock().unwrap() = body;
+    }
+
+    /// 让管理接口按 404 回，模拟"这个站根本没有这个接口"（§11.2 的识别）。
+    pub fn absent_billing(&self) {
+        *self.billing_absent.lock().unwrap() = true;
+    }
+
+    pub fn absent_groups(&self) {
+        *self.groups_absent.lock().unwrap() = true;
+    }
+
+    /// 让管理接口按 403 回：路径存在、凭据不被接受。识别动作**不能**据此换候选。
+    pub fn lock_billing(&self) {
+        *self.billing_locked.lock().unwrap() = true;
+    }
+
+    pub fn lock_groups(&self) {
+        *self.groups_locked.lock().unwrap() = true;
     }
 
     pub fn requests(&self) -> usize {
@@ -316,11 +344,19 @@ async fn inference(
 }
 
 async fn billing(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Response {
+    // 先记账再决定怎么回：识别动作要断言的正是"探测顺序"，而 404/403 的
+    // 响应同样证明这次请求到达过这个路径。
     upstream.seen.lock().unwrap().push(Seen {
         path: "/v1/sub2api/billing".into(),
         body: Value::Null,
         headers,
     });
+    if *upstream.billing_absent.lock().unwrap() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if *upstream.billing_locked.lock().unwrap() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match upstream.billing.lock().unwrap().clone() {
         Some(body) => axum::Json(body).into_response(),
         None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -328,11 +364,19 @@ async fn billing(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Re
 }
 
 async fn groups(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Response {
+    // 先记账再决定怎么回：识别动作要断言的正是"探测顺序"，而 404/403 的
+    // 响应同样证明这次请求到达过这个路径。
     upstream.seen.lock().unwrap().push(Seen {
         path: "/api/user/self/groups".into(),
         body: Value::Null,
         headers,
     });
+    if *upstream.groups_absent.lock().unwrap() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if *upstream.groups_locked.lock().unwrap() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match upstream.groups.lock().unwrap().clone() {
         Some(body) => axum::Json(body).into_response(),
         None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -548,6 +592,29 @@ pub async fn spawn_akhub_at(dir: &std::path::Path, key: Option<&str>) -> Option<
     })
 }
 
+/// 把已经建好的共享状态包成 harness，不再另起 HTTP 服务。
+///
+/// 供"自己起服务、但要用 harness 的数据库与状态"的测试使用（识别来源这类
+/// 要直接改库、再通过后台接口读回的用例）。
+pub async fn spawn_akhub_on(state: SharedState, dir: tempfile::TempDir) -> Akhub {
+    let group_id = state
+        .store
+        .list_groups()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .map(|group| group.id)
+        .unwrap_or_default();
+    Akhub {
+        base_url: String::new(),
+        key: String::new(),
+        group_id,
+        state,
+        dir,
+    }
+}
+
 /// 用已有的状态再起一台 HTTP 服务，模拟重启后的进程。
 pub async fn serve(state: SharedState) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -718,7 +785,6 @@ pub async fn wire_target(akhub: &Akhub, spec: TargetSpec<'_>) -> Wired {
         id: ids::account(),
         group_id: akhub.group_id.clone(),
         name: spec.name.into(),
-        upstream_type: UpstreamType::OpenAiCompatible,
         base_url: spec.base_url.into(),
         preferred_protocol: spec.protocol,
         adaptive_protocol: spec.adaptive,

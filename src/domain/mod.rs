@@ -45,46 +45,6 @@ impl Protocol {
     }
 }
 
-/// 上游站点类型。第一期只影响倍率探针的可用性与默认端点。
-///
-/// 与 [`Protocol`] 同理，serde 名称显式对齐 [`UpstreamType::as_str`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UpstreamType {
-    #[serde(rename = "openai")]
-    OpenAi,
-    #[serde(rename = "anthropic")]
-    Anthropic,
-    #[serde(rename = "new_api")]
-    NewApi,
-    #[serde(rename = "sub2api")]
-    Sub2Api,
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
-}
-
-impl UpstreamType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAi => "openai",
-            Self::Anthropic => "anthropic",
-            Self::NewApi => "new_api",
-            Self::Sub2Api => "sub2api",
-            Self::OpenAiCompatible => "openai_compatible",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "openai" => Some(Self::OpenAi),
-            "anthropic" => Some(Self::Anthropic),
-            "new_api" => Some(Self::NewApi),
-            "sub2api" => Some(Self::Sub2Api),
-            "openai_compatible" => Some(Self::OpenAiCompatible),
-            _ => None,
-        }
-    }
-}
-
 /// 逻辑模型的来源，决定零目标时是清理还是保留（§4.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -244,7 +204,6 @@ pub struct Account {
     pub id: String,
     pub group_id: String,
     pub name: String,
-    pub upstream_type: UpstreamType,
     pub base_url: String,
     pub preferred_protocol: Protocol,
     pub adaptive_protocol: bool,
@@ -346,20 +305,6 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<Protocol>(&encoded).unwrap(),
                 protocol
-            );
-        }
-        for upstream in [
-            UpstreamType::OpenAi,
-            UpstreamType::Anthropic,
-            UpstreamType::NewApi,
-            UpstreamType::Sub2Api,
-            UpstreamType::OpenAiCompatible,
-        ] {
-            let encoded = serde_json::to_string(&upstream).unwrap();
-            assert_eq!(encoded, format!("\"{}\"", upstream.as_str()));
-            assert_eq!(
-                serde_json::from_str::<UpstreamType>(&encoded).unwrap(),
-                upstream
             );
         }
         for origin in [ModelOrigin::Auto, ModelOrigin::Manual] {

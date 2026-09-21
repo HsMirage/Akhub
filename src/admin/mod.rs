@@ -245,6 +245,10 @@ pub fn router() -> Router<SharedState> {
             post(r::refresh_account_multiplier),
         )
         .route(
+            "/admin/api/accounts/{id}/detect-multiplier-source",
+            post(r::detect_account_multiplier_source),
+        )
+        .route(
             "/admin/api/accounts/{id}/multiplier-groups",
             get(r::account_multiplier_groups),
         )

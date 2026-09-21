@@ -1,6 +1,9 @@
 //! 后台资源接口：分组、账号、逻辑模型、调度目标与只读视图。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::config::{GroupView, LogicalModelView};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -16,7 +19,7 @@ use crate::auth::session;
 use crate::discovery;
 use crate::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights, UpstreamType,
+    Protocol, SchedulingWeights,
 };
 use crate::security::url_guard;
 use crate::storage::store::{AccountSecrets, ids};
@@ -781,7 +784,6 @@ pub struct AccountKeyInput {
 pub struct AccountPayload {
     pub group_id: String,
     pub name: String,
-    pub upstream_type: UpstreamType,
     pub base_url: String,
     /// Key 池。为空数组表示"这个账号暂时没有凭据"，是合法状态（§4.2.1）。
     #[serde(default)]
@@ -840,7 +842,6 @@ pub struct AccountDto {
     pub id: String,
     pub group_id: String,
     pub name: String,
-    pub upstream_type: UpstreamType,
     pub base_url: String,
     pub preferred_protocol: Protocol,
     pub adaptive_protocol: bool,
@@ -1061,7 +1062,6 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
         id: account.id.clone(),
         group_id: account.group_id.clone(),
         name: account.name.clone(),
-        upstream_type: account.upstream_type,
         base_url: account.base_url.clone(),
         preferred_protocol: account.preferred_protocol,
         adaptive_protocol: account.adaptive_protocol,
@@ -1399,7 +1399,6 @@ pub async fn create_account(
         id: ids::account(),
         group_id: payload.group_id,
         name,
-        upstream_type: payload.upstream_type,
         base_url,
         preferred_protocol: payload.preferred_protocol,
         adaptive_protocol: payload.adaptive_protocol.unwrap_or(true),
@@ -1684,6 +1683,127 @@ pub async fn refresh_account_multiplier(
         "observed_at": reading.observed_at,
         "notice": format!("已重新探测：当前有效倍率 {}", reading.multiplier),
     })))
+}
+
+/// 识别这个账号的自动倍率来源（§11.2 的"让后台看它是什么站"）。
+///
+/// 与"刷新倍率"是两件事：刷新用**已经配好的**来源去取倍率，识别则是先问清楚
+/// 这个站点到底认哪个接口，然后**把识别结果写回账号**——此后走的还是普通的
+/// 自动刷新路径，没有第二套运行期逻辑。
+///
+/// 顺序固定为先 Sub2API（只要一把 Key）再 New API（要访问令牌与用户 ID）；
+/// 没有凭据的候选直接跳过，不制造注定失败的探测流量。只有"这个接口确实不
+/// 存在"（404/405 或响应形状完全对不上）才换下一个候选；超时、网络、5xx、
+/// 鉴权失败一律如实报错——把它们当成"不是这种站点"会静默改写来源，之后每一
+/// 轮刷新都打在错误的接口上。
+pub async fn detect_account_multiplier_source(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    // 端口放在这里而不是原函数上：让同一段逻辑也能被测试直接调用。
+    let payload = detect_account_source(&state, &id).await?;
+    let mode = payload
+        .0
+        .get("multiplier_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    audit(
+        &state,
+        &admin,
+        "detect_multiplier_source",
+        &format!("{id}:{mode}"),
+    )
+    .await;
+    Ok(payload)
+}
+
+/// 识别并写回来源，返回识别结论。错误一律由调用方转成对外的 502。
+async fn detect_account_source(state: &SharedState, id: &str) -> AdminResult<Json<Value>> {
+    let mut account = find_account(state, id).await?;
+    let context = crate::multiplier::refresh::Context {
+        store: state.store.clone(),
+        cipher: state.cipher.clone(),
+        upstream: state.upstream.clone(),
+        registry: Arc::clone(&state.runtime.multipliers),
+    };
+    // 没有凭据就没有可探测的东西；这个判断要在发请求之前做，而不是让探测
+    // 拿着空 Key 去打一次注定 401 的请求。
+    let api_key = crate::multiplier::refresh::account_api_key(&context, &account)
+        .await
+        .map_err(AdminError::internal)?
+        .ok_or_else(|| {
+            AdminError::bad_request("这个账号还没有 API Key：Sub2API 计费接口需要一把 Key 才能探测")
+        })?;
+    // 账号自己填的优先，其次站点级凭据（§6.4）。两样都没有就是 None，
+    // 识别动作会跳过 New API 候选而不是拿空令牌去打一次。
+    let credentials = crate::multiplier::refresh::new_api_credentials(&context, &account)
+        .await
+        .map_err(AdminError::internal)?;
+    let credentials = credentials
+        .as_ref()
+        .map(|(token, user_id)| (token.as_str(), user_id.as_str()));
+
+    let detected = crate::multiplier::probe::detect(
+        &state.upstream,
+        &account.base_url,
+        &api_key,
+        credentials,
+        account.allow_private_network,
+    )
+    .await
+    .map_err(|error| {
+        AdminError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "识别失败：{}",
+                crate::security::redact::text(&error.to_string())
+            ),
+        )
+    })?;
+
+    // 写回明确的来源。识别成功却只存在内存里，等于让管理员每重启一次再点一次。
+    account.multiplier_mode = detected.mode();
+    state
+        .store
+        .update_account(&account, &AccountSecrets::default())
+        .await
+        .map_err(AdminError::internal)?;
+    reload(state).await?;
+
+    // 来源变了就立刻探测一次：识别的用处是拿到倍率，而不是停在"知道它是什么站"。
+    // 这次刷新失败不回滚来源——识别本身已经成功，倍率失败按 §11.4 的宽限期处理。
+    let mut probe_error = None;
+    match crate::multiplier::refresh::refresh_account_now(state, &account).await {
+        Ok(reading) => tracing::info!(
+            account = account.name,
+            mode = detected.mode().as_str(),
+            multiplier = %reading.multiplier,
+            "识别到倍率来源并完成首次探测"
+        ),
+        Err(error) => {
+            let text = crate::security::redact::text(&error.to_string());
+            tracing::warn!(account = account.name, %text, "识别成功但首次倍率探测失败");
+            probe_error = Some(text);
+        }
+    }
+
+    let mut payload = detected_payload(&detected);
+    if let Some(error) = probe_error
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("probe_error".to_string(), Value::String(error));
+    }
+    Ok(payload)
+}
+
+fn detected_payload(detected: &crate::multiplier::probe::Detected) -> Json<Value> {
+    Json(json!({
+        "multiplier_mode": detected.mode().as_str(),
+        "detected": true,
+        "notice": format!("已识别为{}并写回账号，正在按它获取倍率", detected.label()),
+    }))
 }
 
 /// 批量刷新所有自动倍率账号（§11.3、§27 阶段5）。
@@ -2144,7 +2264,7 @@ pub struct TargetDto {
 }
 
 /// 分维得分。流式与非流式分开统计，这里给出该模型下样本更多的那一份。
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ScoreDto {
     pub total: f64,
     pub multiplier: f64,
@@ -2162,7 +2282,7 @@ pub struct ScoreDto {
 }
 
 /// 分维加权贡献（§6.5）。
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 pub struct ScoreContributionDto {
     pub multiplier: f64,
     pub reliability: f64,
@@ -2170,14 +2290,14 @@ pub struct ScoreContributionDto {
     pub throughput: f64,
 }
 
-fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
-    let config = state.config.current();
-    let view = config
-        .groups
-        .iter()
-        .flat_map(|group| group.models.values())
-        .flat_map(|model| model.targets.iter())
-        .find(|candidate| candidate.target.id == target.id);
+fn target_dto(
+    state: &SharedState,
+    config: &crate::config::RuntimeConfig,
+    rows: &HashMap<&str, TargetRow<'_>>,
+    target: &DispatchTarget,
+) -> TargetDto {
+    let row = rows.get(target.id.as_str());
+    let view = row.and_then(|row| row.view);
 
     let (priority, effective_limits) = view
         .map(|view| (view.priority, view.limits()))
@@ -2211,10 +2331,10 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
             .cooldown_remaining(tokio::time::Instant::now())
             .map(|d| d.as_secs()),
         inflight: health.inflight(),
-        score: view.and_then(|view| score_dto(state, view)),
-        first_token_ms: ewma_metric(state, view, |stats| stats.first_token_ms),
-        output_tps: ewma_metric(state, view, |stats| stats.output_tps),
-        total_ms: ewma_metric(state, view, |stats| stats.total_ms),
+        score: row.and_then(|row| row.score.clone()),
+        first_token_ms: ewma_metric(row, |stats| stats.first_token_ms),
+        output_tps: ewma_metric(row, |stats| stats.output_tps),
+        total_ms: ewma_metric(row, |stats| stats.total_ms),
         pause_reason: pause_reason(state, target, view),
     }
 }
@@ -2222,13 +2342,12 @@ fn target_dto(state: &SharedState, target: &DispatchTarget) -> TargetDto {
 /// 取某个目标的 EWMA 指标。样本不足（冷启动）时返回 None 而不是 0——0 会被
 /// 误读成"这个目标很快"（§6.5、§9.4）。
 fn ewma_metric(
-    state: &SharedState,
-    view: Option<&std::sync::Arc<crate::config::TargetView>>,
+    row: Option<&TargetRow<'_>>,
     pick: impl Fn(&crate::routing::score::Stats) -> f64,
 ) -> Option<f64> {
-    let view = view?;
-    let dimension = display_dimension(state, view)?;
-    let stats = state.runtime.perf.stats(&view.target.id, dimension);
+    let row = row?;
+    row.dimension?;
+    let stats = row.stats;
     stats.is_warm().then(|| pick(&stats))
 }
 
@@ -2301,23 +2420,17 @@ fn multiplier_pause_reason(
     }
 }
 
-/// 用与调度完全相同的算法算出这个目标当前的综合评分。
-///
-/// 后台看到的分数必须和调度器用的是同一个数字，否则诊断毫无意义。
 /// 展示用的统计维度：取这个逻辑模型下样本最多的"协议 + 是否流式"组合。
 ///
 /// 跨协议之后一个目标可能同时服务三种下游协议，展示时整个模型统一用同一维，
 /// 否则参照系不一致，分数就不可比了（§9.4）。评分和 EWMA 列共用它。
-fn display_dimension(
+///
+/// 它只依赖逻辑模型，与具体目标无关，所以按模型算一次即可——原先按目标逐行
+/// 计算时，500 个目标的列表要把同样的 6 次统计查表重复上百遍。
+fn model_dimension(
     state: &SharedState,
-    view: &crate::config::TargetView,
+    model: &LogicalModelView,
 ) -> Option<crate::routing::score::Dimension> {
-    let config = state.config.current();
-    let group = config.group_by_id(&view.account.group_id)?;
-    let model = group
-        .models
-        .values()
-        .find(|model| model.model.id == view.target.logical_model_id)?;
     let samples_of = |dimension: crate::routing::score::Dimension| -> u64 {
         model
             .targets
@@ -2346,37 +2459,39 @@ fn display_dimension(
         })
         .max_by_key(|dimension| samples_of(*dimension))
         .unwrap_or(crate::routing::score::Dimension {
-            protocol: view.account.preferred_protocol,
+            protocol: Protocol::OpenAiChat,
             streaming: false,
         }),
     )
 }
 
-fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<ScoreDto> {
-    let config = state.config.current();
-    let group = config.group_by_id(&view.account.group_id)?;
+/// 一个逻辑模型下全部目标的评分，顺序与 `model.targets` 一致（§9.4）。
+///
+/// 用与调度完全相同的算法算出来：后台看到的分数必须和调度器用的是同一个数字，
+/// 否则诊断毫无意义。按模型算一次，行级 DTO 只取下标——否则每个目标都要重算
+/// 整个模型的候选集，500 个目标就是 500 倍的计算量。
+fn model_scores(
+    state: &SharedState,
+    group: &GroupView,
+    model: &LogicalModelView,
+    dimension: Option<crate::routing::score::Dimension>,
+) -> Vec<ScoreDto> {
     let multipliers = state.runtime.multipliers.view();
     let now = crate::storage::now_unix();
+    let weights = group.group.weights;
+    let share = |value: f64, weight: u32| {
+        round4(value * f64::from(weight) / f64::from(SchedulingWeights::TOTAL))
+    };
 
-    let model = group
-        .models
-        .values()
-        .find(|model| model.model.id == view.target.logical_model_id)?;
-    let dimension = display_dimension(state, view)?;
-    let candidates: Vec<_> = model
-        .targets
-        .iter()
-        .map(|target| {
-            let effective =
-                multipliers.effective(&target.account, group.group.multiplier_limit, now);
-            crate::routing::score::Candidate {
-                target_id: target.target.id.clone(),
-                multiplier: effective.value,
-                multiplier_stale: effective.status == crate::multiplier::Status::Stale,
-                stats: state.runtime.perf.stats(&target.target.id, dimension),
-            }
-        })
-        .collect();
+    let mut values = Vec::with_capacity(model.targets.len());
+    for target in &model.targets {
+        let effective = multipliers.effective(&target.account, group.group.multiplier_limit, now);
+        values.push((
+            target.target.id.clone(),
+            effective.value,
+            effective.status == crate::multiplier::Status::Stale,
+        ));
+    }
     let cheapest = group
         .models
         .values()
@@ -2387,38 +2502,114 @@ fn score_dto(state: &SharedState, view: &crate::config::TargetView) -> Option<Sc
                 .value
         })
         .min();
+    let candidates: Vec<_> = values
+        .iter()
+        .map(|(id, multiplier, stale)| crate::routing::score::Candidate {
+            target_id: id.clone(),
+            multiplier: *multiplier,
+            multiplier_stale: *stale,
+            stats: dimension
+                .map(|dimension| state.runtime.perf.stats(id, dimension))
+                .unwrap_or_default(),
+        })
+        .collect();
+    let scores = crate::routing::score::score_all(&candidates, weights, cheapest);
 
-    let scores = crate::routing::score::score_all(&candidates, group.group.weights, cheapest);
-    let index = model
+    model
         .targets
         .iter()
-        .position(|target| target.target.id == view.target.id)?;
-    let score = scores.get(index)?;
-    let stats = state.runtime.perf.stats(&view.target.id, dimension);
-    // 贡献 = 归一化得分 × 该维权重 ÷ 总分权重（§9.4）；四项之和即综合评分。
-    let weights = group.group.weights;
-    let share = |value: f64, weight: u32| {
-        round4(value * f64::from(weight) / f64::from(crate::domain::SchedulingWeights::TOTAL))
-    };
-    Some(ScoreDto {
-        total: round4(score.total),
-        multiplier: round4(score.multiplier),
-        reliability: round4(score.reliability),
-        first_token: round4(score.first_token),
-        throughput: round4(score.throughput),
-        samples: stats.samples,
-        warm: stats.is_warm(),
-        contribution: ScoreContributionDto {
-            multiplier: share(score.multiplier, weights.multiplier),
-            reliability: share(score.reliability, weights.reliability),
-            first_token: share(score.first_token, weights.first_token),
-            throughput: share(score.throughput, weights.throughput),
-        },
-    })
+        .enumerate()
+        .map(|(index, target)| {
+            // score_all 对每个候选都返回一个分数，下标必然有效；真的缺了也
+            // 退回全中性分，而不是让整个列表构建失败。
+            let score = scores
+                .get(index)
+                .copied()
+                .unwrap_or(crate::routing::score::Score {
+                    multiplier: crate::routing::score::NEUTRAL,
+                    reliability: crate::routing::score::NEUTRAL,
+                    first_token: crate::routing::score::NEUTRAL,
+                    throughput: crate::routing::score::NEUTRAL,
+                    total: crate::routing::score::NEUTRAL,
+                });
+            let stats = dimension
+                .map(|dimension| state.runtime.perf.stats(&target.target.id, dimension))
+                .unwrap_or_default();
+            ScoreDto {
+                total: round4(score.total),
+                multiplier: round4(score.multiplier),
+                reliability: round4(score.reliability),
+                first_token: round4(score.first_token),
+                throughput: round4(score.throughput),
+                samples: stats.samples,
+                warm: stats.is_warm(),
+                contribution: ScoreContributionDto {
+                    multiplier: share(score.multiplier, weights.multiplier),
+                    reliability: share(score.reliability, weights.reliability),
+                    first_token: share(score.first_token, weights.first_token),
+                    throughput: share(score.throughput, weights.throughput),
+                },
+            }
+        })
+        .collect()
 }
 
 fn round4(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+/// 列表里一行的**预计算结果**（§9.4）。
+///
+/// 评分、展示维度与 EWMA 都只依赖"逻辑模型"，按模型算一次即可。行的 DTO 只
+/// 从中取自己那一份——这正是原先按目标重算时最贵的地方：500 个目标会把同一个
+/// 模型算 500 遍，接口要 60 毫秒以上，而每次写操作之后界面都会立刻重拉它。
+struct TargetRow<'a> {
+    view: Option<&'a Arc<crate::config::TargetView>>,
+    dimension: Option<crate::routing::score::Dimension>,
+    stats: crate::routing::score::Stats,
+    score: Option<ScoreDto>,
+}
+
+/// 一次性把全部目标行的预计算结果建好，键是目标 ID。
+///
+/// 同时也给出"目标 ID → 分组与逻辑模型"的索引：逐条写接口靠它回吐刚写入的
+/// 那一行，不必再扫整棵配置树。
+fn target_rows<'a>(
+    state: &SharedState,
+    config: &'a crate::config::RuntimeConfig,
+) -> HashMap<&'a str, TargetRow<'a>> {
+    let mut rows = HashMap::new();
+    for group in &config.groups {
+        for model in group.models.values() {
+            let dimension = model_dimension(state, model);
+            let scores = model_scores(state, group, model, dimension);
+            for (index, target) in model.targets.iter().enumerate() {
+                let stats = dimension
+                    .map(|dimension| state.runtime.perf.stats(&target.target.id, dimension))
+                    .unwrap_or_default();
+                rows.insert(
+                    target.target.id.as_str(),
+                    TargetRow {
+                        view: Some(target),
+                        dimension,
+                        stats,
+                        score: scores.get(index).cloned(),
+                    },
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// 单个目标的 DTO，供写接口回吐刚写入的那一行。
+fn target_dto_by_id(
+    state: &SharedState,
+    config: &crate::config::RuntimeConfig,
+    target: &DispatchTarget,
+) -> TargetDto {
+    let rows = target_rows(state, config);
+    target_dto(state, config, &rows, target)
 }
 
 pub async fn list_targets(
@@ -2431,7 +2622,18 @@ pub async fn list_targets(
         .list_targets()
         .await
         .map_err(AdminError::internal)?;
-    let dtos: Vec<TargetDto> = targets.iter().map(|t| target_dto(&state, t)).collect();
+    // 目标视图是按"目标 ID → (分组视图, 逻辑模型视图)"一次性建索引的。
+    //
+    // 逐个目标去扫整棵配置树是 O(目标 × 目标)：500 个目标时这个接口要
+    // 140 ms 以上，而写操作之后界面会立刻重拉它——这就是"改完卡一下"。
+    // 现在是 O(目标)。
+    let config = state.config.current();
+    let rows = target_rows(&state, &config);
+
+    let dtos: Vec<TargetDto> = targets
+        .iter()
+        .map(|target| target_dto(&state, &config, &rows, target))
+        .collect();
     Ok(paged(dtos, &page))
 }
 
@@ -2480,7 +2682,10 @@ pub async fn create_target(
     reload(&state).await?;
     audit(&state, &admin, "create_target", &target.id).await;
 
-    Ok((StatusCode::CREATED, Json(target_dto(&state, &target))))
+    Ok((
+        StatusCode::CREATED,
+        Json(target_dto_by_id(&state, &state.config.current(), &target)),
+    ))
 }
 
 pub async fn update_target(
@@ -2525,7 +2730,11 @@ pub async fn update_target(
         .map_err(AdminError::internal)?;
     reload(&state).await?;
     audit(&state, &admin, "update_target", &target.id).await;
-    Ok(Json(target_dto(&state, &target)))
+    Ok(Json(target_dto_by_id(
+        &state,
+        &state.config.current(),
+        &target,
+    )))
 }
 
 pub async fn delete_target(
@@ -3069,7 +3278,6 @@ pub async fn copy_account(
         group_id: account.group_id.clone(),
         name: format!("{} - 副本", account.name),
         // 静态配置原样复制；停用状态让管理员检查完再启用（§6.4）。
-        upstream_type: account.upstream_type,
         base_url: account.base_url.clone(),
         preferred_protocol: account.preferred_protocol,
         adaptive_protocol: account.adaptive_protocol,

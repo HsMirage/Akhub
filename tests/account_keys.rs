@@ -14,7 +14,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use akhub::domain::{Account, Limits, Multiplier, MultiplierMode, Protocol, UpstreamType};
+use akhub::domain::{Account, Limits, Multiplier, MultiplierMode, Protocol};
 use akhub::storage::store::{AccountKeyWrite, AccountSecrets, ids};
 use common::{
     Akhub, Behavior, FakeUpstream, TargetSpec, chat, insert_account_with_key, spawn_akhub,
@@ -58,7 +58,6 @@ async fn wire_account_with_keys(
         id: ids::account(),
         group_id,
         name: name.into(),
-        upstream_type: UpstreamType::OpenAiCompatible,
         base_url: base_url.into(),
         preferred_protocol: CHAT,
         adaptive_protocol: true,

@@ -5,7 +5,11 @@
  * 都无法对外服务，而错误只会在真实调用时以 503 的形式暴露。所以配置未完成时，
  * 这一页的主体是一份引导清单：直接告诉你缺哪一步、点哪里补。
  */
+import { useEffect, useState } from "react";
+
+import { api } from "../lib/api";
 import type { Data } from "../lib/store";
+import type { RequestRecord } from "../lib/types";
 import type { Route } from "../routes";
 import { Badge, Button, Card, CopyButton, EmptyState, InfoTip } from "../components/ui";
 import { TrendChart } from "../components/TrendChart";
@@ -40,7 +44,25 @@ export function Overview({
   data: Data;
   navigate: (route: Route, params?: Record<string, string>) => void;
 }) {
-  const { overview, groups, accounts, models, targets, requests } = data;
+  const { overview, groups, accounts, models, targets } = data;
+
+  // "最近请求"自己拉一小片：请求记录不参与全局刷新（它是全量刷新里最贵的一项，
+  // 其他页面又完全用不到），所以这里按需取最近 6 条。
+  const [requests, setRequests] = useState<RequestRecord[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void api
+      .requests({ limit: 6 })
+      .then((result) => {
+        if (alive) setRequests(result.data);
+      })
+      .catch(() => {
+        if (alive) setRequests([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [overview.requests, overview.trend]);
 
   const steps = [
     {

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use akhub::app::{AppState, Settings, SharedState};
 use akhub::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights, UpstreamType,
+    Protocol, SchedulingWeights,
 };
 use akhub::storage::store::ids;
 use axum::Router;
@@ -145,7 +145,6 @@ async fn wire_target(
         id: ids::account(),
         group_id: group_id.clone(),
         name: name.into(),
-        upstream_type: UpstreamType::OpenAiCompatible,
         base_url: base_url.into(),
         preferred_protocol: protocol,
         adaptive_protocol: true,

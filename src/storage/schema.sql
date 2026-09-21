@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS upstream_accounts (
     id                    TEXT PRIMARY KEY,
     group_id              TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     name                  TEXT NOT NULL,
-    upstream_type         TEXT NOT NULL,
+    -- 历史列：早期用来区分官方直连、中转站与“OpenAI 兼容”，但全仓没有一处
+    -- 按它分支——端点由协议决定，倍率来源由 multiplier_mode 决定。v12 起不再
+    -- 写入也不用，只为兼容不认识新结构的旧二进制而保留（§4.2）。
+    upstream_type         TEXT NOT NULL DEFAULT '',
     base_url              TEXT NOT NULL,
     preferred_protocol    TEXT NOT NULL,
     adaptive_protocol     INTEGER NOT NULL,

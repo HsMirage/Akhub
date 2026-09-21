@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::domain::Multiplier;
+use crate::domain::{Multiplier, MultiplierMode};
 use crate::security::url_guard;
 use crate::upstream::UpstreamClient;
 
@@ -100,6 +100,163 @@ fn parse_clock(raw: &str) -> Result<u32> {
     Ok(hours * 3600 + minutes * 60)
 }
 
+// -------------------------------------------------------------- 站点类型识别
+
+/// 一次识别得出的站点类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detected {
+    Sub2Api,
+    NewApi,
+}
+
+impl Detected {
+    pub fn mode(self) -> MultiplierMode {
+        match self {
+            Self::Sub2Api => MultiplierMode::Sub2Api,
+            Self::NewApi => MultiplierMode::NewApi,
+        }
+    }
+
+    /// 简短的名字，用于给管理员的提示语。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sub2Api => "Sub2API",
+            Self::NewApi => "New API",
+        }
+    }
+
+    /// 探测这一档"不认"时用的接口名，用于拼装给管理员看的错误。
+    #[allow(dead_code)]
+    pub fn probe_label(self) -> &'static str {
+        match self {
+            Self::Sub2Api => "Sub2API 计费接口（/v1/sub2api/billing）",
+            Self::NewApi => "New API 分组接口（/api/user/self/groups）",
+        }
+    }
+}
+
+/// 探针响应的 HTTP 状态码。单独成类型是为了让识别动作能可靠地分辨
+/// "这个端点不存在"与"这次请求没能到达上游"——用错误文本做判断太脆。
+#[derive(Debug)]
+struct HttpStatus(u16);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// 上游回了 200，但响应不是这个管理接口的形状。
+///
+/// 这类错误与 404 等价：路径后面没有我们要的接口。为了不改动对外错误文本，
+/// 它只作为错误链上的一个标记，由 verdict 认领。
+#[derive(Debug)]
+struct NotThisApi;
+
+impl std::fmt::Display for NotThisApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("响应形状不是这个接口")
+    }
+}
+
+impl std::error::Error for NotThisApi {}
+
+/// 一次候选探测的裁定。识别动作只允许在 NoMatch 时换下一个候选。
+enum Verdict<T> {
+    Ok(T),
+    /// 明确不是这个接口（HTTP 404/405，或 200 但形状完全不对）。
+    NoMatch,
+    /// 说不准：网络、TLS、超时、5xx、鉴权失败，或上游返回了自己的错误。
+    /// 这种情况必须如实上报，绝不能当成"不是这个站点"而改写来源。
+    Inconclusive(anyhow::Error),
+}
+
+/// 把一次候选探测的结果归类。
+///
+/// 401/403 是**有意**归入"说不准"的：它说明路径上确实有这个接口，只是凭据
+/// 不被接受。站点类型的判断没有错，错的是凭据，所以要报错而不是换候选。
+fn verdict<T>(result: Result<T>) -> Verdict<T> {
+    let error = match result {
+        Ok(value) => return Verdict::Ok(value),
+        Err(error) => error,
+    };
+    let status = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<HttpStatus>())
+        .map(|status| status.0);
+    if matches!(status, Some(404 | 405)) || error.chain().any(|cause| cause.is::<NotThisApi>()) {
+        return Verdict::NoMatch;
+    }
+    Verdict::Inconclusive(error)
+}
+
+/// 识别站点类型：先 Sub2API（只要一把 Key），不认再试 New API（要额外凭据）。
+///
+/// 顺序不能反：绝大多数账号都配了 Key 却没配 New API 的访问令牌与用户 ID，
+/// 先试 New API 只会多打一次注定失败的请求。没有凭据的候选**直接跳过**，
+/// 不制造探测流量。
+///
+/// 这个函数不写任何配置：识别成功与否都不改账号，调用方拿到结论后再决定。
+/// 探测失败按分类如实报错——猜一个来源写进去，只会让接下来的每一轮刷新都打
+/// 在错误的接口上。
+///
+/// **已知限制**：Sub2API 是 Key 级计费，而这里用的 API Key 是账号 Key 池的第一
+/// 把（镜像，§4.2.1）。多 Key 账号识别出的来源对全体 Key 成立，倍率则未必。
+pub async fn detect(
+    client: &UpstreamClient,
+    base_url: &str,
+    api_key: &str,
+    new_api_credentials: Option<(&str, &str)>,
+    allow_private: bool,
+) -> Result<Detected> {
+    // 1) Sub2API：只要一把 Key，先问它。
+    match verdict(sub2api(client, base_url, api_key, allow_private).await) {
+        Verdict::Ok(_) => return Ok(Detected::Sub2Api),
+        // 说不准就**立刻停**：403 说明路径上确实有这个接口，只是凭据不被接受；
+        // 网络失败更是与"这个站是什么"无关。继续换候选会把这些故障悄悄伪装成
+        // "识别成功"，代价是之后每一轮刷新都打在错误的接口上。
+        Verdict::Inconclusive(error) => bail!(
+            "识别失败：{}：{}",
+            Detected::Sub2Api.probe_label(),
+            sanitize_probe_error(&error)
+        ),
+        Verdict::NoMatch => {}
+    }
+
+    // 2) New API：需要额外的访问令牌与用户 ID。没凭据就如实说明"没问过"，
+    //    而不是把"没探测"说成"它也不认"。
+    let Some((token, user_id)) = new_api_credentials else {
+        bail!(
+            "识别未能得出结论：{}不认这个站点；{}需要访问令牌与用户 ID 才能探测（可在账号编辑页填写，或在设置页按站点配置一次）",
+            Detected::Sub2Api.probe_label(),
+            Detected::NewApi.probe_label()
+        )
+    };
+    match verdict(new_api(client, base_url, token, user_id, None, allow_private).await) {
+        Verdict::Ok(_) => Ok(Detected::NewApi),
+        Verdict::Inconclusive(error) => bail!(
+            "识别失败：{}：{}",
+            Detected::NewApi.probe_label(),
+            sanitize_probe_error(&error)
+        ),
+        Verdict::NoMatch => bail!(
+            "这个站点既不认{}，也不认{}",
+            Detected::Sub2Api.probe_label(),
+            Detected::NewApi.probe_label()
+        ),
+    }
+}
+
+/// 识别路径上的错误文本统一脱敏，避免上游把凭据回显在正文里（§20.2）。
+fn sanitize_probe_error(error: &anyhow::Error) -> String {
+    let text = crate::security::redact::text(&format!("{error:#}"));
+    // 错误链最外层往往只是"探针返回 HTTP 404"，真正的形状错误在里层，
+    // 这里整条链一起给出，便于管理员判断到底哪一步不匹配。
+    text.trim().chars().take(300).collect()
+}
+
 // ------------------------------------------------------------------ Sub2API
 
 /// Sub2API 的 Key 级计费响应（兼容两代现场形状）。
@@ -188,8 +345,11 @@ pub async fn sub2api(
         .await
         .context("Sub2API 计费接口请求失败")?;
     let body = read_json_body(response).await?;
-    let billing: Sub2ApiBilling =
-        serde_json::from_slice(&body).context("Sub2API 计费响应结构不符合预期")?;
+    let billing: Sub2ApiBilling = serde_json::from_slice(&body).map_err(|error| {
+        anyhow::Error::new(error)
+            .context(NotThisApi)
+            .context("Sub2API 计费响应结构不符合预期")
+    })?;
 
     if billing.object != "billing" && billing.object != "sub2api.key_billing" {
         bail!("Sub2API 计费响应的对象类型非法：{}", billing.object);
@@ -340,17 +500,22 @@ async fn fetch_new_api_groups(
         .await
         .context("New API 分组接口请求失败")?;
     let body = read_json_body(response).await?;
-    let groups: NewApiGroups =
-        serde_json::from_slice(&body).context("New API 分组响应结构不符合预期")?;
+    let groups: NewApiGroups = serde_json::from_slice(&body).map_err(|error| {
+        anyhow::Error::new(error)
+            .context(NotThisApi)
+            .context("New API 分组响应结构不符合预期")
+    })?;
 
     if !groups.success {
-        bail!(
-            "New API 分组接口返回失败：{}",
-            if groups.message.is_empty() {
-                "未提供原因（通常是访问令牌过期或用户 ID 不匹配）"
-            } else {
-                &groups.message
-            }
+        // 回了一张 success:false 的 JSON：这个站点确实有 New API 的接口，只是
+        // 这次没通过鉴权或用户 ID 不对。识别动作必须把它当“说不准”，不能换候选。
+        let reason = if groups.message.is_empty() {
+            "未提供原因（通常是访问令牌过期或用户 ID 不匹配）".to_string()
+        } else {
+            groups.message.clone()
+        };
+        return Err(
+            anyhow::Error::new(NotThisApi).context(format!("New API 分组接口返回失败：{reason}"))
         );
     }
     groups
@@ -418,7 +583,10 @@ async fn read_json_body(response: reqwest::Response) -> Result<Vec<u8>> {
         .to_ascii_lowercase();
 
     if !status.is_success() {
-        bail!("探针返回 HTTP {}", status.as_u16());
+        // 状态码单独挂一层：识别动作靠它区分“端点不存在”与“这次没到上游”，
+        // 用错误文本判断太脆。
+        return Err(anyhow::Error::new(HttpStatus(status.as_u16()))
+            .context(format!("探针返回 HTTP {}", status.as_u16())));
     }
     if !content_type.contains("json") {
         bail!("探针响应的 Content-Type 不是 JSON：{content_type}");
@@ -433,6 +601,63 @@ async fn read_json_body(response: reqwest::Response) -> Result<Vec<u8>> {
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// 识别动作的裁定表。这三行是它与普通刷新之间最大的行为差异：
+/// 只有“确实不是这个接口”才允许换下一个候选。
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+
+    fn error_with_status(code: u16) -> anyhow::Error {
+        anyhow::Error::new(HttpStatus(code)).context(format!("探针返回 HTTP {code}"))
+    }
+
+    #[test]
+    fn a_missing_endpoint_is_a_no_match() {
+        for code in [404, 405] {
+            match verdict::<()>(Err(error_with_status(code))) {
+                Verdict::NoMatch => {}
+                _ => panic!("HTTP {code} 应当判定为“不是这个接口”"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrong_response_shape_is_a_no_match() {
+        // 200 但不是这个接口的 JSON：与 404 等价。
+        match verdict::<()>(Err(anyhow::Error::new(NotThisApi).context("形状不对"))) {
+            Verdict::NoMatch => {}
+            _ => panic!("形状不匹配应当判定为“不是这个接口”"),
+        }
+    }
+
+    #[test]
+    fn authentication_and_transport_failures_are_inconclusive() {
+        // 403 说明路径上确实有这个接口，只是凭据不被接受：换候选会掩盖真正的问题。
+        for error in [
+            error_with_status(403),
+            error_with_status(401),
+            error_with_status(500),
+            anyhow::anyhow!("Sub2API 计费接口请求失败：连接被重置"),
+        ] {
+            match verdict::<()>(Err(error)) {
+                Verdict::Inconclusive(_) => {}
+                _ => panic!("鉴权与网络失败不能当成“不是这个接口”"),
+            }
+        }
+    }
+
+    #[test]
+    fn inconclusive_errors_keep_their_whole_chain() {
+        // 识别失败时管理员要能看到“为什么”，最外层那句 HTTP 状态码远远不够。
+        let error = anyhow::Error::new(serde_json::Error::io(std::io::Error::other("boom")))
+            .context(NotThisApi)
+            .context("Sub2API 计费响应结构不符合预期");
+        let text = sanitize_probe_error(&error);
+        assert!(text.contains("Sub2API 计费响应结构不符合预期"), "{text}");
+        assert!(text.contains("形状不是这个接口"), "{text}");
+    }
 }
 
 #[cfg(test)]

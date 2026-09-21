@@ -122,6 +122,8 @@ export function ModelSelectionDialog({
   /** 二次确认列表的即时副本，供异步回调判断确认框是否还开着。 */
   const confirmWarningsRef = useRef<SelectionWarning[] | null>(null);
   confirmWarningsRef.current = confirmWarnings;
+  /** 版本冲突是否已经自动重试过一次；避免两个标签页互踩时无限重试。 */
+  const conflictRetried = useRef(false);
 
   const load = useCallback(async () => {
     if (!accountId) return;
@@ -145,6 +147,9 @@ export function ModelSelectionDialog({
       setGroupModels([]);
     }
   }, [account]);
+
+  /** 安排一次防抖提交；`delay` 为 0 时立即提交（版本冲突重试用）。 */
+  const scheduleFlushRef = useRef<(delay: number) => void>(() => {});
 
   /**
    * 把草稿合并成一次请求提交。
@@ -183,6 +188,32 @@ export function ModelSelectionDialog({
         if (confirmWarningsRef.current !== null) setConfirmWarnings(null);
         await onChangedRef.current();
       } catch (cause) {
+        // 409 有两种完全不同的含义，必须分开：
+        //
+        // - `config_conflict`：乐观锁拦下的并发写（多半是上一次自己的写在途，
+        //   或者另一个标签页刚改过配置）。它不是"有流量的模型要确认"，
+        //   把它当成后者会弹出一个**一条警告都没有**的确认框——用户只能反复
+        //   点"仍然停用"，而每次都会再撞一次。正确做法是把改动放回草稿，
+        //   刷新一次配置版本，然后自动重试一次。
+        // - 其余 409 才是"以下模型最近 24 小时有流量"的二次确认。
+        if (cause instanceof ApiError && cause.status === 409 && cause.configConflict) {
+          for (const change of changes) {
+            pending.current.set(change.upstream_model, {
+              ...(pending.current.get(change.upstream_model) ?? {}),
+              ...change,
+            });
+          }
+          await load();
+          if (!conflictRetried.current) {
+            conflictRetried.current = true;
+            // 等这次 flush 的 `setSaving(false)` 落定再重试，避免紧挨着的又一次
+            // 请求仍带着同一个过期版本号。
+            window.setTimeout(() => scheduleFlushRef.current(0), 0);
+          } else {
+            toast.error("配置刚被其他会话改过，已保留你的改动；请确认目录后重试");
+          }
+          return;
+        }
         if (cause instanceof ApiError && cause.status === 409) {
           // 停用有流量的模型：先让用户确认，改动原样留在 rejected 里。
           const payload = cause.payload as
@@ -202,6 +233,19 @@ export function ModelSelectionDialog({
     [accountId, load, toast],
   );
 
+  const scheduleFlush = useCallback(
+    (delay: number) => {
+      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      flushTimer.current = window.setTimeout(() => {
+        flushTimer.current = null;
+        // 二次确认开着时先只攒着：用户点“仍然停用”会连新改动一起提交。
+        if (rejected.current === null) void flush();
+      }, delay);
+    },
+    [flush],
+  );
+  scheduleFlushRef.current = scheduleFlush;
+
   /** 记下一行改动并安排防抖提交。 */
   const queueChange = useCallback(
     (upstreamModel: string, change: PendingChange) => {
@@ -209,14 +253,11 @@ export function ModelSelectionDialog({
         ...(pending.current.get(upstreamModel) ?? {}),
         ...change,
       });
-      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
-      flushTimer.current = window.setTimeout(() => {
-        flushTimer.current = null;
-        // 二次确认开着时先只攒着：用户点“仍然停用”会连新改动一起提交。
-        if (rejected.current === null) void flush();
-      }, FLUSH_DELAY_MS);
+      // 用户又动手了：这一批改动值得再获得一次自动重试。
+      conflictRetried.current = false;
+      scheduleFlush(FLUSH_DELAY_MS);
     },
-    [flush],
+    [scheduleFlush],
   );
 
   useEffect(() => {
@@ -230,6 +271,7 @@ export function ModelSelectionDialog({
     setNotice(null);
     setConfirmWarnings(null);
     rejected.current = null;
+    conflictRetried.current = false;
     setHideOriginal(account?.hide_original ?? false);
     void load();
     void loadGroupNames();

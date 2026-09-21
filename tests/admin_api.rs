@@ -249,7 +249,6 @@ async fn the_full_configuration_path_works_end_to_end() {
     .json(&json!({
         "group_id": group_id,
         "name": "账号A",
-        "upstream_type": "anthropic",
         "base_url": "https://api.anthropic.com",
         "api_key": "sk-上游真Key",
         "preferred_protocol": "anthropic_messages",
@@ -363,7 +362,6 @@ async fn cross_group_target_binding_is_rejected() {
     .json(&json!({
         "group_id": ids[0],
         "name": "账号A",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -461,7 +459,6 @@ async fn invalid_configuration_is_rejected_with_useful_messages() {
     .json(&json!({
         "group_id": group_id,
         "name": "内网账号",
-        "upstream_type": "openai_compatible",
         "base_url": "http://169.254.169.254",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -628,7 +625,6 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     .json(&json!({
         "group_id": group_id,
         "name": "缺令牌",
-        "upstream_type": "new_api",
         "base_url": "https://newapi.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -649,7 +645,6 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     .json(&json!({
         "group_id": group_id,
         "name": "零并发",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -668,7 +663,6 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     .json(&json!({
         "group_id": group_id,
         "name": "自动倍率",
-        "upstream_type": "new_api",
         "base_url": "https://newapi.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -741,7 +735,6 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
     .json(&json!({
         "group_id": group_id,
         "name": "手动",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -813,7 +806,6 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .json(&json!({
         "group_id": group_id,
         "name": "账号A",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -883,6 +875,114 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .await
     .unwrap();
     assert_eq!(zero.status(), 400);
+}
+
+/// 列表接口必须按行给出与调度器一致的评分（§9.4）。
+///
+/// `/targets` 现在是"按逻辑模型预计算一次、每行只取自己那份"的；预计算与
+/// 逐行计算必须给出同一个数字，否则后台看到的分数就不再是调度器用的那个。
+#[tokio::test]
+async fn list_target_scores_are_per_row_not_shared() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+
+    // 一个逻辑模型，三个账号接上去：同层、同模型，倍率不同，评分必须不同。
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    for (index, multiplier) in ["0.5", "1", "0.25"].iter().enumerate() {
+        let account: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/accounts"),
+        )
+        .json(&json!({
+            "group_id": group_id,
+            "name": format!("账号{index}"),
+            "base_url": "https://api.example.com",
+            "api_key": "sk-x",
+            "preferred_protocol": "openai_chat",
+            "manual_multiplier": multiplier,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let response = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/targets"),
+        )
+        .json(&json!({
+            "logical_model_id": model["id"],
+            "account_id": account["id"],
+            "upstream_model": "glm-4.6",
+        }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    }
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = listed["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "三个目标都要出现");
+
+    let totals: Vec<f64> = rows
+        .iter()
+        .map(|row| row["score"]["total"].as_f64().unwrap())
+        .collect();
+    assert!(
+        totals
+            .windows(2)
+            .any(|pair| (pair[0] - pair[1]).abs() > f64::EPSILON),
+        "不同倍率的行必须拿到不同评分（而不是共享同一个兜底分）：{totals:?}"
+    );
+    for row in rows {
+        assert!(
+            row["logical_model_id"].is_string(),
+            "每行都要能定位到自己的逻辑模型"
+        );
+        assert_eq!(row["score"]["warm"], false);
+        assert!(
+            row["score"]["contribution"]["multiplier"]
+                .as_f64()
+                .is_some()
+        );
+        assert!(row["score"]["samples"].is_number());
+    }
 }
 
 /// 配置版本乐观锁（§7.4）：带上对不上的版本写 → 409，带上当前版本 → 成功，
@@ -1086,7 +1186,6 @@ async fn accounts_report_a_health_summary() {
     .json(&json!({
         "group_id": group_id,
         "name": "账号A",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -1236,7 +1335,6 @@ async fn groups_report_their_own_alerts() {
     .json(&json!({
         "group_id": group_id,
         "name": "账号A",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -1319,7 +1417,6 @@ async fn a_disabled_target_reports_its_pause_reason() {
     .json(&json!({
         "group_id": group_id,
         "name": "账号A",
-        "upstream_type": "openai_compatible",
         "base_url": "https://api.example.com",
         "api_key": "sk-x",
         "preferred_protocol": "openai_chat",
@@ -1410,4 +1507,82 @@ async fn a_disabled_target_reports_its_pause_reason() {
         row["pause_reason"].as_str().is_some_and(|r| !r.is_empty()),
         "停用必须给出原因：{row}"
     );
+}
+
+/// 配置列表的分页契约（§7.4）：后台靠 offset 翻页把列表取全。
+///
+/// 前端 `requestAllPages` 用 `limit=<上限>&offset=<已取条数>` 一直翻到
+/// `data.length >= total`。这条测试把服务端那一半钉死：`total` 永远是全量、
+/// `offset` 真的跳过前面的行、`limit` 超上限时被夹住而不是报错。
+///
+/// 背景：调度视图曾经只拉第一页就在本地过滤，配置超过单次上限（200 条）之后
+/// 出现"配置里明明有、界面却搜不到"的假结果，还提示用户"先筛选"——而筛选根本
+/// 够不到没取回来的那些行。翻页取全是修复这件事的另一半。
+#[tokio::test]
+async fn configuration_lists_page_with_a_stable_total() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+
+    for name in ["甲", "乙", "丙"] {
+        let created = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/groups"),
+        )
+        .json(&json!({"name": name, "multiplier_limit": "1"}))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(created.status(), 201);
+    }
+
+    let page = |query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .get(format!("{base}/admin/api/groups?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 第一页：2 条，但 total 是全量。
+    let first = page("limit=2&offset=0").await;
+    assert_eq!(first["total"], 3);
+    assert_eq!(first["limit"], 2);
+    assert_eq!(first["offset"], 0);
+    let first_ids: Vec<String> = first["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(first_ids.len(), 2);
+
+    // 第二页：接着 offset 取剩下的，两页合起来正好是全量且不重叠。
+    let second = page("limit=2&offset=2").await;
+    assert_eq!(second["total"], 3);
+    let second_ids: Vec<String> = second["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(second_ids.len(), 1);
+    assert!(!first_ids.contains(&second_ids[0]));
+
+    // limit 超过上限被夹到 1000：不报错，也不放任无上限。
+    let huge = page("limit=100000").await;
+    assert_eq!(huge["limit"], 1000);
+    assert_eq!(huge["data"].as_array().unwrap().len(), 3);
+
+    // offset 超出总数：空页 + 仍然是全量 total，前端据此停下。
+    let beyond = page("limit=2&offset=99").await;
+    assert_eq!(beyond["total"], 3);
+    assert!(beyond["data"].as_array().unwrap().is_empty());
 }

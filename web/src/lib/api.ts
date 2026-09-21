@@ -23,6 +23,7 @@ import type {
   NewApiGroupOption,
   NewApiSite,
   TestResult,
+  DetectMultiplierResult,
   MultiplierRefreshResult,
   BatchMultiplierRefreshResult,
   UpdateStatus,
@@ -71,16 +72,51 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 写操作的串行队列（§7.4）。
+ *
+ * 乐观锁比的是"客户端手上的版本号"，而**我们自己**的成功写入也会让版本号 +1。
+ * 于是两个写请求只要重叠，后发的那一个就带着已经过期的版本号，被服务端判成
+ * "配置已被其他会话修改"——明明只有一个管理员在操作，却收到冲突提示。
+ *
+ * 所以写操作必须排队：同一时刻只允许一个写在途，后到的等前一个结束（此时
+ * `configVersion` 已被它的响应刷新）再发出。读操作不受影响，仍然并发。
+ */
+let writeChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * 排队执行一个写请求，返回它自己的响应。
+ *
+ * 队列本身用 `catch` 吞掉前一个请求的错误：前一个失败不该拦住后一个，
+ * 每个调用者只关心自己那次的结果。
+ */
+function enqueueWrite<T>(run: () => Promise<T>): Promise<T> {
+  const next = writeChain.then(run, run);
+  writeChain = next.catch(() => undefined);
+  return next;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit & { method?: string } = {},
 ): Promise<T> {
   const method = init.method ?? "GET";
+  // 写操作排队，读操作直发。
+  const send = () => sendOnce<T>(path, init, method);
+  return method === "GET" ? send() : enqueueWrite(send);
+}
+
+async function sendOnce<T>(
+  path: string,
+  init: RequestInit & { method?: string },
+  method: string,
+): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set("content-type", "application/json");
   if (method !== "GET") {
     headers.set(CSRF_HEADER, "1");
-    // 写操作带上读到的版本，让服务端能发现并发修改。
+    // 版本号在**真正发出前**才读取：排队等待期间前一个写操作已经把
+    // `configVersion` 刷新过了。用旧值就会把自己判成冲突（见 `enqueueWrite`）。
     if (configVersion > 0) {
       headers.set(CONFIG_VERSION_HEADER, String(configVersion));
     }
@@ -153,7 +189,6 @@ export interface GroupInput {
 export interface AccountInput {
   group_id: string;
   name: string;
-  upstream_type: Account["upstream_type"];
   base_url: string;
   /** 账号内 Key 池（§4.2.1）。整体替换；缺省时后台不动 Key 池。 */
   keys?: AccountKeyInput[];
@@ -186,6 +221,43 @@ export interface TargetInput {
   enabled?: boolean;
 }
 
+/**
+ * 配置列表一次最多能要多少条（§7.4：列表上限 1000 条）。
+ *
+ * 后台的四个配置列表——分组、账号、逻辑模型、调度目标——在界面上是**整体使用**的：
+ * 搜索、筛选、跨列表引用（目标 → 账号 / 模型）都建立在本地的完整集合上。
+ * 只取一页再到本地过滤，会得到"配置里明明有、却搜不到"的假结果，模型与目标
+ * 一多（比如迁移进来几十个上游账号之后），页面还会静默少显示一大截。
+ */
+const PAGE_SIZE_MAX = 1000;
+
+/**
+ * 取全一个配置列表的所有分页，返回合并后的 `Page`。
+ *
+ * 单页上限是服务端的硬约束，客户端能做的正确选择是**按 offset 翻到底**，
+ * 而不是把第一页当成全部。正常情况下这里只发一次请求（1000 ≥ 配置规模）；
+ * 超过上限时自动多发几次，界面拿到的永远是完整集合。
+ *
+ * 兜底：某一页返回空、或返回的长度不再增长（服务端异常）时立刻停下，
+ * 用 `data.length >= total` 判断交给调用方，绝不在这里死循环。
+ */
+async function requestAllPages<T>(path: string): Promise<Page<T>> {
+  const data: T[] = [];
+  let total = 0;
+  let limit = PAGE_SIZE_MAX;
+  for (;;) {
+    const page = await request<Page<T>>(
+      `${path}?limit=${PAGE_SIZE_MAX}&offset=${data.length}`,
+    );
+    total = page.total;
+    limit = page.limit;
+    if (page.data.length === 0) break;
+    data.push(...page.data);
+    if (data.length >= page.total) break;
+  }
+  return { data, total: Math.max(total, data.length), limit, offset: 0 };
+}
+
 export const api = {
   setupStatus: () => request<SetupStatus>("/setup/status"),
   setup: (username: string, password: string) =>
@@ -197,7 +269,7 @@ export const api = {
   overview: () => request<Overview>("/overview"),
   settings: () => request<Settings>("/settings"),
 
-  groups: () => request<Page<Group>>("/groups"),
+  groups: () => requestAllPages<Group>("/groups"),
   availableGroupModels: (id: string) =>
     request<{ models: AvailableModel[] }>(`/groups/${id}/available-models`),
   createGroup: (input: GroupInput) => post<KeyReveal>("/groups", input),
@@ -206,13 +278,16 @@ export const api = {
   deleteGroup: (id: string) => del(`/groups/${id}`),
   regenerateKey: (id: string) => post<KeyReveal>(`/groups/${id}/regenerate-key`),
 
-  accounts: () => request<Page<Account>>("/accounts"),
+  accounts: () => requestAllPages<Account>("/accounts"),
   createAccount: (input: AccountInput) => post<Account>("/accounts", input),
   updateAccount: (id: string, input: Partial<AccountInput>) =>
     patch<Account>(`/accounts/${id}`, input),
   deleteAccount: (id: string) => del(`/accounts/${id}`),
   refreshMultiplier: (id: string) =>
     post<MultiplierRefreshResult>(`/accounts/${id}/refresh-multiplier`),
+  /** 识别这个账号的倍率来源并写回（§11.2）：识别成功即成为该账号的倍率来源。 */
+  detectMultiplierSource: (id: string) =>
+    post<DetectMultiplierResult>(`/accounts/${id}/detect-multiplier-source`),
   /** 批量刷新所有自动倍率账号（§11.3、§27 阶段5）。 */
   refreshAllMultipliers: () =>
     post<BatchMultiplierRefreshResult>("/accounts/refresh-multipliers"),
@@ -239,10 +314,17 @@ export const api = {
     request<CostView>(`/cost?period=${period}`),
 
   /** 导出加密配置备份，返回信封 JSON 文本（§23.5）。 */
-  exportBackup: async (password: string) => {
+  exportBackup: async (password: string) =>
+    enqueueWrite(async () => {
+    // 走同一条写队列：导出本身不改配置，但"导出与恢复不能交叉"。
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      [CSRF_HEADER]: "1",
+    };
+    if (configVersion > 0) headers[CONFIG_VERSION_HEADER] = String(configVersion);
     const response = await fetch(BASE + "/backup/export", {
       method: "POST",
-      headers: { "content-type": "application/json", [CSRF_HEADER]: "1" },
+      headers,
       body: JSON.stringify({ password }),
     });
     const text = await response.text();
@@ -251,7 +333,7 @@ export const api = {
       throw new ApiError(body?.error ?? `导出失败（HTTP ${response.status}）`, response.status);
     }
     return text;
-  },
+    }),
   /** 校验并原子恢复一份备份（§23.5）。 */
   importBackup: (password: string, content: string) =>
     post<{ groups: number; accounts: number; logical_models: number; dispatch_targets: number }>(
@@ -340,14 +422,14 @@ export const api = {
       body: JSON.stringify({ aliases }),
     }),
 
-  models: () => request<Page<LogicalModel>>("/logical-models"),
+  models: () => requestAllPages<LogicalModel>("/logical-models"),
   createModel: (input: { group_id: string; name: string; enabled?: boolean }) =>
     post<LogicalModel>("/logical-models", input),
   updateModel: (id: string, input: { name?: string; enabled?: boolean }) =>
     patch<void>(`/logical-models/${id}`, input),
   deleteModel: (id: string) => del(`/logical-models/${id}`),
 
-  targets: () => request<Page<DispatchTarget>>("/targets"),
+  targets: () => requestAllPages<DispatchTarget>("/targets"),
   createTarget: (input: TargetInput) => post<DispatchTarget>("/targets", input),
   updateTarget: (id: string, input: Partial<TargetInput>) =>
     patch<DispatchTarget>(`/targets/${id}`, input),

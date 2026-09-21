@@ -733,7 +733,7 @@ mod tests {
     use crate::config::LogicalModelView;
     use crate::domain::{
         Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, MultiplierMode,
-        SchedulingWeights, UpstreamType,
+        Protocol, SchedulingWeights,
     };
 
     fn account(id: &str, multiplier: &str, protocol: Protocol, enabled: bool) -> Arc<Account> {
@@ -741,7 +741,6 @@ mod tests {
             id: id.into(),
             group_id: "g1".into(),
             name: id.into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: protocol,
             adaptive_protocol: true,

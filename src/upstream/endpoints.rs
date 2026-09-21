@@ -194,18 +194,16 @@ pub fn proves_missing_endpoint(account: &Account, endpoint: Endpoint, status: u1
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::domain::{Limits, Multiplier, MultiplierMode, Protocol};
     use serde_json::json;
     use time::OffsetDateTime;
-
-    use super::*;
-    use crate::domain::{Limits, Multiplier, MultiplierMode, UpstreamType};
 
     fn account(preferred: Protocol, adaptive: bool) -> Account {
         Account {
             id: "acc".into(),
             group_id: "g".into(),
             name: "账号A".into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: preferred,
             adaptive_protocol: adaptive,

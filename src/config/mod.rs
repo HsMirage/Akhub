@@ -298,9 +298,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::domain::{
-        ModelOrigin, Multiplier, MultiplierMode, Protocol, SchedulingWeights, UpstreamType,
-    };
+    use crate::domain::{ModelOrigin, Multiplier, MultiplierMode, Protocol, SchedulingWeights};
 
     fn group(id: &str, digest: &str) -> Group {
         Group {
@@ -323,7 +321,6 @@ mod tests {
             id: id.into(),
             group_id: group_id.into(),
             name: id.into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,
             adaptive_protocol: true,

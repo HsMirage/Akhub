@@ -48,7 +48,6 @@ async fn create_account(
         .json(&json!({
             "group_id": akhub.group_id,
             "name": name,
-            "upstream_type": "openai_compatible",
             "base_url": upstream.base_url,
             "api_key": format!("key-{name}"),
             "preferred_protocol": Protocol::OpenAiChat.as_str(),

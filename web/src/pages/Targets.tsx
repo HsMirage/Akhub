@@ -268,8 +268,14 @@ export function Targets({
                 只看异常
               </label>
               <span className="spacer" />
+              {/* 调度视图是只读的全局视图：这里必须能看出"手上拿的是不是全量"。
+                  列表在数据层已翻页取全，所以正常显示"已全部加载"；
+                  万一服务端没给全，立刻退化成"已加载 N/共 M"。 */}
               <span className="table-filter-summary tabular">
-                {visible.length} / {entries.length} 个模型 · {targetTotal} 个目标
+                {visible.length} / {entries.length} 个模型 · {targetTotal} 个目标 ·{" "}
+                {data.targets.length >= data.totals.targets
+                  ? "已全部加载"
+                  : `已加载 ${data.targets.length}/${data.totals.targets}`}
               </span>
             </div>
 

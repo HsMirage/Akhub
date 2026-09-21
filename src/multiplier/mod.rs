@@ -304,9 +304,8 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Limits, Protocol};
     use time::OffsetDateTime;
-
-    use crate::domain::{Limits, Protocol, UpstreamType};
 
     fn multiplier(raw: &str) -> Multiplier {
         Multiplier::parse(raw).unwrap()
@@ -317,7 +316,6 @@ mod tests {
             id: "acc".into(),
             group_id: "g1".into(),
             name: "账号A".into(),
-            upstream_type: UpstreamType::OpenAiCompatible,
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,
             adaptive_protocol: true,

@@ -1,5 +1,5 @@
 /** 全局数据装载：一次拉齐所有资源，任何写操作后统一 refresh。 */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, api } from "./api";
 import type {
   Account,
@@ -18,6 +18,19 @@ export interface Data {
   accounts: Account[];
   models: LogicalModel[];
   targets: DispatchTarget[];
+  /**
+   * 服务端各配置列表的总条数。
+   *
+   * 列表本身已经翻页取全（见 `requestAllPages`），所以正常情况下
+   * `targets.length === totals.targets`。把总数一并留下，是为了让页面能
+   * 明确显示"已加载 N / 共 M"，而不是让管理员自己猜这份列表是不是完整的。
+   */
+  totals: {
+    groups: number;
+    accounts: number;
+    models: number;
+    targets: number;
+  };
   requests: RequestRecord[];
 }
 
@@ -26,9 +39,11 @@ export interface DataStore {
   loading: boolean;
   error: string | null;
   /**
-   * 被服务端截断的列表名（§7.4）。
+   * 服务端**没能**返回完整的列表名（§7.4）。
    *
-   * 列表接口有 1000 条上限；超了要明说，否则管理员会以为配置里就只有这些。
+   * 配置列表在客户端会按服务端上限自动翻页取全，所以这里通常为空；
+   * 一旦非空就说明服务端确实没给全（异常、或某次分页失败了），必须明说，
+   * 否则管理员会以为配置里就只有这些。
    */
   truncated: string[];
   /** 最近一次成功刷新的时间（毫秒）；用于展示"更新于 X 分钟前"。 */
@@ -39,7 +54,16 @@ export interface DataStore {
 
 /**
  * 资源之间互相引用（目标要显示模型名与账号名），分页与增量同步在这个规模下
- * 只会带来不一致的中间态。整体重取一次，代价是几个 KB 的 JSON。
+ * 只会带来不一致的中间态。整体重取一次。
+ *
+ * 两条约束来自实测（管理端与服务器通常隔着几千公里，单程约一秒）：
+ *
+ * 1. **同一时刻只允许一次全量刷新。** 一次模型管理里的保存会连着触发好几次
+ *    `refresh`，并发发出去只会互相排队、把"更新时间"推来推去。这里用共享的
+ *    in-flight Promise 把它们合并掉。
+ * 2. **请求记录不进全量刷新。** `/requests` 只服务"请求记录"页面，却是全量
+ *    刷新里最贵的一个（服务端要连表取每次尝试明细）。模型管理之类的写操作
+ *    根本不需要它；请求记录页自己会在筛选或翻页时按需拉取。
  */
 export function useData(active: boolean, onUnauthorized: () => void): DataStore {
   const [data, setData] = useState<Data | null>(null);
@@ -48,27 +72,37 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
   const [truncated, setTruncated] = useState<string[]>([]);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
-  const refresh = useCallback(async (): Promise<boolean> => {
+  /** 合并并发刷新：同一时刻只跑一次，后到的等同一份结果。 */
+  const inFlight = useRef<Promise<boolean> | null>(null);
+  const unauthorizedRef = useRef(onUnauthorized);
+  unauthorizedRef.current = onUnauthorized;
+
+  const runRefresh = useCallback(async (): Promise<boolean> => {
     try {
-      const [overview, settings, groups, accounts, models, targets, requests] =
-        await Promise.all([
-          api.overview(),
-          api.settings(),
-          api.groups(),
-          api.accounts(),
-          api.models(),
-          api.targets(),
-          api.requests(),
-        ]);
-      setData({
+      const [overview, settings, groups, accounts, models, targets] = await Promise.all([
+        api.overview(),
+        api.settings(),
+        api.groups(),
+        api.accounts(),
+        api.models(),
+        api.targets(),
+      ]);
+      setData((current) => ({
         overview,
         settings,
         groups: groups.data,
         accounts: accounts.data,
         models: models.data,
         targets: targets.data,
-        requests: requests.data,
-      });
+        totals: {
+          groups: groups.total,
+          accounts: accounts.total,
+          models: models.total,
+          targets: targets.total,
+        },
+        // 请求记录不在这次刷新里：保留上一次的结果，别把页面清空。
+        requests: current?.requests ?? [],
+      }));
       // 哪个列表被截断了要说出来（§7.4）。
       setTruncated(
         (
@@ -87,7 +121,7 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
       return true;
     } catch (cause) {
       if (cause instanceof ApiError && cause.unauthorized) {
-        onUnauthorized();
+        unauthorizedRef.current();
         return false;
       }
       setError(cause instanceof Error ? cause.message : "加载失败");
@@ -95,7 +129,16 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
     } finally {
       setLoading(false);
     }
-  }, [onUnauthorized]);
+  }, []);
+
+  const refresh = useCallback((): Promise<boolean> => {
+    if (inFlight.current) return inFlight.current;
+    const pending = runRefresh().finally(() => {
+      inFlight.current = null;
+    });
+    inFlight.current = pending;
+    return pending;
+  }, [runRefresh]);
 
   useEffect(() => {
     if (!active) return;

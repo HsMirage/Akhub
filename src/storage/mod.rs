@@ -36,7 +36,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v10：账号内 Key 池。新增 `upstream_account_keys`，请求记录、尝试明细与
 /// Responses 状态链补 Key 定位列；老库的单把 Key 由
 /// [`migrate_account_keys`] 展开成一把 Key 的池（§4.2.1）。
-const SCHEMA_VERSION: i64 = 10;
+/// v11：上游类型合并成"官方 OpenAI / 官方 Anthropic"两家：`openai_compatible`
+/// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
+/// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
+/// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
+const SCHEMA_VERSION: i64 = 12;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -251,6 +255,42 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                     .with_context(|| format!("迁移 request_records.{column} 失败"))?;
             }
         }
+    }
+    if from < 11 {
+        // v11：上游类型归一化（见 SCHEMA_VERSION 的说明）。用事务包起来，
+        // 并且**先改数据、后写版本**：中途失败整体回滚，下次启动从头再来，
+        // 不会留下"版本已是 11、库里还是旧值"的分叉（§27）。
+        let mut tx = pool.begin().await.context("开始 v11 迁移事务失败")?;
+        sqlx::query(
+            "UPDATE upstream_accounts SET upstream_type = 'openai'
+              WHERE upstream_type = 'openai_compatible'",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("归一化新 OpenAI 兼容账号失败")?;
+        for (legacy, protocol) in [
+            ("new_api", "anthropic_messages"),
+            ("sub2api", "anthropic_messages"),
+        ] {
+            sqlx::query(
+                "UPDATE upstream_accounts SET upstream_type = 'anthropic'
+                  WHERE upstream_type = ? AND preferred_protocol = ?",
+            )
+            .bind(legacy)
+            .bind(protocol)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("归一转发站账号（{legacy}，Anthropic 协议）失败"))?;
+            sqlx::query(
+                "UPDATE upstream_accounts SET upstream_type = 'openai'
+                  WHERE upstream_type = ?",
+            )
+            .bind(legacy)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("归一转发站账号（{legacy}）失败"))?;
+        }
+        tx.commit().await.context("提交 v11 迁移失败")?;
     }
     if from < 8 {
         // v8：别名与"隐藏原始模型"的落点改为账号模型目录；旧别名表的数据

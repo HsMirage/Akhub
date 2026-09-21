@@ -238,7 +238,6 @@ function Console({
         groups: data.groups.length,
         accounts: data.accounts.length,
         targets: data.targets.length,
-        requests: data.requests.length,
       }
     : {};
 
@@ -423,12 +422,18 @@ function Console({
               </div>
             )}
             {/* 列表被服务端截断时必须明说（§7.4）：否则管理员会以为配置里
-                就只有这些，而漏掉的恰恰可能是出问题的那一条。 */}
+                就只有这些，而漏掉的恰恰可能是出问题的那一条。
+
+                配置列表在客户端会按服务端单次上限自动翻页取全（api.requestAllPages），
+                所以正常情况下这里不会出现；一旦出现就说明**服务端确实没返回完整数据**。
+                这时提"请先筛选"是错的——筛选只作用于本地已加载的集合，看不到没取到的那部分，
+                该说的是重试与查日志。 */}
             {truncated.length > 0 && (
               <div className="callout callout-warn">
                 <span style={{ flex: 1 }}>
-                  列表超出单次返回上限，以下内容未完整显示：{truncated.join("、")}。
-                  请先用搜索或筛选缩小范围；必要时可分批查看。
+                  服务端未能返回完整数据：{truncated.join("、")}（已加载 / 总数）。
+                  界面已按服务端上限自动翻页；请点「重新加载」重试，
+                  若持续出现请查看服务端日志。
                 </span>
                 <Button
                   size="sm"

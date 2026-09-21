@@ -425,7 +425,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
             preferred_protocol, adaptive_protocol, default_priority, calibration,
             multiplier_mode, manual_multiplier, allow_private_network, enabled, created_at)
-         VALUES ('a-old', 'g-old', '老账号', 'openai_compatible', 'https://old.example.com',
+         VALUES ('a-old', 'g-old', '老账号', 'openai', 'https://old.example.com',
             'openai_chat', 1, 0, 1000000, 'manual', 1000000, 0, 1, 1)",
     )
     .execute(state.store.pool())
@@ -566,6 +566,21 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         sticky_columns.contains("credential_digest"),
         "迁移后 sticky_bindings 缺少 credential_digest"
     );
+    // v11/v12：上游类型先归一、再整个停用（§4.2）。这一列现在是历史遗留，
+    // 旧值不该让账号加载失败，新写入也不该再碰它。
+    let stored: String =
+        sqlx::query_scalar("SELECT upstream_type FROM upstream_accounts WHERE id = 'a-old'")
+            .fetch_one(reopened.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, "openai",
+        "v11 迁移必须把 openai_compatible 归一为 openai，v12 之后不再改写这一列"
+    );
+    // 账号本身必须能读出来：类型字段已经不在领域模型里了。
+    let loaded = reopened.store.list_accounts().await.unwrap();
+    assert_eq!(loaded.len(), 1, "老库的账号必须能正常加载");
+    assert_eq!(loaded[0].name, "老账号");
     // 凭据快照能读到这把 Key：账号不会因为升级而失去凭据。
     let account_id: String = sqlx::query_scalar("SELECT id FROM upstream_accounts LIMIT 1")
         .fetch_one(reopened.store.pool())
@@ -582,7 +597,8 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "10");
+    // v11 是当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
+    assert_eq!(version, "12");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。
