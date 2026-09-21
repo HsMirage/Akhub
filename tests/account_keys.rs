@@ -406,8 +406,13 @@ async fn different_prefixes_spread_across_the_pool() {
     )
     .await;
 
-    // 12 个互不相同的前缀：每个都建一条自己的绑定。
-    for index in 0..12 {
+    // 60 个互不相同的前缀：每个都建一条自己的绑定。
+    //
+    // 抽样次数不能太小：每一条绑定的 Key 都是在这个池里独立抽的，12 次抽样下
+    // "有一把 Key 一次没抽到"的概率约 2.3%（3 × (2/3)^12），CI 上真的因此红过。
+    // 60 次把同一个概率压到 1e-10 量级，而断言的意思没有变。
+    const PREFIXES: usize = 60;
+    for index in 0..PREFIXES {
         assert_eq!(
             chat(&akhub, sticky_body(&format!("项目 {index}"), "hi"))
                 .await
@@ -421,7 +426,7 @@ async fn different_prefixes_spread_across_the_pool() {
         3,
         "多个前缀应当把流量摊到整个池上：{histogram:?}"
     );
-    assert_eq!(histogram.values().sum::<usize>(), 12);
+    assert_eq!(histogram.values().sum::<usize>(), PREFIXES);
 }
 
 /// 绑定的那把 Key 失效时，绑定仍然成立（目标没变），只是换池里另一把。
@@ -797,7 +802,8 @@ async fn a_key_pool_dispatches_like_separate_accounts() {
         50,
     )
     .await;
-    for round in 0..12 {
+    const ROUNDS: usize = 40;
+    for round in 0..ROUNDS {
         assert_eq!(
             chat(&split, sticky_body(&format!("项目 {round}"), "hi"))
                 .await
@@ -818,7 +824,7 @@ async fn a_key_pool_dispatches_like_separate_accounts() {
         50,
     )
     .await;
-    for round in 0..12 {
+    for round in 0..ROUNDS {
         assert_eq!(
             chat(&pool, sticky_body(&format!("项目 {round}"), "hi"))
                 .await
