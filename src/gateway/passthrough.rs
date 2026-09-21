@@ -235,6 +235,12 @@ struct Walk<'a> {
     usage_detail: Option<stream::UsageBreakdown>,
     /// 每次上游尝试的明细，随请求记录一起落库（§6.6）。
     attempt_log: Vec<AttemptRecord>,
+    /// 弱身份（稳定前缀）软亲和所偏好的**凭据摘要**（§10.1 修订）。
+    ///
+    /// 软亲和偏的是"那把 Key"，不是"那个目标"：上游的前缀缓存按凭据隔离，
+    /// 保住 Key 才是保住缓存。目标会不会变由层内抽签决定——某个账号变慢时，
+    /// 评分把它的权重压下去，流量才真的走得掉。
+    soft_affinity: Option<String>,
 }
 
 /// 一次请求里"用过哪把 Key"的记录（§4.2.1）。
@@ -371,12 +377,46 @@ async fn forward_inner<'a>(
         usage_parts: (None, None),
         usage_detail: None,
         attempt_log: Vec::new(),
+        // 软亲和偏好哪把 Key 由绑定决定，填充在下面（弱身份才有）。
+        soft_affinity: None,
     };
+
+    // 粘性键必须在**抽签之前**推导出来：弱身份（稳定前缀）的绑定要作为抽签的
+    // 权重倾斜参与，而不是事后短路（§10.1 修订）。
+    let sticky_key = sticky::derive(
+        &forward.state.key_digest,
+        &forward.group.group.id,
+        &forward.logical_model,
+        forward.downstream_headers,
+        &forward.body,
+    );
+    // 绑定是"软"还是"硬"，取决于粘性键的来源：
+    //
+    // * **强身份**（1/2/3 级：响应链、显式会话头、prompt_cache_key）：客户端
+    //   已经说明这是"同一件事的延续"，换号会真的打断它，必须钉死。
+    // * **弱身份**（4 级：稳定前缀摘要）：它只是"同一个 agent 项目"。被同一套
+    //   system prompt 与工具定义命中的**所有**会话都落在一个键上，把这种键硬
+    //   钉在一个账号上就等于"一个项目 = 一个上游账号"，永远没有第二次抽签的
+    //   机会——现场（gpt-boom / gpt-5.6-sol，259 条请求）正是如此：265 次粘性
+    //   命中把首次抽签的结果整整固化了一天，评分与速度怎么变都没用。
+    //
+    // 弱绑定改为**软亲和**：只把绑定目标在层内抽签里的权重放大若干倍，不再
+    // 短路抽签。这既保住"同一个项目倾向于落在同一个账号"（前缀缓存的价值），
+    // 又让每个前缀在每次请求都有一次重新分配的机会（负载均衡的价值）。
+    let soft = sticky_key
+        .as_ref()
+        .is_some_and(|(_, origin)| *origin == sticky::Origin::StablePrefix);
+    let existing = sticky_key
+        .as_ref()
+        .and_then(|(key, _)| forward.state.runtime.sticky.get(key, now_unix));
 
     let plan = match routing::plan(
         forward.group,
         &forward.logical_model,
         &context,
+        // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
+        soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
+            .flatten(),
         &mut score::random_unit,
     ) {
         Ok(plan) => plan,
@@ -393,17 +433,11 @@ async fn forward_inner<'a>(
         .and_then(|layer| layer.candidates.first())
         .map(|candidate| candidate.target.account.multiplier_mode.as_str());
 
-    // 粘性命中的请求不参与抽签，直接走已绑定目标（§9.5）。
-    let sticky_key = sticky::derive(
-        &forward.state.key_digest,
-        &forward.group.group.id,
-        &forward.logical_model,
-        forward.downstream_headers,
-        &forward.body,
-    );
-    let bound = sticky_key.as_ref().and_then(|(key, _)| {
-        let binding = forward.state.runtime.sticky.get(key, now_unix)?;
-        // 普通粘性只能在当前最高合格层内生效；低层绑定不能绕过已恢复的高层。
+    // 强身份粘性命中的请求不参与抽签，直接走已绑定目标（§9.5）；弱身份
+    // （稳定前缀）的绑定也在这里取出来，但只是为了拿到它的 Key 亲和——
+    // 下面会把它清成 None、不抢占第一步。
+    let bound = sticky_key.as_ref().and_then(|_| {
+        let binding = existing?;
         // 普通粘性只能在当前最高合格层内生效：低层绑定不能绕过已恢复的高层
         // （§9.5）。这条硬边界与凭据无关，不能被 Key 池改掉。
         let candidate = routing::binding_target(&plan, &binding.target_id, true)?;
@@ -433,6 +467,28 @@ async fn forward_inner<'a>(
         // 绑定还在但目标已经不合格：清除，重新抽签（§10.2）。
         forward.state.runtime.sticky.clear(key);
     }
+
+    // 弱绑定不做第一步：它不抢占，只以"Key 亲和"的形式参与（§10.1 修订）。
+    //
+    // 关键的区分是**偏的是 Key，不是目标**：真正保住前缀缓存的是"同一把凭据"
+    // （§4.2.1 的不变量 B），而目标会不会变正是评分该管的事。把目标也钉死，
+    // 就等于某个账号一旦变慢就再也无法被流量反馈发现——现场（gpt-boom /
+    // gpt-5.6-sol）正是 265 次粘性命中把首次抽签的结果锁死了一整天。
+    // 目标变不变交给层内抽签（上面的 affinity 只做权重倾斜），Key 则优先复用
+    // 绑定里的那一把。
+    let bound = if soft {
+        if let Some((_, binding, _)) = bound.as_ref() {
+            walk.soft_affinity = binding.credential_digest.clone();
+            // 软命中同样是"命中"：不等待，但要在记录里区分于"根本没粘上"（§24.1）。
+            walk.telemetry.sticky_hit = true;
+            walk.telemetry.sticky_wait = Some(Duration::ZERO);
+            walk.telemetry.sticky_freshness =
+                Some(sticky::freshness_for(now_unix - binding.last_used_at));
+        }
+        None
+    } else {
+        bound
+    };
 
     // 第一步：粘性命中时先按等待预算争取原目标（§10.3）。
     if let Some((candidate, binding, pinned)) = bound {
@@ -835,6 +891,9 @@ impl Walk<'_> {
             .reconcile_capacity(candidate.target.target.limits.max_concurrency);
         // Key 状态的时钟是 tokio 的：测试用 `tokio::time::pause` 精确推进冷却。
         let now = tokio::time::Instant::now();
+        // 软亲和在这里统一生效：调用方不必各自传递。它只是一条**偏好**，
+        // 排在响应链钉住之后、随机抽签之前（§4.2.1、§10.1 修订）。
+        let sticky = sticky.or(self.soft_affinity.as_deref());
         let choice = crate::credential::select_key(
             keys,
             pinned,
@@ -1046,6 +1105,11 @@ impl Walk<'_> {
                             started,
                             request_started: self.forward.started_at,
                             first_token: success.first_token.unwrap_or_default(),
+                            // 首字节：排队的 20 秒也会体现在评分里，而不是只记
+                            // 上游吐第一个事件用掉的那 1 毫秒（§9.3）。
+                            first_byte: success
+                                .first_byte
+                                .unwrap_or_else(|| success.first_token.unwrap_or_default()),
                             record,
                             admission: Some(admission),
                             responses,
@@ -1062,7 +1126,10 @@ impl Walk<'_> {
                         dimension,
                         &score::Sample {
                             success: true,
-                            first_token: success.first_token,
+                            // 用客户端体感的首字节时间，而不是"响应头之后到首个
+                            // 语义事件"那一段：上游先憋响应头时后者接近 0（§9.3）。
+                            // 非流式没有首字，退回 None，由总耗时代言。
+                            first_token: success.first_byte.or(success.first_token),
                             total: started.elapsed(),
                             output_tokens: success.output_tokens,
                         },
@@ -1644,7 +1711,15 @@ impl Walk<'_> {
 struct Success {
     status: StatusCode,
     response: Response,
+    /// 首个**语义**事件的距离，用于评分（§9.3）。
     first_token: Option<Duration>,
+    /// 客户端收到第一个字节前实际等掉的整段时间（§6.6、§24.1）。
+    ///
+    /// `first_token` 只覆盖"响应头之后到首个语义事件"，对一次高并发下排了
+    /// 20 秒队、然后首个事件立刻到达的请求，它会记成 1 毫秒。评分要的是用户
+    /// 体感，因此性能样本改用这一项；记录里两项都保留，诊断时能分清"上游慢"
+    /// 与"网关排队慢"。
+    first_byte: Option<Duration>,
     output_tokens: Option<u64>,
     usage_tokens: Option<u64>,
     /// (输入, 输出) Token；流式在结算时才拿得到，这里为 None（§6.6）。
@@ -1783,6 +1858,10 @@ async fn attempt(
         })?,
     };
 
+    // 从发出上游请求到**收到响应头**的等待。它必须单独计时：上游"先回 200、
+    // 再憋很久才吐第一个事件"是常见故障，此时首字延迟接近 0，只有把这段等待
+    // 一并计入，评分才看得见这次卡顿（§6.6、§9.3）。
+    let sent_at = Instant::now();
     let response = forward
         .state
         .upstream
@@ -1824,8 +1903,10 @@ async fn attempt(
         }
         return classify_upstream_error(forward, target, prepared, response, status).await;
     }
+    // 响应头之前已经等掉的时间，之后所有"首字延迟"都必须从这一刻起算。
+    let headers_wait = sent_at.elapsed();
     if streaming {
-        commit_stream(forward, target, prepared, response, status).await
+        commit_stream(forward, target, prepared, response, status, headers_wait).await
     } else {
         commit_body(forward, target, prepared, response, status).await
     }
@@ -1841,6 +1922,7 @@ async fn commit_stream(
     prepared: &Prepared,
     response: reqwest::Response,
     status: StatusCode,
+    headers_wait: Duration,
 ) -> Result<Success, AttemptFailure> {
     let downstream = forward.endpoint.protocol();
     let upstream_protocol = prepared.endpoint.protocol();
@@ -1895,6 +1977,7 @@ async fn commit_stream(
                 status,
                 response: build_response(forward, status, &headers, prepared, committed.body),
                 first_token: Some(committed.first_token),
+                first_byte: Some(headers_wait + committed.first_token),
                 output_tokens: None,
                 usage_tokens: None,
                 usage_parts: (None, None),
@@ -1957,6 +2040,7 @@ async fn commit_stream(
                                 status,
                                 response: build_response(forward, status, &headers, prepared, body),
                                 first_token: Some(started.elapsed()),
+                                first_byte: Some(headers_wait + started.elapsed()),
                                 output_tokens: None,
                                 usage_tokens: None,
                                 usage_parts: (None, None),
@@ -2028,6 +2112,7 @@ async fn commit_stream(
                         status,
                         response: build_response(forward, status, &headers, prepared, body),
                         first_token: Some(started.elapsed()),
+                        first_byte: Some(headers_wait + started.elapsed()),
                         output_tokens: None,
                         usage_tokens: None,
                         usage_parts: (None, None),
@@ -2174,6 +2259,8 @@ async fn commit_body(
         status,
         response: build_response(forward, status, &headers, prepared, body),
         first_token: None,
+        // 非流式没有"首字"，整段等待就是用户体感（§6.6）。
+        first_byte: None,
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
         usage_parts: stream::usage_parts(&parsed),

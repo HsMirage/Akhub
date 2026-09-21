@@ -45,6 +45,8 @@ pub struct StreamSettlement {
     pub request_started: Instant,
     /// 首个语义块时间（首字延迟）。
     pub first_token: Duration,
+    /// 客户端体感的首字节时间：排队 + 上游响应头 + 首个语义块（§6.6、§9.3）。
+    pub first_byte: Duration,
     /// 提交那一刻生成的记录，流结束后才真正落库。
     pub record: RequestRecord,
     /// 健康与限额准入；流结束时释放。
@@ -157,7 +159,8 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
         settlement.dimension,
         &score::Sample {
             success: ending == Ending::Completed,
-            first_token: Some(settlement.first_token),
+            // 样本用首字节而不是首字：评分要反映用户实际等了多久（§9.3）。
+            first_token: Some(settlement.first_byte),
             // 现在才是真正的"流结束时间"，不是首段提交时间。
             total: settlement.started.elapsed(),
             output_tokens: accounting.output_tokens(),
@@ -167,7 +170,9 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     let mut record = settlement.record;
     record.duration_ms = settlement.request_started.elapsed().as_millis() as i64;
     // 流式的用量与首字延迟只有在这里才拿得到（§6.6、§6.8）。
-    record.first_token_ms = Some(settlement.first_token.as_millis() as i64);
+    // 记录里写**首字节**：一次排了 20 秒队、首个事件随即到达的请求，
+    // 首字延迟是 1 毫秒，只有这一项能如实反映那次等待（§24.1）。
+    record.first_token_ms = Some(settlement.first_byte.as_millis() as i64);
     record.input_tokens = accounting.input_tokens().map(|value| value as i64);
     record.output_tokens = accounting.output_tokens().map(|value| value as i64);
     // Token 细分同样只有流结束才拿得到（§11.6）。

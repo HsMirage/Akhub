@@ -15,8 +15,8 @@ use akhub::multiplier::{Status, refresh};
 use akhub::routing::score::Dimension;
 use akhub::storage::store::MultiplierSnapshotRow;
 use common::{
-    Akhub, Behavior, FakeUpstream, TargetSpec, bulky_chat_body, chat, chat_at, messages, serve,
-    spawn_akhub, spawn_akhub_with, wire_extra_target, wire_target,
+    Akhub, Behavior, FakeUpstream, TargetSpec, chat, chat_at, messages, serve, spawn_akhub,
+    spawn_akhub_with, wire_extra_target, wire_target,
 };
 use serde_json::{Value, json};
 
@@ -37,6 +37,34 @@ fn small_body(system: &str, user: &str) -> Value {
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+    })
+}
+
+/// 带显式 `prompt_cache_key` 的请求体：粘性键落在第 3 级，属于**强身份**。
+///
+/// 与 `small_body`（只有 system prompt，落在第 4 级稳定前缀）刻意区分：后者是
+/// "弱身份"，绑定只做软亲和、不短路抽签（§10.1 修订）。排队预算、Retry-After
+/// 与重启恢复这些**硬粘性机制**的验收必须用强身份键来测。
+fn strong_body(system: &str, user: &str, cache_key: &str) -> Value {
+    json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "prompt_cache_key": cache_key,
+    })
+}
+
+/// 同 `strong_body`，但请求体足够大以驱动粘性等待预算的体积档位（§10.3）。
+fn strong_bulky_body(system: &str, user: &str, cache_key: &str) -> Value {
+    json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": format!("{user}{}", "字".repeat(12 * 1024))},
+        ],
+        "prompt_cache_key": cache_key,
     })
 }
 
@@ -366,14 +394,16 @@ async fn sticky_requests_follow_the_first_target_and_move_when_it_breaks() {
 
     let system = "你是项目 Alpha 的编码助手";
     assert_eq!(
-        chat(&akhub, small_body(system, "第一问")).await.status(),
+        chat(&akhub, strong_body(system, "第一问", "alpha"))
+            .await
+            .status(),
         200
     );
     let (bound, other) = bound_side(&x, &y);
 
-    // 同一 system prompt、不同用户消息：粘性命中不参与抽签（§9.5）。
+    // 同一个强身份会话：粘性命中不参与抽签，直接走绑定（§9.5、§10.1）。
     for round in 0..6 {
-        let body = small_body(system, &format!("第 {round} 轮，时间 {round}:00"));
+        let body = strong_body(system, &format!("第 {round} 轮，时间 {round}:00"), "alpha");
         assert_eq!(chat(&akhub, body).await.status(), 200);
     }
     assert_eq!(bound.requests(), 7);
@@ -382,13 +412,116 @@ async fn sticky_requests_follow_the_first_target_and_move_when_it_breaks() {
 
     // 原目标失败一次：切换并把绑定挪到新目标，之后不再抢回（§10.2）。
     bound.script([Behavior::Status(500, None)]);
-    assert_eq!(chat(&akhub, small_body(system, "再问")).await.status(), 200);
+    assert_eq!(
+        chat(&akhub, strong_body(system, "再问", "alpha"))
+            .await
+            .status(),
+        200
+    );
     assert_eq!(other.requests(), 1);
     for _ in 0..3 {
-        assert_eq!(chat(&akhub, small_body(system, "继续")).await.status(), 200);
+        assert_eq!(
+            chat(&akhub, strong_body(system, "继续", "alpha"))
+                .await
+                .status(),
+            200
+        );
     }
     assert_eq!(other.requests(), 4);
     assert_eq!(bound.requests(), 8, "旧目标不再被强制抢回");
+}
+
+/// 稳定前缀的粘性应当是**软**的：同一个项目仍倾向于回到原账号，但不会把
+/// 首次抽签的结果永久锁死（§10.1 修订）。
+///
+/// 这是现场事故的回归测试。修复前：第 4 级粘性键（稳定前缀）直接短路抽签，
+/// 于是 700 次同前缀请求会 100% 落在一个账号上——不管它多慢、多差。
+/// 修复后：绑定只把该账号的抽签权重放大 4 倍，流量可以重新分配。
+#[tokio::test]
+async fn stable_prefix_stickiness_is_soft_and_still_allows_redistribution() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    // 两个同优先级、同倍率的账号：没有分数差时抽签应当接近均分。
+    wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let system = "你是项目 Gamma 的编码助手";
+    for round in 0..80 {
+        let body = small_body(system, &format!("第 {round} 轮"));
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+
+    // 软粘性下两个账号都必须拿到流量：绑定不再是"永久独占"。
+    assert!(
+        x.requests() > 0 && y.requests() > 0,
+        "软粘性必须允许流量重新分配（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+    // 但仍然明显偏向绑定：不能退化成完全无视前缀缓存的纯轮询。
+    let (bigger, smaller) = if x.requests() >= y.requests() {
+        (x.requests(), y.requests())
+    } else {
+        (y.requests(), x.requests())
+    };
+    assert!(
+        bigger > smaller,
+        "绑定目标应当拿到更多流量（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+    assert!(
+        smaller as f64 / (bigger + smaller) as f64 > 0.15,
+        "少数侧不该被饿死（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+}
+
+/// 一个持续失败的账号必须被流量真正绕开：软粘性不能妨碍故障切换（§10.2）。
+#[tokio::test]
+async fn a_failing_bound_target_is_abandoned_by_soft_stickiness() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let system = "你是项目 Delta 的编码助手";
+    assert_eq!(chat(&akhub, small_body(system, "首问")).await.status(), 200);
+
+    // 让 X 从此刻起每次都 500。软粘性必须让请求落到 Y 上并成功。
+    x.fallback(Behavior::Status(500, None));
+    for round in 0..6 {
+        let body = small_body(system, &format!("第 {round} 轮"));
+        assert_eq!(
+            chat(&akhub, body).await.status(),
+            200,
+            "绑定目标失败时必须能换到健康账号"
+        );
+    }
+    assert!(
+        y.requests() >= 6,
+        "健康的账号必须接到全部流量（Y={}）",
+        y.requests()
+    );
 }
 
 #[tokio::test]
@@ -409,7 +542,9 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
 
     let system = "你是项目 Beta 的编码助手";
     assert_eq!(
-        chat(&akhub, bulky_chat_body(system, "首问")).await.status(),
+        chat(&akhub, strong_bulky_body(system, "首问", "beta"))
+            .await
+            .status(),
         200
     );
     let (bound, other) = bound_side(&x, &y);
@@ -434,7 +569,7 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
             0,
         )
         .unwrap();
-    let waiting = tokio::spawn(chat(&akhub, bulky_chat_body(system, "大请求")));
+    let waiting = tokio::spawn(chat(&akhub, strong_bulky_body(system, "大请求", "beta")));
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!waiting.is_finished(), "粘性请求应当在原目标的队列里等待");
     assert_eq!(other.requests(), 0, "等待期间不能换号");
@@ -459,7 +594,9 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
         .unwrap();
     let started = Instant::now();
     assert_eq!(
-        chat(&akhub, small_body(system, "小请求")).await.status(),
+        chat(&akhub, strong_body(system, "小请求", "beta"))
+            .await
+            .status(),
         200
     );
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -467,7 +604,7 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
     // 绑定已经挪到新目标：原目标空出来之后也不再抢回。
     drop(_held);
     assert_eq!(
-        chat(&akhub, small_body(system, "又一个小请求"))
+        chat(&akhub, strong_body(system, "又一个小请求", "beta"))
             .await
             .status(),
         200
@@ -494,7 +631,9 @@ async fn a_sticky_request_honours_retry_after_within_its_budget() {
 
     let system = "你是项目 Gamma 的编码助手";
     assert_eq!(
-        chat(&akhub, bulky_chat_body(system, "首问")).await.status(),
+        chat(&akhub, strong_bulky_body(system, "首问", "gamma"))
+            .await
+            .status(),
         200
     );
     let (bound, other) = bound_side(&x, &y);
@@ -503,7 +642,7 @@ async fn a_sticky_request_honours_retry_after_within_its_budget() {
     bound.script([Behavior::Status(429, Some(1))]);
     let started = Instant::now();
     assert_eq!(
-        chat(&akhub, bulky_chat_body(system, "大请求"))
+        chat(&akhub, strong_bulky_body(system, "大请求", "gamma"))
             .await
             .status(),
         200
@@ -519,7 +658,9 @@ async fn a_sticky_request_honours_retry_after_within_its_budget() {
     bound.script([Behavior::Status(429, Some(1))]);
     let started = Instant::now();
     assert_eq!(
-        chat(&akhub, small_body(system, "小请求")).await.status(),
+        chat(&akhub, strong_body(system, "小请求", "gamma"))
+            .await
+            .status(),
         200
     );
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -1106,7 +1247,7 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
 
     let system = "你是项目 Delta 的编码助手";
     for round in 0..25 {
-        let body = small_body(system, &format!("第 {round} 轮"));
+        let body = strong_body(system, &format!("第 {round} 轮"), "delta");
         assert_eq!(chat(&akhub, body).await.status(), 200);
     }
     let (bound, other) = bound_side(&x, &y);
@@ -1141,12 +1282,16 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
     assert!(stats.is_warm(), "评分从快照继续，不从零开始");
     assert_eq!(stats.samples, 25);
 
-    // 同一前缀仍打到原目标（§26.7）。
+    // 同一个强身份会话重启后仍打到原目标（§26.7）。
     let base_url = serve(Arc::clone(&restarted)).await;
     assert_eq!(
-        chat_at(&base_url, &akhub.key, small_body(system, "重启后"))
-            .await
-            .status(),
+        chat_at(
+            &base_url,
+            &akhub.key,
+            strong_body(system, "重启后", "delta")
+        )
+        .await
+        .status(),
         200
     );
     assert_eq!(bound.requests(), 26);

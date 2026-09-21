@@ -406,11 +406,16 @@ fn resolve_key<'a>(
 
 /// 为一个逻辑模型排出完整的尝试计划。
 ///
+/// `affinity` 是**软粘性**倾斜的目标（§10.1 修订）：稳定前缀摘要这类"弱身份"
+/// 键绑定的目标不再短路抽签，只在这里把权重放大若干倍，让同一个 agent 项目
+/// 仍倾向于落在同一个账号上，同时保留每次请求重新分配的机会。
+///
 /// `random` 是层内加权抽签的随机源，注入进来是为了让分配行为可被测试断言。
 pub fn plan(
     group: &GroupView,
     model_name: &str,
     context: &Context<'_>,
+    affinity: Option<&str>,
     random: &mut impl FnMut() -> f64,
 ) -> Result<Plan, SelectionFailure> {
     // 分组是硬边界：查不到就是查不到，绝不跨组搜索（§7.3）。
@@ -544,7 +549,7 @@ pub fn plan(
         }
     }
     Ok(Plan {
-        layers: into_layers(candidates, random),
+        layers: into_layers(candidates, affinity, random),
         cheapest,
         dearest,
         filtered,
@@ -580,7 +585,11 @@ fn catalog_discouraged(
 /// 排最前；能无损表达但目录存疑的排中间；只能降级表达的排最后。这就是
 /// "降级只在故障切换时生效"——层内的无损目标全部试完之前，需要丢弃 thinking
 /// 的目标根本轮不到。
-fn into_layers(mut candidates: Vec<Candidate>, random: &mut impl FnMut() -> f64) -> Vec<Layer> {
+fn into_layers(
+    mut candidates: Vec<Candidate>,
+    affinity: Option<&str>,
+    random: &mut impl FnMut() -> f64,
+) -> Vec<Layer> {
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.target.priority));
 
     let mut layers: Vec<Layer> = Vec::new();
@@ -604,16 +613,46 @@ fn into_layers(mut candidates: Vec<Candidate>, random: &mut impl FnMut() -> f64)
         }
         layer.candidates = buckets
             .into_iter()
-            .flat_map(|bucket| shuffle(bucket, random))
+            .flat_map(|bucket| shuffle(bucket, affinity, random))
             .collect();
     }
     layers
 }
 
+/// 软粘性（弱身份）在层内抽签里的**权重**倍数。
+///
+/// 4 倍而不是"必中"：绑定目标拿到约 4 倍权重，意味着同分候选之间约八成流量
+/// 仍留在原账号——前缀缓存的价值基本保住——但每五次里总有一次会重新分配。
+/// 这个比例直接决定"某个账号变慢或变差之后，多久能被评分发现并真正让出流量"。
+///
+/// 注意它是**权重**倍数而不是分数倍数：分数被夹在 1.0，乘在分数上会撞上限，
+/// 让倍数失真（`weighted_order_with` 的注释里有完整说明）。
+const AFFINITY_BOOST: f64 = 4.0;
+
 /// 按综合评分加权随机排出一组候选的尝试顺序。
-fn shuffle(candidates: Vec<Candidate>, random: &mut impl FnMut() -> f64) -> Vec<Candidate> {
+///
+/// `affinity` 命中时把那个候选的**权重**乘以 [`AFFINITY_BOOST`]（§10.1 修订的
+/// 软粘性）。它只影响**层内**顺序，不跨层。
+fn shuffle(
+    candidates: Vec<Candidate>,
+    affinity: Option<&str>,
+    random: &mut impl FnMut() -> f64,
+) -> Vec<Candidate> {
     let scores: Vec<score::Score> = candidates.iter().map(|c| c.score).collect();
-    let order = score::weighted_order(&scores, random);
+    let boost: Vec<f64> = match affinity {
+        Some(id) => candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.target.target.id == id {
+                    AFFINITY_BOOST
+                } else {
+                    1.0
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let order = score::weighted_order_with(&scores, &boost, random);
     let mut slots: Vec<Option<Candidate>> = candidates.into_iter().map(Some).collect();
     order
         .into_iter()
@@ -935,6 +974,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -970,6 +1010,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -1004,6 +1045,7 @@ mod tests {
                 &allowed,
                 "glm-4.6",
                 &context!(fixture, view, translation),
+                None,
                 &mut fixed(0.5)
             )
             .unwrap()
@@ -1024,6 +1066,7 @@ mod tests {
             &refused,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap_err();
@@ -1051,6 +1094,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -1093,7 +1137,7 @@ mod tests {
             now_unix: 0,
             now: std::time::Instant::now(),
         };
-        let native = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        let native = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
         let candidate = &native.attempts()[0];
         assert!(candidate.is_lossless(), "纯文本请求跨协议无损");
         // 原生端点未被证实缺失时先走它：上游很可能两个端点都有（§14.2）。
@@ -1103,7 +1147,7 @@ mod tests {
         fixture
             .evidence
             .note_unsupported("a1", Endpoint::Messages, context.now);
-        let converted = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        let converted = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
         assert_eq!(
             converted.attempts()[0].endpoints[0].endpoint,
             Endpoint::ChatCompletions
@@ -1141,7 +1185,7 @@ mod tests {
             now_unix: 0,
             now: std::time::Instant::now(),
         };
-        let failure = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap_err();
+        let failure = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap_err();
         assert_eq!(failure.code, ErrorCode::UnsupportedParameter);
         assert!(!failure.code.is_retryable(), "换个目标也是同样结果");
     }
@@ -1192,7 +1236,7 @@ mod tests {
             now: std::time::Instant::now(),
         };
 
-        let lossless_first = plan(&group, "glm-4.6", &make(true), &mut fixed(0.5)).unwrap();
+        let lossless_first = plan(&group, "glm-4.6", &make(true), None, &mut fixed(0.5)).unwrap();
         let order: Vec<_> = lossless_first
             .attempts()
             .iter()
@@ -1206,7 +1250,7 @@ mod tests {
         assert!(lossless_first.layers[0].candidates[0].is_lossless());
 
         // 分组关掉降级开关：只能降级表达的目标直接出局。
-        let strict = plan(&group, "glm-4.6", &make(false), &mut fixed(0.5)).unwrap();
+        let strict = plan(&group, "glm-4.6", &make(false), None, &mut fixed(0.5)).unwrap();
         assert_eq!(strict.attempts().len(), 1);
         assert_eq!(strict.attempts()[0].target.target.id, "lossless");
     }
@@ -1221,6 +1265,7 @@ mod tests {
             &group,
             "不存在的模型",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap_err();
@@ -1237,6 +1282,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap_err();
@@ -1306,6 +1352,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -1348,7 +1395,7 @@ mod tests {
             now_unix: 1,
             now: std::time::Instant::now(),
         };
-        let failure = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap_err();
+        let failure = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap_err();
         assert_eq!(failure.code, ErrorCode::MultiplierUnknown);
         assert!(!failure.code.is_retryable());
     }
@@ -1372,6 +1419,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -1457,6 +1505,7 @@ mod tests {
             &group,
             "glm-4.6",
             &context!(fixture, view, translation),
+            None,
             &mut fixed(0.5),
         )
         .unwrap();
@@ -1527,7 +1576,7 @@ mod tests {
             now_unix: 0,
             now: std::time::Instant::now(),
         };
-        let planned = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        let planned = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
         // 两个候选都还在计划里——目录不构成硬性不合格。
         assert_eq!(planned.attempts().len(), 2, "目录不该把目标踢出计划");
         // 两个都在第一层。
@@ -1587,7 +1636,7 @@ mod tests {
             now_unix: 0,
             now,
         };
-        let planned = plan(&group, "glm-4.6", &context, &mut fixed(0.5)).unwrap();
+        let planned = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
         // 图片请求仍然只有一个候选，且没有因为目录被降权之外的影响。
         assert_eq!(planned.attempts().len(), 1);
     }
