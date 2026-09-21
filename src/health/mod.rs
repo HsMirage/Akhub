@@ -36,56 +36,124 @@ const COOLDOWN_CAP: Duration = Duration::from_secs(300);
 /// 值，统一走同一条准入路径才不会出现两套语义。
 const UNLIMITED: u32 = 1 << 20;
 
-/// 账号共享预算与目标局部预算必须同时满足。
+/// 账号、Key 与目标三级的预算，必须同时满足。
+///
+/// 三级是**逐级收紧**的关系：账号限额是所有 Key 共享的总闸门，Key 覆盖在它
+/// 之内再收紧，目标覆盖再收紧一次（§4.2.1、§17.1）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdmissionLimits {
     pub account: Limits,
+    /// Key 级覆盖。单 Key 账号与老库迁移后都是默认值（无覆盖）。
+    pub key: Limits,
     pub target: Limits,
 }
 
 impl From<Limits> for AdmissionLimits {
-    fn from(target: Limits) -> Self {
+    /// 单个 [\`Limits\`] 会被当作**有效预算**：账号与 Key 两级都不再单独收紧，
+    /// 目标级承担全部限制。
+    ///
+    /// 这条语义必须保住：探针、后台测试与单 Key 路径都只提供一个 Limits，把它们
+    /// 折叠进 Key 级会让账号总额度悄悄失效（§4.2.1、§17.1）。
+    fn from(effective: Limits) -> Self {
         Self {
             account: Limits::default(),
-            target,
+            key: Limits::default(),
+            target: effective,
         }
     }
 }
 
+/// 这次准入是谁发起的：账号、账号内的哪把 Key、以及目标。
+///
+/// Key 用 `Option` 表达"这次调用不绑定具体凭据"（探针、后台测试等），
+/// 那时 Key 级状态完全不参与——这正是单 Key 账号行为的零成本兼容路径。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Caller<'a> {
+    pub account_id: &'a str,
+    /// 账号内的哪把 Key，填**凭据摘要**（不是行 ID）。
+    ///
+    /// 摘要由 [\`crate::credential::credential_id\`] 与账号一起拼成动态状态表
+    /// 的归类键。用摘要而不是行 ID：换标签、重新粘贴同一把 Key 都不该丢掉
+    /// 熔断与额度状态（§4.2.1）。
+    pub key_id: Option<&'a str>,
+    pub target_id: &'a str,
+}
+
+/// 一次排队要等的并发名额。
+///
+/// **只有配置了上限的那一级才有信号量**（`None` = 不限）：不限的级别不该成为
+/// 排队的原因，也不该跟别的级别互相挤占。三级各有自己的额度，所以"某把 Key
+/// 的并发满了"不会连累另一把 Key（§4.2.1）。
 #[derive(Debug, Clone)]
 pub struct Capacity {
-    pub account: Arc<Semaphore>,
-    pub target: Arc<Semaphore>,
+    pub account: Option<Arc<Semaphore>>,
+    pub key: Option<Arc<Semaphore>>,
+    pub target: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug)]
 pub struct CapacityPermit {
-    _account: OwnedSemaphorePermit,
-    _target: OwnedSemaphorePermit,
+    _account: Option<OwnedSemaphorePermit>,
+    _key: Option<OwnedSemaphorePermit>,
+    _target: Option<OwnedSemaphorePermit>,
 }
 
 impl Capacity {
+    /// 这一级是否完全不限（没有信号量）。
+    pub fn is_unbounded(&self) -> bool {
+        self.account.is_none() && self.key.is_none() && self.target.is_none()
+    }
+
     fn try_acquire(self) -> Result<CapacityPermit, Unavailable> {
-        let target = self
-            .target
-            .try_acquire_owned()
-            .map_err(|_| Unavailable::ConcurrencyFull)?;
-        let account = self
-            .account
-            .try_acquire_owned()
-            .map_err(|_| Unavailable::ConcurrencyFull)?;
+        // 顺序无关正确性：任何一步失败时，已拿到的名额随局部变量析构归还。
+        let target = match &self.target {
+            Some(target) => Some(
+                Arc::clone(target)
+                    .try_acquire_owned()
+                    .map_err(|_| Unavailable::ConcurrencyFull)?,
+            ),
+            None => None,
+        };
+        let key = match &self.key {
+            Some(key) => Some(
+                Arc::clone(key)
+                    .try_acquire_owned()
+                    .map_err(|_| Unavailable::ConcurrencyFull)?,
+            ),
+            None => None,
+        };
+        let account = match &self.account {
+            Some(account) => Some(
+                Arc::clone(account)
+                    .try_acquire_owned()
+                    .map_err(|_| Unavailable::ConcurrencyFull)?,
+            ),
+            None => None,
+        };
         Ok(CapacityPermit {
             _account: account,
+            _key: key,
             _target: target,
         })
     }
 
     pub async fn acquire(self) -> Option<CapacityPermit> {
         // 不在等待繁忙目标时占住账号名额，其他模型仍可使用空闲账号容量。
-        let target = self.target.acquire_owned().await.ok()?;
-        let account = self.account.acquire_owned().await.ok()?;
+        let target = match &self.target {
+            Some(target) => Some(Arc::clone(target).acquire_owned().await.ok()?),
+            None => None,
+        };
+        let key = match &self.key {
+            Some(key) => Some(Arc::clone(key).acquire_owned().await.ok()?),
+            None => None,
+        };
+        let account = match &self.account {
+            Some(account) => Some(Arc::clone(account).acquire_owned().await.ok()?),
+            None => None,
+        };
         Some(CapacityPermit {
             _account: account,
+            _key: key,
             _target: target,
         })
     }
@@ -94,8 +162,15 @@ impl Capacity {
 /// 目标当前不可用的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unavailable {
-    /// 401/403 明确证明 Key 失效，换凭据前一直硬停（§12.3）。
+    /// 401/403 明确证明凭据失效，换凭据前一直硬停（§12.3）。
+    ///
+    /// 范围是**那把 Key**而不是整个账号：账号里其他 Key 照常服务（§4.2.1）。
     KeyInvalid,
+    /// 这个账号一把可用的 Key 都没有（从未配置或全部被删）。
+    ///
+    /// 与 `KeyInvalid` 分开：前者是"上游拒绝了这把凭据"，这里是"管理员还
+    /// 没填凭据"，后台的提示文案与处置动作完全不同。
+    NoKey,
     /// 额度耗尽，等待恢复时间或半开试运行。
     QuotaExhausted,
     /// 正在冷却，且当前没有空出的半开名额。
@@ -115,6 +190,7 @@ impl Unavailable {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::KeyInvalid => "key_invalid",
+            Self::NoKey => "no_key",
             Self::QuotaExhausted => "quota_exhausted",
             Self::Cooling => "cooldown",
             Self::ConcurrencyFull => "concurrency_full",
@@ -151,6 +227,7 @@ pub enum TargetStatus {
     HalfOpen,
     QuotaExhausted,
     KeyInvalid,
+    NoKey,
 }
 
 impl TargetStatus {
@@ -161,6 +238,7 @@ impl TargetStatus {
             Self::HalfOpen => "half_open",
             Self::QuotaExhausted => "quota_exhausted",
             Self::KeyInvalid => "key_invalid",
+            Self::NoKey => "no_key",
         }
     }
 }
@@ -174,6 +252,11 @@ const MAX_TRACKED: usize = 5_000;
 #[derive(Default)]
 pub struct Registry {
     accounts: RwLock<HashMap<String, Arc<AccountState>>>,
+    /// Key 级状态，键是 [`crate::credential::credential_id`]（账号 + 凭据摘要）。
+    ///
+    /// 与账号、目标并列而不是嵌进账号：热路径只经过读锁拿一个 `Arc`，
+    /// 不必先拿账号条目再进它的内部锁（§19.4）。
+    keys: RwLock<HashMap<String, Arc<KeyState>>>,
     targets: RwLock<HashMap<String, Arc<TargetState>>>,
 }
 
@@ -187,35 +270,80 @@ impl Registry {
         get_or_insert(&self.accounts, account_id, AccountState::new)
     }
 
+    /// 取出（必要时创建）Key 状态。
+    pub fn key(&self, credential_id: &str) -> Arc<KeyState> {
+        get_or_insert(&self.keys, credential_id, KeyState::new)
+    }
+
     /// 取出（必要时创建）目标状态。
     pub fn target(&self, target_id: &str) -> Arc<TargetState> {
         get_or_insert(&self.targets, target_id, TargetState::new)
     }
 
-    /// 丢弃已经不在配置里的账号与目标状态，避免内存随改配置无限增长。
+    /// 丢弃已经不在配置里的账号、Key 与目标状态，避免内存随改配置无限增长。
+    ///
+    /// Key 的存活集合来自凭据快照而不是配置快照：摘要变了（换了真正的凭据）
+    /// 或 Key 被删掉时，旧状态必须一起消失——**换掉一把坏 Key 就该重新开始**。
     pub fn retain(&self, live_accounts: &[String], live_targets: &[String]) {
+        self.retain_with_keys(live_accounts, live_targets, None);
+    }
+
+    /// 带 Key 集合的状态清理。
+    ///
+    /// `live_key_ids` 为 `None` 时**不动** Key 状态：调用方手里没有凭据快照
+    /// （例如只重载了配置），此时清空会把所有 Key 的熔断记错。传空的 `Some`
+    /// 才表示"确实一把 Key 都没有了"。
+    pub fn retain_with_keys(
+        &self,
+        live_accounts: &[String],
+        live_targets: &[String],
+        live_key_ids: Option<&[String]>,
+    ) {
         if let Ok(mut accounts) = self.accounts.write() {
             accounts.retain(|id, _| live_accounts.iter().any(|live| live == id));
         }
         if let Ok(mut targets) = self.targets.write() {
             targets.retain(|id, _| live_targets.iter().any(|live| live == id));
         }
+        if let Some(live) = live_key_ids
+            && let Ok(mut keys) = self.keys.write()
+        {
+            keys.retain(|id, _| live.iter().any(|candidate| candidate == id));
+        }
     }
 
-    /// 管理员改过凭据或手动测试成功后解除账号硬停（§12.3）。
+    /// 管理员改过凭据或手动测试成功后解除硬停（§12.3）。
+    ///
+    /// 作用于账号的**每一把 Key**：权限改在账号页上，管理员期待的是"这个账号
+    /// 现在可以再试一次"，而不是"只有第一把 Key 被放行"。
     pub fn clear_account_faults(&self, account_id: &str) {
+        let prefix = format!("{account_id}:");
+        let affected: Vec<Arc<KeyState>> = match self.keys.read() {
+            Ok(guard) => guard
+                .iter()
+                .filter(|(id, _)| id.starts_with(&prefix))
+                .map(|(_, state)| Arc::clone(state))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for state in affected {
+            state.reset();
+        }
+        // 账号级额度熔断同样要清：New API 的站点级额度是按账号计的。
         let account = self.account(account_id);
-        account.key_invalid.store(false, Ordering::Release);
         if let Ok(mut quota) = account.quota.lock() {
             quota.reset();
         }
     }
 
-    /// 清空全部账号与目标状态。备份恢复后调用：账号与目标可能整个换了一批，
-    /// 旧的熔断与额度计数不再成立（§23.5）。
+    /// 清空全部账号、Key 与目标状态。备份恢复后调用：账号与目标可能整个换了
+    /// 一批，旧的熔断与额度计数不再成立（§23.5）。
     pub fn clear_all(&self) {
         if let Ok(mut accounts) = self.accounts.write() {
             accounts.clear();
+        }
+        if let Ok(mut keys) = self.keys.write() {
+            keys.clear();
         }
         if let Ok(mut targets) = self.targets.write() {
             targets.clear();
@@ -254,14 +382,79 @@ fn get_or_insert<T>(
     )
 }
 
-/// 账号级状态：Key 失效与额度耗尽影响该 Key 下的所有模型（§12.1）。
+/// 账号级状态：只有**所有 Key 共享**的那部分（§4.2.1 的不变量 C）。
+///
+/// 账号总并发 / RPM / TPM 与站点级额度属于这里；凭据级的失效与额度在
+/// [`KeyState`] 里。单 Key 账号的表现与改造前完全一致——那时账号与 Key
+/// 的作用域恰好重合。
 pub struct AccountState {
-    key_invalid: AtomicBool,
     quota: Mutex<Circuit>,
     budget: Budget,
 }
 
 impl AccountState {
+    fn new() -> Self {
+        Self {
+            quota: Mutex::new(Circuit::default()),
+            budget: Budget::new(),
+        }
+    }
+
+    /// 当前空闲的账号级并发名额，供后台与诊断使用。
+    pub fn available(&self) -> usize {
+        self.budget.available()
+    }
+
+    /// 管理员给这个账号配的并发上限（`None` 表示不限）。
+    pub fn configured(&self) -> Option<u32> {
+        self.budget.configured()
+    }
+
+    /// 把账号级并发名额校准到配置值（§17.1）。
+    ///
+    /// 热路径上的准入会自己校准；选 Key 与排队路径需要**提前**看到真实名额，
+    /// 否则"账号已经满载"会被误判成"有空位"。
+    pub fn reconcile_capacity(&self, configured: Option<u32>) {
+        self.budget.reconcile_capacity(configured);
+    }
+
+    /// 账号级并发额度（`None` 表示不限），供后台与诊断使用。
+    pub fn concurrency_limit(&self) -> Option<u32> {
+        (self.budget.capacity() != UNLIMITED).then(|| self.budget.capacity())
+    }
+
+    /// 账号级额度是否处于耗尽等待中（§12.3）。供后台的账号健康摘要使用。
+    pub fn quota_exhausted(&self) -> bool {
+        crate::sync::lock(&self.quota).is_cooling(Instant::now())
+    }
+
+    /// 不改变半开状态的资格检查。真正占用半开试运行名额由 `try_enter` 完成。
+    fn check(&self, now: Instant) -> Result<(), Unavailable> {
+        match crate::sync::lock(&self.quota).phase(now) {
+            Phase::Cooling | Phase::HalfOpenTaken => Err(Unavailable::QuotaExhausted),
+            Phase::Closed | Phase::HalfOpenAvailable => Ok(()),
+        }
+    }
+
+    /// 真正准入时占用账号级半开试运行名额。
+    fn try_enter(&self, now: Instant) -> Result<bool, Unavailable> {
+        crate::sync::lock(&self.quota)
+            .try_enter(now)
+            .map_err(|_| Unavailable::QuotaExhausted)
+    }
+}
+
+/// Key 级状态：凭据失效、凭据额度与 Key 级限额（§4.2.1）。
+///
+/// **401/403 与额度耗尽落在这里而不是账号上**：一把 Key 被上游封了不该让
+/// 同账号的其他九把一起停摆——那会把 Key 池的全部价值抵消掉。
+pub struct KeyState {
+    key_invalid: AtomicBool,
+    quota: Mutex<Circuit>,
+    budget: Budget,
+}
+
+impl KeyState {
     fn new() -> Self {
         Self {
             key_invalid: AtomicBool::new(false),
@@ -270,28 +463,82 @@ impl AccountState {
         }
     }
 
-    /// Key 是否已被上游明确判定为失效（§12.3）。供后台的账号健康摘要使用。
+    /// 这把 Key 是否已被上游明确判定为失效（§12.3）。
     pub fn key_invalid(&self) -> bool {
         self.key_invalid.load(Ordering::Acquire)
     }
 
-    /// 额度是否处于耗尽等待中（§12.3）。
+    /// 管理员给这把 Key 配的并发上限（`None` 表示不限）。
+    pub fn configured(&self) -> Option<u32> {
+        self.budget.configured()
+    }
+
+    /// 这把 Key 的额度是否处于耗尽等待中（§12.3）。
     pub fn quota_exhausted(&self) -> bool {
         crate::sync::lock(&self.quota).is_cooling(Instant::now())
     }
 
-    /// 不改变半开状态的资格检查。真正占用半开试运行名额由 `try_enter` 完成。
-    fn check(&self, now: Instant) -> Result<(), Unavailable> {
+    /// 当前在途请求数，供后台逐 Key 展示。
+    pub fn inflight(&self) -> u32 {
+        self.budget.inflight.load(Ordering::Relaxed)
+    }
+
+    /// 解除硬停并把额度熔断与半开占用一起复位。
+    ///
+    /// 管理员改过凭据或手动测试成功后调用。半开标记必须一起清：留在
+    /// `HalfOpenTaken` 上会让这把 Key 在冷却结束后仍然拒绝新请求。
+    pub fn reset(&self) {
+        self.key_invalid.store(false, Ordering::Release);
+        if let Ok(mut quota) = self.quota.lock() {
+            quota.reset();
+        }
+    }
+
+    /// 逐 Key 的运行状态，供后台的 Key 徽标使用。
+    pub fn status(&self) -> TargetStatus {
+        if self.key_invalid.load(Ordering::Acquire) {
+            return TargetStatus::KeyInvalid;
+        }
+        let now = Instant::now();
+        let circuit = crate::sync::lock(&self.quota);
+        match circuit.phase(now) {
+            Phase::Closed => TargetStatus::Active,
+            Phase::Cooling => TargetStatus::QuotaExhausted,
+            Phase::HalfOpenAvailable | Phase::HalfOpenTaken => TargetStatus::HalfOpen,
+        }
+    }
+
+    /// 冷却剩余秒数，供后台展示与 `Retry-After`。
+    pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
+        crate::sync::lock(&self.quota).cooldown_remaining(now)
+    }
+
+    /// 先让并发名额追上配置，再做资格检查。
+    ///
+    /// **选 Key 的时候必须走这一条**，不能只调 [`Self::check`]：容量是在
+    /// 准入路径上校准的，而选 Key 发生在准入之前，不校准就会拿着"1<<20 个名额"
+    /// 的信号量做判断，把配了上限的 Key 当成永远有空（§17.1）。
+    pub fn reconcile_and_check(&self, budget: Limits, now: Instant) -> Result<(), Unavailable> {
+        self.budget.reconcile_capacity(budget.max_concurrency);
+        self.check(budget, now)
+    }
+
+    /// 不消耗额度的资格检查（§9.1）。
+    ///
+    /// 只看**这一把 Key** 的额度；账号总额度由 [`TargetState::check`] 在同一轮
+    /// 检查里负责，调用方必须两级都过（§4.2.1）。
+    pub fn check(&self, budget: Limits, now: Instant) -> Result<(), Unavailable> {
         if self.key_invalid.load(Ordering::Acquire) {
             return Err(Unavailable::KeyInvalid);
         }
         match crate::sync::lock(&self.quota).phase(now) {
-            Phase::Cooling | Phase::HalfOpenTaken => Err(Unavailable::QuotaExhausted),
-            Phase::Closed | Phase::HalfOpenAvailable => Ok(()),
+            Phase::Cooling | Phase::HalfOpenTaken => return Err(Unavailable::QuotaExhausted),
+            Phase::Closed | Phase::HalfOpenAvailable => {}
         }
+        self.budget.check(budget, now)
     }
 
-    /// 真正准入时占用账号级半开试运行名额。
+    /// 真正准入时占用 Key 级半开试运行名额。
     fn try_enter(&self, now: Instant) -> Result<bool, Unavailable> {
         if self.key_invalid.load(Ordering::Acquire) {
             return Err(Unavailable::KeyInvalid);
@@ -332,10 +579,32 @@ impl TargetState {
         self.budget.inflight.load(Ordering::Relaxed)
     }
 
+    /// 管理员给这个目标配的并发上限（`None` 表示不限）。
+    pub fn configured(&self) -> Option<u32> {
+        self.budget.configured()
+    }
+
+    /// 把这个目标的并发名额校准到配置值（§17.1）。
+    ///
+    /// 准入路径会自己校准；选 Key 与排队路径需要**提前**看到真实名额，否则
+    /// "这个目标已经满载"会被误判成"有空位"。
+    pub fn reconcile_capacity(&self, configured: Option<u32>) {
+        self.budget.reconcile_capacity(configured);
+    }
+
     /// 用于后台展示的运行状态。
-    pub fn status(&self, account: &AccountState) -> TargetStatus {
-        if account.key_invalid.load(Ordering::Acquire) {
-            return TargetStatus::KeyInvalid;
+    ///
+    /// 严重程度按"最影响可用性的先说"排序：凭据失效 > 凭据额度 > 账号额度 >
+    /// 目标熔断（§6.9 的既有口径，只是多了一层凭据）。
+    pub fn status(&self, account: &AccountState, key: Option<&KeyState>) -> TargetStatus {
+        if let Some(key) = key {
+            if key.key_invalid.load(Ordering::Acquire) {
+                return TargetStatus::KeyInvalid;
+            }
+            let now = Instant::now();
+            if crate::sync::lock(&key.quota).is_cooling(now) {
+                return TargetStatus::QuotaExhausted;
+            }
         }
         let now = Instant::now();
         if crate::sync::lock(&account.quota).is_cooling(now) {
@@ -355,13 +624,23 @@ impl TargetState {
     }
 
     /// 不消耗任何额度的资格检查，用于 §9.1 的硬性过滤。
+    ///
+    /// 顺序是"坏不坏"优先于"忙不忙"：一个既熔断又满载的目标必须报熔断，
+    /// 否则调用方会把它当成"忙"去排队等一个永远不会好的目标。
     fn check(
         &self,
         account: &AccountState,
+        key: Option<&KeyState>,
         limits: AdmissionLimits,
         now: Instant,
     ) -> Result<(), Unavailable> {
+        // 从粗到细：账号级熔断（站点额度）先拦，再拦凭据，最后是目标。
+        // 顺序影响错误码的可读性——账号整体不可用时不该报成某把 Key 的问题。
         account.check(now)?;
+        // `None` 表示这次调用不绑定具体凭据（探针、后台测试），跳过 Key 级判断。
+        if let Some(key) = key {
+            key.check(limits.key, now)?;
+        }
         match crate::sync::lock(&self.circuit).phase(now) {
             Phase::Cooling | Phase::HalfOpenTaken => return Err(Unavailable::Cooling),
             Phase::Closed | Phase::HalfOpenAvailable => {}
@@ -383,6 +662,23 @@ impl Budget {
         }
     }
 
+    /// 当前空闲的并发名额。
+    pub fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// 管理员配的并发上限（`None` 表示不限）。
+    pub fn configured(&self) -> Option<u32> {
+        let current = self.capacity.load(Ordering::Acquire);
+        (current != UNLIMITED).then_some(current)
+    }
+
+    /// 立即取一个并发名额，供测试直接验证预算的收发。
+    #[cfg(test)]
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
     fn check(&self, limits: Limits, now: Instant) -> Result<(), Unavailable> {
         if let Some(rpm) = limits.rpm
             && crate::sync::lock(&self.rpm).estimate(now) >= f64::from(rpm)
@@ -400,12 +696,24 @@ impl Budget {
         Ok(())
     }
 
-    /// 让 Semaphore 的容量追上管理员配置的最大并发。
+    /// 额定容量，供诊断与后台展示。
+    pub fn capacity(&self) -> u32 {
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    /// 让 Semaphore 的容量追上要用的最大并发。
     ///
     /// 缩容时只能回收当前空闲的名额，在途请求归还后由下一次准入继续回收；
     /// 这样永远不会超过旧上限，也总会收敛到新上限。
-    fn reconcile_capacity(&self, limits: Limits) {
-        let wanted = limits.max_concurrency.unwrap_or(UNLIMITED).max(1);
+    ///
+    /// \`None\` 表示**调用方对并发没有意见**（读路径与默认端口常常如此），
+    /// 此时保持现状。把它当成"重置为不限"会抹掉已经校准好的上限，满载就会
+    /// 被看成有空位（§13.6、§17.1）。
+    fn reconcile_capacity(&self, wanted: Option<u32>) {
+        let Some(wanted) = wanted else {
+            return;
+        };
+        let wanted = wanted.max(1);
         let _guard = crate::sync::lock(&self.capacity_lock);
         let current = self.capacity.load(Ordering::Acquire);
         if wanted == current {
@@ -430,6 +738,24 @@ impl Budget {
         }
     }
 
+    /// 把取消时**已经拿走**的并发名额补回额定容量。
+    ///
+    /// [`Self::cancel`] 只退限流计数，退不了信号量：信号量名额是靠 permit 析构
+    /// 归还的。于是"预扣 → 取消"这条路径会把额定容量越削越小，最终所有同级请求
+    /// 都拿不到名额。取消意味着这次预扣整个作废，容量必须回到配置值（§17.1）。
+    fn restore_rate(&self, limits: Limits) {
+        if limits.max_concurrency.is_none() {
+            return;
+        }
+        let wanted = limits.max_concurrency.unwrap_or(UNLIMITED).max(1);
+        let _guard = crate::sync::lock(&self.capacity_lock);
+        let current = self.capacity.load(Ordering::Acquire);
+        if current < wanted {
+            self.permits.add_permits((wanted - current) as usize);
+            self.capacity.store(wanted, Ordering::Release);
+        }
+    }
+
     fn settle(&self, reservation: RateReservation, actual: Option<u64>, now: Instant) {
         if let (Some(reserved), Some(actual)) = (reservation.tokens, actual) {
             let mut tpm = crate::sync::lock(&self.tpm);
@@ -449,18 +775,42 @@ struct RateReservation {
     tokens: Option<u64>,
 }
 
+impl RateReservation {
+    /// 未占用任何额度的空预留，便于三级扣减统一走同一套退回逻辑。
+    fn none() -> Self {
+        Self {
+            at: Instant::now(),
+            rpm: false,
+            tokens: None,
+        }
+    }
+}
+
+/// 一次尝试在三级上分别预扣的额度。
+#[derive(Clone, Copy)]
+struct RateReservations {
+    account: RateReservation,
+    key: RateReservation,
+    target: RateReservation,
+}
+
 /// 一次已获准的尝试。析构即释放并发名额。
 pub struct Admission {
     account: Arc<AccountState>,
+    /// 本次尝试绑定的 Key。`None` 表示这次调用不带凭据语义（探针等）。
+    key: Option<Arc<KeyState>>,
     target: Arc<TargetState>,
     /// 名额随本结构体一同释放，不需要显式归还。
     _permit: CapacityPermit,
     /// 本次是否占用了账号级额度熔断的半开试运行名额。
     account_half_open: bool,
-    /// 本次是否占用了半开试运行名额。
+    /// 本次是否占用了该 Key 额度熔断的半开试运行名额。
+    key_half_open: bool,
+    /// 本次是否占用了目标半开试运行名额。
     half_open: bool,
-    account_rate: RateReservation,
-    target_rate: RateReservation,
+    reservations: RateReservations,
+    /// 本次准入用的三级额度。取消时据此把并发容量补回配置值。
+    limits: AdmissionLimits,
     settled: bool,
 }
 
@@ -470,9 +820,22 @@ impl Admission {
         self.half_open
     }
 
+    /// 绑定到本次尝试的 Key 状态。
+    pub fn key_state(&self) -> Option<&Arc<KeyState>> {
+        self.key.as_ref()
+    }
+
     fn release_account_half_open(&self) {
         if self.account_half_open {
             crate::sync::lock(&self.account.quota).release_half_open();
+        }
+    }
+
+    fn release_key_half_open(&self) {
+        if self.key_half_open
+            && let Some(key) = &self.key
+        {
+            crate::sync::lock(&key.quota).release_half_open();
         }
     }
 
@@ -480,9 +843,20 @@ impl Admission {
     pub fn cancel_before_upstream(mut self) {
         self.settled = true;
         let now = Instant::now();
-        self.account.budget.cancel(self.account_rate, now);
-        self.target.budget.cancel(self.target_rate, now);
+        self.account.budget.cancel(self.reservations.account, now);
+        if let Some(key) = &self.key {
+            key.budget.cancel(self.reservations.key, now);
+        }
+        self.target.budget.cancel(self.reservations.target, now);
+        // 并发名额随 permit 析构归还，但额定容量还要补回去，否则反复的
+        // "预扣 → 取消"会把这一级的容量越削越小（§17.1）。
+        self.account.budget.restore_rate(self.limits.account);
+        if let Some(key) = &self.key {
+            key.budget.restore_rate(self.limits.key);
+        }
+        self.target.budget.restore_rate(self.limits.target);
         self.release_account_half_open();
+        self.release_key_half_open();
         crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
     }
 
@@ -490,38 +864,61 @@ impl Admission {
     ///
     /// `actual_tokens` 已知时按真实用量归还预留差额；未知（没有 tokenizer 且
     /// 上游没回 usage）时保留保守估算，宁可少发也不要超限（§17.2）。
+    ///
+    /// 凭据级结果（失效、额度耗尽）只作用于**这一把 Key**：账号里其他 Key 继续
+    /// 服务，这正是 Key 池相对"一 Key 一账号"的额外价值（§4.2.1）。
     pub fn settle(mut self, outcome: Outcome, actual_tokens: Option<u64>) {
         self.settled = true;
         let now = Instant::now();
 
         self.account
             .budget
-            .settle(self.account_rate, actual_tokens, now);
+            .settle(self.reservations.account, actual_tokens, now);
+        if let Some(key) = &self.key {
+            key.budget.settle(self.reservations.key, actual_tokens, now);
+        }
         self.target
             .budget
-            .settle(self.target_rate, actual_tokens, now);
+            .settle(self.reservations.target, actual_tokens, now);
 
         match outcome {
             Outcome::Neutral => {
                 self.release_account_half_open();
+                self.release_key_half_open();
                 crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::Success => {
-                self.account.key_invalid.store(false, Ordering::Release);
+                // 成功一次就清掉凭据的硬停与额度熔断：这是 Key 从"坏"回到
+                // "好"的唯一路径。
+                if let Some(key) = &self.key {
+                    key.key_invalid.store(false, Ordering::Release);
+                    crate::sync::lock(&key.quota).on_success(now);
+                }
                 crate::sync::lock(&self.account.quota).on_success(now);
                 crate::sync::lock(&self.target.circuit).on_success(now);
             }
             Outcome::KeyInvalid => {
-                self.account.key_invalid.store(true, Ordering::Release);
+                // 三层半开名额都要还回去，否则这个目标会一直卡在"有人正在
+                // 试运行"而永远无法恢复。凭据层要显式 undo：它的半开名额是
+                // 这次尝试占的，跟着这次失败一起作废。
+                if let Some(key) = &self.key {
+                    key.key_invalid.store(true, Ordering::Release);
+                    crate::sync::lock(&key.quota).undo_half_open(self.key_half_open);
+                }
                 self.release_account_half_open();
                 crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::QuotaExhausted { retry_after } => {
-                crate::sync::lock(&self.account.quota).trip(now, retry_after);
+                // `trip` 自己会把半开状态清成"冷却中"，不需要再 release。
+                match &self.key {
+                    Some(key) => crate::sync::lock(&key.quota).trip(now, retry_after),
+                    None => crate::sync::lock(&self.account.quota).trip(now, retry_after),
+                }
                 crate::sync::lock(&self.target.circuit).release_half_open();
             }
             Outcome::RateLimited { retry_after } => {
                 self.release_account_half_open();
+                self.release_key_half_open();
                 let mut circuit = crate::sync::lock(&self.target.circuit);
                 match retry_after {
                     // 上游明确说了多久，就照做，不叠加自己的指数退避。
@@ -532,6 +929,7 @@ impl Admission {
             }
             Outcome::Fault => {
                 self.release_account_half_open();
+                self.release_key_half_open();
                 crate::sync::lock(&self.target.circuit).on_fault(now);
             }
         }
@@ -542,83 +940,115 @@ impl Drop for Admission {
     fn drop(&mut self) {
         self.target.budget.inflight.fetch_sub(1, Ordering::Relaxed);
         self.account.budget.inflight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(key) = &self.key {
+            key.budget.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
         if !self.settled {
             // 客户端断开或任务被取消：半开名额必须还回去，否则这个目标会
             // 一直卡在"有人正在试运行"而永远无法恢复。
             self.release_account_half_open();
+            self.release_key_half_open();
             crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
         }
     }
 }
 
 impl Registry {
+    /// 一次调用在动态状态表里的 Key 归类键。
+    ///
+    /// 账号前缀必须有：同一个真实 Key 可以出现在两个分组的两条账号记录里，
+    /// 那时它们的熔断与额度必须各自独立（§4.2）。
+    fn keyed(&self, account_id: &str, credential_digest: Option<&str>) -> Option<Arc<KeyState>> {
+        let digest = credential_digest?;
+        Some(self.key(&crate::credential::credential_id(account_id, digest)))
+    }
+
     /// 不消耗额度的资格检查（§9.1）。
-    pub fn check<L: Into<AdmissionLimits>>(
+    pub fn check<'a, C: Into<Caller<'a>>, L: Into<AdmissionLimits>>(
         &self,
-        account_id: &str,
-        target_id: &str,
+        caller: C,
         limits: L,
     ) -> Result<(), Unavailable> {
+        let caller = caller.into();
         let limits = limits.into();
-        let account = self.account(account_id);
-        let target = self.target(target_id);
-        account.budget.reconcile_capacity(limits.account);
-        target.budget.reconcile_capacity(limits.target);
-        target.check(&account, limits, Instant::now())
+        let account = self.account(caller.account_id);
+        let key = self.keyed(caller.account_id, caller.key_id);
+        let target = self.target(caller.target_id);
+        // 与准入、排队看到同一份额度，否则三处会各算各的（§13.6）。
+        let limits = effective_limits(limits, &account, key.as_ref(), &target);
+        target.check(&account, key.as_deref(), limits, Instant::now())
     }
 
     /// 立即准入：拿不到名额时不等待，由调用方决定换目标还是排队。
-    pub fn try_admit<L: Into<AdmissionLimits>>(
+    pub fn try_admit<'a, C: Into<Caller<'a>>, L: Into<AdmissionLimits>>(
         &self,
-        account_id: &str,
-        target_id: &str,
+        caller: C,
         limits: L,
         estimated_tokens: u64,
     ) -> Result<Admission, Unavailable> {
-        self.admit(account_id, target_id, limits.into(), estimated_tokens, None)
+        self.admit(caller.into(), limits.into(), estimated_tokens, None)
     }
 
     /// 用排队时已经赢到的并发名额准入。
     ///
     /// 名额是 FIFO 排到的，直接带着它进门才能保证等了 30 秒的请求不会在最后
     /// 一步被刚到的新请求插队；倍率与健康终检仍然照做，名额不能绕过它们。
-    pub fn admit_with_permit<L: Into<AdmissionLimits>>(
+    pub fn admit_with_permit<'a, C: Into<Caller<'a>>, L: Into<AdmissionLimits>>(
         &self,
-        account_id: &str,
-        target_id: &str,
+        caller: C,
         limits: L,
         estimated_tokens: u64,
         permit: CapacityPermit,
     ) -> Result<Admission, Unavailable> {
-        self.admit(
-            account_id,
-            target_id,
-            limits.into(),
-            estimated_tokens,
-            Some(permit),
-        )
+        self.admit(caller.into(), limits.into(), estimated_tokens, Some(permit))
     }
 
     fn admit(
         &self,
-        account_id: &str,
-        target_id: &str,
+        caller: Caller<'_>,
         limits: AdmissionLimits,
         estimated_tokens: u64,
         permit: Option<CapacityPermit>,
     ) -> Result<Admission, Unavailable> {
-        let account = self.account(account_id);
-        let target = self.target(target_id);
-        account.budget.reconcile_capacity(limits.account);
-        target.budget.reconcile_capacity(limits.target);
+        let account = self.account(caller.account_id);
+        let key = self.keyed(caller.account_id, caller.key_id);
+        let target = self.target(caller.target_id);
+        // 本轮**实际生效**的额度。只在准入、资格检查、排队三处各算一遍会漂移：
+        // 某处把 `None` 当"不限"、另一处当成"沿用配置"，就会出现"准入认为满、
+        // 排队认为不限"这种组合，请求于是绕过排队（§13.6、§17.1）。
+        let effective = effective_limits(limits, &account, key.as_ref(), &target);
+        account
+            .budget
+            .reconcile_capacity(effective.account.max_concurrency);
+        if let Some(key) = &key {
+            key.budget.reconcile_capacity(effective.key.max_concurrency);
+        }
+        target
+            .budget
+            .reconcile_capacity(effective.target.max_concurrency);
+        let limits = effective;
         let now = Instant::now();
 
         // 先看"坏不坏"再看"忙不忙"：一个既熔断又满载的目标必须报熔断，否则
-        // 调用方会把它当成"忙"去排队等一个永远不会好的目标。
+        // 调用方会把它当成"忙"去排队等一个永远不会好的目标。三级依次占用
+        // 半开名额，任何一级失败都要把前面占到的还回去。
         let account_half_open = account.try_enter(now)?;
+        let key_half_open = match &key {
+            Some(key) => match key.try_enter(now) {
+                Ok(taken) => taken,
+                Err(reason) => {
+                    crate::sync::lock(&account.quota).undo_half_open(account_half_open);
+                    return Err(reason);
+                }
+            },
+            None => false,
+        };
         let half_open = crate::sync::lock(&target.circuit)
             .try_enter(now)
             .map_err(|()| {
+                if let Some(key) = &key {
+                    crate::sync::lock(&key.quota).undo_half_open(key_half_open);
+                }
                 crate::sync::lock(&account.quota).undo_half_open(account_half_open);
                 Unavailable::Cooling
             })?;
@@ -626,56 +1056,179 @@ impl Registry {
         // 名额先拿，额度后扣：拿不到名额时不能留下已扣的限流计数。
         let permit = match permit {
             Some(permit) => permit,
-            None => match self.capacity(account_id, target_id).try_acquire() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    crate::sync::lock(&target.circuit).undo_half_open(half_open);
-                    crate::sync::lock(&account.quota).undo_half_open(account_half_open);
-                    return Err(Unavailable::ConcurrencyFull);
+            None => {
+                // 用**本轮实际生效**的额度取名额：只按调用方传的值取，会让
+                // "调用方没提并发但管理员配了上限"的目标完全没有名额可抢
+                // （§17.1）。
+                match self
+                    .capacity_of(&account, key.as_ref(), &target, limits)
+                    .try_acquire()
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        crate::sync::lock(&target.circuit).undo_half_open(half_open);
+                        if let Some(key) = &key {
+                            crate::sync::lock(&key.quota).undo_half_open(key_half_open);
+                        }
+                        crate::sync::lock(&account.quota).undo_half_open(account_half_open);
+                        return Err(Unavailable::ConcurrencyFull);
+                    }
                 }
-            },
+            }
         };
 
-        let reservations = (|| {
-            let account_rate =
+        // 额度逐级扣减。任何一级不够就把前面已扣的完整退回。
+        let mut reservations = RateReservations {
+            account: RateReservation::none(),
+            key: RateReservation::none(),
+            target: RateReservation::none(),
+        };
+        let consumed = (|| -> Result<(), Unavailable> {
+            reservations.account =
                 consume_rate(&account.budget, limits.account, estimated_tokens, now)?;
+            if let Some(key) = &key {
+                reservations.key = consume_rate(&key.budget, limits.key, estimated_tokens, now)?;
+            }
             match consume_rate(&target.budget, limits.target, estimated_tokens, now) {
-                Ok(target_rate) => Ok((account_rate, target_rate)),
-                Err(reason) => {
-                    account.budget.cancel(account_rate, now);
-                    Err(reason)
+                Ok(reservation) => {
+                    reservations.target = reservation;
+                    Ok(())
                 }
+                Err(reason) => Err(reason),
             }
         })();
-        let (account_rate, target_rate) = match reservations {
-            Ok(reservations) => reservations,
-            Err(reason) => {
-                crate::sync::lock(&target.circuit).undo_half_open(half_open);
-                crate::sync::lock(&account.quota).undo_half_open(account_half_open);
-                return Err(reason);
+        if let Err(reason) = consumed {
+            account.budget.cancel(reservations.account, now);
+            if let Some(key) = &key {
+                key.budget.cancel(reservations.key, now);
             }
-        };
+            target.budget.cancel(reservations.target, now);
+            crate::sync::lock(&target.circuit).undo_half_open(half_open);
+            if let Some(key) = &key {
+                crate::sync::lock(&key.quota).undo_half_open(key_half_open);
+            }
+            crate::sync::lock(&account.quota).undo_half_open(account_half_open);
+            return Err(reason);
+        }
 
         target.budget.inflight.fetch_add(1, Ordering::Relaxed);
         account.budget.inflight.fetch_add(1, Ordering::Relaxed);
+        if let Some(key) = &key {
+            key.budget.inflight.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Admission {
             account,
+            key,
             target,
             _permit: permit,
             account_half_open,
+            key_half_open,
             half_open,
-            account_rate,
-            target_rate,
+            reservations,
+            limits,
             settled: false,
         })
     }
 
-    /// 排队必须同时等待账号共享容量与目标局部容量。
-    pub fn capacity(&self, account_id: &str, target_id: &str) -> Capacity {
+    /// 排队必须同时等待账号共享容量、Key 容量与目标局部容量（§4.2.1）。
+    pub fn capacity<L: Into<AdmissionLimits>>(&self, caller: Caller<'_>, limits: L) -> Capacity {
+        let account = self.account(caller.account_id);
+        let key = self.keyed(caller.account_id, caller.key_id);
+        let target = self.target(caller.target_id);
+        // 用**实际生效**的额度决定等哪一级：只看调用方传的值会漏掉真正满载的
+        // 那一级，等待者于是立刻被"有空位"的假象唤醒（§13.6、§17.1）。
+        let limits = effective_limits(limits.into(), &account, key.as_ref(), &target);
+        // 不限的级别不参与排队：只有配了上限的那一级才会被等。
+        self.capacity_of(&account, key.as_ref(), &target, limits)
+    }
+
+    /// 一个候选在"Key 还没选定"时可以等的容量。
+    ///
+    /// 排队阶段还不知道最终会用哪把 Key。等待**任意一把** Key 的名额释放，
+    /// 否则"池里两把都满"会一直卡在目标名额上，等一个永远不会到来的唤醒。
+    ///
+    /// 这里挑"最容易空出来"的那把：先看谁还有空闲名额，再看谁的上限最大。
+    /// 单靠一个信号量无法覆盖池里的每一把，所以调用方必须把这种情况当作"限流"
+    /// 做短轮询——唤醒可能来自没被选中的那一把（§13.6）。
+    pub fn capacity_any_key(
+        &self,
+        caller: Caller<'_>,
+        limits: AdmissionLimits,
+        keys: &[Arc<crate::credential::Credential>],
+    ) -> Capacity {
+        let account = self.account(caller.account_id);
+        let target = self.target(caller.target_id);
+        let key_budget = keys
+            .iter()
+            .filter(|key| key.enabled && key.limits.max_concurrency.is_some())
+            // 已经校准过的那把优先；同为满时取上限最大的（空出来的机会最多）。
+            .max_by_key(|key| {
+                let state = self.keyed(&key.account_id, Some(&key.credential_digest));
+                let free = state.as_ref().map(|s| s.budget.available()).unwrap_or(0);
+                (free > 0, key.limits.max_concurrency.unwrap_or(0), free)
+            })
+            .and_then(|key| self.keyed(&key.account_id, Some(&key.credential_digest)))
+            .map(|state| {
+                // 校准放在这里而不是选 Key 路径上：等待方要知道"这把 Key 有几个
+                // 名额"，否则信号量的额定容量还停在"不限"，等它永远不会醒。
+                state.budget.reconcile_capacity(limits.key.max_concurrency);
+                Arc::clone(&state.budget.permits)
+            });
         Capacity {
-            account: Arc::clone(&self.account(account_id).budget.permits),
-            target: Arc::clone(&self.target(target_id).budget.permits),
+            account: limits
+                .account
+                .max_concurrency
+                .map(|_| Arc::clone(&account.budget.permits)),
+            key: key_budget,
+            target: limits
+                .target
+                .max_concurrency
+                .map(|_| Arc::clone(&target.budget.permits)),
         }
+    }
+
+    /// 三级各自的名额；**只有配了上限的那一级才有名额可等**。
+    fn capacity_of(
+        &self,
+        account: &Arc<AccountState>,
+        key: Option<&Arc<KeyState>>,
+        target: &Arc<TargetState>,
+        limits: AdmissionLimits,
+    ) -> Capacity {
+        let bounded = |limits: Limits, budget: &Budget| {
+            limits.max_concurrency.map(|_| Arc::clone(&budget.permits))
+        };
+        Capacity {
+            account: bounded(limits.account, &account.budget),
+            key: key.and_then(|key| bounded(limits.key, &key.budget)),
+            target: bounded(limits.target, &target.budget),
+        }
+    }
+}
+
+/// 把"调用方要求的额度"与"三级各自已经配好的额度"合成**本轮实际生效**的额度。
+///
+/// 三处必须看到同一份结果：
+///
+/// * 准入（[\`Registry::admit\`]）用它决定扣多少、开哪个信号量；
+/// * 排队（[\`Registry::capacity\`]）用它决定等哪一级的名额；
+/// * 资格检查（[\`Registry::check\`]）用它判断忙不忙。
+///
+/// 口径是"逐级继承"：调用方没提并发就用该级已经校准好的配置值。把 `None` 当成
+/// "不限"会让满载的一级被当成有空位；把 `Some` 当成"只按它算"又会让排队的
+/// 唤醒源漏掉真正满载的那一级（§13.6、§17.1）。
+fn effective_limits(
+    requested: AdmissionLimits,
+    account: &AccountState,
+    key: Option<&Arc<KeyState>>,
+    target: &TargetState,
+) -> AdmissionLimits {
+    AdmissionLimits {
+        account: requested.account.with_configured(account.configured()),
+        key: requested
+            .key
+            .with_configured(key.and_then(|key| key.configured())),
+        target: requested.target.with_configured(target.configured()),
     }
 }
 
@@ -941,24 +1494,49 @@ mod tests {
         }
     }
 
+    /// 一个不带 Key 语义的调用者（账号 + 目标）。
+    ///
+    /// 单 Key 账号与探针路径都是这个形状：Key 级状态不参与，行为与引入 Key 池
+    /// 之前完全一致（§4.2.1）。
+    fn caller<'a>(account_id: &'a str, target_id: &'a str) -> Caller<'a> {
+        Caller {
+            account_id,
+            key_id: None,
+            target_id,
+        }
+    }
+
+    /// 一个绑定到具体 Key 的调用者（账号 + Key 归类键 + 目标）。
+    fn caller_with_key<'a>(account_id: &'a str, key_id: &'a str, target_id: &'a str) -> Caller<'a> {
+        Caller {
+            account_id,
+            key_id: Some(key_id),
+            target_id,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn isolated_faults_only_switch_but_a_run_of_them_trips_the_breaker() {
         let registry = Registry::new();
         // 孤立错误不熔断：连续 4 次仍然可以继续尝试（§12.3）。
         for _ in 0..CONSECUTIVE_TRIP - 1 {
             let admission = registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap();
             admission.settle(Outcome::Fault, None);
-            assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+            assert!(
+                registry
+                    .check(caller("acc", "tgt"), Limits::default())
+                    .is_ok()
+            );
         }
 
         let admission = registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap();
         admission.settle(Outcome::Fault, None);
         assert_eq!(
-            registry.check("acc", "tgt", Limits::default()),
+            registry.check(caller("acc", "tgt"), Limits::default()),
             Err(Unavailable::Cooling)
         );
     }
@@ -970,14 +1548,15 @@ mod tests {
         let mut tripped_after = None;
         for pair in 1..=20 {
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .settle(Outcome::Success, None);
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .settle(Outcome::Fault, None);
-            if registry.check("acc", "tgt", Limits::default()) == Err(Unavailable::Cooling) {
+            if registry.check(caller("acc", "tgt"), Limits::default()) == Err(Unavailable::Cooling)
+            {
                 tripped_after = Some(pair);
                 break;
             }
@@ -996,29 +1575,35 @@ mod tests {
         let registry = Registry::new();
         for _ in 0..CONSECUTIVE_TRIP {
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .settle(Outcome::Fault, None);
         }
         assert!(
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .is_err()
         );
 
         tokio::time::advance(COOLDOWN_BASE * 2).await;
         let trial = registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap();
         assert!(trial.is_half_open());
         // 只放行一个真实请求：第二个仍然被挡在冷却外（§12.3）。
         assert_eq!(
-            registry.try_admit("acc", "tgt", Limits::default(), 0).err(),
+            registry
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
+                .err(),
             Some(Unavailable::Cooling)
         );
 
         trial.settle(Outcome::Success, None);
-        assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+        assert!(
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1026,24 +1611,28 @@ mod tests {
         let registry = Registry::new();
         for _ in 0..CONSECUTIVE_TRIP {
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .settle(Outcome::Fault, None);
         }
         tokio::time::advance(COOLDOWN_BASE * 2).await;
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(Outcome::Fault, None);
 
         // 第一次冷却是 2^1，失败后升到 2^2；原来的时长已不足以放行。
         tokio::time::advance(COOLDOWN_BASE * 2).await;
         assert_eq!(
-            registry.check("acc", "tgt", Limits::default()),
+            registry.check(caller("acc", "tgt"), Limits::default()),
             Err(Unavailable::Cooling)
         );
         tokio::time::advance(COOLDOWN_BASE * 4).await;
-        assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+        assert!(
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1051,7 +1640,7 @@ mod tests {
         let registry = Registry::new();
         for _ in 0..CONSECUTIVE_TRIP {
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .settle(Outcome::Fault, None);
         }
@@ -1061,41 +1650,139 @@ mod tests {
         // 否则这个目标会永远停在"有人正在试运行"。
         drop(
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap(),
         );
         assert!(
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .unwrap()
                 .is_half_open()
         );
     }
 
+    /// 401/403 只停**那一把 Key**，账号内其他 Key 继续服务（§4.2.1）。
+    ///
+    /// 这是相对"一 Key 一账号"时代最重要的行为修正：单 Key 账号里账号与 Key
+    /// 的作用域恰好重合，表现不变；多 Key 账号里一把 Key 被封不该让整号停摆。
     #[tokio::test(start_paused = true)]
-    async fn an_invalid_key_pauses_every_model_on_the_account() {
+    async fn an_invalid_key_only_pauses_that_key() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt-a", Limits::default(), 0)
+            .try_admit(
+                caller_with_key("acc", "key-a", "tgt-a"),
+                Limits::default(),
+                0,
+            )
             .unwrap()
             .settle(Outcome::KeyInvalid, None);
-
-        // 同一把 Key 下的另一个模型也必须一起停（§12.1）。
+        // 同一把 Key 下的另一个模型也必须一起停。
         assert_eq!(
-            registry.check("acc", "tgt-b", Limits::default()),
+            registry.check(caller_with_key("acc", "key-a", "tgt-b"), Limits::default()),
             Err(Unavailable::KeyInvalid)
         );
         assert!(!Unavailable::KeyInvalid.is_queueable(), "鉴权失败绝不排队");
+        // 换一把 Key 立刻可用：账号没有整体进入硬停。
+        assert!(
+            registry
+                .check(caller_with_key("acc", "key-b", "tgt-a"), Limits::default())
+                .is_ok(),
+            "同账号的另一把 Key 不该被牵连"
+        );
 
+        // 管理员改过凭据之后，整个账号的 Key 一起解除硬停。
         registry.clear_account_faults("acc");
-        assert!(registry.check("acc", "tgt-b", Limits::default()).is_ok());
+        assert_eq!(
+            registry.check(caller_with_key("acc", "key-a", "tgt-b"), Limits::default()),
+            Ok(()),
+            "clear_account_faults 必须把该账号下每一把 Key 的硬停都清掉"
+        );
+    }
+
+    /// 一把 Key 额度耗尽同样只影响它自己（§4.2.1）。
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_key_leaves_the_others_alone() {
+        let registry = Registry::new();
+        registry
+            .try_admit(caller_with_key("acc", "key-a", "tgt"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::QuotaExhausted { retry_after: None }, None);
+
+        assert_eq!(
+            registry.check(caller_with_key("acc", "key-a", "tgt"), Limits::default()),
+            Err(Unavailable::QuotaExhausted)
+        );
+        assert!(
+            registry
+                .check(caller_with_key("acc", "key-b", "tgt"), Limits::default())
+                .is_ok()
+        );
+    }
+
+    /// 预算缩容之后，已发出的名额不能再被重复发放。
+    ///
+    /// 这是 Key 池最容易踩坏的一条：账号里每把 Key 都有自己的信号量，缩容必须
+    /// 只回收空闲名额，否则"把并发从 100 改成 1"会变成"再发一轮 99 个名额"。
+    #[tokio::test(start_paused = true)]
+    async fn shrinking_a_budget_never_hands_out_the_same_slot_twice() {
+        let budget = Budget::new();
+        let limits = Limits {
+            max_concurrency: Some(1),
+            ..Limits::default()
+        };
+        budget.reconcile_capacity(limits.max_concurrency);
+        let held = budget.try_acquire().unwrap();
+        assert_eq!(budget.available(), 0);
+        // 反复用同一个上限做校准：不能再放出名额。
+        for _ in 0..3 {
+            budget.reconcile_capacity(limits.max_concurrency);
+            assert_eq!(budget.available(), 0, "重复校准不能凭空放名额");
+        }
+        drop(held);
+        assert_eq!(budget.available(), 1);
+    }
+
+    /// Key 级并发上限独立生效：一把 Key 满了，另一把照常接（§17.1）。
+    ///
+    /// 三级门限是"账号 → Key → 目标"逐级收紧。这里刻意让**目标**宽松、只让 Key
+    /// 收紧，才能验证账号内多把 Key 之间额度互不侵占；三个维度混在一个用例里
+    /// 会先被上一层挡住，测不出 Key 级的独立性。
+    #[tokio::test(start_paused = true)]
+    async fn key_level_concurrency_is_enforced_per_key() {
+        let registry = Registry::new();
+        let key_slots = |slots: u32| AdmissionLimits {
+            key: Limits {
+                max_concurrency: Some(slots),
+                ..Limits::default()
+            },
+            ..AdmissionLimits::default()
+        };
+        let _held = registry
+            .try_admit(caller_with_key("acc", "key-a", "tgt-1"), key_slots(1), 0)
+            .unwrap();
+
+        // 同一把 Key、另一个目标：Key 级额度是跨目标的，仍然满。
+        assert_eq!(
+            registry
+                .try_admit(caller_with_key("acc", "key-a", "tgt-2"), key_slots(1), 0)
+                .err(),
+            Some(Unavailable::ConcurrencyFull),
+            "同一把 Key 的并发额度在它的所有目标之间共享"
+        );
+        // 换一把 Key、同一个目标：这把 Key 有自己的额度。
+        assert!(
+            registry
+                .try_admit(caller_with_key("acc", "key-b", "tgt-2"), key_slots(1), 0)
+                .is_ok(),
+            "另一把 Key 必须有自己的并发额度"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn quota_exhaustion_honours_the_upstream_recovery_time() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(
                 Outcome::QuotaExhausted {
@@ -1104,19 +1791,23 @@ mod tests {
                 None,
             );
         assert_eq!(
-            registry.check("acc", "tgt", Limits::default()),
+            registry.check(caller("acc", "tgt"), Limits::default()),
             Err(Unavailable::QuotaExhausted)
         );
 
         tokio::time::advance(Duration::from_secs(31)).await;
-        assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+        assert!(
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn quota_half_open_is_reserved_only_by_real_admission() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(
                 Outcome::QuotaExhausted {
@@ -1127,12 +1818,16 @@ mod tests {
         tokio::time::advance(Duration::from_secs(31)).await;
 
         // 资格检查不能提前占用账号级半开名额，否则后面的真实准入会被自己挡住。
-        assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+        assert!(
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok()
+        );
         let trial = registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .expect("半开恢复应允许一个真实试运行请求");
         assert_eq!(
-            registry.check("acc", "tgt", Limits::default()),
+            registry.check(caller("acc", "tgt"), Limits::default()),
             Err(Unavailable::QuotaExhausted)
         );
 
@@ -1140,7 +1835,7 @@ mod tests {
         drop(trial);
         assert!(
             registry
-                .try_admit("acc", "tgt", Limits::default(), 0)
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
                 .is_ok()
         );
     }
@@ -1154,19 +1849,19 @@ mod tests {
             ..Limits::default()
         };
         registry
-            .try_admit("acc", "tgt", limits, 50)
+            .try_admit(caller("acc", "tgt"), limits, 50)
             .unwrap()
             .cancel_before_upstream();
 
         // 终检失败或请求被取消在发往上游前发生时，不应吞掉本次限流预算。
-        assert!(registry.try_admit("acc", "tgt", limits, 50).is_ok());
+        assert!(registry.try_admit(caller("acc", "tgt"), limits, 50).is_ok());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_429_with_retry_after_cools_for_exactly_that_long() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(
                 Outcome::RateLimited {
@@ -1176,22 +1871,28 @@ mod tests {
             );
         tokio::time::advance(Duration::from_secs(11)).await;
         assert_eq!(
-            registry.check("acc", "tgt", Limits::default()),
+            registry.check(caller("acc", "tgt"), Limits::default()),
             Err(Unavailable::Cooling)
         );
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(registry.check("acc", "tgt", Limits::default()).is_ok());
+        assert!(
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_isolated_429_without_retry_after_only_switches() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(Outcome::RateLimited { retry_after: None }, None);
         assert!(
-            registry.check("acc", "tgt", Limits::default()).is_ok(),
+            registry
+                .check(caller("acc", "tgt"), Limits::default())
+                .is_ok(),
             "一次没带恢复时间的 429 只该触发本次切换"
         );
     }
@@ -1200,10 +1901,12 @@ mod tests {
     async fn concurrency_is_capped_and_released_on_drop() {
         let registry = Registry::new();
         let first = registry
-            .try_admit("acc", "tgt", limits(Some(1)), 0)
+            .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
             .unwrap();
         assert_eq!(
-            registry.try_admit("acc", "tgt", limits(Some(1)), 0).err(),
+            registry
+                .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
+                .err(),
             Some(Unavailable::ConcurrencyFull)
         );
         assert!(
@@ -1212,24 +1915,30 @@ mod tests {
         );
 
         drop(first);
-        assert!(registry.try_admit("acc", "tgt", limits(Some(1)), 0).is_ok());
+        assert!(
+            registry
+                .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn raising_and_lowering_the_concurrency_cap_takes_effect() {
         let registry = Registry::new();
         let held = registry
-            .try_admit("acc", "tgt", limits(Some(1)), 0)
+            .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
             .unwrap();
         // 提高上限立即生效。
         let second = registry
-            .try_admit("acc", "tgt", limits(Some(3)), 0)
+            .try_admit(caller("acc", "tgt"), limits(Some(3)), 0)
             .unwrap();
         let third = registry
-            .try_admit("acc", "tgt", limits(Some(3)), 0)
+            .try_admit(caller("acc", "tgt"), limits(Some(3)), 0)
             .unwrap();
         assert_eq!(
-            registry.try_admit("acc", "tgt", limits(Some(3)), 0).err(),
+            registry
+                .try_admit(caller("acc", "tgt"), limits(Some(3)), 0)
+                .err(),
             Some(Unavailable::ConcurrencyFull)
         );
 
@@ -1238,17 +1947,79 @@ mod tests {
         drop(third);
         assert!(
             registry
-                .try_admit("acc", "tgt", limits(Some(1)), 0)
+                .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
                 .is_err()
         );
         drop(held);
-        assert!(registry.try_admit("acc", "tgt", limits(Some(1)), 0).is_ok());
+        assert!(
+            registry
+                .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
+                .is_ok()
+        );
     }
 
+    /// 目标已配满时，**准入**必须拒绝（不能等只读的资格检查来拦）。
+    ///
+    /// 准入是热路径，它自己就是那道闸门：调用方传 `Limits::default()`（"对并发
+    /// 没意见"）时，必须沿用已经校准好的上限，而不是把它当成"不限"放行。
+    #[tokio::test(start_paused = true)]
+    async fn admission_honours_an_already_calibrated_target_cap() {
+        let registry = Registry::new();
+        let one_slot = Limits {
+            max_concurrency: Some(1),
+            ..Limits::default()
+        };
+        let _held = registry
+            .try_admit(caller("acc", "tgt"), one_slot, 0)
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .try_admit(caller("acc", "tgt"), Limits::default(), 0)
+                .err(),
+            Some(Unavailable::ConcurrencyFull),
+            "调用方没提并发时也要沿用已校准的上限"
+        );
+    }
+
+    /// 目标级满载必须被资格检查看到（§13.6）。
+    ///
+    /// 这条曾经被打破：资格检查路径上不校准容量，于是"目标已经满载"在检查看来
+    /// 是"1<<20 个名额全空"，排队与限流一起失效。
+    #[tokio::test(start_paused = true)]
+    async fn a_full_target_reports_concurrency_full() {
+        let registry = Registry::new();
+        let one_slot = Limits {
+            max_concurrency: Some(1),
+            ..Limits::default()
+        };
+        let _held = registry
+            .try_admit(caller("acc", "tgt"), one_slot, 0)
+            .unwrap();
+
+        assert_eq!(
+            registry.check(caller("acc", "tgt"), one_slot),
+            Err(Unavailable::ConcurrencyFull),
+            "占住唯一名额之后，检查必须报满载"
+        );
+        assert!(
+            Unavailable::ConcurrencyFull.is_queueable(),
+            "满载是\"忙\"，必须可排队"
+        );
+    }
+
+    /// 并发准入时容量校准不能重复发放名额。
+    ///
+    /// 校准是"把额定容量改到配置值"，多线程同时进来也必须收敛到同一个数字；
+    /// 这是 Key 池里每把 Key 各有一个信号量之后最容易踩坏的地方（§17.1）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_capacity_reconciliation_does_not_duplicate_permits() {
         let registry = Arc::new(Registry::new());
-        assert!(registry.check("acc", "tgt", limits(Some(1))).is_ok());
+        assert!(
+            registry
+                .try_admit(caller("acc", "tgt"), limits(Some(1)), 0)
+                .is_ok()
+        );
 
         let barrier = Arc::new(tokio::sync::Barrier::new(16));
         let mut tasks = Vec::new();
@@ -1257,7 +2028,10 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                registry.check("acc", "tgt", limits(Some(8)))
+                // 每一次都真的走准入路径：校准正是发生在这里。
+                registry
+                    .try_admit(caller("acc", "tgt"), limits(Some(8)), 0)
+                    .map(|admission| admission.cancel_before_upstream())
             }));
         }
         for task in tasks {
@@ -1265,8 +2039,13 @@ mod tests {
         }
 
         assert_eq!(
-            registry.capacity("acc", "tgt").target.available_permits(),
-            8
+            registry
+                .capacity(caller("acc", "tgt"), limits(Some(8)))
+                .target
+                .expect("target 名额应当存在")
+                .available_permits(),
+            8,
+            "反复校准必须恰好收敛到配置的 8，而不是越加越多"
         );
     }
 
@@ -1279,17 +2058,17 @@ mod tests {
         };
         for _ in 0..2 {
             registry
-                .try_admit("acc", "tgt", capped, 0)
+                .try_admit(caller("acc", "tgt"), capped, 0)
                 .unwrap()
                 .settle(Outcome::Success, None);
         }
         assert_eq!(
-            registry.try_admit("acc", "tgt", capped, 0).err(),
+            registry.try_admit(caller("acc", "tgt"), capped, 0).err(),
             Some(Unavailable::RateLimited)
         );
 
         tokio::time::advance(RATE_WINDOW * 2 + Duration::from_secs(1)).await;
-        assert!(registry.try_admit("acc", "tgt", capped, 0).is_ok());
+        assert!(registry.try_admit(caller("acc", "tgt"), capped, 0).is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1302,10 +2081,14 @@ mod tests {
         // 保守估算预留 900，实际只用了 100：差额必须还回窗口，否则一次
         // 大幅高估就能把整分钟的额度锁死。
         registry
-            .try_admit("acc", "tgt", capped, 900)
+            .try_admit(caller("acc", "tgt"), capped, 900)
             .unwrap()
             .settle(Outcome::Success, Some(100));
-        assert!(registry.try_admit("acc", "tgt", capped, 800).is_ok());
+        assert!(
+            registry
+                .try_admit(caller("acc", "tgt"), capped, 800)
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1316,10 +2099,10 @@ mod tests {
             max_concurrency: Some(1),
             ..Limits::default()
         };
-        let held = registry.try_admit("acc", "tgt", capped, 0).unwrap();
+        let held = registry.try_admit(caller("acc", "tgt"), capped, 0).unwrap();
         for _ in 0..20 {
             assert_eq!(
-                registry.try_admit("acc", "tgt", capped, 0).err(),
+                registry.try_admit(caller("acc", "tgt"), capped, 0).err(),
                 Some(Unavailable::ConcurrencyFull)
             );
         }
@@ -1327,7 +2110,7 @@ mod tests {
         // 被并发挡回的 20 次不能悄悄吃掉 RPM 额度。
         for _ in 0..9 {
             registry
-                .try_admit("acc", "tgt", capped, 0)
+                .try_admit(caller("acc", "tgt"), capped, 0)
                 .unwrap()
                 .settle(Outcome::Success, None);
         }
@@ -1337,7 +2120,7 @@ mod tests {
     async fn stale_entries_are_dropped_when_the_configuration_changes() {
         let registry = Registry::new();
         registry
-            .try_admit("acc", "tgt", Limits::default(), 0)
+            .try_admit(caller("acc", "tgt"), Limits::default(), 0)
             .unwrap()
             .settle(Outcome::Fault, None);
         registry.retain(&[], &[]);

@@ -113,6 +113,7 @@ const CHANGE_ACTION_LABELS: Record<string, string> = {
   update_account: "更新上游账号",
   delete_account: "删除上游账号",
   copy_account: "复制上游账号",
+  move_account: "迁移账号分组",
   test_account: "测试上游账号",
   refresh_multiplier: "刷新单个账号倍率",
   refresh_all_multipliers: "批量刷新倍率",

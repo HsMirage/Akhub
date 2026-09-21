@@ -111,16 +111,61 @@ export interface Account {
   model_synced_at: number | null;
   /** 账号级健康摘要（§6.9）：列表行内徽标用它。 */
   health: AccountHealth;
+  /** 账号内 Key 池的元数据（§4.2.1）。**不含明文**，只有标签、限额与摘要前缀。 */
+  keys: AccountKey[];
+}
+
+/// 账号内的一把 Key。**绝不包含明文凭据**（§23.2）。
+export interface AccountKey {
+  id: string;
+  label: string;
+  enabled: boolean;
+  limits: Limits;
+  /// 凭据摘要前 8 位，用于在同一账号的多把 Key 之间对号。
+  digest_prefix: string;
+  health: AccountKeyHealth;
+}
+
+/// 一把 Key 的健康摘要（§4.2.1）。
+export interface AccountKeyHealth {
+  id: string;
+  label: string;
+  enabled: boolean;
+  digest_prefix: string;
+  limits: Limits;
+  /// active / quota_exhausted / key_invalid / half_open
+  status: string;
+  /// 熔断冷却剩余秒数。
+  cooldown_secs: number | null;
+  /// 当前在途请求数。
+  inflight: number;
+}
+
+/// 提交给后台的一把 Key（§4.2.1）。
+///
+/// \`api_key\` 留空表示"保持已保存的那把不变"——后台从不回吐明文，所以"没改"
+/// 在传参上就是"有 id、没明文"。没有 \`id\` 的条目会被当作新增。
+export interface AccountKeyInput {
+  id?: string;
+  api_key?: string;
+  label?: string;
+  limits?: Limits;
+  enabled?: boolean;
 }
 
 /** 账号级健康摘要（§6.9）。 */
 export interface AccountHealth {
-  /** active / cooldown / half_open / quota_exhausted / key_invalid / disabled */
+  /** active / cooldown / half_open / quota_exhausted / key_invalid / no_key / disabled */
   status: string;
   reason: string | null;
   /** 该账号下的目标状态计数。 */
   targets: Record<string, number>;
   target_total: number;
+  /** 逐把 Key 的状态（§4.2.1）。 */
+  keys: AccountKeyHealth[];
+  /** Key 总数与其中启用的数量。 */
+  key_total: number;
+  key_enabled: number;
 }
 
 /** 账号模型目录里的一行（§16.2 / §16.4）。 */
@@ -534,6 +579,22 @@ export interface TestResult {
   status: number;
   latency_ms: number;
   model: string;
+  message: string;
+  /** 逐把 Key 的结果（§4.2.1）：多 Key 账号最有用的诊断动作。 */
+  keys?: TestKeyResult[];
+  /** 通过测试的 Key 数量，与总数一起给出"2/3 可用"。 */
+  healthy_keys?: number;
+  key_total?: number;
+}
+
+/** 单把 Key 的测试结果。只带标签，不带凭据。 */
+export interface TestKeyResult {
+  id: string;
+  label: string;
+  enabled: boolean;
+  ok: boolean;
+  status: number;
+  latency_ms: number;
   message: string;
 }
 

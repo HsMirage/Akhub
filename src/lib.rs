@@ -8,6 +8,7 @@ pub mod app;
 pub mod auth;
 pub mod capability;
 pub mod config;
+pub mod credential;
 pub mod discovery;
 pub mod domain;
 pub mod gateway;

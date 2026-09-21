@@ -165,6 +165,17 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// 调用方没提并发时，沿用已经配好的上限。
+    ///
+    /// `None` 在准入路径上表示"调用方对并发没有意见"，而**不是**"把上限改成
+    /// 不限"。两者混同会让一个已经校准到 1 的目标被当成有空位（§17.1）。
+    pub fn with_configured(self, configured: Option<u32>) -> Limits {
+        Limits {
+            max_concurrency: self.max_concurrency.or(configured),
+            ..self
+        }
+    }
+
     /// 用目标的覆盖值盖住账号默认值，逐项生效。
     pub fn overridden_by(self, over: Limits) -> Limits {
         Limits {

@@ -399,6 +399,171 @@ pub async fn add_manual_model(
     Ok(())
 }
 
+// ------------------------------------------------------------------ 批量应用
+
+/// 一次批量应用里的单行改动（§16.3）。
+///
+/// 界面的勾选是"本地草稿 + 防抖提交"：连点十几个复选框只发一次请求，服务端
+/// 也只调和一遍目标、只重载一遍配置。
+#[derive(Debug, Clone)]
+pub struct ModelChange {
+    pub upstream_model: String,
+    /// `None` 表示不改下游模型名；空字符串表示清空、回到上游原名。
+    pub alias: Option<String>,
+    pub selected: Option<bool>,
+    /// 从目录里删除这一行（连同它的调度目标）。
+    pub delete: bool,
+}
+
+/// 批量应用的结果：需要二次确认时整体不动。
+#[derive(Debug)]
+pub enum Changes {
+    Applied { updated: usize },
+    NeedsConfirm(Vec<UnselectWarning>),
+}
+
+/// 批量应用模型目录改动，并把目标调和一次（§16.3）。
+///
+/// 勾选、改名、删除都从这里走：改动先校验、再一次事务落库，然后**只**调和
+/// 一遍目标。逐行调用会让每一次勾选都付出"重建配置快照 + 重建凭据池"的
+/// 代价，几百个模型时界面就会明显卡住。
+pub async fn apply_changes(
+    state: &SharedState,
+    account: &Account,
+    changes: &[ModelChange],
+    force: bool,
+) -> Result<Changes> {
+    if changes.is_empty() {
+        return Ok(Changes::Applied { updated: 0 });
+    }
+    let catalog = state.store.list_account_models(&account.id).await?;
+    let targets = state.store.list_targets().await?;
+    let by_name: HashMap<&str, &AccountModelRow> = catalog
+        .iter()
+        .map(|row| (row.upstream_model.as_str(), row))
+        .collect();
+
+    // 先把请求本身校验干净：名字与下游名都要过和拉取时同一套清洗规则，
+    // 并且指向目录里真实存在的行（否则改完谁都不知道改了什么）。校验失败时
+    // 直接返回错误、一行都不写。
+    let mut validated: Vec<(String, &ModelChange)> = Vec::with_capacity(changes.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(changes.len());
+    for change in changes {
+        let upstream = validate_model_id(&change.upstream_model)?;
+        if !seen.insert(upstream.clone()) {
+            bail!("模型 {upstream} 在同一次请求里出现了两次");
+        }
+        if !by_name.contains_key(upstream.as_str()) {
+            bail!("模型不在当前目录里：{upstream}");
+        }
+        if let Some(alias) = &change.alias {
+            normalize_alias(&upstream, alias)?;
+        }
+        validated.push((upstream, change));
+    }
+
+    // 停用 / 删除有流量的模型要二次确认，未确认时整体不动（§16.3）。
+    let enabled: HashSet<&str> = targets
+        .iter()
+        .filter(|target| target.account_id == account.id && target.enabled)
+        .map(|target| target.upstream_model.as_str())
+        .collect();
+    let traffic = if validated
+        .iter()
+        .any(|(_, change)| change.delete || change.selected == Some(false))
+    {
+        recent_traffic(state, account).await?
+    } else {
+        HashMap::new()
+    };
+
+    let mut writes: Vec<AccountModelRow> = Vec::new();
+    let mut deletes: Vec<String> = Vec::new();
+    let mut warnings: Vec<UnselectWarning> = Vec::new();
+    for (upstream, change) in &validated {
+        let row = by_name[upstream.as_str()];
+        if change.delete {
+            if row.selected && enabled.contains(upstream.as_str()) {
+                let calls = traffic.get(&row.public_name).copied().unwrap_or(0);
+                if calls > 0 {
+                    warnings.push(UnselectWarning {
+                        public_name: row.public_name.clone(),
+                        calls,
+                    });
+                }
+            }
+            deletes.push(upstream.clone());
+            continue;
+        }
+        let mut updated = row.clone();
+        let mut dirty = false;
+        if let Some(alias) = &change.alias {
+            let next = normalize_alias(upstream, alias)?;
+            if next != updated.public_name {
+                updated.public_name = next;
+                dirty = true;
+            }
+        }
+        if let Some(selected) = change.selected {
+            if row.selected && !selected && enabled.contains(upstream.as_str()) {
+                let calls = traffic.get(&row.public_name).copied().unwrap_or(0);
+                if calls > 0 {
+                    warnings.push(UnselectWarning {
+                        public_name: row.public_name.clone(),
+                        calls,
+                    });
+                }
+            }
+            if updated.selected != selected {
+                updated.selected = selected;
+                dirty = true;
+            }
+        }
+        if dirty {
+            writes.push(updated);
+        }
+    }
+
+    if !warnings.is_empty() && !force {
+        return Ok(Changes::NeedsConfirm(warnings));
+    }
+
+    // 目录改动一次事务落库；删除行对应的目标先摘掉，调和阶段才能把零目标的
+    // 自动逻辑模型一起收走。
+    state
+        .store
+        .upsert_account_models(&account.id, &writes)
+        .await?;
+    let mut removed_targets: Vec<String> = Vec::new();
+    for upstream in &deletes {
+        state
+            .store
+            .delete_account_model(&account.id, upstream)
+            .await?;
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.account_id == account.id && &target.upstream_model == upstream)
+        {
+            removed_targets.push(target.id.clone());
+        }
+    }
+    if !removed_targets.is_empty() {
+        state
+            .store
+            .apply_config_delta(&[], &[], &removed_targets, &[])
+            .await?;
+    }
+
+    let reconciled = reconcile_account(state, account, account.auto_sync).await?;
+    // 调和没发现变化时也要重载：刚才摘掉的目标是直接写库的。
+    if !reconciled && !removed_targets.is_empty() {
+        state.reload_config().await?;
+    }
+    Ok(Changes::Applied {
+        updated: writes.len() + deletes.len(),
+    })
+}
+
 // ---------------------------------------------------------------- 选择集兼容
 
 /// 把账号的选择集批量应用为期望状态（§16.2、§16.3）。
@@ -413,6 +578,14 @@ pub async fn apply_selection(
 ) -> Result<Selection> {
     let catalog = state.store.list_account_models(&account.id).await?;
     let traffic = recent_traffic(state, account).await?;
+    // 目标按 (账号, 上游模型) 建一次索引。逐行去扫一遍全表在几百个模型
+    // 时是 O(行 × 目标)，而勾选一次就要走一遍这个循环。
+    let targets = state.store.list_targets().await?;
+    let enabled: HashSet<(&str, &str)> = targets
+        .iter()
+        .filter(|target| target.account_id == account.id && target.enabled)
+        .map(|target| (target.account_id.as_str(), target.upstream_model.as_str()))
+        .collect();
 
     // 先算清楚哪些移除需要确认：需要时整体拒绝，不做一半留一半。
     let mut conflicts = Vec::new();
@@ -420,9 +593,7 @@ pub async fn apply_selection(
         if is_desired(row, desired) {
             continue;
         }
-        if let Some(target) = find_target_for_upstream(state, account, &row.upstream_model).await?
-            && target.enabled
-        {
+        if enabled.contains(&(account.id.as_str(), row.upstream_model.as_str())) {
             let calls = traffic.get(&row.public_name).copied().unwrap_or(0);
             if calls > 0 {
                 conflicts.push(UnselectWarning {
@@ -436,21 +607,25 @@ pub async fn apply_selection(
         return Ok(Selection::NeedsConfirm(conflicts));
     }
 
+    // 选择集标记一次性落库：逐行 UPDATE 是逐行一个事务，全选一百个模型
+    // 就是一百次提交。
+    let mut pending: Vec<AccountModelRow> = Vec::new();
     for row in &catalog {
         let want = is_desired(row, desired);
         if row.selected != want {
-            state
-                .store
-                .set_account_model_selected(&account.id, &row.upstream_model, want)
-                .await?;
+            let mut updated = row.clone();
+            updated.selected = want;
+            pending.push(updated);
         }
     }
-    let before = state
+    state
         .store
-        .list_targets()
-        .await?
+        .upsert_account_models(&account.id, &pending)
+        .await?;
+
+    let before = targets
         .iter()
-        .filter(|t| t.account_id == account.id)
+        .filter(|target| target.account_id == account.id)
         .count();
     reconcile_account(state, account, false).await?;
     let after = state
@@ -509,28 +684,84 @@ pub async fn reconcile_account(
         }
     }
 
-    for row in &catalog {
-        let wanted = include_all || row.selected;
-        let intent = if !wanted {
-            RowIntent::Remove
-        } else if row.missing {
-            RowIntent::Disable
-        } else {
-            RowIntent::Ensure
-        };
+    // 目录每一行的期望状态先算清楚：下面既要用它决定目标增删，也要用它算出
+    // "还有哪些逻辑模型有目标"。
+    let intents: HashMap<&str, RowIntent> = catalog
+        .iter()
+        .map(|row| {
+            let wanted = include_all || row.selected;
+            let intent = if !wanted {
+                RowIntent::Remove
+            } else if row.missing {
+                RowIntent::Disable
+            } else {
+                RowIntent::Ensure
+            };
+            (row.upstream_model.as_str(), intent)
+        })
+        .collect();
 
-        let position = targets
-            .iter()
-            .position(|t| t.account_id == account.id && t.upstream_model == row.upstream_model);
+    // 本账号的目标按上游模型名建索引。逐行掃一遍全表是
+    // O(目录行数 × 目标数)，几百个模型的账号上一次勾选就会明显卡住。
+    let mut owned: HashMap<String, usize> = HashMap::with_capacity(catalog.len());
+    for (index, target) in targets.iter().enumerate() {
+        if target.account_id == account.id {
+            owned.insert(target.upstream_model.clone(), index);
+        }
+    }
+
+    // 逻辑模型索引：分组 + 名字 → 下标。没有索引时每一行都要列一遍全部逻辑
+    // 模型，"一个账号两百个模型"就会退化成几万次字符串比较。
+    let mut model_index: HashMap<(String, String), usize> = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| ((model.group_id.clone(), model.name.clone()), index))
+        .collect();
+
+    // 下面所有改动都先记在内存里，最后合成一次事务落库。逐行写是逐行事务，
+    // 在几百行的目录上等于几百次提交，这也是"勾一下卡一下"的来源之一。
+    let mut target_writes: Vec<DispatchTarget> = Vec::new();
+    let mut target_deletes: Vec<String> = Vec::new();
+    let mut model_writes: Vec<LogicalModel> = Vec::new();
+    let mut model_deletes: Vec<String> = Vec::new();
+
+    // 有目标的逻辑模型：先把全部目标算进来，再挖掉这次要删除的本账号目标。
+    // 只按"目录里还有没有行"判断会漏掉"最后一行被移出选择集"的情况（§16.3）。
+    let mut live: HashSet<String> = HashSet::new();
+    for target in &targets {
+        let removed = target.account_id == account.id
+            && matches!(
+                intents.get(target.upstream_model.as_str()),
+                Some(RowIntent::Remove)
+            );
+        if !removed {
+            live.insert(target.logical_model_id.clone());
+        }
+    }
+
+    for row in &catalog {
+        let intent = intents
+            .get(row.upstream_model.as_str())
+            .copied()
+            .unwrap_or(RowIntent::Ensure);
+        let position = owned.get(&row.upstream_model).copied();
 
         match (intent, position) {
             (RowIntent::Ensure, Some(index)) => {
-                let desired =
-                    ensure_logical_model(state, &account.group_id, &row.public_name).await?;
+                let model = ensure_logical_model(
+                    &mut models,
+                    &mut model_writes,
+                    &mut model_index,
+                    &account.group_id,
+                    &row.public_name,
+                    ModelOrigin::Auto,
+                );
+                let desired_id = models[model].id.clone();
+                live.insert(desired_id.clone());
                 let target = &mut targets[index];
                 let mut dirty = false;
-                if target.logical_model_id != desired.id {
-                    target.logical_model_id = desired.id.clone();
+                if target.logical_model_id != desired_id {
+                    target.logical_model_id = desired_id;
                     dirty = true;
                 }
                 if target.enabled != !row.missing {
@@ -547,17 +778,24 @@ pub async fn reconcile_account(
                     dirty = true;
                 }
                 if dirty {
-                    state.store.update_target(target).await?;
+                    target_writes.push(target.clone());
                     changed = true;
                 }
-                models.push(desired);
             }
             (RowIntent::Ensure, None) => {
-                let desired =
-                    ensure_logical_model(state, &account.group_id, &row.public_name).await?;
-                let target = DispatchTarget {
+                let model = ensure_logical_model(
+                    &mut models,
+                    &mut model_writes,
+                    &mut model_index,
+                    &account.group_id,
+                    &row.public_name,
+                    ModelOrigin::Auto,
+                );
+                let model_id = models[model].id.clone();
+                live.insert(model_id.clone());
+                target_writes.push(DispatchTarget {
                     id: ids::target(),
-                    logical_model_id: desired.id.clone(),
+                    logical_model_id: model_id,
                     account_id: account.id.clone(),
                     upstream_model: row.upstream_model.clone(),
                     hide_original: account.hide_original,
@@ -566,22 +804,19 @@ pub async fn reconcile_account(
                     limits: Limits::default(),
                     enabled: true,
                     created_at: OffsetDateTime::now_utc(),
-                };
-                state.store.insert_target(&target).await?;
-                targets.push(target);
-                models.push(desired);
+                });
                 changed = true;
             }
             (RowIntent::Disable, Some(index)) => {
-                if targets[index].enabled {
-                    targets[index].enabled = false;
-                    state.store.update_target(&targets[index]).await?;
+                let target = &mut targets[index];
+                if target.enabled {
+                    target.enabled = false;
+                    target_writes.push(target.clone());
                     changed = true;
                 }
             }
             (RowIntent::Remove, Some(index)) => {
-                let target = targets.remove(index);
-                state.store.delete_target(&target.id).await?;
+                target_deletes.push(targets[index].id.clone());
                 changed = true;
             }
             (RowIntent::Disable | RowIntent::Remove, None) => {}
@@ -589,15 +824,27 @@ pub async fn reconcile_account(
     }
 
     // 零目标的自动创建逻辑模型随最后一个目标一起清理（§16.3）。
-    let live: HashSet<String> = targets
-        .iter()
-        .map(|target| target.logical_model_id.clone())
-        .collect();
     for model in models.iter().filter(|m| m.origin == ModelOrigin::Auto) {
         if !live.contains(&model.id) {
-            state.store.delete_logical_model(&model.id).await?;
+            model_deletes.push(model.id.clone());
             changed = true;
         }
+    }
+
+    if !target_writes.is_empty()
+        || !target_deletes.is_empty()
+        || !model_writes.is_empty()
+        || !model_deletes.is_empty()
+    {
+        state
+            .store
+            .apply_config_delta(
+                &model_writes,
+                &target_writes,
+                &target_deletes,
+                &model_deletes,
+            )
+            .await?;
     }
 
     if changed {
@@ -606,25 +853,133 @@ pub async fn reconcile_account(
     Ok(changed)
 }
 
-/// 按分组与对外名找到逻辑模型；不存在时自动创建（§16.3）。
-async fn ensure_logical_model(
+/// 账号换组后，把它名下的调度目标按对外名一起搬到新分组（§4.2.2）。
+///
+/// 分组是调度的硬边界：目标必须与账号同组，跨组的行在配置装配时会被直接
+/// 丢弃（§4.1）。所以"改分组"不能只改账号上那一列外键——旧的逻辑模型属于
+/// 旧分组，账号搬过去之后一个模型都不剩。这里的口径是**按对外名平移**：
+///
+/// * 新分组里已有同名逻辑模型 → 目标直接挂上去，与新分组的其他账号合并候选；
+/// * 没有 → 建一个同名的，来源标记（自动 / 手工）沿用原模型，因此"自动模型
+///   随最后一个目标消失"的清理规则不会因为搬过一次家而失效；
+/// * 旧分组里因此空出来的自动模型随最后一个目标一起清理（§16.3）。
+///
+/// 只动这个账号自己的目标：别的账号与旧分组的其余配置一概不碰。返回移动过的
+/// 目标数，供调用方写审计与提示。
+pub async fn move_account_targets(
     state: &SharedState,
+    account: &Account,
+    from_group: &str,
+) -> Result<usize> {
+    let mut models = state.store.list_logical_models().await?;
+    let mut targets = state.store.list_targets().await?;
+    // 目标在下面会被改写，先把"它原来挂在哪个模型上"抄下来：模型的组、对外名
+    // 与来源在搬迁过程中都不该被重新推导。
+    let meta: HashMap<String, (String, String, ModelOrigin)> = models
+        .iter()
+        .map(|model| {
+            (
+                model.id.clone(),
+                (model.name.clone(), model.group_id.clone(), model.origin),
+            )
+        })
+        .collect();
+
+    let mut model_writes: Vec<LogicalModel> = Vec::new();
+    let mut model_index: HashMap<(String, String), usize> = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| ((model.group_id.clone(), model.name.clone()), index))
+        .collect();
+    let mut target_writes: Vec<DispatchTarget> = Vec::new();
+    let mut moved = 0usize;
+
+    for target in targets.iter_mut().filter(|t| t.account_id == account.id) {
+        let Some((name, group, origin)) = meta.get(&target.logical_model_id) else {
+            continue;
+        };
+        // 已经在新分组里的目标不动：迁移中途失败时重跑一次即可收敛。
+        if group != from_group {
+            continue;
+        }
+        let position = ensure_logical_model(
+            &mut models,
+            &mut model_writes,
+            &mut model_index,
+            &account.group_id,
+            name,
+            *origin,
+        );
+        let desired = models[position].id.clone();
+        if desired != target.logical_model_id {
+            target.logical_model_id = desired;
+            target_writes.push(target.clone());
+            moved += 1;
+        }
+    }
+
+    // 旧分组里空出来的自动模型随最后一个目标一起清理（§16.3）。手工模型保留，
+    // 与"零目标仍留在管理页面"的口径一致（§4.4）。
+    let live: HashSet<&str> = targets
+        .iter()
+        .map(|target| target.logical_model_id.as_str())
+        .collect();
+    let model_deletes: Vec<String> = models
+        .iter()
+        .filter(|model| {
+            model.group_id == from_group
+                && model.origin == ModelOrigin::Auto
+                && !live.contains(model.id.as_str())
+        })
+        .map(|model| model.id.clone())
+        .collect();
+
+    if !model_writes.is_empty() || !target_writes.is_empty() || !model_deletes.is_empty() {
+        state
+            .store
+            .apply_config_delta(&model_writes, &target_writes, &[], &model_deletes)
+            .await?;
+    }
+    if moved > 0 || !model_deletes.is_empty() {
+        state.reload_config().await?;
+    }
+    Ok(moved)
+}
+
+/// 按分组与对外名定位逻辑模型；不存在时登记待创建并返回它在 models 里的下标。
+///
+/// 新建的模型同时写进 pending（本次事务要落库的部分）与内存索引，所以同一
+/// 次调和里多个目录行要同一个对外名时只会建一个——"两个上游名归并到同一个
+/// 下游名"正是靠这一点才成为同一个逻辑模型（§16.4）。
+///
+/// `origin` 是"这个新模型凭什么被清理"的标记（§4.4）：目录调和建出来的是
+/// 自动模型，随最后一个目标消失；分组迁移沿用原模型的来源，手工建的模型
+/// 不会因为搬了一次家就变成会被自动清理的。
+fn ensure_logical_model(
+    models: &mut Vec<LogicalModel>,
+    pending: &mut Vec<LogicalModel>,
+    index: &mut HashMap<(String, String), usize>,
     group_id: &str,
     name: &str,
-) -> Result<LogicalModel> {
-    if let Some(model) = find_logical_model(state, group_id, name).await? {
-        return Ok(model);
+    origin: ModelOrigin,
+) -> usize {
+    let key = (group_id.to_string(), name.to_string());
+    if let Some(existing) = index.get(&key) {
+        return *existing;
     }
     let model = LogicalModel {
         id: ids::logical_model(),
         group_id: group_id.to_string(),
         name: name.to_string(),
-        origin: ModelOrigin::Auto,
+        origin,
         enabled: true,
         created_at: OffsetDateTime::now_utc(),
     };
-    state.store.insert_logical_model(&model).await?;
-    Ok(model)
+    models.push(model.clone());
+    pending.push(model);
+    let position = models.len() - 1;
+    index.insert(key, position);
+    position
 }
 
 /// 自动创建的逻辑模型失去最后一个目标时随之清理（§16.3）。
@@ -665,20 +1020,6 @@ async fn find_target_for_upstream(
         .await?
         .into_iter()
         .find(|t| t.account_id == account.id && t.upstream_model == upstream_model))
-}
-
-/// 按分组与对外名定位逻辑模型。
-async fn find_logical_model(
-    state: &SharedState,
-    group_id: &str,
-    name: &str,
-) -> Result<Option<LogicalModel>> {
-    Ok(state
-        .store
-        .list_logical_models()
-        .await?
-        .into_iter()
-        .find(|m| m.group_id == group_id && m.name == name))
 }
 
 /// 该账号各逻辑模型最近 24 小时的调用次数（§16.3）。

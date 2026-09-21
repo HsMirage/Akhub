@@ -45,6 +45,9 @@ pub enum Behavior {
     StreamErrorEvent,
     /// 按协议返回一次工具调用，用于验证跨协议的工具往返。
     ToolCall,
+    /// 按**凭据**决定行为（§4.2.1）：命中给定 Key 时走对应的行为，否则走
+    /// 默认行为。用来验证"哪把 Key 被用了"与"Key 级故障转移"。
+    PerKey(std::collections::HashMap<String, Behavior>),
 }
 
 /// 假上游收到的一次请求。
@@ -136,6 +139,27 @@ impl FakeUpstream {
         self.seen.lock().unwrap().len()
     }
 
+    /// 某一把 Key 收到过多少次请求（§4.2.1 的归因断言）。
+    pub fn requests_with_key(&self, key: &str) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| api_key_of(&seen.headers).as_deref() == Some(key))
+            .count()
+    }
+
+    /// 每把 Key 各收到多少次请求，按 Key 排序。
+    pub fn key_histogram(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for seen in self.seen.lock().unwrap().iter() {
+            if let Some(key) = api_key_of(&seen.headers) {
+                *counts.entry(key).or_insert(0usize) += 1;
+            }
+        }
+        counts
+    }
+
     /// 等到假上游收到第 `count` 个请求，用于同步"请求已经挂起"这类状态。
     pub async fn wait_for_requests(&self, count: usize) {
         for _ in 0..200 {
@@ -156,6 +180,18 @@ impl FakeUpstream {
     }
 }
 
+/// 从请求头里取出这次调用用的凭据。
+///
+/// OpenAI 形状用 Authorization: Bearer，Anthropic 形状用 x-api-key。假上游靠它
+/// 把请求归因到具体哪把 Key（§4.2.1）。
+pub fn api_key_of(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(value.to_string());
+    }
+    let value = headers.get("authorization")?.to_str().ok()?;
+    Some(value.strip_prefix("Bearer ").unwrap_or(value).to_string())
+}
+
 async fn inference(
     State(upstream): State<FakeUpstream>,
     uri: Uri,
@@ -166,7 +202,7 @@ async fn inference(
     upstream.seen.lock().unwrap().push(Seen {
         path: uri.path().to_string(),
         body: parsed.clone(),
-        headers,
+        headers: headers.clone(),
     });
     let streaming = parsed
         .get("stream")
@@ -174,8 +210,17 @@ async fn inference(
         .unwrap_or(false);
     let path = uri.path().to_string();
 
-    match upstream.next_behavior() {
-        Behavior::Ok => {
+    // 按凭据分派时先看这一把 Key：命中就用它的行为，未命中回落到默认行为。
+    let behavior = match upstream.next_behavior() {
+        Behavior::PerKey(map) => match api_key_of(&headers) {
+            Some(key) => map.get(&key).cloned().unwrap_or(Behavior::Ok),
+            None => Behavior::Ok,
+        },
+        other => other,
+    };
+    match behavior {
+        // 上面已经拆过一层；嵌套的 PerKey 不再展开，按默认行为处理。
+        Behavior::PerKey(_) | Behavior::Ok => {
             if streaming {
                 sse(&path, &ok_frames(&path))
             } else {
@@ -454,6 +499,55 @@ impl Akhub {
     }
 }
 
+/// 在**指定目录**上启动 Akhub 并建一个分组。
+///
+/// 供"同一个数据目录起两遍"的重启类用例使用：第二次调用时分组已经存在，
+/// 只把服务重新挂起来，并复用原来那把下游 Key。
+pub async fn spawn_akhub_at(dir: &std::path::Path, key: Option<&str>) -> Option<Akhub> {
+    let state = AppState::bootstrap(dir, Settings::default()).await.ok()?;
+    let existing = state.store.list_groups().await.ok()?.into_iter().next();
+    let group = match existing {
+        Some(group) => group,
+        None => {
+            // 第一次调用：key 为 None 时现生成一把；重启调用应当把上一轮的 key
+            // 传回来，否则第二次的服务会拒绝所有下游请求。
+            let (generated, prefix) = akhub::security::generate_group_key().unwrap();
+            let key = key.unwrap_or(&generated).to_string();
+            let group = Group {
+                id: ids::group(),
+                name: "主力".into(),
+                key_prefix: prefix,
+                key_digest_hex: state.key_digest.digest_hex(&key),
+                multiplier_limit: Multiplier::ONE,
+                weights: SchedulingWeights::default(),
+                queue_capacity: 100,
+                max_wait_secs: 60,
+                allow_managed_background: false,
+                allow_degrade: true,
+                created_at: OffsetDateTime::now_utc(),
+            };
+            state.store.insert_group(&group).await.unwrap();
+            state.reload_config().await.unwrap();
+            return Some(Akhub {
+                base_url: serve(state.clone()).await,
+                key,
+                group_id: group.id,
+                state,
+                dir: tempfile::tempdir().unwrap(),
+            });
+        }
+    };
+    // 分组已经存在：调用方必须给出上一轮那把下游 Key。
+    let key = key?.to_string();
+    Some(Akhub {
+        base_url: serve(state.clone()).await,
+        key,
+        group_id: group.id,
+        state,
+        dir: tempfile::tempdir().unwrap(),
+    })
+}
+
 /// 用已有的状态再起一台 HTTP 服务，模拟重启后的进程。
 pub async fn serve(state: SharedState) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -573,8 +667,47 @@ impl<'a> TargetSpec<'a> {
 pub struct Wired {
     pub account_id: String,
     pub target_id: String,
+    /// 该账号的唯一那把 Key 的行 ID（§4.2.1）。
+    pub key_id: String,
+    /// 那把 Key 在动态状态表里的归类键（凭据摘要）。
+    pub credential_digest: String,
     /// 该账号的上游 API Key 明文，形如 `key-<账号名>`，供假上游按请求头归因。
     pub api_key: String,
+}
+
+/// 直接建一个账号行并带上**一把 Key 的池**（§4.2.1）。
+///
+/// 供只关心调度行为的测试使用：它们要的是"这个账号有一把能用的凭据"，
+/// 而不是走一遍后台的建号流程。Key 池不能省——网关的凭据只从池里取。
+pub async fn insert_account_with_key(
+    state: &SharedState,
+    account: &Account,
+    api_key: &str,
+) -> String {
+    let sealed = state.cipher.seal(api_key.as_bytes()).unwrap();
+    state
+        .store
+        .insert_account(account, &AccountSecrets::new(sealed.clone(), None))
+        .await
+        .unwrap();
+    let key_id = format!("key_{}", account.id);
+    state
+        .store
+        .replace_account_keys(
+            &account.id,
+            &[akhub::storage::store::AccountKeyWrite {
+                id: key_id.clone(),
+                label: String::new(),
+                sealed_key: sealed,
+                credential_digest: akhub::security::credential_digest(api_key),
+                limits: akhub::domain::Limits::default(),
+                enabled: true,
+            }],
+        )
+        .await
+        .unwrap();
+    state.reload_credentials().await.unwrap();
+    key_id
 }
 
 /// 在分组下建一个账号，并把它接到一个逻辑模型上。
@@ -606,22 +739,30 @@ pub async fn wire_target(akhub: &Akhub, spec: TargetSpec<'_>) -> Wired {
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
     };
-    let secrets = AccountSecrets::new(
-        state.cipher.seal(api_key.as_bytes()).unwrap(),
-        spec.new_api
-            .map(|(token, _, _)| state.cipher.seal(token.as_bytes()).unwrap()),
-    );
-    state
-        .store
-        .insert_account(&account, &secrets)
-        .await
-        .unwrap();
+    // 推理凭据与 New API 访问令牌是两把不同的 Key（§11.2），由 helper 一次
+    // 写全：先建账号 + Key 池，再补探针令牌。
+    let key_id = insert_account_with_key(state, &account, &api_key).await;
+    if let Some((token, _, _)) = spec.new_api {
+        state
+            .store
+            .update_account(
+                &account,
+                &AccountSecrets {
+                    api_key: None,
+                    new_api_token: Some(state.cipher.seal(token.as_bytes()).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+    }
 
     let target_id =
         wire_extra_target(akhub, &account.id, spec.logical_model, spec.upstream_model).await;
     Wired {
         account_id: account.id,
         target_id,
+        key_id,
+        credential_digest: akhub::security::credential_digest(&api_key),
         api_key,
     }
 }

@@ -37,7 +37,17 @@ pub struct BackupData {
     pub groups: Vec<Value>,
     pub accounts: Vec<Value>,
     /// 上游凭据：`{account_id, api_key, new_api_token}`，明文（整体加密保护）。
+    ///
+    /// v10 起它是 **Key 池第一把 Key 的镜像**：Key 池是唯一真相，这里保留一份
+    /// 是为了让旧二进制与旧备份的恢复路径仍然可用（§4.2.1）。
     pub secrets: Vec<Value>,
+    /// 账号内 Key 池：`{id, account_id, label, api_key, limits..., enabled}`。
+    ///
+    /// 带 `serde(default)`：v10 之前导出的备份没有这一项，恢复时按"从
+    /// `secrets` 展开成一把 Key"处理，不能因为多了个字段就拒绝一份本来
+    /// 完好的备份（§23.5）。
+    #[serde(default)]
+    pub account_keys: Vec<Value>,
     pub logical_models: Vec<Value>,
     pub dispatch_targets: Vec<Value>,
     pub account_models: Vec<Value>,
@@ -75,6 +85,7 @@ pub async fn export_backup(
         groups: store.backup_groups().await?,
         accounts: store.backup_accounts().await?,
         secrets: store.backup_secrets(cipher).await?,
+        account_keys: store.backup_account_keys(cipher).await?,
         logical_models: store.backup_logical_models().await?,
         dispatch_targets: store.backup_targets().await?,
         account_models: store.backup_account_models().await?,
@@ -171,6 +182,7 @@ mod tests {
             dispatch_targets: vec![],
             account_models: vec![],
             account_aliases: vec![],
+            account_keys: vec![],
             app_settings: vec![],
         };
         let bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "口令123").unwrap();
@@ -196,6 +208,7 @@ mod tests {
             dispatch_targets: vec![],
             account_models: vec![],
             account_aliases: vec![],
+            account_keys: vec![],
             app_settings: vec![],
         };
         let mut bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "pw").unwrap();

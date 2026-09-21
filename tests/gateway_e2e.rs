@@ -3,6 +3,8 @@
 //! 这些测试不 mock 网关内部，只 mock 上游站点：请求经过完整的鉴权、配置快照、
 //! 资格过滤、模型改写、请求头构造和响应转发路径。
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +14,7 @@ use akhub::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
     Protocol, SchedulingWeights, UpstreamType,
 };
-use akhub::storage::store::{AccountSecrets, ids};
+use akhub::storage::store::ids;
 use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -162,12 +164,8 @@ async fn wire_target(
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
     };
-    let sealed = state.cipher.seal(b"upstream-secret-key").unwrap();
-    state
-        .store
-        .insert_account(&account, &AccountSecrets::new(sealed, None))
-        .await
-        .unwrap();
+    // 凭据必须同时进 Key 池：网关只从池里取（§4.2.1）。
+    common::insert_account_with_key(state, &account, "upstream-secret-key").await;
 
     let existing = state
         .store

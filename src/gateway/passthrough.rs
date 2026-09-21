@@ -60,6 +60,47 @@ const RATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 按上游的 `Retry-After` 等待时额外多等的余量，避免卡在冷却结束的临界点上。
 const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
 
+/// 一次请求针对**同一个目标**最多换几把 Key（§4.2.1）。
+///
+/// 换 Key 属于 §13.1 的廉价失败（连凭据都没被接受），但它必须设上限：一个
+/// 账号里 50 把 Key 全是坏的时候，一次下游请求会打出 50 次上游尝试。取 3 与
+/// "三把坏 Key 就足够断定这个账号的凭据有问题"这个判断一致。
+const MAX_KEY_SWITCHES_PER_TARGET: usize = 3;
+
+/// 挑 Key 的结果（§4.2.1）。
+///
+/// **"忙"与"坏"必须分开**：所有 Key 都只是暂时限流/并发满时，这个候选应当进入
+/// 排队等待，与账号层的 §13.6 完全一致；只有一把可用的 Key 都没有时才算这个
+/// 候选不合格。
+enum Picked {
+    Ready(Option<Arc<crate::credential::Credential>>),
+    /// 账号里所有 Key 都只是忙——等一会儿就有名额。
+    Busy,
+    /// 账号一把能用的 Key 都没有。
+    Unavailable(String),
+}
+
+/// 一次尝试的归属：正常结束，还是"这把 Key 不行、换一把再试"。
+enum Attempted {
+    /// 已经有最终结果（成功、终止性错误或可切换失败）。
+    Done(Flow),
+    /// 凭据被上游拒绝。带着准入一并返回，由调用方结算到**那一把** Key 上。
+    CredentialFailed(health::Admission),
+}
+
+/// 凭据被拒绝对应的健康结果。
+///
+/// 只有 401/403 与额度耗尽会走到这里（调用方已经筛过），所以保留
+/// `Retry-After` 供额度熔断使用。
+fn bad_key_outcome(retry_after: Option<Duration>) -> health::Outcome {
+    match retry_after {
+        Some(wait) => health::Outcome::QuotaExhausted {
+            retry_after: Some(wait),
+        },
+        None => health::Outcome::KeyInvalid,
+    }
+}
+
 /// 需要原样发送的请求正文。`content_type` 保留客户端提供的 multipart
 /// boundary，不能被统一 JSON 头覆盖。
 #[derive(Debug, Clone)]
@@ -161,6 +202,12 @@ struct Telemetry {
     filter_summary: Option<String>,
     /// 最终选中的层；粘性命中时是绑定目标所在的层（§24.1）。
     selected_layer: Option<i64>,
+    /// 本次请求实际使用的 Key 的内部 ID 与标签（§4.2.1）。
+    ///
+    /// **只记 ID 与标签，绝不记凭据本身**：请求记录要能回答"这次走的哪把
+    /// Key"，但它是给人看的诊断信息，不是密钥仓库（§23.4、§24.1）。
+    key_id: Option<String>,
+    key_label: Option<String>,
 }
 
 /// 一次请求在候选之间游走时的全部可变状态。
@@ -175,8 +222,9 @@ struct Walk<'a> {
     /// 队列等待的截止时刻：分组配置的"最长等待"与请求总超时取更早者（§6.3）。
     queue_deadline: Instant,
     now_unix: i64,
-    /// 已经真正发过请求的目标。每个目标最多尝试一次（§13.1）。
-    attempted: Vec<String>,
+    /// 已经真正发过请求的（目标, 凭据）。同一个目标可以换 Key 重试，但同一对
+    /// 组合只发一次（§4.2.1、§13.1）。
+    attempted: Vec<AttemptedKey>,
     /// 最后一次可切换失败，用来在候选耗尽时决定错误码。
     last: Option<(ErrorCode, String)>,
     /// 最后一次失败附带的 `Retry-After`，粘性路径据此决定是否原地等待（§10.3）。
@@ -189,6 +237,9 @@ struct Walk<'a> {
     attempt_log: Vec<AttemptRecord>,
 }
 
+/// 一次请求里"用过哪把 Key"的记录（§4.2.1）。
+type AttemptedKey = (String, Option<String>);
+
 /// 一次尝试要发出的东西：端点、已改写模型名的请求体与降级记录。
 struct Prepared {
     endpoint: Endpoint,
@@ -198,10 +249,30 @@ struct Prepared {
     degraded: Vec<String>,
 }
 
-fn admission_limits(candidate: &routing::Candidate) -> health::AdmissionLimits {
+/// 三级门限：账号总额度 → Key 覆盖 → 目标覆盖（§4.2.1）。
+fn admission_limits(
+    candidate: &routing::Candidate,
+    credential: Option<&Arc<crate::credential::Credential>>,
+) -> health::AdmissionLimits {
     health::AdmissionLimits {
         account: candidate.target.account.limits,
+        key: credential.map(|key| key.limits).unwrap_or_default(),
         target: candidate.target.target.limits,
+    }
+}
+
+/// 这次尝试的发起者：账号 + 具体 Key + 目标。
+///
+/// `key_id` 填凭据摘要：动态状态表按"账号 + 摘要"归类，换标签或重新粘贴
+/// 同一把 Key 都不会丢掉熔断与额度状态（§4.2.1）。
+fn admission_caller<'a>(
+    candidate: &'a routing::Candidate,
+    credential: Option<&'a Arc<crate::credential::Credential>>,
+) -> health::Caller<'a> {
+    health::Caller {
+        account_id: &candidate.target.account.id,
+        key_id: credential.map(|key| key.credential_digest.as_str()),
+        target_id: &candidate.target.target.id,
     }
 }
 
@@ -258,10 +329,14 @@ async fn forward_inner<'a>(
         forward.endpoint.protocol(),
         forward.chain.body_for_translation(&forward.body),
     );
+    // 凭据快照在整次请求内保持不变：换 Key 只能通过显式的重试发生，配置在
+    // 请求中途被改动不会让后半段跑到另一把 Key 上（§4.2.1 的不变量 A）。
+    let credentials = forward.state.runtime.credentials.current();
     let context = routing::Context {
         health: &forward.state.runtime.health,
         perf: &forward.state.runtime.perf,
         multipliers,
+        credentials: &credentials,
         evidence: &forward.state.runtime.evidence,
         capabilities: &forward.state.runtime.capabilities,
         translation: &translation,
@@ -271,6 +346,8 @@ async fn forward_inner<'a>(
         streaming,
         now_unix,
         now: Instant::now(),
+        // 粘性绑定的凭据在下面查到之后才知道；计划本身不需要它。
+        bound_credential: None,
     };
 
     let deadline = forward.started_at + forward.state.settings.get().request_timeout;
@@ -327,12 +404,28 @@ async fn forward_inner<'a>(
     let bound = sticky_key.as_ref().and_then(|(key, _)| {
         let binding = forward.state.runtime.sticky.get(key, now_unix)?;
         // 普通粘性只能在当前最高合格层内生效；低层绑定不能绕过已恢复的高层。
-        let candidate = plan
-            .first_layer()
-            .iter()
-            .find(|candidate| candidate.target.target.id == binding.target_id)?;
-        routing::sticky_still_valid(forward.group, &candidate.target, &context)
-            .then_some((candidate, binding))
+        // 普通粘性只能在当前最高合格层内生效：低层绑定不能绕过已恢复的高层
+        // （§9.5）。这条硬边界与凭据无关，不能被 Key 池改掉。
+        let candidate = routing::binding_target(&plan, &binding.target_id, true)?;
+        // 绑定记的是"目标 + Key"（§4.2.1）。钉住那把 Key 做资格判定：它坏了
+        // 就不该继续用这个绑定，否则每次请求都在 Key 之间漂移，把上游按凭据
+        // 隔离的前缀缓存打碎。
+        let pinned = binding.credential_digest.clone();
+        let scoped = context.with_bound_credential(pinned.clone());
+        if routing::sticky_still_valid(forward.group, &candidate.target, &scoped) {
+            return Some((candidate, binding, pinned));
+        }
+        // 目标还合格、只是那把 Key 不再可用时，绑定仍然成立：请求照样打到这个
+        // 目标，由发请求那一刻重新选一把 Key 并改写绑定。这比"整个绑定作废、
+        // 重新抽签"温和得多——目标（也就省下了的连接与配额）没有变。
+        let target_ok = routing::sticky_still_valid(forward.group, &candidate.target, &context);
+        let key_gone = pinned.is_some()
+            && binding.credential_digest.as_deref().is_some_and(|digest| {
+                credentials
+                    .by_digest(&candidate.target.account.id, digest)
+                    .is_none()
+            });
+        (target_ok && key_gone).then_some((candidate, binding, None))
     });
     if bound.is_none()
         && let Some((key, _)) = &sticky_key
@@ -342,7 +435,7 @@ async fn forward_inner<'a>(
     }
 
     // 第一步：粘性命中时先按等待预算争取原目标（§10.3）。
-    if let Some((candidate, binding)) = bound {
+    if let Some((candidate, binding, pinned)) = bound {
         walk.telemetry.sticky_hit = true;
         // 命中粘性即开始计这一项：即使目标当时有空位、一秒没等，也要写下 0
         // 而不是 null——"命中但没等"与"根本没命中"是两回事（§24.1）。
@@ -357,7 +450,14 @@ async fn forward_inner<'a>(
         // 新鲜度系数记下来，解释"这次为什么愿意等/不愿意等"（§24.1）。
         walk.telemetry.sticky_freshness = Some(freshness);
         let outcome = walk
-            .wait_and_run(&[candidate], budget, &sticky_key, true)
+            .wait_and_run(
+                &[candidate],
+                budget,
+                &sticky_key,
+                true,
+                pinned.as_deref(),
+                binding.credential_digest.as_deref(),
+            )
             .await;
         match outcome {
             Flow::Done(response) => return response,
@@ -416,7 +516,10 @@ impl Walk<'_> {
             let budget = self
                 .queue_deadline
                 .saturating_duration_since(Instant::now());
-            match self.wait_and_run(&busy, budget, sticky_key, false).await {
+            match self
+                .wait_and_run(&busy, budget, sticky_key, false, None, None)
+                .await
+            {
                 Flow::Continue => {}
                 other => return other,
             }
@@ -433,7 +536,10 @@ impl Walk<'_> {
         let budget = self
             .queue_deadline
             .saturating_duration_since(Instant::now());
-        match self.wait_and_run(&busy, budget, sticky_key, false).await {
+        match self
+            .wait_and_run(&busy, budget, sticky_key, false, None, None)
+            .await
+        {
             Flow::Continue => Flow::Exhausted,
             other => other,
         }
@@ -454,7 +560,9 @@ impl Walk<'_> {
             if self.attempted.len() >= routing::MAX_TARGET_ATTEMPTS {
                 break;
             }
-            if self.already_tried(candidate) {
+            // 这一轮还没有选定 Key，用"绑定/无绑定"这一维判断是否试过；
+            // 同一目标换 Key 的重复在这里不会被误跳过（§4.2.1）。
+            if self.already_tried(candidate, None) {
                 continue;
             }
             if Instant::now() >= self.deadline {
@@ -462,13 +570,24 @@ impl Walk<'_> {
                     self.fail(ErrorCode::UpstreamTimeout, "请求已达到总超时".into()),
                 ));
             }
-            match self.try_admit(candidate) {
-                Ok(admission) => match self.run(candidate, admission, sticky_key).await {
-                    Flow::Continue => {}
-                    other => return Err(other),
+            match self.select_credential(candidate, None, None, None) {
+                Picked::Ready(credential) => match self.try_admit(candidate, credential.as_ref()) {
+                    Ok(admission) => {
+                        match self.run(candidate, admission, sticky_key, None, None).await {
+                            Flow::Continue => {}
+                            other => return Err(other),
+                        }
+                    }
+                    Err(reason) if reason.is_queueable() => busy.push(candidate),
+                    Err(reason) => self.note_unavailable(candidate, reason),
                 },
-                Err(reason) if reason.is_queueable() => busy.push(candidate),
-                Err(reason) => self.note_unavailable(candidate, reason),
+                // 选不出 Key（全忙或一把能用的都没有）在本层排队等名额：
+                // 与 §13.6 同一条规则，忙不等于坏。
+                Picked::Busy => busy.push(candidate),
+                // 没有可用 Key 是"坏"：这个候选本次彻底不可用。
+                Picked::Unavailable(message) => {
+                    self.last = Some((ErrorCode::NoEligibleTarget, message));
+                }
             }
         }
         Ok(busy)
@@ -488,11 +607,13 @@ impl Walk<'_> {
         budget: Duration,
         sticky_key: &Option<(sticky::Key, sticky::Origin)>,
         sticky: bool,
+        pinned: Option<&str>,
+        preferred: Option<&str>,
     ) -> Flow {
         let mut pending: Vec<&routing::Candidate> = candidates
             .iter()
             .copied()
-            .filter(|candidate| !self.already_tried(candidate))
+            .filter(|candidate| !self.already_tried(candidate, None))
             .collect();
         let started = Instant::now();
         // 只有真的要等，才占用分组的排队名额；一次等待只占一个。
@@ -514,10 +635,26 @@ impl Walk<'_> {
             let mut index = 0;
             while index < pending.len() {
                 let candidate = pending[index];
-                match self.try_admit(candidate) {
+                let credential = match self.select_credential(candidate, pinned, preferred, None) {
+                    Picked::Ready(credential) => credential,
+                    // 忙：留在 pending 里，稍后按信号量唤醒再试。
+                    Picked::Busy => {
+                        index += 1;
+                        continue;
+                    }
+                    Picked::Unavailable(message) => {
+                        self.last = Some((ErrorCode::NoEligibleTarget, message));
+                        pending.remove(index);
+                        continue;
+                    }
+                };
+                match self.try_admit(candidate, credential.as_ref()) {
                     Ok(admission) => {
                         pending.remove(index);
-                        match self.run(candidate, admission, sticky_key).await {
+                        match self
+                            .run(candidate, admission, sticky_key, pinned, preferred)
+                            .await
+                        {
                             Flow::Continue => {
                                 if sticky
                                     && !retried_after_429
@@ -567,7 +704,16 @@ impl Walk<'_> {
             // 并发名额靠信号量唤醒；RPM / TPM 窗口只会随时间推移释放，没有可
             // 等的信号，只能按短间隔轮询。
             let rate_limited = pending.iter().any(|candidate| {
-                matches!(self.check(candidate), Err(health::Unavailable::RateLimited))
+                let credential = match self.select_credential(candidate, pinned, preferred, None) {
+                    Picked::Ready(credential) => credential,
+                    // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
+                    // 用短轮询比干等到底更早恢复。
+                    Picked::Busy | Picked::Unavailable(_) => None,
+                };
+                matches!(
+                    self.check(candidate, credential.as_ref()),
+                    Err(health::Unavailable::RateLimited)
+                )
             });
             let slice = if rate_limited {
                 remaining.min(RATE_POLL_INTERVAL)
@@ -577,16 +723,40 @@ impl Walk<'_> {
             let capacities: Vec<_> = pending
                 .iter()
                 .map(|candidate| {
-                    self.forward
-                        .state
-                        .runtime
-                        .health
-                        .capacity(&candidate.target.account.id, &candidate.target.target.id)
+                    let caller = health::Caller {
+                        account_id: &candidate.target.account.id,
+                        key_id: None,
+                        target_id: &candidate.target.target.id,
+                    };
+                    match self.select_credential(candidate, pinned, preferred, None) {
+                        Picked::Ready(credential) => {
+                            let caller = health::Caller {
+                                key_id: credential.as_ref().map(|key| key.id.as_str()),
+                                ..caller
+                            };
+                            self.forward
+                                .state
+                                .runtime
+                                .health
+                                .capacity(caller, admission_limits(candidate, credential.as_ref()))
+                        }
+                        // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
+                        // 否则"两把都满"会等一个永远不会到来的唤醒。
+                        Picked::Busy | Picked::Unavailable(_) => {
+                            let pool = self.forward.state.runtime.credentials.current();
+                            self.forward.state.runtime.health.capacity_any_key(
+                                caller,
+                                admission_limits(candidate, None),
+                                pool.keys_of(&candidate.target.account.id),
+                            )
+                        }
+                    }
                 })
                 .collect();
 
             let waited = Instant::now();
             let outcome = queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await;
+
             let elapsed = waited.elapsed();
             // 粘性路径上的等待记到 sticky_wait，其余记到普通排队（§6.6、§24.1）。
             // 两者分开才能回答"这次请求为前缀缓存等了多久"。
@@ -605,11 +775,25 @@ impl Walk<'_> {
             }
             if let queue::CapacityWaitOutcome::Ready(index, permit) = outcome {
                 let candidate = pending[index];
-                // 被唤醒后重新做完整终检：等待期间倍率或配置可能已经变了（§13.6）。
-                match self.admit_with_permit(candidate, permit) {
+                // 被唤醒后重新选一次 Key 并做完整终检：等待期间倍率、配置或
+                // Key 的健康状态都可能已经变了（§13.6）。
+                let credential = match self.select_credential(candidate, pinned, preferred, None) {
+                    Picked::Ready(credential) => credential,
+                    // 忙：名额已经到手，先还回去，回到等待循环。
+                    Picked::Busy => continue,
+                    Picked::Unavailable(message) => {
+                        self.last = Some((ErrorCode::NoEligibleTarget, message));
+                        pending.remove(index);
+                        continue;
+                    }
+                };
+                match self.admit_with_permit(candidate, credential.as_ref(), permit) {
                     Ok(admission) => {
                         pending.remove(index);
-                        match self.run(candidate, admission, sticky_key).await {
+                        match self
+                            .run(candidate, admission, sticky_key, pinned, preferred)
+                            .await
+                        {
                             Flow::Continue => {}
                             other => return other,
                         }
@@ -624,14 +808,75 @@ impl Walk<'_> {
         }
     }
 
+    /// 选出这次调用要用的 Key（§4.2.1）。
+    ///
+    /// `pinned` 是响应链钉住的凭据摘要（最强约束）；`sticky` 是"已经有并发名额、
+    /// 不想在最后一步换 Key 打碎缓存"时的偏好。真正的可用性由
+    /// [`crate::credential::select_key`] 结合健康状态判断。
+    fn select_credential(
+        &self,
+        candidate: &routing::Candidate,
+        pinned: Option<&str>,
+        sticky: Option<&str>,
+        excluded: Option<&str>,
+    ) -> Picked {
+        let account = &candidate.target.account;
+        let pool = self.forward.state.runtime.credentials.current();
+        let keys = pool.keys_of(&account.id);
+        let health = &self.forward.state.runtime.health;
+        // 账号与目标两级的额度先校到配置值：这里只做资格判断、不校准的话，会
+        // 拿着一个"1<<20 个名额"的信号量把"已满"看成"有空位"，排队与限流就全
+        // 失效了（§13.6、§17.1）。Key 级由下面的 reconcile_and_check 负责。
+        health
+            .account(&account.id)
+            .reconcile_capacity(account.limits.max_concurrency);
+        health
+            .target(&candidate.target.target.id)
+            .reconcile_capacity(candidate.target.target.limits.max_concurrency);
+        // Key 状态的时钟是 tokio 的：测试用 `tokio::time::pause` 精确推进冷却。
+        let now = tokio::time::Instant::now();
+        let choice = crate::credential::select_key(
+            keys,
+            pinned,
+            sticky,
+            excluded,
+            |key| {
+                let state = health.key(&crate::credential::credential_id(
+                    &key.account_id,
+                    &key.credential_digest,
+                ));
+                match state.reconcile_and_check(key.limits, now) {
+                    Ok(()) => Ok(true),
+                    Err(reason) if reason.is_queueable() => Err(()),
+                    Err(_) => Ok(false),
+                }
+            },
+            &mut score::random_unit,
+        );
+        match choice {
+            crate::credential::KeyChoice::Ready(Some(key)) => Picked::Ready(Some(Arc::clone(key))),
+            crate::credential::KeyChoice::Ready(None) => Picked::Unavailable(format!(
+                "账号「{}」没有可用的 API Key（可能未配置、已停用或已全部失效）",
+                account.name
+            )),
+            // 全部在忙不是失败：交给上层的排队路径，与 §13.6 同一条规则。
+            crate::credential::KeyChoice::Busy => Picked::Busy,
+        }
+    }
+
     /// 发起一次尝试并把结果同时喂给健康状态与性能统计。
     ///
     /// 只有 `Continue` 表示"可以换下一个"；其余情况都已经有了最终响应。
+    ///
+    /// 凭据级失败（401/403、额度耗尽）会在**同一个目标内换成另一把 Key** 重试，
+    /// 换 Key 次数受 [`MAX_KEY_SWITCHES_PER_TARGET`] 限制（§4.2.1）。
     async fn run(
         &mut self,
         candidate: &routing::Candidate,
         admission: health::Admission,
         sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+        pinned: Option<&str>,
+        preferred: Option<&str>,
     ) -> Flow {
         if let Err((code, message)) = self.recheck_multiplier(candidate) {
             // 倍率终检发生在准入之后；终检失败时本次请求从未发给上游，
@@ -640,13 +885,111 @@ impl Walk<'_> {
             self.last = Some((code, message));
             return Flow::Continue;
         }
+        // 这次调用用哪把 Key。选到之后**整个请求内不再改变**，除非换 Key 重试
+        // 显式发生——这就是"一次下游调用只使用一把 Key"（不变量 A）。
+        //
+        // 所有 Key 都只是"忙"时把名额还回去：调用方（`try_candidates` /
+        // `wait_and_run`）会把这个候选放进排队集合，等到有名额再回来。在这里
+        // 直接放弃会让"两把 Key 都满"变成一个立刻失败的账号，而不是等一会儿
+        // 就能用的账号（§13.6）。
+        let first = match self.select_credential(candidate, pinned, preferred, None) {
+            Picked::Ready(credential) => credential,
+            Picked::Busy => {
+                admission.cancel_before_upstream();
+                return Flow::Continue;
+            }
+            Picked::Unavailable(message) => {
+                admission.cancel_before_upstream();
+                self.last = Some((ErrorCode::NoEligibleTarget, message));
+                return Flow::Continue;
+            }
+        };
+        // 粘性/钉住命中的那把要跨重试保留：换 Key 只发生在凭据真的被拒绝之后。
+        let mut digest = first.as_ref().map(|key| key.credential_digest.clone());
+        let mut credential = first;
+        let mut admission = Some(admission);
+        let mut switches = 0usize;
 
-        self.attempted.push(candidate.target.target.id.clone());
+        loop {
+            let Some(current_admission) = admission.take() else {
+                break;
+            };
+            match self
+                .run_attempt(
+                    candidate,
+                    current_admission,
+                    sticky_key,
+                    credential.clone(),
+                    digest.clone(),
+                )
+                .await
+            {
+                Attempted::Done(flow) => return flow,
+                Attempted::CredentialFailed(failed) => {
+                    // 先把这次失败结算到**那一把** Key 上，否则下一轮抽签会
+                    // 再次选中它，换 Key 就变成了空转。
+                    failed.settle(bad_key_outcome(self.last_retry_after), None);
+                    if switches >= MAX_KEY_SWITCHES_PER_TARGET {
+                        // 换 Key 次数用尽：当作这个目标不可用，交给上层换目标。
+                        return Flow::Continue;
+                    }
+                    switches += 1;
+                    let Some(next) = self.choose_next_credential(candidate, digest.as_deref())
+                    else {
+                        return Flow::Continue;
+                    };
+                    match self.try_admit(candidate, Some(&next)) {
+                        Ok(next_admission) => {
+                            digest = Some(next.credential_digest.clone());
+                            credential = Some(next);
+                            admission = Some(next_admission);
+                        }
+                        // 新 Key 在忙：这次请求换目标，不原地排队——已经打过一次
+                        // 上游了，再等下去不如让别的账号接。
+                        Err(_) => return Flow::Continue,
+                    }
+                }
+            }
+        }
+        Flow::Continue
+    }
+
+    /// 换 Key 时挑下一把。
+    ///
+    /// 刚刚失败的那把已经被结算成"失效"或"额度冷却"，因此会被
+    /// [`Self::select_credential`] 自然跳过——不需要在这里显式排除。
+    fn choose_next_credential(
+        &self,
+        candidate: &routing::Candidate,
+        just_failed: Option<&str>,
+    ) -> Option<Arc<crate::credential::Credential>> {
+        // 把刚刚失败的那把显式排除掉：它可能还没被标记成"坏"（上游的拒绝方式
+        // 不构成 KeyInvalid），但这一次调用已经用它打失败过（§4.2.1）。
+        let picked = self.select_credential(candidate, None, None, just_failed);
+        match picked {
+            Picked::Ready(Some(next)) => Some(next),
+            _ => None,
+        }
+    }
+
+    /// 带着一把已经选定（且已准入）的 Key 发出一次尝试。
+    async fn run_attempt(
+        &mut self,
+        candidate: &routing::Candidate,
+        admission: health::Admission,
+        sticky_key: &Option<(sticky::Key, sticky::Origin)>,
+        credential: Option<Arc<crate::credential::Credential>>,
+        digest: Option<String>,
+    ) -> Attempted {
+        self.attempted
+            .push((candidate.target.target.id.clone(), digest.clone()));
         self.telemetry.attempts += 1;
         self.telemetry.effective = Some(candidate.multiplier);
+        self.telemetry.key_id = credential.as_ref().map(|key| key.id.clone());
+        self.telemetry.key_label = credential.as_ref().map(|key| key.label.clone());
 
         let started = Instant::now();
-        let result = self.walk_endpoints(candidate).await;
+        let result = self.walk_endpoints(candidate, credential.as_ref()).await;
 
         let dimension = score::Dimension {
             protocol: self.forward.endpoint.protocol(),
@@ -655,11 +998,14 @@ impl Walk<'_> {
         match result {
             Ok(success) => {
                 if let Some((key, _)) = sticky_key {
+                    // 绑定记的是"目标 + Key"：只绑目标会在下次请求时重新抽签，
+                    // 把上游按凭据隔离的前缀缓存打碎（§4.2.1 的不变量 B）。
                     self.forward.state.runtime.sticky.bind(
                         key.clone(),
                         &self.forward.group.group.id,
                         &self.forward.logical_model,
                         &candidate.target.target.id,
+                        digest.as_deref(),
                         self.now_unix,
                     );
                 }
@@ -690,7 +1036,7 @@ impl Walk<'_> {
                             entry_protocol: self.forward.endpoint.protocol(),
                             retention_days: self.forward.state.settings.get().response_state_days,
                         });
-                    Flow::Done(settle::settle_stream(
+                    Attempted::Done(Flow::Done(settle::settle_stream(
                         success.response,
                         settle::StreamSettlement {
                             state: self.forward.state.clone(),
@@ -705,7 +1051,7 @@ impl Walk<'_> {
                             responses,
                             degraded: success.degraded.unwrap_or_else(translate::degradation_sink),
                         },
-                    ))
+                    )))
                 } else {
                     self.usage_parts = success.usage_parts;
                     self.usage_detail = success.usage_detail;
@@ -721,27 +1067,33 @@ impl Walk<'_> {
                             output_tokens: success.output_tokens,
                         },
                     );
-                    Flow::Done(self.finish(
+                    Attempted::Done(Flow::Done(self.finish(
                         Some(candidate),
                         success.status,
                         None,
                         Some(success.status),
                         success.response,
-                    ))
+                    )))
                 }
             }
             Err(AttemptFailure::Terminal(response)) => {
                 admission.settle(health::Outcome::Neutral, None);
                 let status = response.status();
                 self.note_attempt(candidate, started, "failed", None, true);
-                Flow::Done(self.finish(Some(candidate), status, None, None, *response))
+                Attempted::Done(Flow::Done(self.finish(
+                    Some(candidate),
+                    status,
+                    None,
+                    None,
+                    *response,
+                )))
             }
             // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
             Err(AttemptFailure::MissingEndpoint) => {
                 admission.settle(health::Outcome::Neutral, None);
                 // 走错门是廉价失败：不计入尝试预算（§13.1）。
                 self.note_attempt(candidate, started, "missing_endpoint", None, false);
-                Flow::Continue
+                Attempted::Done(Flow::Continue)
             }
             Err(AttemptFailure::Switchable {
                 code,
@@ -750,6 +1102,26 @@ impl Walk<'_> {
                 retry_after,
             }) => {
                 let outcome = classify_outcome(code, upstream_status, retry_after);
+                // 凭据级失败：账号内还有别的 Key 时应当换一把重试，而不是
+                // 立刻放弃这个账号（§4.2.1）。这时的 admission 原样交回调用方，
+                // 由它把失败结算到**那一把** Key 上——在这里结算会把状态记到
+                // 一个已经失败、即将被丢弃的准入上。
+                if matches!(outcome, health::Outcome::KeyInvalid)
+                    || matches!(outcome, health::Outcome::QuotaExhausted { .. })
+                {
+                    self.last_retry_after = retry_after;
+                    self.last = Some((code, message));
+                    tracing::warn!(
+                        request_id = self.forward.request_id,
+                        target = candidate.target.target.id,
+                        account = candidate.target.account.name,
+                        key = self.telemetry.key_label.as_deref().unwrap_or("-"),
+                        upstream_status = upstream_status.map(|s| s.as_u16()),
+                        error_code = code.as_str(),
+                        "凭据被上游拒绝，尝试账号内换一把 Key"
+                    );
+                    return Attempted::CredentialFailed(admission);
+                }
                 admission.settle(outcome, None);
                 self.last_retry_after = retry_after;
                 // 连接都没建立、上游没给状态码的 exhausted 属于廉价失败，
@@ -780,7 +1152,7 @@ impl Walk<'_> {
                     "目标尝试失败，切换到下一个候选"
                 );
                 self.last = Some((code, message));
-                Flow::Continue
+                Attempted::Done(Flow::Continue)
             }
         }
     }
@@ -792,6 +1164,7 @@ impl Walk<'_> {
     async fn walk_endpoints(
         &mut self,
         candidate: &routing::Candidate,
+        credential: Option<&Arc<crate::credential::Credential>>,
     ) -> Result<Success, AttemptFailure> {
         let mut plan = candidate.endpoints.clone();
 
@@ -807,6 +1180,7 @@ impl Walk<'_> {
             match attempt(
                 self.forward,
                 &candidate.target,
+                credential,
                 &prepared,
                 self.streaming,
                 timeout,
@@ -989,25 +1363,36 @@ impl Walk<'_> {
     }
 
     /// 允许一个目标被再试一次。只用于 §10.3 的粘性 429 重试。
+    ///
+    /// 按**目标**清，不按 (目标, Key) 清：粘性 429 重试的语义是"等一会儿再打
+    /// 同一个目标"，那把 Key 若已进入限流冷却，下一轮会自然换到别的 Key
+    /// （§4.2.1）。
     fn forget_attempt(&mut self, candidate: &routing::Candidate) {
         self.attempted
-            .retain(|id| *id != candidate.target.target.id);
+            .retain(|(target, _)| target != &candidate.target.target.id);
     }
 
-    fn already_tried(&self, candidate: &routing::Candidate) -> bool {
-        self.attempted
-            .iter()
-            .any(|id| *id == candidate.target.target.id)
+    /// 这个候选与这把 Key 的组合是否已经试过。
+    ///
+    /// `credential` 为 `None` 表示"这一轮还没选 Key"，此时只按目标判断——同一个
+    /// 目标与**任何** Key 的组合都不再重复尝试。换 Key 重试走的是另一条路径：
+    /// 它带着具体的凭据摘要进来，因此 (`target`, 新 Key) 仍然是"没试过"。
+    fn already_tried(&self, candidate: &routing::Candidate, credential: Option<&str>) -> bool {
+        self.attempted.iter().any(|(target, key)| {
+            target == &candidate.target.target.id
+                && (credential.is_none() || key.as_deref() == credential)
+        })
     }
 
     fn try_admit(
         &self,
         candidate: &routing::Candidate,
+        credential: Option<&Arc<crate::credential::Credential>>,
     ) -> Result<health::Admission, health::Unavailable> {
+        let caller = admission_caller(candidate, credential);
         self.forward.state.runtime.health.try_admit(
-            &candidate.target.account.id,
-            &candidate.target.target.id,
-            admission_limits(candidate),
+            caller,
+            admission_limits(candidate, credential),
             self.estimated_tokens,
         )
     }
@@ -1015,23 +1400,29 @@ impl Walk<'_> {
     fn admit_with_permit(
         &self,
         candidate: &routing::Candidate,
+        credential: Option<&Arc<crate::credential::Credential>>,
         permit: health::CapacityPermit,
     ) -> Result<health::Admission, health::Unavailable> {
+        let caller = admission_caller(candidate, credential);
         self.forward.state.runtime.health.admit_with_permit(
-            &candidate.target.account.id,
-            &candidate.target.target.id,
-            admission_limits(candidate),
+            caller,
+            admission_limits(candidate, credential),
             self.estimated_tokens,
             permit,
         )
     }
 
-    fn check(&self, candidate: &routing::Candidate) -> Result<(), health::Unavailable> {
-        self.forward.state.runtime.health.check(
-            &candidate.target.account.id,
-            &candidate.target.target.id,
-            admission_limits(candidate),
-        )
+    fn check(
+        &self,
+        candidate: &routing::Candidate,
+        credential: Option<&Arc<crate::credential::Credential>>,
+    ) -> Result<(), health::Unavailable> {
+        let caller = admission_caller(candidate, credential);
+        self.forward
+            .state
+            .runtime
+            .health
+            .check(caller, admission_limits(candidate, credential))
     }
 
     fn note_unavailable(&mut self, candidate: &routing::Candidate, reason: health::Unavailable) {
@@ -1187,7 +1578,23 @@ impl Walk<'_> {
             .health
             .account(&target.account.id);
         let state = self.forward.state.runtime.health.target(&target.target.id);
-        Some(state.status(&account).as_str().to_string())
+        // 带上这次实际使用的那把 Key 的状态：多 Key 账号里"账号正常但某把
+        // Key 额度耗尽"是最常见的一种，只看目标状态会把原因丢掉（§24.1）。
+        let pool = self.forward.state.runtime.credentials.current();
+        let key = self.telemetry.key_id.as_deref().and_then(|key_id| {
+            let credential = pool.by_id(&target.account.id, key_id)?;
+            Some(
+                self.forward
+                    .state
+                    .runtime
+                    .health
+                    .key(&crate::credential::credential_id(
+                        &credential.account_id,
+                        &credential.credential_digest,
+                    )),
+            )
+        });
+        Some(state.status(&account, key.as_deref()).as_str().to_string())
     }
 
     /// 输出速度（token/秒）。只有拿到输出 Token 与真实总耗时才算得出；
@@ -1291,9 +1698,14 @@ fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
 }
 
 /// 向单个目标的一个端点发起一次尝试。
+///
+/// `credential` 是本次调用选定的那把 Key（§4.2.1 的不变量 A）：整个请求处理
+/// 期间它不变。为 `None` 时退回账号的第一把 Key——这只可能发生在配置被外部
+/// 改动而快照还没重建的窗口里，属于兜底而不是常规路径。
 async fn attempt(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
+    credential: Option<&Arc<crate::credential::Credential>>,
     prepared: &Prepared,
     streaming: bool,
     timeout: Duration,
@@ -1323,9 +1735,12 @@ async fn attempt(
             )
         })?;
 
-    let api_key = load_api_key(forward.state, &account.id)
-        .await
-        .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?;
+    let api_key = match credential {
+        Some(credential) => credential.secret.to_string(),
+        None => load_api_key(forward.state, &account.id)
+            .await
+            .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?,
+    };
     // 请求头按**上游端点**的协议构造，与下游用哪个协议进来无关（§14.7）。
     // 原始 multipart 路径必须保留客户端的 Content-Type（尤其是 boundary），
     // 不能让普通 JSON 头覆盖它。
@@ -2017,7 +2432,10 @@ fn estimate_tokens(request_bytes: usize, body: &serde_json::Value) -> u64 {
     input.saturating_add(output)
 }
 
-/// 解密账号凭据。错误信息里不能出现任何密钥材料。
+/// 兜底凭据来源：数据库里账号凭据信封的第一把 Key。
+///
+/// 常规路径不用它——凭据由 [`crate::credential::CredentialPool`] 在内存里
+/// 提供，这里只覆盖"快照尚未重建"的短暂窗口。错误信息里不能出现任何密钥材料。
 async fn load_api_key(state: &SharedState, account_id: &str) -> Result<String, String> {
     let sealed = state
         .store

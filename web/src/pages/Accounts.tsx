@@ -42,6 +42,14 @@ import {
   useToast,
 } from "../components/ui";
 import { ModelSelectionDialog } from "../components/ModelSelectionDialog";
+import {
+  KeyPoolEditor,
+  draftsFromKeys,
+  draftsToInputs,
+  emptyDraft,
+  validateDrafts,
+  type KeyDraft,
+} from "../components/KeyPoolEditor";
 import { CalibrationDialog } from "../components/CalibrationDialog";
 import { IconPlus, IconRefresh, IconSearch, IconServer } from "../components/Icons";
 
@@ -260,7 +268,7 @@ export function Accounts({
     <>
       <Card
         title="上游账号"
-        description="一个账号 = 一套独立凭据。同一把 Key 要用在两个分组，请复制成两个账号。"
+        description="一个账号 = 一套独立凭据。同一把 Key 要同时用在两个分组，请复制成两个账号；只是换归属，在编辑里改「所属分组」，模型会一起迁过去。"
         actions={
           <div className="row" style={{ gap: 8 }}>
             {/* 批量刷新：一次探测所有自动倍率账号（§11.3）。 */}
@@ -415,6 +423,7 @@ export function Accounts({
                 <thead>
                   <tr>
                     <th>账号</th>
+                    <th>Key</th>
                     <th>分组</th>
                     <th>Base URL</th>
                     <th>优先级</th>
@@ -428,7 +437,7 @@ export function Accounts({
                 <tbody>
                   {filteredAccounts.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="table-empty-cell">
+                      <td colSpan={9} className="table-empty-cell">
                         没有符合条件的账号
                       </td>
                     </tr>
@@ -445,6 +454,9 @@ export function Accounts({
                             {UPSTREAM_LABELS[account.upstream_type]} ·{" "}
                             {PROTOCOL_LABELS[account.preferred_protocol]}
                           </div>
+                        </td>
+                        <td>
+                          <KeyCountCell account={account} />
                         </td>
                         <td className="cell-dim">{groupName(account.group_id)}</td>
                         <td>
@@ -671,6 +683,36 @@ export function Accounts({
  * 必须在这个列表里就能看见——否则只能逐个点进目标页猜，而"这个号还能不能用"
  * 正是翻这个列表时最想知道的事。
  */
+/**
+ * Key 池一格（§4.2.1）："3 把 / 1 把异常"。
+ *
+ * 多 Key 之后"这个号还有没有能用的凭据"和"这个号整体正不正常"是两个问题，
+ * 所以 Key 数量单独占一格，异常时直接标出来。
+ */
+function KeyCountCell({ account }: { account: Account }) {
+  const total = account.health.key_total ?? account.keys?.length ?? 0;
+  const enabled = account.health.key_enabled ?? total;
+  const unhealthy = (account.keys ?? []).filter(
+    (key) => key.enabled && key.health.status !== "active",
+  ).length;
+
+  if (total === 0) {
+    return <Badge tone="danger">未配置</Badge>;
+  }
+  return (
+    <div title={unhealthy > 0 ? `${unhealthy} 把 Key 当前不可用` : undefined}>
+      <span className="mono">
+        {enabled}/{total}
+      </span>
+      {unhealthy > 0 && (
+        <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
+          <Badge tone="danger">{unhealthy} 把异常</Badge>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AccountHealthBadge({ health }: { health: AccountHealth }) {
   const labels: Record<string, string> = {
     active: "正常",
@@ -678,6 +720,7 @@ function AccountHealthBadge({ health }: { health: AccountHealth }) {
     half_open: "半开试运行",
     quota_exhausted: "额度耗尽",
     key_invalid: "Key 失效",
+    no_key: "没有可用的 Key",
     disabled: "已停用",
   };
   const tones: Record<string, "success" | "warn" | "danger" | "neutral"> = {
@@ -686,6 +729,7 @@ function AccountHealthBadge({ health }: { health: AccountHealth }) {
     half_open: "warn",
     quota_exhausted: "danger",
     key_invalid: "danger",
+    no_key: "danger",
     disabled: "neutral",
   };
   const tone = tones[health.status] ?? "neutral";
@@ -847,10 +891,35 @@ function AccountDrawer({
     adaptive_protocol: account?.adaptive_protocol ?? true,
   });
   const [busy, setBusy] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
   const [testing, setTesting] = useState(false);
+  /** 改分组待确认时暂存的提交内容（§4.2.2）。 */
+  const [pendingMove, setPendingMove] = useState<AccountInput | null>(null);
+  const groupName = (id: string) => data.groups.find((group) => group.id === id)?.name ?? id;
+  /**
+   * 目标分组的上限低于账号当前有效倍率时，迁过去它不会被调度（§11.5 的红线），
+   * 而这件事在账号列表上完全看不出来——提前说一句。
+   */
+  const moveEligibilityNotice = (() => {
+    if (!editing || !account || form.group_id === account.group_id) return null;
+    const target = data.groups.find((group) => group.id === form.group_id);
+    if (!target) return null;
+    const limit = Number(target.multiplier_limit);
+    const effective = Number(account.effective_multiplier);
+    if (!Number.isFinite(limit) || !Number.isFinite(effective) || effective <= limit) return null;
+    return `注意：账号当前有效倍率 ${account.effective_multiplier} 高于「${target.name}」的上限 ${target.multiplier_limit}，迁过去后它不会被调度，除非同时降低倍率或提高该分组的上限。`;
+  })();
+  // Key 池（§4.2.1）：编辑已有账号时从后台带回的元数据起手，明文一律为空。
+  const [keyDrafts, setKeyDrafts] = useState<KeyDraft[]>(() =>
+    account ? draftsFromKeys(account.keys ?? []) : [emptyDraft()],
+  );
+  // 逐把 Key 的测试结果，按 Key 行 ID 对齐；新增行用序号兜底。
+  const [keyTestResults, setKeyTestResults] = useState<
+    Record<string, { ok: boolean; message: string }>
+  >({});
   const [initialSnapshot] = useState(() => JSON.stringify(form));
-  const dirty = JSON.stringify(form) !== initialSnapshot;
+  const [initialKeys] = useState(() => JSON.stringify(keyDrafts));
+  const dirty =
+    JSON.stringify(form) !== initialSnapshot || JSON.stringify(keyDrafts) !== initialKeys;
 
   const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) =>
     setForm((current) => ({ ...current, [key]: value }));
@@ -917,10 +986,12 @@ function AccountDrawer({
   const needsNewApiUser =
     form.multiplier_mode === "new_api" && !form.new_api_user_id.trim() && !usesSiteCredential;
 
+  // Key 池自己的校验：新增的 Key 必须填明文、限额必须是正整数（§4.2.1）。
+  const keyDraftError = validateDrafts(keyDrafts);
   const invalid =
     !form.name.trim() ||
     !form.base_url.trim() ||
-    (!editing && !form.api_key.trim()) ||
+    !!keyDraftError ||
     !!multiplierError ||
     !!calibrationError ||
     !!priorityError ||
@@ -934,8 +1005,24 @@ function AccountDrawer({
     setTesting(true);
     try {
       const result = await api.testAccount(account.id);
-      if (result.ok) toast.success(`「${account.name}」${result.message}`);
-      else toast.error(`「${account.name}」${result.message}`);
+      // 逐把 Key 的结果按行 ID 落到编辑器上：多 Key 账号最有用的诊断动作就是
+      // "哪几把已经死了"（§4.2.1）。
+      const perKey: Record<string, { ok: boolean; message: string }> = {};
+      for (const entry of result.keys ?? []) {
+        perKey[entry.id] = { ok: entry.ok, message: entry.message };
+      }
+      setKeyTestResults(perKey);
+      const total = result.key_total ?? 0;
+      if (total > 1) {
+        const healthy = result.healthy_keys ?? 0;
+        const summary = `「${account.name}」${healthy}/${total} 把 Key 可用`;
+        if (healthy === total) toast.success(summary);
+        else toast.error(summary);
+      } else if (result.ok) {
+        toast.success(`「${account.name}」${result.message}`);
+      } else {
+        toast.error(`「${account.name}」${result.message}`);
+      }
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "测试失败");
     } finally {
@@ -943,35 +1030,17 @@ function AccountDrawer({
     }
   };
 
-  const submit = async () => {
-    if (invalid) return;
+  /** 真正落库。编辑态下 keys 是整体替换：带 id 的沿用原密文、带明文的轮换、没出现的删除。 */
+  const save = async (payload: AccountInput, moving: boolean) => {
     setBusy(true);
     try {
-      const payload: AccountInput = {
-        group_id: form.group_id,
-        name: form.name.trim(),
-        upstream_type: form.upstream_type,
-        base_url: form.base_url.trim(),
-        api_key: form.api_key.trim(),
-        preferred_protocol: form.preferred_protocol,
-        default_priority: priority,
-        multiplier_mode: form.multiplier_mode,
-        manual_multiplier: form.manual_multiplier.trim(),
-        calibration: form.calibration.trim(),
-        new_api_user_id: form.new_api_user_id.trim() || undefined,
-        new_api_group: form.new_api_group.trim() || undefined,
-        limits,
-        allow_private_network: form.allow_private_network,
-        auto_sync: form.auto_sync,
-        hide_original: form.hide_original,
-        adaptive_protocol: form.adaptive_protocol,
-      };
-      if (form.new_api_token.trim()) payload.new_api_token = form.new_api_token.trim();
       if (editing) {
-        // api_key 留空表示保持原有凭据；后台不提供读取完整 Key 的接口。
-        const { group_id: _group, api_key, ...rest } = payload;
-        await api.updateAccount(account.id, api_key ? { ...rest, api_key } : rest);
-        toast.success("账号已更新");
+        await api.updateAccount(account.id, payload);
+        toast.success(
+          moving
+            ? `账号已迁入「${groupName(form.group_id)}」，模型已按对外名一并迁移`
+            : "账号已更新",
+        );
         await onSaved();
       } else {
         const created = await api.createAccount(payload);
@@ -985,7 +1054,39 @@ function AccountDrawer({
     }
   };
 
+  const submit = () => {
+    if (invalid) return;
+    const payload: AccountInput = {
+      group_id: form.group_id,
+      name: form.name.trim(),
+      upstream_type: form.upstream_type,
+      base_url: form.base_url.trim(),
+      keys: draftsToInputs(keyDrafts),
+      preferred_protocol: form.preferred_protocol,
+      default_priority: priority,
+      multiplier_mode: form.multiplier_mode,
+      manual_multiplier: form.manual_multiplier.trim(),
+      calibration: form.calibration.trim(),
+      new_api_user_id: form.new_api_user_id.trim() || undefined,
+      new_api_group: form.new_api_group.trim() || undefined,
+      limits,
+      allow_private_network: form.allow_private_network,
+      auto_sync: form.auto_sync,
+      hide_original: form.hide_original,
+      adaptive_protocol: form.adaptive_protocol,
+    };
+    if (form.new_api_token.trim()) payload.new_api_token = form.new_api_token.trim();
+    // 改分组会把整台账号的模型搬到另一个分组（§4.2.2）：旧分组可能因此少了
+    // 这些模型，先让管理员看清后果再发。
+    if (editing && form.group_id !== account.group_id) {
+      setPendingMove(payload);
+      return;
+    }
+    void save(payload, false);
+  };
+
   return (
+    <>
     <Drawer
       open={open}
       onClose={onClose}
@@ -1002,42 +1103,30 @@ function AccountDrawer({
       }
     >
       <div className="stack">
-        {!editing && (
-          <Field label="所属分组" hint="账号归属分组后不可迁移，改分组请新建。">
-            {(id) => (
-              <select
-                id={id}
-                className="select"
-                value={form.group_id}
-                onChange={(e) => set("group_id", e.target.value)}
-              >
-                {data.groups.map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {group.name}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
-        )}
-
         <FormSection title="基本信息" description="账号身份、归属与上游地址。">
-        {editing && account && (
-          <Field label="所属分组" hint="账号归属分组后不可迁移，改分组请新建。">
-            {(id) => (
-              <input
-                id={id}
-                className="input"
-                value={
-                  data.groups.find((group) => group.id === account.group_id)?.name ??
-                  account.group_id
-                }
-                readOnly
-                aria-readonly="true"
-              />
-            )}
-          </Field>
-        )}
+        <Field
+          label="所属分组"
+          hint={
+            editing
+              ? "改分组会把账号的模型按对外名一起迁过去：新分组缺同名逻辑模型会自动建好，旧分组里只靠它提供的自动模型会随最后一个目标消失。"
+              : "账号必须属于某个分组；分组决定它能被哪把下游 Key 使用。"
+          }
+        >
+          {(id) => (
+            <select
+              id={id}
+              className="select"
+              value={form.group_id}
+              onChange={(e) => set("group_id", e.target.value)}
+            >
+              {data.groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </Field>
         <Field label="名称">
           {(id) => (
             <input
@@ -1101,47 +1190,14 @@ function AccountDrawer({
           )}
         </Field>
 
-        <Field
-          label={editing ? "API Key（留空则不变）" : "API Key"}
-          hint="加密保存。已保存的 Key 无法查看或回显；如需更换，直接粘贴新的 Key 覆盖。"
-        >
-          {(id) => (
-            <>
-              <div className="input-affix">
-                <input
-                  id={id}
-                  className="input mono"
-                  type={showApiKey ? "text" : "password"}
-                  value={form.api_key}
-                  onChange={(e) => set("api_key", e.target.value)}
-                  placeholder={editing ? "保持原有凭据" : "sk-…"}
-                  autoComplete="new-password"
-                />
-                <button
-                  type="button"
-                  className="input-affix-button"
-                  aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}
-                  aria-pressed={showApiKey}
-                  onClick={() => setShowApiKey((current) => !current)}
-                >
-                  {showApiKey ? "隐藏" : "显示"}
-                </button>
-              </div>
-              <div className="row" style={{ justifyContent: "flex-end", marginTop: 6 }}>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={!editing || testing}
-                  title={editing ? "用已保存的凭据发送一次真实测试请求" : "保存账号后即可测试连接"}
-                  onClick={() => void testConnection()}
-                >
-                  {testing && <span className="spinner spinner-sm" aria-hidden="true" />}
-                  {testing ? "测试中…" : editing ? "测试连接" : "保存后可测试"}
-                </Button>
-              </div>
-            </>
-          )}
-        </Field>
+        <KeyPoolEditor
+          drafts={keyDrafts}
+          editing={!!editing}
+          testing={testing}
+          testResults={keyTestResults}
+          onChange={setKeyDrafts}
+          onTest={() => void testConnection()}
+        />
 
         <Field
           label="默认人工优先级"
@@ -1404,5 +1460,36 @@ function AccountDrawer({
         </FormSection>
       </div>
     </Drawer>
+
+    <ConfirmDialog
+      open={pendingMove !== null}
+      title="迁移账号分组"
+      confirmLabel="迁移"
+      message={
+        editing && account ? (
+          <>
+            保存后「{account.name}」会从「{groupName(account.group_id)}」迁到「
+            {groupName(form.group_id)}」。
+            <br />
+            模型目录按对外名一起迁过去：新分组缺同名逻辑模型会自动建好；旧分组里
+            只靠这台账号提供的自动逻辑模型会随最后一个目标消失，旧分组的下游 Key
+            可能因此取不到这些模型。
+            {moveEligibilityNotice && (
+              <>
+                <br />
+                <strong>{moveEligibilityNotice}</strong>
+              </>
+            )}
+          </>
+        ) : null
+      }
+      onClose={() => setPendingMove(null)}
+      onConfirm={() => {
+        const payload = pendingMove;
+        setPendingMove(null);
+        if (payload) void save(payload, true);
+      }}
+    />
+    </>
   );
 }

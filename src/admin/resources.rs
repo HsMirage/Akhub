@@ -481,10 +481,47 @@ fn group_alerts(
             crate::multiplier::Status::Known => {}
         }
         let account = state.runtime.health.account(&target.account.id);
-        if account.key_invalid() {
-            hard_stopped.push(format!("{}（Key 失效）", target.account.name));
+        // 多 Key 之后"账号被硬停"要看最严重的那把 Key：一把 Key 失效不再等于
+        // 整个账号不可用（§4.2.1）。
+        let pool = state.runtime.credentials.current();
+        let keys = pool.keys_of(&target.account.id);
+        if keys.is_empty() {
+            hard_stopped.push(format!("{}（没有可用的 API Key）", target.account.name));
+            continue;
+        }
+        let mut invalid = 0usize;
+        let mut quota = 0usize;
+        for key in keys.iter().filter(|key| key.enabled) {
+            let key_state = state.runtime.health.key(&crate::credential::credential_id(
+                &key.account_id,
+                &key.credential_digest,
+            ));
+            if key_state.key_invalid() {
+                invalid += 1;
+            } else if key_state.quota_exhausted() {
+                quota += 1;
+            }
+        }
+        let enabled = keys.iter().filter(|key| key.enabled).count();
+        if invalid == enabled {
+            hard_stopped.push(format!(
+                "{}（全部 {} 把 Key 失效）",
+                target.account.name, enabled
+            ));
+        } else if invalid > 0 {
+            hard_stopped.push(format!(
+                "{}（{} 把 Key 失效）",
+                target.account.name, invalid
+            ));
+        } else if quota == enabled {
+            hard_stopped.push(format!("{}（全部 Key 额度耗尽）", target.account.name));
+        } else if quota > 0 {
+            hard_stopped.push(format!(
+                "{}（{} 把 Key 额度耗尽）",
+                target.account.name, quota
+            ));
         } else if account.quota_exhausted() {
-            hard_stopped.push(format!("{}（额度耗尽）", target.account.name));
+            hard_stopped.push(format!("{}（账号总额度耗尽）", target.account.name));
         }
     }
     if !hard_stopped.is_empty() {
@@ -521,10 +558,24 @@ fn group_alerts(
                 let account = state.runtime.health.account(&target.account.id);
                 let target_state = state.runtime.health.target(&target.target.id);
                 // 冷却与半开算"暂时不可用"，和 /v1/models 的口径一致（§7.3）。
-                !matches!(
-                    target_state.status(&account),
-                    crate::health::TargetStatus::Active
-                )
+                // 逐把 Key 看一遍：只要还有一把能把请求送出去，这个目标就算可用。
+                let pool = state.runtime.credentials.current();
+                let usable = pool
+                    .keys_of(&target.account.id)
+                    .iter()
+                    .filter(|key| key.enabled)
+                    .any(|key| {
+                        let key_state =
+                            state.runtime.health.key(&crate::credential::credential_id(
+                                &key.account_id,
+                                &key.credential_digest,
+                            ));
+                        matches!(
+                            target_state.status(&account, Some(&key_state)),
+                            crate::health::TargetStatus::Active
+                        )
+                    });
+                !usable
             })
             .count();
         if unusable == total {
@@ -704,13 +755,39 @@ pub async fn regenerate_key(
 
 // ------------------------------------------------------------------ 账号
 
+/// 请求体里的一把 Key（§4.2.1）。
+///
+/// 三件事必须分清：
+///
+/// * 带 `id` 且 `api_key` 为空 → 复用已保存的密文（界面不回吐明文，所以
+///   "没改这一把"在传参上就是"有 id、没明文"）。
+/// * 带 `id` 且有 `api_key` → 轮换这一把的凭据。
+/// * 没有 `id` → 新增一把。
+///
+/// 列表里**没出现**的 `id` 会被删除：Key 池是"一组凭据"，整体替换才能让
+/// 界面与服务端的认知不漂移。
+#[derive(Deserialize)]
+pub struct AccountKeyInput {
+    pub id: Option<String>,
+    /// 留空表示"保持已保存的那把不变"；新 Key 必须填。
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub limits: Option<Limits>,
+    pub enabled: Option<bool>,
+}
+
 #[derive(Deserialize)]
 pub struct AccountPayload {
     pub group_id: String,
     pub name: String,
     pub upstream_type: UpstreamType,
     pub base_url: String,
-    pub api_key: String,
+    /// Key 池。为空数组表示"这个账号暂时没有凭据"，是合法状态（§4.2.1）。
+    #[serde(default)]
+    pub keys: Vec<AccountKeyInput>,
+    /// 旧版单 Key 字段。单独给出时等价于"一把 Key 的池"，向后兼容。
+    pub api_key: Option<String>,
     pub preferred_protocol: Protocol,
     pub adaptive_protocol: Option<bool>,
     pub default_priority: Option<i32>,
@@ -733,8 +810,13 @@ pub struct AccountPayload {
 
 #[derive(Deserialize)]
 pub struct AccountPatch {
+    /// 改所属分组（§4.2.2）。缺省表示"不搬家"；只有与当前分组不同才触发迁移。
+    pub group_id: Option<String>,
     pub name: Option<String>,
     pub base_url: Option<String>,
+    /// Key 池整体替换（§4.2.1）。缺省表示"不动 Key 池"。
+    pub keys: Option<Vec<AccountKeyInput>>,
+    /// 旧版单 Key 字段。给出且 `keys` 缺省时，等价于"把池换成这一把"。
     /// 只允许覆盖写入，后台不提供读取完整 Key 的接口（§23.2）。
     pub api_key: Option<String>,
     pub preferred_protocol: Option<Protocol>,
@@ -792,12 +874,28 @@ pub struct AccountDto {
     pub model_synced_at: Option<i64>,
     /// 账号级健康摘要（§6.9）。账号列表行内徽标直接用它，不必点进目标页。
     pub health: AccountHealthDto,
+    /// Key 池的元数据（§4.2.1）。**不含明文**，只有标签、限额与摘要前缀。
+    pub keys: Vec<AccountKeyDto>,
+}
+
+/// 一把 Key 的元数据。绝不包含明文凭据（§23.2）。
+#[derive(Serialize)]
+pub struct AccountKeyDto {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub limits: Limits,
+    /// 凭据摘要前 8 位，用于在同一账号的多把 Key 之间对号。
+    pub digest_prefix: String,
+    /// 与 [`AccountHealthDto::keys`] 里同 id 的那条对应。
+    pub health: AccountKeyHealthDto,
 }
 
 /// 账号级健康摘要（§6.9）。
 ///
-/// 账号的熔断与额度是**整个账号**范围的（同一把 Key 下的所有模型共享，§12.1），
-/// 所以列表里必须能一眼看出来——不然只能逐个点进目标页猜。
+/// 账号总并发与总限额是**整个账号**范围的，凭据的失效与额度是**逐把 Key** 的
+/// （§4.2.1）。所以摘要分两层：账号级回答"这个号整体还能不能接"，keys 数组
+/// 回答"具体哪几把 Key 有问题"。列表徽标用前者，账号抽屉里的 Key 行用后者。
 #[derive(Serialize)]
 pub struct AccountHealthDto {
     /// 最严重的那个状态：\`active\` / \`cooldown\` / \`half_open\` /
@@ -809,6 +907,106 @@ pub struct AccountHealthDto {
     pub targets: std::collections::BTreeMap<&'static str, usize>,
     /// 目标总数，方便前端显示"3/5 可用"。
     pub target_total: usize,
+    /// 逐把 Key 的状态（§4.2.1）。
+    pub keys: Vec<AccountKeyHealthDto>,
+    /// Key 总数与其中启用的数量，方便列表显示"3 把 / 1 把异常"。
+    pub key_total: usize,
+    pub key_enabled: usize,
+}
+
+/// 一把 Key 的健康摘要。**不含任何凭据材料**，只有摘要前缀用于对号。
+#[derive(Serialize, Clone)]
+pub struct AccountKeyHealthDto {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    /// 凭据摘要前 8 位。够在同一账号的多把 Key 之间对上号，不足以反推凭据。
+    pub digest_prefix: String,
+    pub limits: Limits,
+    /// active / quota_exhausted / key_invalid / half_open。
+    pub status: &'static str,
+    /// 熔断冷却剩余秒数。
+    pub cooldown_secs: Option<u64>,
+    /// 当前在途请求数。
+    pub inflight: u32,
+}
+
+/// 把界面提交的 Key 列表解析成可落库的形状（§4.2.1）。
+///
+/// 没带明文的条目复用已保存的密文与摘要——界面从不回吐明文，所以"有 id、
+/// 没明文"就是"这一把没动"。带了明文就重新密封：每次都取新 nonce，两条记录
+/// 绝不共享密文（§20.4）。
+fn resolve_keys(
+    state: &SharedState,
+    inputs: &[AccountKeyInput],
+    current: &[crate::storage::store::AccountKeyRow],
+) -> AdminResult<Vec<crate::storage::store::AccountKeyWrite>> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let label = input
+            .label
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if label.chars().count() > 64 {
+            return Err(AdminError::bad_request("Key 标签不能超过 64 个字符"));
+        }
+        let limits = input
+            .limits
+            .map(validate_limits)
+            .transpose()?
+            .unwrap_or_default();
+        let plaintext = input
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+
+        let (id, sealed_key, credential_digest) = match (plaintext, input.id.as_deref()) {
+            (Some(key), id) => (
+                id.map(str::to_string)
+                    .unwrap_or_else(crate::storage::store::ids::account_key),
+                seal(state, key)?,
+                crate::security::credential_digest(key),
+            ),
+            (None, Some(id)) => {
+                let existing = current.iter().find(|row| row.id == id).ok_or_else(|| {
+                    AdminError::bad_request("要保留的 Key 已经不在这个账号上了，请刷新后重试")
+                })?;
+                (
+                    id.to_string(),
+                    existing.sealed_key.clone(),
+                    // 摘要按明文现算（见 `CredentialPool::load`），这里留空即可：
+                    // 落库的那一列只是给人看的副本。
+                    String::new(),
+                )
+            }
+            (None, None) => {
+                return Err(AdminError::bad_request("新增的 Key 必须填写 API Key"));
+            }
+        };
+        out.push(crate::storage::store::AccountKeyWrite {
+            id,
+            label,
+            sealed_key,
+            credential_digest,
+            limits,
+            enabled: input.enabled.unwrap_or(true),
+        });
+    }
+    Ok(out)
+}
+
+/// 旧的单 Key 字段转成"一把 Key 的池"，供向后兼容使用。
+fn single_key_input(api_key: &str) -> AccountKeyInput {
+    AccountKeyInput {
+        id: None,
+        api_key: Some(api_key.to_string()),
+        label: None,
+        limits: None,
+        enabled: None,
+    }
 }
 
 async fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
@@ -841,6 +1039,24 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
             .flatten()
             .is_some();
 
+    // Key 池的元数据与逐把健康状态一次算好：两者按 id 一一对应，界面直接并排
+    // 展示，不需要自己拼接（§4.2.1）。
+    let keys = state
+        .runtime
+        .credentials
+        .current()
+        .keys_of(&account.id)
+        .iter()
+        .map(|key| AccountKeyDto {
+            id: key.id.clone(),
+            label: key.label.clone(),
+            enabled: key.enabled,
+            limits: key.limits,
+            digest_prefix: key.credential_digest.chars().take(8).collect(),
+            health: account_key_health_of(state, key),
+        })
+        .collect();
+
     AccountDto {
         id: account.id.clone(),
         group_id: account.group_id.clone(),
@@ -871,6 +1087,7 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
         hide_original: account.hide_original,
         model_synced_at: account.model_synced_at,
         health: account_health(state, account),
+        keys,
     }
 }
 
@@ -886,6 +1103,17 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
     let mut reason: Option<String> = None;
     let health = state.runtime.health.account(&account.id);
 
+    // 逐把 Key 的状态：账号徽标要能回答"这个号整体还能不能接"，所以先取
+    // 最严重的那把（§4.2.1）。
+    let keys = account_key_health(state, account);
+    let key_enabled = keys.iter().filter(|key| key.enabled).count();
+    let key_total = keys.len();
+    let worst_key = keys
+        .iter()
+        .filter(|key| key.enabled)
+        .max_by_key(|key| rank(key.status))
+        .map(|key| key.status);
+
     for group in &config.groups {
         for model in group.models.values() {
             for target in &model.targets {
@@ -894,7 +1122,26 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
                 }
                 total += 1;
                 let target_state = state.runtime.health.target(&target.target.id);
-                let status = target_state.status(&health).as_str();
+                // 目标状态取"账号内最好的一把 Key"：账号里还有一把健康 Key 时，
+                // 目标不该被某一把坏 Key 拖成不可用，否则列表会系统性报警。
+                let best_key = keys
+                    .iter()
+                    .filter(|key| key.enabled)
+                    .min_by_key(|key| rank(key.status))
+                    .and_then(|key| {
+                        state
+                            .runtime
+                            .credentials
+                            .current()
+                            .by_id(&account.id, &key.id)
+                            .map(|credential| {
+                                state.runtime.health.key(&crate::credential::credential_id(
+                                    &credential.account_id,
+                                    &credential.credential_digest,
+                                ))
+                            })
+                    });
+                let status = target_state.status(&health, best_key.as_deref()).as_str();
                 *targets.entry(status).or_insert(0usize) += 1;
                 // 只记第一个最严重的原因，避免列出十几条同样的话。
                 if rank(status) > worst.map(rank).unwrap_or(0) {
@@ -910,17 +1157,32 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
 
     let status = if !account.enabled {
         "disabled"
-    } else if health.key_invalid() {
+    } else if key_enabled == 0 {
+        // 没有任何启用的 Key 是比"某把 Key 失效"更根本的问题：管理员还没填
+        // 凭据，而不是上游拒绝了凭据。两者的处置动作完全不同。
+        "no_key"
+    } else if worst_key == Some("key_invalid") {
         "key_invalid"
-    } else if health.quota_exhausted() {
+    } else if worst_key == Some("quota_exhausted") {
         "quota_exhausted"
     } else {
         worst.unwrap_or("active")
     };
     let reason = match status {
         "disabled" => Some("管理员已停用该账号".to_string()),
-        "key_invalid" => Some("上游 Key 失效，需重新配置凭据".to_string()),
-        "quota_exhausted" => Some("额度耗尽，等待上游恢复时间".to_string()),
+        "no_key" => Some("该账号没有启用的 API Key，任何请求都会被拒绝".to_string()),
+        "key_invalid" => Some(format!(
+            "有 {} 把 Key 已被上游判定失效，需重新配置凭据",
+            keys.iter()
+                .filter(|key| key.enabled && key.status == "key_invalid")
+                .count()
+        )),
+        "quota_exhausted" => Some(format!(
+            "有 {} 把 Key 额度耗尽，等待上游恢复时间",
+            keys.iter()
+                .filter(|key| key.enabled && key.status == "quota_exhausted")
+                .count()
+        )),
         "active" if total == 0 => Some("该账号还没有任何调度目标".to_string()),
         // 只有目标级问题时把具体是哪个目标说出来。
         _ if total > 0 && status != "active" => reason,
@@ -932,6 +1194,44 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
         reason,
         targets,
         target_total: total,
+        keys,
+        key_total,
+        key_enabled,
+    }
+}
+
+/// 逐把 Key 的健康摘要（§4.2.1）。**不返回任何凭据材料**，只有摘要前缀。
+fn account_key_health(state: &SharedState, account: &Account) -> Vec<AccountKeyHealthDto> {
+    state
+        .runtime
+        .credentials
+        .current()
+        .keys_of(&account.id)
+        .iter()
+        .map(|key| account_key_health_of(state, key))
+        .collect()
+}
+
+/// 单把 Key 的健康摘要。
+fn account_key_health_of(
+    state: &SharedState,
+    key: &crate::credential::Credential,
+) -> AccountKeyHealthDto {
+    let health = state.runtime.health.key(&crate::credential::credential_id(
+        &key.account_id,
+        &key.credential_digest,
+    ));
+    // Key 状态的时钟是 tokio 的：后台与路由读的是同一个冷却剩余时间。
+    let now = tokio::time::Instant::now();
+    AccountKeyHealthDto {
+        id: key.id.clone(),
+        label: key.label.clone(),
+        enabled: key.enabled,
+        digest_prefix: key.credential_digest.chars().take(8).collect(),
+        limits: key.limits,
+        status: health.status().as_str(),
+        cooldown_secs: health.cooldown_remaining(now).map(|wait| wait.as_secs()),
+        inflight: health.inflight(),
     }
 }
 
@@ -974,8 +1274,12 @@ pub fn effective_target_status(
     }
     let account = state.runtime.health.account(&target.account.id);
     let health = state.runtime.health.target(&target.target.id);
-    match health.status(&account) {
+    // 取账号内状态最好的那把 Key：只要还有一把能把请求送出去，这个目标就算
+    // 可用，不能被某一把坏 Key 拖成不可用（§4.2.1）。
+    let key = best_key_state(state, &target.account.id);
+    match health.status(&account, key.as_deref()) {
         crate::health::TargetStatus::KeyInvalid => "key_invalid",
+        crate::health::TargetStatus::NoKey => "no_key",
         crate::health::TargetStatus::QuotaExhausted => "quota_exhausted",
         crate::health::TargetStatus::Cooldown => "cooldown",
         crate::health::TargetStatus::HalfOpen => "half_open",
@@ -989,9 +1293,33 @@ pub fn effective_target_status(
     }
 }
 
+/// 账号内状态最好的那把 Key 的健康状态（§4.2.1）。
+///
+/// 没有启用的 Key 时返回 `None`：调用方按 `no_key` 处理，而不是把账号的
+/// 目标状态误报成"正常"。
+fn best_key_state(
+    state: &SharedState,
+    account_id: &str,
+) -> Option<std::sync::Arc<crate::health::KeyState>> {
+    let pool = state.runtime.credentials.current();
+    let keys = pool.keys_of(account_id);
+    let best = keys.iter().filter(|key| key.enabled).min_by_key(|key| {
+        let health = state.runtime.health.key(&crate::credential::credential_id(
+            &key.account_id,
+            &key.credential_digest,
+        ));
+        rank(health.status().as_str())
+    })?;
+    Some(state.runtime.health.key(&crate::credential::credential_id(
+        &best.account_id,
+        &best.credential_digest,
+    )))
+}
+
 /// 状态严重程度，用于从目标状态里挑出最严重的那个。
 fn rank(status: &str) -> u8 {
     match status {
+        "no_key" => 7,
         "key_invalid" => 6,
         "quota_exhausted" => 5,
         "cooldown" => 3,
@@ -1030,9 +1358,19 @@ pub async fn create_account(
 ) -> AdminResult<(StatusCode, Json<AccountDto>)> {
     find_group(&state, &payload.group_id).await?;
     let name = require_name(&payload.name, "账号名称")?;
-    if payload.api_key.trim().is_empty() {
-        return Err(AdminError::bad_request("API Key 不能为空"));
+    // Key 池：新格式用 `keys`，只给了旧的 `api_key` 时等价于"一把 Key 的池"
+    // （§4.2.1）。Key 池为空是合法状态——管理员可以先建账号再填凭据。
+    let mut inputs = payload.keys;
+    if inputs.is_empty()
+        && let Some(legacy) = payload
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+    {
+        inputs.push(single_key_input(legacy));
     }
+    let key_writes = resolve_keys(&state, &inputs, &[])?;
     let allow_private = payload.allow_private_network.unwrap_or(false);
     let base_url = validate_base_url(&payload.base_url, allow_private)?;
     // 人工优先级默认 0：默认所有账号同层，由综合评分决定分配；只有在
@@ -1080,8 +1418,12 @@ pub async fn create_account(
         created_at: OffsetDateTime::now_utc(),
     };
 
+    // 凭据镜像取第一把 Key：旧二进制与旧恢复路径仍能读到它（§4.2.1）。
     let secrets = AccountSecrets::new(
-        seal(&state, payload.api_key.trim())?,
+        key_writes
+            .first()
+            .map(|key| key.sealed_key.clone())
+            .unwrap_or_default(),
         token.map(|t| seal(&state, t)).transpose()?,
     );
     state
@@ -1089,6 +1431,13 @@ pub async fn create_account(
         .insert_account(&account, &secrets)
         .await
         .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+    // 建账号与写 Key 池分两步：账号行必须先存在（外键）。两步之间失败只会留下
+    // 一个"没有凭据"的账号，后台如实显示，管理员补一次即可。
+    state
+        .store
+        .replace_account_keys(&account.id, &key_writes)
+        .await
+        .map_err(AdminError::internal)?;
     reload(&state).await?;
     audit(&state, &admin, "create_account", &account.id).await;
 
@@ -1115,6 +1464,41 @@ pub async fn update_account(
 
     if let Some(name) = patch.name {
         account.name = require_name(&name, "账号名称")?;
+    }
+    // 改分组（§4.2.2）。分组是调度硬边界，但迁移本身是后台的正当操作：
+    // 账号的模型目录按对外名一起搬过去，管理员不必"复制一个新账号再删旧的"。
+    // 名称检查放在后面：同一分组内名称唯一，改名与搬家同时提交时应该按**改完
+    // 的名字**判冲突。
+    let mut previous_group: Option<String> = None;
+    if let Some(group_id) = patch
+        .group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        && group_id != account.group_id
+    {
+        find_group(&state, group_id).await?;
+        let clash = state
+            .store
+            .list_accounts()
+            .await
+            .map_err(AdminError::internal)?
+            .into_iter()
+            .any(|other| {
+                other.id != account.id && other.group_id == group_id && other.name == account.name
+            });
+        // 交给数据库的唯一约束也能拦住，但报出来的是"名称已存在"，管理员看不出
+        // 是搬家撞上的。这里先判一次，把话说清楚。
+        if clash {
+            return Err(AdminError::conflict(format!(
+                "目标分组里已经有叫「{}」的账号，请先改账号名称，或换一个目标分组",
+                account.name
+            )));
+        }
+        previous_group = Some(std::mem::replace(
+            &mut account.group_id,
+            group_id.to_string(),
+        ));
     }
     if let Some(allow) = patch.allow_private_network {
         account.allow_private_network = allow;
@@ -1181,14 +1565,31 @@ pub async fn update_account(
         site_available,
     )?;
 
-    let secrets = AccountSecrets {
-        api_key: patch
+    // Key 池：新格式用 `keys`（整体替换），只给了旧的 `api_key` 时换成
+    // "一把 Key 的池"。两者都没给就是"不动 Key 池"（§4.2.1）。
+    let mut inputs = patch.keys;
+    if inputs.is_none()
+        && let Some(legacy) = patch
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty())
-            .map(|key| seal(&state, key))
-            .transpose()?,
+    {
+        inputs = Some(vec![single_key_input(legacy)]);
+    }
+    let current_keys = state
+        .store
+        .list_account_key_rows(&account.id)
+        .await
+        .map_err(AdminError::internal)?;
+    let key_writes = inputs
+        .as_deref()
+        .map(|inputs| resolve_keys(&state, inputs, &current_keys))
+        .transpose()?;
+
+    let secrets = AccountSecrets {
+        // 镜像列由 `replace_account_keys` 统一维护，这里不再单独写它。
+        api_key: None,
         new_api_token: token.map(|t| seal(&state, t)).transpose()?,
     };
     state
@@ -1196,9 +1597,45 @@ pub async fn update_account(
         .update_account(&account, &secrets)
         .await
         .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
-    // 凭据换了就清掉"Key 失效"的硬停：这正是 §12.3 允许的恢复途径。
-    if secrets.api_key.is_some() {
-        state.runtime.health.clear_account_faults(&account.id);
+    if let Some(keys) = key_writes {
+        // 凭据换过就清掉"Key 失效"的硬停：这正是 §12.3 允许的恢复途径。
+        // 没换的那些 Key 的熔断状态保留——按凭据摘要归类本来就该认得出是同一把
+        // （§4.2.1）。
+        let replaced = keys.iter().any(|key| {
+            current_keys
+                .iter()
+                .find(|row| row.id == key.id)
+                .is_none_or(|row| row.sealed_key != key.sealed_key)
+        });
+        state
+            .store
+            .upsert_account_keys(&account.id, &keys)
+            .await
+            .map_err(AdminError::internal)?;
+        if replaced {
+            state.runtime.health.clear_account_faults(&account.id);
+        }
+    }
+    // 搬家：账号行已经落库，接着把目标按对外名搬到新分组，再按目录整体调和
+    // 一遍（§4.2.2）。顺序不能反——先搬目标再改账号行的话，中间那一刻的快照
+    // 里目标与账号不同组，会被配置装配整批丢掉。
+    if let Some(from_group) = previous_group.as_deref() {
+        let moved = discovery::move_account_targets(&state, &account, from_group)
+            .await
+            .map_err(AdminError::internal)?;
+        // 目录调和兜底：迁移只搬"已经存在的目标"，"哪些目录行该有目标"仍然
+        // 由目录说了算（托管开关、上游已消失的行都在这一步收敛）。
+        discovery::reconcile_account(&state, &account, account.auto_sync)
+            .await
+            .map_err(AdminError::internal)?;
+        tracing::info!(
+            account = %account.id,
+            from = from_group,
+            to = %account.group_id,
+            moved,
+            "账号已迁移分组"
+        );
+        audit(&state, &admin, "move_account", &account.id).await;
     }
     reload(&state).await?;
     if was_managed && !account.auto_sync {
@@ -1813,7 +2250,8 @@ fn pause_reason(
     }
     let account = state.runtime.health.account(&target.account_id);
     let health = state.runtime.health.target(&target.id);
-    match health.status(&account) {
+    let key = best_key_state(state, &target.account_id);
+    match health.status(&account, key.as_deref()) {
         crate::health::TargetStatus::Active => {
             // 参与调度也可能因为倍率被拦，这里把倍率原因补上。
             multiplier_pause_reason(state, view)
@@ -1828,7 +2266,10 @@ fn pause_reason(
         crate::health::TargetStatus::HalfOpen => Some("半开试运行中，只放行一个请求".to_string()),
         crate::health::TargetStatus::QuotaExhausted => Some("额度耗尽，等待恢复时间".to_string()),
         crate::health::TargetStatus::KeyInvalid => {
-            Some("上游 Key 失效，需重新配置凭据".to_string())
+            Some("账号内所有 Key 都已失效，需重新配置凭据".to_string())
+        }
+        crate::health::TargetStatus::NoKey => {
+            Some("该账号没有启用的 API Key，任何请求都会被拒绝".to_string())
         }
     }
 }
@@ -2240,6 +2681,36 @@ pub struct UpdateAccountModelPayload {
     /// 启用 / 停用该模型。
     #[serde(default)]
     pub selected: Option<bool>,
+    /// 停用最近 24 小时有流量的模型需要它二次确认（§16.3）。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 一次批量应用里的单行改动（§16.3）。
+///
+/// 勾选是本地草稿 + 防抖提交的：用户连点十几个复选框只发一次请求，服务端
+/// 只调和一遍目标、只重载一遍配置。逐行调用在几百个模型的目录上会让每一次
+/// 勾选都走一遍"重建配置快照 + 重建凭据池"。
+#[derive(Deserialize)]
+pub struct ModelChangePayload {
+    pub upstream_model: String,
+    /// 下游模型名。`null`/`None` 表示不改；空字符串表示清空、回到上游原名。
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// 启用 / 停用该模型。
+    #[serde(default)]
+    pub selected: Option<bool>,
+    /// 从目录里删除这一行（连同它的调度目标）。
+    #[serde(default)]
+    pub delete: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ApplyAccountModelsPayload {
+    pub changes: Vec<ModelChangePayload>,
+    /// 最近 24 小时有流量的模型被停用/删除时需要二次确认（§16.3）。
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// 修改一行目录的下游模型名与启用状态，并立即调和目标（§16.3）。
@@ -2250,15 +2721,29 @@ pub async fn update_account_model(
     Json(payload): Json<UpdateAccountModelPayload>,
 ) -> AdminResult<Json<Vec<AccountModelDto>>> {
     let account = find_account(&state, &id).await?;
-    discovery::update_model(
+    let outcome = discovery::apply_changes(
         &state,
         &account,
-        &payload.upstream_model,
-        payload.alias.as_deref(),
-        payload.selected,
+        &[discovery::ModelChange {
+            upstream_model: payload.upstream_model.clone(),
+            alias: payload.alias.clone(),
+            selected: payload.selected,
+            delete: false,
+        }],
+        payload.force,
     )
     .await
     .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    if let discovery::Changes::NeedsConfirm(warnings) = outcome {
+        return Err(AdminError::conflict(format!(
+            "以下模型最近 24 小时有流量，停用前请确认：{}",
+            warnings
+                .iter()
+                .map(|warning| warning.public_name.clone())
+                .collect::<Vec<_>>()
+                .join("、")
+        )));
+    }
     audit(
         &state,
         &admin,
@@ -2267,6 +2752,51 @@ pub async fn update_account_model(
     )
     .await;
     account_models_json(&state, &id).await
+}
+
+/// 批量应用勾选 / 改名 / 删除，只调和一次目标（§16.3）。
+pub async fn apply_account_models(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplyAccountModelsPayload>,
+) -> AdminResult<Response> {
+    let account = find_account(&state, &id).await?;
+    if account.auto_sync {
+        return Err(AdminError::conflict(
+            "该账号已开启模型自动同步，模型目录由后台托管；如需手动修改请先关闭自动同步",
+        ));
+    }
+    let changes: Vec<discovery::ModelChange> = payload
+        .changes
+        .into_iter()
+        .map(|change| discovery::ModelChange {
+            upstream_model: change.upstream_model,
+            alias: change.alias,
+            selected: change.selected,
+            delete: change.delete,
+        })
+        .collect();
+    match discovery::apply_changes(&state, &account, &changes, payload.force)
+        .await
+        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?
+    {
+        discovery::Changes::NeedsConfirm(warnings) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "以下模型最近 24 小时有流量，停用前请确认",
+                "warnings": warnings
+                    .iter()
+                    .map(|w| json!({"public_name": w.public_name, "calls": w.calls}))
+                    .collect::<Vec<_>>(),
+            })),
+        )
+            .into_response()),
+        discovery::Changes::Applied { .. } => {
+            audit(&state, &admin, "apply_account_models", &id).await;
+            Ok(account_models_json(&state, &id).await?.into_response())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2518,12 +3048,16 @@ pub async fn copy_account(
     Path(id): Path<String>,
 ) -> AdminResult<(StatusCode, Json<AccountDto>)> {
     let account = find_account(&state, &id).await?;
-    let sealed_key = state
+    let source_keys = state
         .store
-        .account_sealed_key(&id)
+        .list_account_key_rows(&id)
         .await
-        .map_err(AdminError::internal)?
-        .ok_or_else(|| AdminError::bad_request("账号没有已保存的 API Key，无法复制"))?;
+        .map_err(AdminError::internal)?;
+    if source_keys.is_empty() {
+        return Err(AdminError::bad_request(
+            "账号没有已保存的 API Key，无法复制",
+        ));
+    }
     let sealed_token = state
         .store
         .account_sealed_new_api_token(&id)
@@ -2553,23 +3087,38 @@ pub async fn copy_account(
         model_synced_at: None,
         created_at: OffsetDateTime::now_utc(),
     };
-    // 重新加密：`Cipher::open` 每次返回独立的明文，`seal` 每次取新 nonce。
-    // 重新加密：`Cipher::open` 每次返回独立的明文，`seal` 每次取新 nonce，
-    // 两条记录绝不共享密文（§20.4）。
-    let key = state
-        .cipher
-        .open(&sealed_key)
-        .map_err(AdminError::internal)?;
+    // 整个 Key 池一起复制，每把都重新加密：`Cipher::open` 每次返回独立的
+    // 明文，`seal` 每次取新 nonce，两条记录绝不共享密文（§20.4）。
+    let mut copy_keys: Vec<crate::storage::store::AccountKeyWrite> =
+        Vec::with_capacity(source_keys.len());
+    for row in &source_keys {
+        let plaintext = state
+            .cipher
+            .open(&row.sealed_key)
+            .map_err(AdminError::internal)?;
+        let secret = String::from_utf8_lossy(&plaintext).into_owned();
+        copy_keys.push(crate::storage::store::AccountKeyWrite {
+            id: crate::storage::store::ids::account_key(),
+            label: row.label.clone(),
+            sealed_key: state
+                .cipher
+                .seal(secret.as_bytes())
+                .map_err(AdminError::internal)?,
+            credential_digest: crate::security::credential_digest(&secret),
+            limits: row.limits,
+            enabled: row.enabled,
+        });
+    }
     let token = match sealed_token {
         Some(sealed) => Some(state.cipher.open(&sealed).map_err(AdminError::internal)?),
         None => None,
     };
     let has_token = token.is_some();
     let secrets = AccountSecrets::new(
-        state
-            .cipher
-            .seal(key.as_ref())
-            .map_err(AdminError::internal)?,
+        copy_keys
+            .first()
+            .map(|key| key.sealed_key.clone())
+            .unwrap_or_default(),
         token
             .map(|t| state.cipher.seal(t.as_ref()))
             .transpose()
@@ -2581,6 +3130,11 @@ pub async fn copy_account(
         .insert_account(&copy, &secrets)
         .await
         .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+    state
+        .store
+        .replace_account_keys(&copy.id, &copy_keys)
+        .await
+        .map_err(AdminError::internal)?;
 
     // 选择集、别名与调度目标随账号独立一份（§6.4：所有配置独立，Key 和状态
     // 不共享）。
@@ -2643,10 +3197,14 @@ pub struct TestAccountPayload {
     pub model: Option<String>,
 }
 
-/// 测试连接（§6.4、§7）：发送一次真实的 `hi`。
+/// 测试连接（§6.4、§7）：发送一次真实的 \`hi\`。
 ///
 /// 测试数据不参与自适应、粘性与正常重试统计：走独立的请求路径，不写
 /// 端点证据、健康状态或评分，只报告能不能通。
+///
+/// **逐把 Key 测试**（§4.2.1）：多 Key 账号最有用的诊断动作就是"哪几把已经
+/// 死了"。历史字段保持不变（指向第一把 Key），额外用 \`keys\` 数组给出每一把的
+/// 结果，前端按需展示。
 pub async fn test_account(
     State(state): State<SharedState>,
     admin: Admin,
@@ -2679,14 +3237,14 @@ pub async fn test_account(
         }
     };
 
-    let sealed = state
+    let keys = state
         .store
-        .account_sealed_key(&id)
+        .list_account_key_rows(&id)
         .await
-        .map_err(AdminError::internal)?
-        .ok_or_else(|| AdminError::bad_request("账号没有已保存的 API Key"))?;
-    let key = state.cipher.open(&sealed).map_err(AdminError::internal)?;
-    let api_key = String::from_utf8_lossy(&key).into_owned();
+        .map_err(AdminError::internal)?;
+    if keys.is_empty() {
+        return Err(AdminError::bad_request("账号没有已保存的 API Key"));
+    }
 
     let endpoint = crate::upstream::Endpoint::native(account.preferred_protocol);
     let url = crate::upstream::build_url(&account.base_url, endpoint)
@@ -2698,22 +3256,79 @@ pub async fn test_account(
         "max_tokens": 8,
     });
 
-    let headers = crate::upstream::headers_for_protocol(account.preferred_protocol, &api_key)
-        .map_err(|error| AdminError::bad_request(format!("请求头构造失败：{error}")))?;
+    let mut results = Vec::with_capacity(keys.len());
+    for (index, row) in keys.iter().enumerate() {
+        let plaintext = state
+            .cipher
+            .open(&row.sealed_key)
+            .map_err(AdminError::internal)?;
+        let api_key = String::from_utf8_lossy(&plaintext).into_owned();
+        let label = if row.label.trim().is_empty() {
+            format!("Key {}", index + 1)
+        } else {
+            row.label.clone()
+        };
+        let attempt = test_one_key(&state, &account, &url, &model, &body, &api_key).await;
+        results.push(json!({
+            "id": row.id,
+            "label": label,
+            "enabled": row.enabled,
+            "ok": attempt.0,
+            "status": attempt.1,
+            "latency_ms": attempt.2,
+            "message": attempt.3,
+        }));
+    }
+
+    // 汇总：只要有任意一把通，这个账号就算能用。返回的 \`ok\`/\`message\` 仍按
+    // 第一把给出，保持旧前端的展示不变。
+    let first = &results[0];
+    let healthy = results
+        .iter()
+        .filter(|entry| entry["ok"] == json!(true))
+        .count();
+    let result = json!({
+        "ok": first["ok"],
+        "status": first["status"],
+        "latency_ms": first["latency_ms"],
+        "model": model,
+        "message": first["message"],
+        "keys": results,
+        "healthy_keys": healthy,
+        "key_total": keys.len(),
+    });
+
+    audit(&state, &admin, "test_account", &id).await;
+    Ok(Json(result))
+}
+
+/// 用一把 Key 发一次测试请求。返回 (是否成功, 状态码, 延迟毫秒, 可读说明)。
+async fn test_one_key(
+    state: &SharedState,
+    account: &Account,
+    url: &reqwest::Url,
+    model: &str,
+    body: &serde_json::Value,
+    api_key: &str,
+) -> (bool, u16, i64, String) {
+    let headers = match crate::upstream::headers_for_protocol(account.preferred_protocol, api_key) {
+        Ok(headers) => headers,
+        Err(error) => return (false, 0, 0, format!("请求头构造失败：{error}")),
+    };
     let started = std::time::Instant::now();
     let outcome = state
         .upstream
         .http_for(account.allow_private_network)
-        .post(url)
+        .post(url.clone())
         .headers(headers)
         .timeout(std::time::Duration::from_secs(20))
-        .json(&body)
+        .json(body)
         .send()
         .await;
     let latency_ms = started.elapsed().as_millis() as i64;
 
     // 网络层失败也返回结构化结果，让前端能展示而不是抛 500。
-    let result = match outcome {
+    match outcome {
         Ok(response) => {
             let status = response.status().as_u16();
             let ok = response.status().is_success();
@@ -2727,25 +3342,11 @@ pub async fn test_account(
                         .unwrap_or_else(|| format!("状态码 {status}"))
                 )
             };
-            json!({
-                "ok": ok,
-                "status": status,
-                "latency_ms": latency_ms,
-                "model": model,
-                "message": message,
-            })
+            let _ = model;
+            (ok, status, latency_ms, message)
         }
-        Err(error) => json!({
-            "ok": false,
-            "status": 0,
-            "latency_ms": latency_ms,
-            "model": model,
-            "message": format!("连接失败：{error}"),
-        }),
-    };
-
-    audit(&state, &admin, "test_account", &id).await;
-    Ok(Json(result))
+        Err(error) => (false, 0, latency_ms, format!("连接失败：{error}")),
+    }
 }
 
 // ------------------------------------------------- 成本页与校准（§6.8）

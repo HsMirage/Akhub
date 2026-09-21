@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountKeyInput,
   AccountModel,
   Alias,
   AvailableModel,
@@ -154,7 +155,10 @@ export interface AccountInput {
   name: string;
   upstream_type: Account["upstream_type"];
   base_url: string;
-  api_key: string;
+  /** 账号内 Key 池（§4.2.1）。整体替换；缺省时后台不动 Key 池。 */
+  keys?: AccountKeyInput[];
+  /** 旧版单 Key 字段。给出且 `keys` 缺省时等价于"把池换成这一把"。 */
+  api_key?: string;
   preferred_protocol: Account["preferred_protocol"];
   adaptive_protocol?: boolean;
   default_priority?: number;
@@ -276,6 +280,23 @@ export const api = {
       selected?: boolean;
     },
   ) => post<AccountModel[]>(`/accounts/${id}/models/update`, payload),
+  /**
+   * 批量应用模型目录改动（§16.3）。
+   *
+   * 界面的勾选是本地草稿 + 防抖：一次请求提交整批改动，服务端只调和一遍目标、
+   * 只重载一遍配置。逐行 `updateAccountModel` 在几百个模型时会明显卡住。
+   * 停用有流量的模型时返回 409，由调用方确认后带 `force` 重发。
+   */
+  applyAccountModels: (
+    id: string,
+    changes: {
+      upstream_model: string;
+      alias?: string;
+      selected?: boolean;
+      delete?: boolean;
+    }[],
+    force = false,
+  ) => post<AccountModel[]>(`/accounts/${id}/models/apply`, { changes, force }),
   /** 从账号目录永久删除一行并移除其目标（§16.5）。 */
   deleteAccountModel: (id: string, upstreamModel: string) =>
     post<void>(`/accounts/${id}/models/delete`, { upstream_model: upstreamModel }),

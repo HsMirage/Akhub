@@ -15,7 +15,7 @@ const GROUPS: { title: string; terms: { term: string; desc: string }[] }[] = [
       },
       {
         term: "上游账号",
-        desc: "一套真实的上游凭据（Base URL + API Key）。同一把 Key 要用在两个分组时，请复制成两个账号。",
+        desc: "一套真实的上游凭据（Base URL + API Key）。同一把 Key 要同时用在两个分组时，请复制成两个账号；只是改归属，直接改「所属分组」即可，模型会按对外名一起迁过去。",
       },
       {
         term: "逻辑模型",

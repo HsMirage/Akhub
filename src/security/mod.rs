@@ -158,6 +158,12 @@ impl Cipher {
     }
 
     /// 加密为 `nonce || ciphertext` 的自包含信封。
+    /// 固定密钥的构造器，只给测试用（生产路径一律经 [\`MasterKey::cipher\`]）。
+    #[cfg(test)]
+    pub fn for_tests(key: &[u8; 32]) -> Self {
+        Self::new(key)
+    }
+
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce_bytes = random_bytes(NONCE_LEN)?;
         let nonce = XNonce::try_from(&nonce_bytes[..]).expect("nonce 长度由常量保证");
@@ -225,6 +231,22 @@ impl KeyDigest {
     pub fn digest_hex(&self, key: &str) -> String {
         hex::encode(self.digest(key))
     }
+}
+
+/// 上游凭据的稳定摘要（hex），用于把 Key 级动态状态归到一起。
+///
+/// **只用固定标签的 HMAC，不掺主密钥**：同一把 Key 在换机恢复、重装或重新
+/// 密封之后必须得到同一个摘要，否则"改个标签就丢掉熔断状态"或"重新粘贴
+/// 同一把 Key 就认不出它是同一把"会成为常态。
+///
+/// 摘要不是凭据：它既不能用于鉴权，也不足以从 128 位以上随机熵的 Key 反推
+/// 原文。它进入内存状态表与数据库的 `credential_digest` 列，不进日志、
+/// 不进 API 响应（§23.4）。
+pub fn credential_digest(api_key: &str) -> String {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(b"akhub:credential-digest:v1")
+        .expect("HMAC-SHA256 接受任意长度密钥");
+    mac.update(api_key.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// 定长常量时间比较（§19.2）。

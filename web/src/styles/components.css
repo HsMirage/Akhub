@@ -3664,3 +3664,102 @@ table.data tbody tr.is-clickable:hover {
     display: none;
   }
 }
+
+/* ---------------------------------------------------------- 账号内 Key 池（§4.2.1） */
+
+.key-pool {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.key-pool-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.key-pool-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.key-pool-index {
+  flex: none;
+  min-width: 28px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.key-pool-label {
+  flex: 0 1 160px;
+  min-width: 96px;
+}
+
+.key-pool-secret {
+  flex: 1 1 220px;
+  min-width: 150px;
+}
+
+.key-pool-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.key-pool-limits {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding-top: var(--space-1);
+  border-top: 1px dashed var(--border);
+}
+
+.key-pool-limits label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 0 1 120px;
+  min-width: 88px;
+}
+
+.key-pool-limits label > span {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.key-pool-limits .key-pool-enabled {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  min-width: 0;
+  padding-bottom: 8px;
+}
+
+.key-pool-empty {
+  padding: var(--space-3);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  text-align: center;
+}
+
+.key-pool-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}

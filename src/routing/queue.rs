@@ -267,7 +267,11 @@ mod tests {
         let target = Arc::new(tokio::sync::Semaphore::new(1));
         let _held_account = account.clone().try_acquire_owned().unwrap();
         let _held_target = target.clone().try_acquire_owned().unwrap();
-        let capacity = Capacity { account, target };
+        let capacity = Capacity {
+            account: Some(account),
+            key: None,
+            target: Some(target),
+        };
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let waiting = tokio::spawn(async move {
@@ -293,7 +297,11 @@ mod tests {
 
         let account = Arc::new(tokio::sync::Semaphore::new(0));
         let target = Arc::new(tokio::sync::Semaphore::new(0));
-        let capacity = Capacity { account, target };
+        let capacity = Capacity {
+            account: Some(account),
+            key: None,
+            target: Some(target),
+        };
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         shutdown_tx.send(true).unwrap();
 

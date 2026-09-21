@@ -6,10 +6,16 @@
  * - 填写后 = 下游用这个名称调用；
  * - 多个账号填成同一个名称，会自动合并为一个模型；
  * - 账号级「隐藏原始模型名」打开后，只暴露填写了下游模型名的模型。
+ *
+ * 性能上只有两条规矩，但都是必需的：
+ * 1. 勾选 / 改名先在本地草稿上生效，再用防抖合并成**一次** `/models/apply`。
+ *    逐行 POST 会让服务端每次勾选都重调和一遍目标、重建一遍配置快照，
+ *    几百个模型时界面就会卡住（`/models/apply` 一次请求只调和一遍）。
+ * 2. 行组件用 `memo` 包起来，勾一个复选框只重渲染那一行，而不是整张表。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../lib/api";
-import type { Account, AccountModel, DispatchTarget } from "../lib/types";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiError, api } from "../lib/api";
+import type { Account, AccountModel, DispatchTarget, SelectionWarning } from "../lib/types";
 import { Badge, Button, ConfirmDialog, Modal, Switch, useToast } from "./ui";
 import {
   IconCheck,
@@ -24,6 +30,22 @@ import {
 interface ModelManagerData {
   targets: DispatchTarget[];
 }
+
+/** 一次待提交的单行改动。同一行的多次改动会合并成一条。 */
+interface PendingChange {
+  alias?: string;
+  selected?: boolean;
+  delete?: boolean;
+}
+
+/** 提交给 `/models/apply` 的一行。 */
+type ModelChange = PendingChange & { upstream_model: string };
+
+/** 勾选合并的等待窗口（毫秒）。连点复选框时只发一次请求。 */
+const FLUSH_DELAY_MS = 350;
+
+/** 空数组常量：让未处于编辑态的行拿到稳定引用，`memo` 才不会被破功。 */
+const NO_NAMES: string[] = [];
 
 /** 把模型名压成骨架，用来提示“这两个名字很可能是同一个模型”。 */
 function modelFingerprint(name: string): string {
@@ -73,6 +95,8 @@ export function ModelSelectionDialog({
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  /** 防抖提交进行中：底部用它显示“保存中…”。 */
+  const [saving, setSaving] = useState(false);
   const [query, setQuery] = useState("");
   const [onlyEnabled, setOnlyEnabled] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -83,6 +107,21 @@ export function ModelSelectionDialog({
   const [newUpstream, setNewUpstream] = useState("");
   const [newAlias, setNewAlias] = useState("");
   const [pendingDelete, setPendingDelete] = useState<AccountModel | null>(null);
+  /** 有流量模型被停用/删除时的二次确认（§16.3）。 */
+  const [confirmWarnings, setConfirmWarnings] = useState<SelectionWarning[] | null>(null);
+
+  // 待提交的改动与最近一次被拒的改动：前者是草稿，后者用于“仍然停用”。
+  const pending = useRef<Map<string, PendingChange>>(new Map());
+  const rejected = useRef<ModelChange[] | null>(null);
+  const flushTimer = useRef<number | null>(null);
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  /** 当前账号 ID 的即时副本：慢响应回来时用它判断是否还有效。 */
+  const accountIdRef = useRef(accountId);
+  accountIdRef.current = accountId;
+  /** 二次确认列表的即时副本，供异步回调判断确认框是否还开着。 */
+  const confirmWarningsRef = useRef<SelectionWarning[] | null>(null);
+  confirmWarningsRef.current = confirmWarnings;
 
   const load = useCallback(async () => {
     if (!accountId) return;
@@ -107,17 +146,110 @@ export function ModelSelectionDialog({
     }
   }, [account]);
 
+  /**
+   * 把草稿合并成一次请求提交。
+   *
+   * `force` 用于二次确认之后的再次提交（最近 24 小时有流量的模型）。
+   */
+  const flush = useCallback(
+    async (force = false) => {
+      if (flushTimer.current !== null) {
+        window.clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+      // 上次被 409 拦下的改动与这次新攒的改动按行合并，新意图覆盖旧意图：
+      // 二次确认还开着时用户继续勾选，确认后一次全部生效。
+      const merged = new Map<string, ModelChange>();
+      for (const change of rejected.current ?? []) {
+        merged.set(change.upstream_model, { ...change });
+      }
+      for (const [upstream_model, change] of pending.current) {
+        merged.set(upstream_model, {
+          ...(merged.get(upstream_model) ?? { upstream_model }),
+          ...change,
+          upstream_model,
+        });
+      }
+      const changes = [...merged.values()];
+      if (changes.length === 0) return;
+      pending.current.clear();
+      rejected.current = null;
+      // 请求发出后账号可能已经被切走：回来的目录只属于发出它的那个账号。
+      const requestedFor = accountId;
+      setSaving(true);
+      try {
+        const list = await api.applyAccountModels(requestedFor, changes, force);
+        if (accountIdRef.current === requestedFor) setRows(list);
+        if (confirmWarningsRef.current !== null) setConfirmWarnings(null);
+        await onChangedRef.current();
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 409) {
+          // 停用有流量的模型：先让用户确认，改动原样留在 rejected 里。
+          const payload = cause.payload as
+            | { warnings?: SelectionWarning[]; needs_confirm?: SelectionWarning[] }
+            | null;
+          rejected.current = changes;
+          setConfirmWarnings(payload?.warnings ?? payload?.needs_confirm ?? []);
+        } else {
+          toast.error(cause instanceof Error ? cause.message : "保存失败");
+          // 本地草稿可能与服务端不一致：重新读一次目录，别让界面说谎。
+          await load();
+        }
+      } finally {
+        setSaving(false);
+      }
+    },
+    [accountId, load, toast],
+  );
+
+  /** 记下一行改动并安排防抖提交。 */
+  const queueChange = useCallback(
+    (upstreamModel: string, change: PendingChange) => {
+      pending.current.set(upstreamModel, {
+        ...(pending.current.get(upstreamModel) ?? {}),
+        ...change,
+      });
+      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      flushTimer.current = window.setTimeout(() => {
+        flushTimer.current = null;
+        // 二次确认开着时先只攒着：用户点“仍然停用”会连新改动一起提交。
+        if (rejected.current === null) void flush();
+      }, FLUSH_DELAY_MS);
+    },
+    [flush],
+  );
+
   useEffect(() => {
     if (!open) return;
+    // 切换账号前先把上一个账号的草稿落库，避免改动被静默丢弃。
+    void flush();
     setQuery("");
     setOnlyEnabled(false);
     setEditing(null);
     setAdding(false);
     setNotice(null);
+    setConfirmWarnings(null);
+    rejected.current = null;
     setHideOriginal(account?.hide_original ?? false);
     void load();
     void loadGroupNames();
-  }, [open, account, load, loadGroupNames]);
+  }, [open, account, flush, load, loadGroupNames]);
+
+  // 组件消失时把草稿补交一次；已提交的请求不受影响。
+  useEffect(
+    () => () => {
+      if (flushTimer.current !== null) {
+        window.clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+      const changes = [...pending.current.entries()].map(([upstream_model, change]) => ({
+        upstream_model,
+        ...change,
+      }));
+      if (changes.length > 0) void api.applyAccountModels(accountId, changes, false);
+    },
+    [accountId],
+  );
 
   const existingNames = useMemo(() => {
     const names = new Set<string>();
@@ -161,47 +293,47 @@ export function ModelSelectionDialog({
       ).length
     : 0;
 
-  const beginEdit = (row: AccountModel) => {
-    setEditing(row.upstream_model);
-    setEditAlias(hasDownstreamName(row) ? row.public_name : "");
-  };
+  const beginEdit = useCallback((upstreamModel: string) => {
+    setEditing(upstreamModel);
+    setRows((current) => {
+      const row = current.find((item) => item.upstream_model === upstreamModel);
+      setEditAlias(row && hasDownstreamName(row) ? row.public_name : "");
+      return current;
+    });
+  }, []);
 
-  const cancelEdit = () => {
+  const cancelEdit = useCallback(() => {
     setEditing(null);
     setEditAlias("");
-  };
+  }, []);
 
-  const saveEdit = async () => {
+  const saveEdit = useCallback(() => {
     if (!account || !editing) return;
-    const row = rows.find((item) => item.upstream_model === editing);
-    if (!row) return;
     const alias = editAlias.trim();
-    setBusy(`save:${editing}`);
-    try {
-      const updated = await api.updateAccountModel(account.id, {
-        upstream_model: editing,
-        alias,
-      });
-      setRows(updated);
-      cancelEdit();
-      setNotice(
-        alias
-          ? `已保存：下游用「${alias}」调用这个模型。`
-          : "已清空下游模型名，这个模型会使用上游原名。",
-      );
-      toast.success("模型名称已保存");
-      await onChanged();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "保存失败");
-    } finally {
-      setBusy(null);
-    }
-  };
+    setRows((current) =>
+      current.map((row) => {
+        if (row.upstream_model !== editing) return row;
+        const updated: AccountModel = {
+          ...row,
+          public_name: alias === "" ? row.upstream_model : alias,
+        };
+        return { ...updated, exposed_names: exposedNames(updated, hideOriginal) };
+      }),
+    );
+    queueChange(editing, { alias });
+    cancelEdit();
+    setNotice(
+      alias
+        ? `已保存：下游用「${alias}」调用这个模型。`
+        : "已清空下游模型名，这个模型会使用上游原名。",
+    );
+  }, [account, editing, editAlias, hideOriginal, queueChange, cancelEdit]);
 
   const saveHideOriginal = async (next: boolean) => {
     if (!account) return;
     setBusy("hide");
     try {
+      await flush();
       await api.updateAccount(account.id, { hide_original: next });
       setHideOriginal(next);
       await load();
@@ -214,45 +346,31 @@ export function ModelSelectionDialog({
     }
   };
 
-  const toggleRow = async (row: AccountModel, selected: boolean) => {
-    if (!account) return;
-    setBusy(`toggle:${row.upstream_model}`);
-    try {
-      const updated = await api.updateAccountModel(account.id, {
-        upstream_model: row.upstream_model,
-        selected,
-      });
-      setRows(updated);
-      toast.success(selected ? "模型已启用" : "模型已停用");
-      await onChanged();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "操作失败");
-    } finally {
-      setBusy(null);
-    }
-  };
+  const toggleRow = useCallback(
+    (upstreamModel: string, selected: boolean) => {
+      if (!account) return;
+      setRows((current) =>
+        current.map((row) =>
+          row.upstream_model === upstreamModel ? { ...row, selected } : row,
+        ),
+      );
+      queueChange(upstreamModel, { selected });
+    },
+    [account, queueChange],
+  );
 
-  const removeRow = async (row: AccountModel) => {
-    if (!account) return;
-    setBusy(`delete:${row.upstream_model}`);
-    try {
-      await api.deleteAccountModel(account.id, row.upstream_model);
-      setPendingDelete(null);
-      await load();
-      toast.success(`已删除 ${row.upstream_model}`);
-      await onChanged();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "删除失败");
-    } finally {
-      setBusy(null);
-    }
-  };
+  const requestDelete = useCallback((upstreamModel: string) => {
+    setRows((current) => current.filter((row) => row.upstream_model !== upstreamModel));
+    queueChange(upstreamModel, { delete: true });
+    setPendingDelete(null);
+  }, [queueChange]);
 
   const refreshUpstream = async () => {
     if (!account) return;
     setFetching(true);
     setNotice(null);
     try {
+      await flush();
       const list = await api.refreshAccountModels(account.id);
       setRows(list);
       const created = list.filter((row) => row.is_new).length;
@@ -304,11 +422,17 @@ export function ModelSelectionDialog({
     }
   };
 
+  const close = () => {
+    // 未到防抖窗口的改动在这里补交，关闭弹窗不会丢操作。
+    void flush();
+    onClose();
+  };
+
   return (
     <>
       <Modal
         open={open}
-        onClose={onClose}
+        onClose={close}
         title={account ? `模型管理 · ${account.name}` : "模型管理"}
         className="model-selection-modal"
         footer={
@@ -318,9 +442,10 @@ export function ModelSelectionDialog({
                 ? "加载中…"
                 : `${rows.length} 个模型 · ${enabledCount} 个启用 · ${renamedCount} 个已设下游名`}
               {blockedCount > 0 && ` · ${blockedCount} 个未设下游名且被隐藏`}
+              {saving && " · 保存中…"}
             </span>
             <div className="spacer" />
-            <Button onClick={onClose}>关闭</Button>
+            <Button onClick={close}>关闭</Button>
           </>
         }
       >
@@ -399,7 +524,7 @@ export function ModelSelectionDialog({
                 )
               }
               onClick={() => void refreshUpstream()}
-              disabled={fetching || busy !== null}
+              disabled={fetching || busy !== null || saving}
             >
               {fetching ? "拉取中…" : "获取上游模型"}
             </Button>
@@ -498,33 +623,26 @@ export function ModelSelectionDialog({
                     </tr>
                   ) : (
                     visible.map((row) => {
-                      const renamed = hasDownstreamName(row);
-                      const names = exposedNames(row, hideOriginal);
                       const isEditing = editing === row.upstream_model;
-                      const rowBusy =
-                        busy === `toggle:${row.upstream_model}` ||
-                        busy === `save:${row.upstream_model}` ||
-                        busy === `delete:${row.upstream_model}`;
                       return (
-                        <FragmentRow
+                        <ModelRow
                           key={row.upstream_model}
                           row={row}
-                          renamed={renamed}
-                          names={names}
-                          hiddenWithoutName={hideOriginal && !renamed}
+                          renamed={hasDownstreamName(row)}
+                          names={exposedNames(row, hideOriginal)}
+                          hiddenWithoutName={hideOriginal && !hasDownstreamName(row)}
                           hideOriginal={hideOriginal}
                           isEditing={isEditing}
-                          rowBusy={rowBusy}
                           managed={managed}
-                          editAlias={editAlias}
-                          mergeSuggestions={mergeSuggestions}
-                          existingNames={existingNames}
-                          onEdit={() => beginEdit(row)}
+                          editAlias={isEditing ? editAlias : ""}
+                          mergeSuggestions={isEditing ? mergeSuggestions : NO_NAMES}
+                          existingNames={isEditing ? existingNames : NO_NAMES}
+                          onEdit={beginEdit}
                           onCancelEdit={cancelEdit}
                           onAliasChange={setEditAlias}
-                          onSave={() => void saveEdit()}
-                          onToggle={(selected) => void toggleRow(row, selected)}
-                          onDelete={() => setPendingDelete(row)}
+                          onSave={saveEdit}
+                          onToggle={toggleRow}
+                          onDelete={setPendingDelete}
                         />
                       );
                     })
@@ -550,20 +668,49 @@ export function ModelSelectionDialog({
           ) : null
         }
         onClose={() => setPendingDelete(null)}
-        onConfirm={() => pendingDelete && void removeRow(pendingDelete)}
+        onConfirm={() => pendingDelete && requestDelete(pendingDelete.upstream_model)}
+      />
+
+      <ConfirmDialog
+        open={confirmWarnings !== null}
+        title="这些模型最近 24 小时有流量"
+        danger
+        confirmLabel="仍然停用"
+        message={
+          <>
+            {confirmWarnings?.map((warning) => (
+              <span key={warning.public_name} style={{ display: "block" }}>
+                「{warning.public_name}」最近 24 小时有 {warning.calls} 次调用。
+              </span>
+            ))}
+            停用或删除后，下游再请求这些模型会直接失败。
+          </>
+        }
+        onClose={() => {
+          setConfirmWarnings(null);
+          rejected.current = null;
+          void load();
+        }}
+        onConfirm={() => void flush(true)}
       />
     </>
   );
 }
 
-function FragmentRow({
+/**
+ * 表格里的一行（含展开的改名表单）。
+ *
+ * `memo` 是必需的：一个账号几百个模型时，勾一个复选框不该让整张表重渲染。
+ * 因此回调都做成“接收上游模型名”的稳定函数，未处于编辑态的行拿到的是
+ * 全等的空数组。
+ */
+const ModelRow = memo(function ModelRow({
   row,
   renamed,
   names,
   hiddenWithoutName,
   hideOriginal,
   isEditing,
-  rowBusy,
   managed,
   editAlias,
   mergeSuggestions,
@@ -581,17 +728,16 @@ function FragmentRow({
   hiddenWithoutName: boolean;
   hideOriginal: boolean;
   isEditing: boolean;
-  rowBusy: boolean;
   managed: boolean;
   editAlias: string;
   mergeSuggestions: string[];
   existingNames: string[];
-  onEdit: () => void;
+  onEdit: (upstreamModel: string) => void;
   onCancelEdit: () => void;
   onAliasChange: (value: string) => void;
   onSave: () => void;
-  onToggle: (selected: boolean) => void;
-  onDelete: () => void;
+  onToggle: (upstreamModel: string, selected: boolean) => void;
+  onDelete: (row: AccountModel) => void;
 }) {
   return (
     <>
@@ -600,10 +746,10 @@ function FragmentRow({
           <input
             type="checkbox"
             checked={row.selected}
-            disabled={managed || row.missing || rowBusy}
+            disabled={managed || row.missing}
             aria-label={`启用 ${row.upstream_model}`}
             title={row.missing ? "上游已消失，重新出现后会自动恢复" : "启用 / 停用该模型"}
-            onChange={(event) => onToggle(event.target.checked)}
+            onChange={(event) => onToggle(row.upstream_model, event.target.checked)}
           />
         </td>
         <td>
@@ -668,8 +814,8 @@ function FragmentRow({
             <Button
               size="sm"
               icon={<IconEdit size={13} />}
-              onClick={onEdit}
-              disabled={managed || rowBusy}
+              onClick={() => onEdit(row.upstream_model)}
+              disabled={managed}
             >
               改名
             </Button>
@@ -679,8 +825,8 @@ function FragmentRow({
               icon={<IconTrash size={13} />}
               title="从目录删除并移除目标"
               aria-label={`删除模型 ${row.upstream_model}`}
-              onClick={onDelete}
-              disabled={managed || rowBusy}
+              onClick={() => onDelete(row)}
+              disabled={managed}
             />
           </div>
         </td>
@@ -730,19 +876,12 @@ function FragmentRow({
                 <Button
                   variant="primary"
                   size="sm"
-                  icon={
-                    rowBusy ? (
-                      <span className="spinner spinner-sm" aria-hidden="true" />
-                    ) : (
-                      <IconCheck size={13} />
-                    )
-                  }
+                  icon={<IconCheck size={13} />}
                   onClick={onSave}
-                  disabled={rowBusy}
                 >
                   保存
                 </Button>
-                <Button size="sm" icon={<IconX size={13} />} onClick={onCancelEdit} disabled={rowBusy}>
+                <Button size="sm" icon={<IconX size={13} />} onClick={onCancelEdit}>
                   取消
                 </Button>
               </div>
@@ -767,4 +906,4 @@ function FragmentRow({
       )}
     </>
   );
-}
+});

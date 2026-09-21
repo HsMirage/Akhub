@@ -67,13 +67,40 @@ CREATE TABLE IF NOT EXISTS upstream_accounts (
 CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id);
 
 -- 加密的上游凭据。与账号一一对应，独立成表以便日志与查询默认不触碰密文。
+--
+-- `api_key` 同时是 Key 池第一把 Key 的**镜像**：Key 池（见下）是唯一真相，
+-- 这里保留一份是为了让还不认识 Key 池的旧二进制、以及旧备份的恢复路径
+-- 仍然能读到凭据。写入 Key 池时一并更新它。
 CREATE TABLE IF NOT EXISTS upstream_secrets (
     account_id    TEXT PRIMARY KEY REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     api_key       BLOB NOT NULL,
     -- New API 倍率探针的访问令牌，与推理用的 sk-xxx 是两把不同的凭据（§11.2）。
     new_api_token BLOB,
-    updated_at    INTEGER NOT NULL
+    updated_at    INTEGER NOT NULL,
+    -- 老库的单把 Key 是否已经展开进 Key 池（§4.2.1 的迁移）。
+    keys_migrated INTEGER NOT NULL DEFAULT 0
 );
+
+-- 账号内 Key 池（§4.2.1）。每把 Key 独立密封、独立启用开关与限额覆盖。
+-- 凭据级状态（熔断、额度、RPM/并发）按 credential_digest 归类，不按 id：
+-- 改标签或换 nonce 重新密封同一把 Key 时，健康状态必须对得上。
+CREATE TABLE IF NOT EXISTS upstream_account_keys (
+    id                TEXT PRIMARY KEY,
+    account_id        TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    -- 后台展示用的标签。留空时界面按序号显示。
+    label             TEXT NOT NULL DEFAULT '',
+    sealed_key        BLOB NOT NULL,
+    -- 明文凭据经主密钥 pepper 派生的摘要（hex）。绝不用于鉴权，只用于归类状态。
+    credential_digest TEXT NOT NULL,
+    -- Key 级限额覆盖，逐项盖住账号默认值；NULL 表示继承账号。
+    limit_rpm         INTEGER,
+    limit_tpm         INTEGER,
+    limit_concurrency INTEGER,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_keys ON upstream_account_keys(account_id, created_at);
 
 CREATE TABLE IF NOT EXISTS logical_models (
     id         TEXT PRIMARY KEY,
@@ -126,6 +153,10 @@ CREATE TABLE IF NOT EXISTS sticky_bindings (
     group_id      TEXT NOT NULL,
     logical_model TEXT NOT NULL,
     target_id     TEXT NOT NULL,
+    -- 绑定的那把 Key（凭据摘要）。粘性绑定绑的是"目标 + Key"：上游的 prompt
+    -- cache 按凭据隔离，只绑目标会在账号内换 Key 时把整份前缀缓存作废
+    -- （§4.2.1 的不变量 B）。旧快照里为 NULL，下一次使用即补齐。
+    credential_digest TEXT,
     bound_at      INTEGER NOT NULL,
     last_used_at  INTEGER NOT NULL
 );
@@ -183,6 +214,10 @@ CREATE TABLE IF NOT EXISTS request_records (
     logical_model    TEXT,
     target_id        TEXT,
     account_id       TEXT,
+    -- 本次请求最终落在账号内的哪把 Key 上（§4.2.1）。只记内部 ID 与标签，
+    -- 绝不记凭据本身（§23.4、§24.1）。
+    key_id           TEXT,
+    key_label        TEXT,
     upstream_model   TEXT,
     request_bytes    INTEGER NOT NULL,
     upstream_status  INTEGER,
@@ -234,6 +269,10 @@ CREATE TABLE IF NOT EXISTS request_attempts (
     seq         INTEGER NOT NULL,
     target_id   TEXT,
     account_id  TEXT,
+    -- 这次尝试用哪把 Key。多 Key 之后"换了几个目标"已经不足以解释
+    -- "为什么换了三次才通"（§4.2.1、§6.6）。
+    key_id      TEXT,
+    key_label   TEXT,
     upstream_model TEXT,
     endpoint    TEXT,
     started_at  INTEGER NOT NULL,
@@ -256,6 +295,9 @@ CREATE TABLE IF NOT EXISTS response_states (
     logical_model  TEXT NOT NULL,
     account_id     TEXT,
     target_id      TEXT,
+    -- 创建这条响应时用的那把 Key（§4.2.1、§15.1）。上游的 resp_xxx 是
+    -- 凭据隔离的资源，生命周期代理与链式续写都必须回到同一把 Key。
+    key_id         TEXT,
     endpoint       TEXT,
     upstream_id    TEXT,
     -- 加密的可重放正文：输入项、输出项与工具项的 JSON（§15.2）。

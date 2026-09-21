@@ -273,6 +273,12 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/select",
             post(r::select_account_models),
         )
+        // 写路径的唯一入口：勾选、改名、批量操作都走它，一次请求只调和一遍
+        // 目标、只重载一遍配置（逐行接口在几百个模型上会卡住界面）。
+        .route(
+            "/admin/api/accounts/{id}/models/apply",
+            post(r::apply_account_models),
+        )
         .route(
             "/admin/api/accounts/{id}/models/update",
             post(r::update_account_model),

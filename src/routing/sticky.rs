@@ -29,9 +29,15 @@ const SESSION_HEADERS: &[&str] = &[
 ];
 
 /// 一条粘性绑定。
+///
+/// 绑的是**目标 + Key**：上游的 prompt cache 按凭据隔离，只绑目标会在账号内
+/// 换 Key 时把整份前缀缓存作废（§4.2.1 的不变量 B）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub target_id: String,
+    /// 绑定的那把 Key 的凭据摘要。`None` 表示绑定时账号没有 Key 池语义
+    /// （或来自升级前的快照），下一次成功调用即补齐。
+    pub credential_digest: Option<String>,
     pub bound_at: i64,
     /// 上次真正使用该目标的时间，同时用于滑动过期与缓存新鲜度系数。
     pub last_used_at: i64,
@@ -248,7 +254,18 @@ impl Bindings {
     }
 
     /// 建立或改写绑定。
-    pub fn bind(&self, key: Key, group_id: &str, logical_model: &str, target_id: &str, now: i64) {
+    ///
+    /// `credential_digest` 是这次真正使用的 Key 的摘要，`None` 表示这次
+    /// 调用没有凭据语义。
+    pub fn bind(
+        &self,
+        key: Key,
+        group_id: &str,
+        logical_model: &str,
+        target_id: &str,
+        credential_digest: Option<&str>,
+        now: i64,
+    ) {
         let mut guard = crate::sync::write(&self.inner);
         if guard.len() >= MAX_BINDINGS && !guard.contains_key(&key) {
             evict_oldest(&mut guard);
@@ -260,11 +277,30 @@ impl Bindings {
                 logical_model: logical_model.to_string(),
                 state: std::sync::Mutex::new(Binding {
                     target_id: target_id.to_string(),
+                    credential_digest: credential_digest.map(str::to_string),
                     bound_at: now,
                     last_used_at: now,
                 }),
             }),
         );
+    }
+
+    /// 只把绑定里的 Key 换成另一把，保留绑定时间。
+    ///
+    /// 用于"原 Key 不再可用、同账号内换了另一把"的场景：目标没变，所以
+    /// 不需要重新抽签，只需要把凭据亲和更新到新的那把（§4.2.1）。
+    pub fn rebind_credential(&self, key: &Key, credential_digest: Option<&str>, now: i64) {
+        let entry = match self.inner.read() {
+            Ok(guard) => guard.get(key).map(Arc::clone),
+            Err(_) => None,
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        if let Ok(mut state) = entry.state.lock() {
+            state.credential_digest = credential_digest.map(str::to_string);
+            state.last_used_at = now;
+        }
     }
 
     /// 目标不再合格时清除绑定（§10.2）。
@@ -286,6 +322,7 @@ impl Bindings {
                     group_id: entry.group_id.clone(),
                     logical_model: entry.logical_model.clone(),
                     target_id: state.target_id.clone(),
+                    credential_digest: state.credential_digest.clone(),
                     bound_at: state.bound_at,
                     last_used_at: state.last_used_at,
                 })
@@ -304,6 +341,7 @@ impl Bindings {
                     logical_model: row.logical_model.clone(),
                     state: std::sync::Mutex::new(Binding {
                         target_id: row.target_id.clone(),
+                        credential_digest: row.credential_digest.clone(),
                         bound_at: row.bound_at,
                         last_used_at: row.last_used_at,
                     }),
@@ -551,7 +589,7 @@ mod tests {
     fn bindings_slide_their_expiry_on_every_hit() {
         let bindings = Bindings::new();
         let (key, _) = derive_prefix(&json!({"system": "s"})).unwrap();
-        bindings.bind(key.clone(), "g1", "m1", "tgt-a", 1_000);
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000);
 
         // 3000 秒后仍在，且这次命中把过期时间往后推。
         assert_eq!(bindings.get(&key, 4_000).unwrap().target_id, "tgt-a");
@@ -564,7 +602,7 @@ mod tests {
     fn bindings_survive_a_restart_and_lose_deleted_targets() {
         let bindings = Bindings::new();
         let (key, _) = derive_prefix(&json!({"system": "s"})).unwrap();
-        bindings.bind(key.clone(), "g1", "m1", "tgt-a", 1_000);
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000);
 
         let exported = bindings.export();
         assert_eq!(exported.len(), 1);
@@ -625,13 +663,13 @@ mod tests {
         // 填满到上限，每条的最后使用时间依次递增：最先写入的最旧。
         for i in 0..MAX_BINDINGS {
             let (key, _) = derive_prefix(&json!({"system": format!("项目 {i}")})).unwrap();
-            bindings.bind(key, "g1", "m1", "t1", i as i64);
+            bindings.bind(key, "g1", "m1", "t1", None, i as i64);
         }
         assert_eq!(bindings.len(), MAX_BINDINGS);
 
         // 再写一条，触发按批淘汰。
         let (fresh, _) = derive_prefix(&json!({"system": "新项目"})).unwrap();
-        bindings.bind(fresh.clone(), "g1", "m1", "t2", 1_000_000);
+        bindings.bind(fresh.clone(), "g1", "m1", "t2", None, 1_000_000);
         assert!(
             bindings.len() <= MAX_BINDINGS,
             "淘汰后不该超过上限：{}",

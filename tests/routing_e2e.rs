@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use akhub::app::{AppState, Settings};
 use akhub::domain::{Limits, Multiplier, MultiplierMode, Protocol};
-use akhub::health::{Outcome, Unavailable};
+use akhub::health::{Caller, Outcome, Unavailable};
 use akhub::multiplier::{Status, refresh};
 use akhub::routing::score::Dimension;
 use akhub::storage::store::MultiplierSnapshotRow;
@@ -71,7 +71,15 @@ async fn a_busy_top_layer_queues_instead_of_sinking_to_the_next_layer() {
         .state
         .runtime
         .health
-        .try_admit(&a.account_id, &a.target_id, one_slot(), 0)
+        .try_admit(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id,
+            },
+            one_slot(),
+            0,
+        )
         .unwrap();
 
     let waiting = tokio::spawn(chat(&akhub, small_body("s", "u")));
@@ -104,7 +112,15 @@ async fn queue_full_when_the_group_forbids_waiting() {
         .state
         .runtime
         .health
-        .try_admit(&a.account_id, &a.target_id, one_slot(), 0)
+        .try_admit(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id,
+            },
+            one_slot(),
+            0,
+        )
         .unwrap();
 
     let started = Instant::now();
@@ -136,7 +152,15 @@ async fn queue_timeout_when_the_layer_stays_busy_past_the_deadline() {
         .state
         .runtime
         .health
-        .try_admit(&a.account_id, &a.target_id, one_slot(), 0)
+        .try_admit(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id,
+            },
+            one_slot(),
+            0,
+        )
         .unwrap();
 
     let response = chat(&akhub, small_body("s", "u")).await;
@@ -169,7 +193,15 @@ async fn the_group_max_wait_caps_queue_waiting_before_the_request_timeout() {
         .state
         .runtime
         .health
-        .try_admit(&a.account_id, &a.target_id, one_slot(), 0)
+        .try_admit(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id,
+            },
+            one_slot(),
+            0,
+        )
         .unwrap();
 
     let started = std::time::Instant::now();
@@ -218,7 +250,14 @@ async fn a_slow_upstream_is_neither_retried_nor_tripped() {
             .state
             .runtime
             .health
-            .check(&a.account_id, &a.target_id, Limits::default())
+            .check(
+                Caller {
+                    account_id: &a.account_id,
+                    key_id: None,
+                    target_id: &a.target_id
+                },
+                Limits::default()
+            )
             .is_ok()
     );
     slow.release();
@@ -386,8 +425,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
         .runtime
         .health
         .try_admit(
-            &bound_wired.account_id,
-            &bound_wired.target_id,
+            Caller {
+                account_id: &bound_wired.account_id,
+                key_id: None,
+                target_id: &bound_wired.target_id,
+            },
             one_slot(),
             0,
         )
@@ -406,8 +448,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
         .runtime
         .health
         .try_admit(
-            &bound_wired.account_id,
-            &bound_wired.target_id,
+            Caller {
+                account_id: &bound_wired.account_id,
+                key_id: None,
+                target_id: &bound_wired.target_id,
+            },
             one_slot(),
             0,
         )
@@ -530,8 +575,12 @@ async fn an_error_event_before_content_switches_but_a_delta_does_not() {
 
 // ------------------------------------------------------------ 熔断范围
 
+/// 401 只停**那一把 Key**，429 只停那个模型（§4.2.1、§12.1）。
+///
+/// 这是 Key 池带来的行为修正：单 Key 账号里账号与 Key 的作用域恰好重合，表现
+/// 与"一 Key 一账号"时代一致；多 Key 账号里一把 Key 被封不该让整号停摆。
 #[tokio::test]
-async fn an_invalid_key_pauses_the_whole_account_but_a_429_only_the_model() {
+async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
     let up1 = FakeUpstream::spawn().await;
     let up2 = FakeUpstream::spawn().await;
     let akhub = spawn_akhub().await;
@@ -548,7 +597,7 @@ async fn an_invalid_key_pauses_the_whole_account_but_a_429_only_the_model() {
     .await;
     wire_extra_target(&akhub, &a2.account_id, "glm-4.5", "glm-4.5").await;
 
-    // 401 证明 Key 失效：同一账号下的另一个模型也立即停用（§12.1）。
+    // 401 证明这把 Key 失效：同一个账号下的另一个模型也立即停用。
     up1.script([Behavior::Status(401, None)]);
     assert_eq!(
         chat(&akhub, json!({"model": "glm-4.6", "messages": []}))
@@ -568,12 +617,28 @@ async fn an_invalid_key_pauses_the_whole_account_but_a_429_only_the_model() {
         (1, 2),
         "Key 失效的账号不该再被尝试"
     );
+    // 这条断言刻意**带上凭据**：401 归因到具体哪把 Key，查它就必须报失效。
+    // 不填 key_id 的查询问的是账号级状态，那把 Key 坏了不影响账号本身。
+    // 凭据快照里的归类键必须与测试自己算出来的摘要一致：不一致就意味着
+    // "换一次部署就丢掉全部熔断状态"（§4.2.1）。
+    let pool = akhub.state.runtime.credentials.current();
+    let keys: Vec<_> = pool
+        .keys_of(&a1.account_id)
+        .iter()
+        .map(|k| (k.credential_digest.clone(), k.enabled))
+        .collect();
     assert_eq!(
-        akhub
-            .state
-            .runtime
-            .health
-            .check(&a1.account_id, &a1.target_id, Limits::default()),
+        keys,
+        vec![(a1.credential_digest.clone(), true)],
+        "凭据快照里应当有且只有这把 Key"
+    );
+    let key_id = Caller {
+        account_id: &a1.account_id,
+        key_id: Some(&a1.credential_digest),
+        target_id: &a1.target_id,
+    };
+    assert_eq!(
+        akhub.state.runtime.health.check(key_id, Limits::default()),
         Err(Unavailable::KeyInvalid)
     );
 
@@ -583,6 +648,15 @@ async fn an_invalid_key_pauses_the_whole_account_but_a_429_only_the_model() {
         .runtime
         .health
         .clear_account_faults(&a1.account_id);
+    assert!(
+        akhub
+            .state
+            .runtime
+            .health
+            .check(key_id, Limits::default())
+            .is_ok(),
+        "换过凭据之后这把 Key 必须重新可用"
+    );
 
     // 429 只影响"账号 + 模型"：另一个模型照常走原账号（§12.3）。
     up1.script([Behavior::Status(429, Some(30))]);
@@ -626,11 +700,14 @@ async fn a_run_of_faults_trips_the_breaker_and_the_next_request_skips_the_target
     }
     assert_eq!(bad.requests(), 5, "熔断前每次都先试高优先级目标");
     assert_eq!(
-        akhub
-            .state
-            .runtime
-            .health
-            .check(&a.account_id, &a.target_id, Limits::default()),
+        akhub.state.runtime.health.check(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id
+            },
+            Limits::default()
+        ),
         Err(Unavailable::Cooling)
     );
     // 熔断后不再碰它：请求直接落到下一层。
@@ -1093,7 +1170,15 @@ async fn admissions_settle_correctly_through_the_public_api() {
         .state
         .runtime
         .health
-        .try_admit("acc", "tgt", Limits::default(), 0)
+        .try_admit(
+            Caller {
+                account_id: "acc",
+                key_id: None,
+                target_id: "tgt",
+            },
+            Limits::default(),
+            0,
+        )
         .unwrap();
     admission.settle(Outcome::Success, Some(10));
     assert!(
@@ -1101,7 +1186,14 @@ async fn admissions_settle_correctly_through_the_public_api() {
             .state
             .runtime
             .health
-            .check("acc", "tgt", Limits::default())
+            .check(
+                Caller {
+                    account_id: "acc",
+                    key_id: None,
+                    target_id: "tgt"
+                },
+                Limits::default()
+            )
             .is_ok()
     );
 }

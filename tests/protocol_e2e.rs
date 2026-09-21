@@ -7,6 +7,7 @@
 mod common;
 
 use akhub::domain::Protocol;
+use akhub::health::Caller;
 use common::{
     Behavior, FakeUpstream, TargetSpec, chat, messages, request, responses, spawn_akhub,
     spawn_akhub_with, wire_target,
@@ -371,6 +372,14 @@ async fn thinking_degrades_only_after_the_lossless_target_is_exhausted() {
     assert!(body.to_string().contains("你好"));
 }
 
+/// 无损目标只是忙时不能绕过它去用降级目标（§14.8）。
+///
+/// **这个用例的形状**：两个同名模型分属两个账号，一个走原生 Messages、一个只能
+/// 跨协议转换。它们同层，所以"谁进计划"本来由抽签决定。
+///
+/// 关键在于**两个账号都要被占住**：只占一个的话，抽到另一个时请求会被正常服务，
+/// 用例就会随抽签结果飘。占位用同一个 `Limits`（并发 1）打在两个账号上，于是
+/// 无论抽到谁，无损候选都是"忙"，必须在本层等待而不能下沉到降级候选。
 #[tokio::test]
 async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
     let native = FakeUpstream::spawn().await;
@@ -393,7 +402,9 @@ async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
         }),
     )
     .await;
-    wire_target(
+    // 计划里活下来的是**最后**接线的那个账号：同名逻辑模型的两个目标属于不同
+    // 账号，占位必须占在真正参与调度的那个上（§9.1）。
+    let planned = wire_target(
         &akhub,
         TargetSpec::new(
             "只能转换",
@@ -407,20 +418,38 @@ async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
     )
     .await;
 
-    let held = akhub
-        .state
-        .runtime
-        .health
-        .try_admit(
-            &native_target.account_id,
-            &native_target.target_id,
-            akhub::domain::Limits {
-                max_concurrency: Some(1),
-                ..Default::default()
-            },
-            0,
-        )
-        .unwrap();
+    // 占住**两个**候选账号的唯一并发名额：无损候选有两个，抽签会选其中之一，
+    // 只占一个的话用例会随抽签结果飘。
+    //
+    // 容量是在准入路径上校准的：先"准入后立刻取消"把每个账号校准到 1，再真正
+    // 占住名额。
+    let one_slot = akhub::domain::Limits {
+        max_concurrency: Some(1),
+        ..Default::default()
+    };
+    let mut held = Vec::new();
+    for wired in [&native_target, &planned] {
+        let caller = Caller {
+            account_id: &wired.account_id,
+            key_id: None,
+            target_id: &wired.target_id,
+        };
+        akhub
+            .state
+            .runtime
+            .health
+            .try_admit(caller, one_slot, 0)
+            .unwrap()
+            .cancel_before_upstream();
+        held.push(
+            akhub
+                .state
+                .runtime
+                .health
+                .try_admit(caller, one_slot, 0)
+                .unwrap(),
+        );
+    }
     let waiting = tokio::spawn(messages(&akhub, thinking_body()));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(!waiting.is_finished(), "无损目标只是忙时必须在本层等待");
@@ -651,8 +680,11 @@ async fn a_missing_endpoint_does_not_count_as_a_target_fault() {
             .runtime
             .health
             .check(
-                &wired.account_id,
-                &wired.target_id,
+                Caller {
+                    account_id: &wired.account_id,
+                    key_id: None,
+                    target_id: &wired.target_id
+                },
                 akhub::domain::Limits::default()
             )
             .is_ok(),

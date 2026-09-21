@@ -702,6 +702,245 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
     assert!(!logical_models(&akhub).await.contains_key("glm-4.6"));
 }
 
+/// 批量接口的辅助：一次提交多行改动。
+async fn apply_changes(
+    client: &reqwest::Client,
+    akhub: &Akhub,
+    account_id: &str,
+    changes: Value,
+    force: bool,
+) -> reqwest::Response {
+    client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/apply",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({ "changes": changes, "force": force }))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_batch_apply_reconciles_and_reloads_the_config_only_once() {
+    // 界面勾选走批量接口：一次请求提交整批改动，服务端只调和一遍目标、
+    // 只重载一遍配置。逐行接口在几百个模型时会让每一次勾选都重建整个快照。
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(
+        json!({"data": [{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]}),
+    ));
+    let account = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account).await;
+
+    let version_before = akhub.state.config.version();
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account,
+        json!([
+            {"upstream_model": "a1", "selected": true},
+            {"upstream_model": "a2", "selected": true},
+            {"upstream_model": "a3", "alias": "merged-name", "selected": true, "delete": false},
+        ]),
+        false,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "批量应用失败：{}",
+        response.text().await.unwrap()
+    );
+    // 一次调和 = 一次版本推进（不是每行一次）。
+    assert_eq!(
+        akhub.state.config.version(),
+        version_before + 1,
+        "整批改动只允许重载一次配置"
+    );
+
+    let models = logical_models(&akhub).await;
+    assert!(models.contains_key("a1") && models.contains_key("a2"));
+    assert_eq!(
+        models.get("merged-name").map(Vec::len),
+        Some(1),
+        "改名后归到新的下游模型名"
+    );
+
+    // 删除走同一个入口：目录行与目标一起消失。
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "a2", "delete": true}]),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let models = logical_models(&akhub).await;
+    assert!(!models.contains_key("a2"), "删除后目标与逻辑模型都要收走");
+    let catalog: Vec<Value> = client
+        .get(format!(
+            "{}/admin/api/accounts/{account}/models",
+            akhub.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog.len(), 2);
+
+    // 同一行在一次请求里出现两次：拒绝，且整体不动。
+    let before = logical_models(&akhub).await;
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account,
+        json!([
+            {"upstream_model": "a1", "selected": false},
+            {"upstream_model": "a1", "selected": true},
+        ]),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(logical_models(&akhub).await, before, "校验失败时整批不动");
+}
+
+#[tokio::test]
+async fn a_batch_unselect_of_a_traffic_heavy_model_needs_confirmation() {
+    // 二次确认在批量接口上同样成立：未确认时 409，确认后一次生效。
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "glm-4.6"}]})));
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "旧目标",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "glm-4.6",
+            "glm-4.6",
+            50,
+        ),
+    )
+    .await;
+    let account = wired.account_id.clone();
+    akhub
+        .state
+        .store
+        .insert_request_records(&[akhub::storage::store::RequestRecord {
+            request_id: "req-batch-1".into(),
+            started_at: akhub::storage::now_unix() - 60,
+            duration_ms: 10,
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+            group_id: Some(akhub.group_id.clone()),
+            logical_model: Some("glm-4.6".into()),
+            target_id: Some(wired.target_id.clone()),
+            account_id: Some(account.clone()),
+            upstream_model: Some("glm-4.6".into()),
+            request_bytes: 100,
+            upstream_status: Some(200),
+            http_status: 200,
+            error_code: None,
+            endpoint: Some("chat_completions".into()),
+            degraded: None,
+            effective_multiplier: None,
+            cheapest_multiplier: None,
+            dearest_multiplier: None,
+            attempts: 1,
+            queued_ms: 0,
+            sticky_hit: false,
+            first_token_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            config_version: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            sticky_wait_ms: None,
+            sticky_freshness: None,
+            output_tps: None,
+            multiplier_source: None,
+            quota_status: None,
+            filter_summary: None,
+            selected_layer: None,
+            attempts_detail: Vec::new(),
+        }])
+        .await
+        .unwrap();
+    refresh(&client, &akhub, &account).await;
+
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "glm-4.6", "selected": false}]),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), 409);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["warnings"][0]["calls"], 1);
+    assert_eq!(
+        logical_models(&akhub).await.get("glm-4.6").map(Vec::len),
+        Some(1)
+    );
+
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "glm-4.6", "selected": false}]),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(!logical_models(&akhub).await.contains_key("glm-4.6"));
+}
+
+#[tokio::test]
+async fn the_per_row_endpoints_keep_working_with_the_batched_core() {
+    // 逐行接口是旧前端与脚本的兼容路径：它复用批量核心，所以响应形状、
+    // 校验与调和行为都必须和批量完全一致（不能回退成“本次新增”为真）。
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "solo"}]})));
+    let account = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account).await;
+
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account}/models/update",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"upstream_model": "solo", "alias": "solo-alias", "selected": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "逐行改名失败：{}",
+        response.text().await.unwrap()
+    );
+    let rows: Vec<Value> = response.json().await.unwrap();
+    assert_eq!(rows[0]["public_name"], "solo-alias");
+    assert_eq!(rows[0]["is_new"], false, "重新读取的目录不再标“本次新增”");
+    assert!(logical_models(&akhub).await.contains_key("solo-alias"));
+}
+
 #[tokio::test]
 async fn eight_accounts_times_twenty_models_take_about_ten_operations() {
     // §16.3 验收：8 账号 × 20 模型的配置从约 170 次手工操作降到约 10 次。

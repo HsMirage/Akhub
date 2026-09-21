@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use crate::auth::session::SessionStore;
 use crate::capability;
 use crate::config::ConfigService;
+use crate::credential::CredentialPool;
 use crate::health;
 use crate::multiplier;
 use crate::routing::{queue, score, sticky};
@@ -181,6 +182,34 @@ impl SettingsService {
     }
 }
 
+/// 账号内 Key 池的当前快照（§4.2.1）。
+///
+/// 与 [`RuntimeConfig`] 并列而不是嵌进去：Key 池的明文只在内存，且它的
+/// 重建需要解密，不该让配置快照的 `Debug` 与备份路径有机会碰到它。
+pub struct CredentialService {
+    current: arc_swap::ArcSwap<CredentialPool>,
+}
+
+impl Default for CredentialService {
+    fn default() -> Self {
+        Self {
+            current: arc_swap::ArcSwap::from_pointee(CredentialPool::default()),
+        }
+    }
+}
+
+impl CredentialService {
+    /// 当前快照。热路径上只做一次原子指针读取（§19.4）。
+    pub fn current(&self) -> arc_swap::Guard<Arc<CredentialPool>> {
+        self.current.load()
+    }
+
+    /// 原子替换快照。在途请求持有旧 `Arc`，不会读到一半新一半旧。
+    pub fn replace(&self, pool: CredentialPool) {
+        self.current.store(Arc::new(pool));
+    }
+}
+
 /// 全部动态运行状态。
 ///
 /// 与 [`crate::config::RuntimeConfig`] 并列而不是嵌进去：倍率、熔断、并发和
@@ -200,6 +229,9 @@ pub struct Runtime {
     pub evidence: Evidence,
     /// 模型能力限制：已证实不支持某能力的账号模型（§16.7）。
     pub capabilities: capability::Capabilities,
+    /// 账号内 Key 池的快照（§4.2.1）。在途请求持有的那一份在整个请求内不变，
+    /// 这正是"一次下游调用只使用一把 Key"的实现基础。
+    pub credentials: CredentialService,
     /// 关闭信号：置位后排队中的请求立即取消并返回可重试错误（§25.3 第 2 步）。
     shutdown: tokio::sync::watch::Sender<bool>,
     /// 当前在途请求数（§6.2 概览指标）。计数绑定在响应体上，流式请求直到
@@ -232,6 +264,7 @@ impl Default for Runtime {
             queues: Default::default(),
             evidence: Default::default(),
             capabilities: Default::default(),
+            credentials: CredentialService::default(),
             shutdown: tokio::sync::watch::channel(false).0,
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             background: crate::gateway::background::RunningTasks::new(),
@@ -338,9 +371,11 @@ impl AppState {
         let master_key = MasterKey::load_or_create(data_dir).context("加载主密钥失败")?;
         let pool = crate::storage::open(data_dir).await?;
         let store = Store::new(pool);
+        // 老库的单把凭据已经在 \`storage::open\` 的迁移里展开成 Key 池，这里
+        // 直接装载即可（§4.2.1）。
         let config = ConfigService::load(store.clone()).await?;
         let runtime = Runtime::default();
-        restore(&store, &runtime).await?;
+        restore(&store, &runtime, &master_key).await?;
 
         // 后台保存过的设置覆盖环境变量/默认值；解析失败只告警，不让进程起不来。
         let settings = match store.app_setting(SETTINGS_KEY).await {
@@ -421,10 +456,23 @@ impl AppState {
     }
 
     /// 配置写操作之后重建快照并同步动态状态表。
+    ///
+    /// Key 池必须一起重建：管理员刚改了凭据，热路径不能还拿着旧的那把。
     pub async fn reload_config(&self) -> Result<()> {
         let config = self.config.reload().await?;
+        self.reload_credentials().await?;
         self.runtime.retain(&config);
         self.reseed_multipliers().await
+    }
+
+    /// 重新解密并整体替换 Key 池快照（§4.2.1）。
+    ///
+    /// 失败时**保留旧快照**：一把 Key 的密文损坏不该让整个网关失去全部凭据。
+    pub async fn reload_credentials(&self) -> Result<()> {
+        let accounts = self.store.list_accounts().await?;
+        let pool = CredentialPool::load(&self.store, &self.cipher, &accounts).await?;
+        self.runtime.credentials.replace(pool);
+        Ok(())
     }
 
     /// 用当前账号列表与持久化状态重建倍率表。
@@ -439,7 +487,7 @@ impl AppState {
 }
 
 /// 启动时加载快照：粘性直接恢复，评分从快照继续（§20.1）。
-async fn restore(store: &Store, runtime: &Runtime) -> Result<()> {
+async fn restore(store: &Store, runtime: &Runtime, master_key: &MasterKey) -> Result<()> {
     let now = crate::storage::now_unix();
     // 超过 24 小时的快照宁可丢弃：拿一天前的延迟数据打分还不如中性分。
     let horizon = now - 24 * 3600;
@@ -455,10 +503,22 @@ async fn restore(store: &Store, runtime: &Runtime) -> Result<()> {
     let multipliers = store.list_multiplier_snapshots().await?;
     runtime.multipliers.seed(&accounts, &multipliers, now);
 
+    // Key 池没有"快照"可恢复：它是从数据库现读现解密的。这里是唯一的
+    // 装载点，之后只在配置写操作后整体替换（§4.2.1）。
+    let credentials = CredentialPool::load(store, &master_key.cipher(), &accounts)
+        .await
+        .context("装载账号内 Key 池失败")?;
+    let key_total: usize = accounts
+        .iter()
+        .map(|account| credentials.keys_of(&account.id).len())
+        .sum();
+    runtime.credentials.replace(credentials);
+
     tracing::info!(
         sticky = bindings.len(),
         perf = snapshots.len(),
-        "已从快照恢复粘性绑定与性能统计"
+        keys = key_total,
+        "已从快照恢复粘性绑定、性能统计与账号 Key 池"
     );
     Ok(())
 }

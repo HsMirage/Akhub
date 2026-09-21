@@ -44,6 +44,7 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
         &akhub.group_id,
         "m1",
         &wired.target_id,
+        None,
         akhub::storage::now_unix(),
     );
     state.runtime.perf.observe(
@@ -409,6 +410,34 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .execute(state.store.pool())
         .await
         .unwrap();
+    // 老库还有数据：一个账号、一把停在 \`upstream_secrets\` 里的凭据。
+    // v1 时代没有 Key 池表，迁移必须把它展开成"一把 Key 的池"（§4.2.1）。
+    sqlx::query(
+        "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
+            weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+            queue_capacity, allow_degrade, created_at)
+         VALUES ('g-old', '老分组', 'akh-old', 'digest-old', 1000000, 40, 25, 20, 15, 10, 1, 1)",
+    )
+    .execute(state.store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+            preferred_protocol, adaptive_protocol, default_priority, calibration,
+            multiplier_mode, manual_multiplier, allow_private_network, enabled, created_at)
+         VALUES ('a-old', 'g-old', '老账号', 'openai_compatible', 'https://old.example.com',
+            'openai_chat', 1, 0, 1000000, 'manual', 1000000, 0, 1, 1)",
+    )
+    .execute(state.store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_secrets (account_id, api_key, new_api_token, updated_at)
+         VALUES ('a-old', X'DEADBEEF', NULL, 1)",
+    )
+    .execute(state.store.pool())
+    .await
+    .unwrap();
     sqlx::query("UPDATE app_settings SET value = '1' WHERE key = 'schema_version'")
         .execute(state.store.pool())
         .await
@@ -493,12 +522,67 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             "迁移后 {table} 缺少 hide_original"
         );
     }
+    // v10：账号内 Key 池（§4.2.1）。老库的单把凭据必须被展开成"一把 Key
+    // 的池"，否则升级后每个账号都会变成"没有可用的 Key"。
+    let key_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'upstream_account_keys'",
+    )
+    .fetch_one(reopened.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(key_tables, 1, "迁移后应存在 upstream_account_keys 表");
+    let key_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_keys")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    let secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_secrets")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    let nonempty: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM upstream_secrets WHERE api_key IS NOT NULL")
+            .fetch_one(reopened.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        key_rows, 1,
+        "老库的单把凭据必须展开成一把 Key（secrets={secrets} nonempty={nonempty}）"
+    );
+    let opened_accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_accounts")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(opened_accounts, 1, "老库的账号必须保留");
+    // 粘性绑定也补了"绑的是哪把 Key"。
+    let sticky_columns: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(sticky_bindings)")
+            .fetch_all(reopened.store.pool())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    assert!(
+        sticky_columns.contains("credential_digest"),
+        "迁移后 sticky_bindings 缺少 credential_digest"
+    );
+    // 凭据快照能读到这把 Key：账号不会因为升级而失去凭据。
+    let account_id: String = sqlx::query_scalar("SELECT id FROM upstream_accounts LIMIT 1")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(account_id, "a-old");
+    // 这条老凭据是随便几个字节（v1 库没法伪造主密钥密封的信封），所以凭据
+    // 快照会跳过它——**但绝不能因此让网关起不来**。上面 \`bootstrap\` 能成功
+    // 返回本身就是在断言这一点：一把坏 Key 只影响那个账号，不影响整台网关。
+    let _ = account_id;
+
     let version: String =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

@@ -33,7 +33,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 同一模型的不同上游名可以按对外名归并，并按需隐藏原始名。
 /// v9：把"隐藏原始模型"提升为账号级 `upstream_accounts.hide_original`；
 /// 打开后只暴露设置了下游模型名的模型。
-const SCHEMA_VERSION: i64 = 9;
+/// v10：账号内 Key 池。新增 `upstream_account_keys`，请求记录、尝试明细与
+/// Responses 状态链补 Key 定位列；老库的单把 Key 由
+/// [`migrate_account_keys`] 展开成一把 Key 的池（§4.2.1）。
+const SCHEMA_VERSION: i64 = 10;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -50,11 +53,16 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .busy_timeout(std::time::Duration::from_secs(5))
         .foreign_keys(true);
 
+    // 连接池是 C 库句柄，创建本身不碰数据库文件（真正的打开发生在第一次查询：
+    // 那时 [`apply_schema`] 会建表并读结构版本）。因此这里在**运行时之前**就
+    // 建立起整套连接，真正的数据库打开是异步的，不会阻塞 tokio 的工作线程。
+    //
+    // 这一点是刻意的：配置写操作（勾选模型、改名、调和调度目标）都是短事务，
+    // 单个连接就够用，也不会互相撞 SQLite 写锁；而多连接会让"每次写操作
+    // 都新开一次数据库文件"这类操作付出成倍的打开/关闭成本。
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(options)
-        .await
-        .with_context(|| format!("打开数据库失败：{}", db_path.display()))?;
+        .max_connections(1)
+        .connect_lazy_with(options);
 
     apply_schema(&pool).await?;
     check_schema_version(&pool).await?;
@@ -319,6 +327,77 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         .await
         .context("迁移账号级 hide_original 失败")?;
     }
+    if from < 10 {
+        // v10：Key 池的定位列。表与索引由 schema.sql 的 CREATE TABLE IF NOT
+        // EXISTS 建好，这里只补老库缺的列。
+        let secret_columns = table_columns(pool, "upstream_secrets").await?;
+        if !secret_columns.contains("keys_migrated") {
+            sqlx::query(
+                "ALTER TABLE upstream_secrets ADD COLUMN keys_migrated INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 upstream_secrets.keys_migrated 失败")?;
+        }
+        let record_columns = table_columns(pool, "request_records").await?;
+        for (column, ddl) in [
+            (
+                "key_id",
+                "ALTER TABLE request_records ADD COLUMN key_id TEXT",
+            ),
+            (
+                "key_label",
+                "ALTER TABLE request_records ADD COLUMN key_label TEXT",
+            ),
+        ] {
+            if !record_columns.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
+            }
+        }
+        let attempt_columns = table_columns(pool, "request_attempts").await?;
+        for (column, ddl) in [
+            (
+                "key_id",
+                "ALTER TABLE request_attempts ADD COLUMN key_id TEXT",
+            ),
+            (
+                "key_label",
+                "ALTER TABLE request_attempts ADD COLUMN key_label TEXT",
+            ),
+        ] {
+            if !attempt_columns.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 request_attempts.{column} 失败"))?;
+            }
+        }
+        let state_columns = table_columns(pool, "response_states").await?;
+        if !state_columns.contains("key_id") {
+            sqlx::query("ALTER TABLE response_states ADD COLUMN key_id TEXT")
+                .execute(pool)
+                .await
+                .context("迁移 response_states.key_id 失败")?;
+        }
+        // 粘性绑定补"绑的是哪把 Key"。旧快照为 NULL，下一次使用即补齐：
+        // 老会话的缓存本来就已经冷了，重新绑一次没有额外代价。
+        let sticky_columns = table_columns(pool, "sticky_bindings").await?;
+        if !sticky_columns.contains("credential_digest") {
+            sqlx::query("ALTER TABLE sticky_bindings ADD COLUMN credential_digest TEXT")
+                .execute(pool)
+                .await
+                .context("迁移 sticky_bindings.credential_digest 失败")?;
+        }
+    }
+    if from < 10 {
+        // 老库的单把凭据展开成"一把 Key 的池"（§4.2.1）。放在迁移里而不是
+        // bootstrap 里：内存库、测试与任何直接 open 的路径都走同一条路，
+        // 不会有"某些调用方建出来的库里 Key 池是空的"这种状态。
+        backfill_account_keys(pool).await?;
+    }
     if from < 5 {
         // v5：分钟级性能聚合表。老库需要补建；新库已由 schema.sql 建好，
         // 这里用 CREATE TABLE IF NOT EXISTS 保持幂等（§20.1）。
@@ -359,6 +438,59 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
     Ok(())
 }
 
+/// 把还停在"单把凭据"形状的账号展开成 Key 池（§4.2.1）。
+///
+/// **幂等**，可以反复调用：只处理 \`upstream_account_keys\` 里一行都没有、
+/// 而 \`upstream_secrets.api_key\` 有值的账号。密文直接用原样搬过去——seal 的
+/// 信封本身就是主密钥加密的，不需要也不该在这个没有主密钥的层里解开。
+///
+/// 摘要暂时写空串：它只用于把动态状态归类，而这一类账号此刻还没有任何动态
+/// 状态。真正的摘要在凭据快照装载时按明文现算（[\`crate::credential\`]），
+/// 那才是唯一的真相来源。
+async fn backfill_account_keys(pool: &SqlitePool) -> Result<()> {
+    // 判据只有"这个账号一把 Key 都没有"。\`keys_migrated\` 列保留是为了兼容
+    // 旧库结构，不参与判断：任何把凭据写进 \`upstream_secrets\` 却没建 Key 行的
+    // 路径（老版本、老备份）都会被这里补上。
+    let pending = sqlx::query(
+        "SELECT account_id, api_key FROM upstream_secrets
+          WHERE api_key IS NOT NULL
+            AND NOT EXISTS (
+                  SELECT 1 FROM upstream_account_keys k
+                   WHERE k.account_id = upstream_secrets.account_id
+            )",
+    )
+    .fetch_all(pool)
+    .await
+    .context("读取待展开的账号凭据失败")?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for row in &pending {
+        let account_id: String = sqlx::Row::try_get(row, "account_id")?;
+        let sealed: Vec<u8> = sqlx::Row::try_get(row, "api_key")?;
+        sqlx::query(
+            "INSERT INTO upstream_account_keys
+                (id, account_id, label, sealed_key, credential_digest,
+                 limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
+             VALUES (?, ?, '', ?, '', NULL, NULL, NULL, 1, ?)",
+        )
+        .bind(format!("key_{}", ulid::Ulid::generate()))
+        .bind(&account_id)
+        .bind(&sealed)
+        .bind(now_unix())
+        .execute(&mut *tx)
+        .await
+        .context("展开账号 Key 池失败")?;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        count = pending.len(),
+        "已把老库的单把凭据展开成账号内 Key 池"
+    );
+    Ok(())
+}
+
 /// 读取某张表的列名集合。表名来自代码内常量，不是用户输入。
 async fn table_columns(
     pool: &SqlitePool,
@@ -379,9 +511,9 @@ async fn table_columns(
 pub async fn open_in_memory() -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true))
-        .await?;
+        .connect_lazy_with(SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true));
     apply_schema(&pool).await?;
+    backfill_account_keys(&pool).await?;
     Ok(pool)
 }
 

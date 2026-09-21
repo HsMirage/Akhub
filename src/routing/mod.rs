@@ -36,7 +36,11 @@ pub enum Ineligible {
     /// 这个账号没有能表达本次请求的端点（§14.3、§14.8）。
     Unsupported(String),
     /// 动态状态不允许：熔断、额度耗尽、鉴权失败或暂时容量不足。
-    Unavailable(health::Unavailable),
+    ///
+    /// 第二个字段是**归因到哪把 Key**（凭据摘要）。单 Key 账号与账号级原因
+    /// 都是 `None`；多 Key 账号里"某一把握了"必须说清楚是哪一把，否则请求
+    /// 记录只能告诉你"这个账号不行"，而管理员要改的是其中一把（§4.2.1）。
+    Unavailable(health::Unavailable, Option<String>),
 }
 
 impl Ineligible {
@@ -47,13 +51,22 @@ impl Ineligible {
             Self::MultiplierExceeded => "倍率超限".to_string(),
             Self::MultiplierUnknown => "倍率未知".to_string(),
             Self::Unsupported(_) => "能力不支持".to_string(),
-            Self::Unavailable(reason) => match reason {
-                health::Unavailable::KeyInvalid => "Key 失效".to_string(),
-                health::Unavailable::QuotaExhausted => "额度耗尽".to_string(),
-                health::Unavailable::Cooling => "冷却中".to_string(),
-                health::Unavailable::ConcurrencyFull => "并发已满".to_string(),
-                health::Unavailable::RateLimited => "限流中".to_string(),
-            },
+            Self::Unavailable(reason, key) => {
+                let base = match reason {
+                    health::Unavailable::KeyInvalid => "Key 失效",
+                    health::Unavailable::NoKey => "没有可用的 Key",
+                    health::Unavailable::QuotaExhausted => "额度耗尽",
+                    health::Unavailable::Cooling => "冷却中",
+                    health::Unavailable::ConcurrencyFull => "并发已满",
+                    health::Unavailable::RateLimited => "限流中",
+                };
+                match key {
+                    // 归因到具体某把 Key 时把摘要前 8 位带上：够在后台对上号，
+                    // 又不构成可用的凭据信息（§23.4）。
+                    Some(digest) => format!("{base}（Key {}）", short_digest(digest)),
+                    None => base.to_string(),
+                }
+            }
         }
     }
 
@@ -62,15 +75,20 @@ impl Ineligible {
             Self::MultiplierExceeded => ErrorCode::MultiplierExceeded,
             Self::MultiplierUnknown => ErrorCode::MultiplierUnknown,
             Self::Unsupported(_) => ErrorCode::UnsupportedParameter,
-            Self::Unavailable(health::Unavailable::RateLimited) => ErrorCode::RateLimited,
+            Self::Unavailable(health::Unavailable::RateLimited, _) => ErrorCode::RateLimited,
             _ => ErrorCode::NoEligibleTarget,
         }
     }
 
     /// 只有临时容量不足才允许排队等待（§13.6）。
     fn is_queueable(&self) -> bool {
-        matches!(self, Self::Unavailable(reason) if reason.is_queueable())
+        matches!(self, Self::Unavailable(reason, _) if reason.is_queueable())
     }
+}
+
+/// 凭据摘要的短标识，只用于日志与请求记录里的归因。
+fn short_digest(digest: &str) -> &str {
+    &digest[..digest.len().min(8)]
 }
 
 /// 选择失败的结果，携带对外错误码与可读原因。
@@ -191,6 +209,8 @@ pub struct Context<'a> {
     pub health: &'a health::Registry,
     pub perf: &'a score::Registry,
     pub multipliers: &'a multiplier::View,
+    /// 账号内 Key 池的快照（§4.2.1）。
+    pub credentials: &'a crate::credential::CredentialPool,
     /// 端点能力证据：已证实不存在的路由不再重复尝试（§14.2）。
     pub evidence: &'a Evidence,
     /// 模型能力限制：已证实不支持某能力的账号模型（§16.7）。
@@ -205,6 +225,37 @@ pub struct Context<'a> {
     pub streaming: bool,
     pub now_unix: i64,
     pub now: std::time::Instant,
+    /// 粘性命中时绑定的那把 Key（凭据摘要）。
+    ///
+    /// 有值时资格判定只针对这把 Key：它坏了/停用了，这个目标就该退出候选，
+    /// 而不是"换一把 Key 继续用同一个目标"——后者会让绑定失去意义，
+    /// 每次请求都在 Key 之间漂移（§4.2.1 的不变量 B）。
+    pub bound_credential: Option<String>,
+}
+
+impl Context<'_> {
+    /// 换一个"钉住的凭据"再判一次资格。
+    ///
+    /// 粘性命中时用：绑定的那把 Key 坏了，这个目标就该退出候选，而不是换一把
+    /// Key 继续用同一个绑定（§4.2.1 的不变量 B）。
+    pub fn with_bound_credential(&self, digest: Option<String>) -> Context<'_> {
+        Context {
+            health: self.health,
+            perf: self.perf,
+            multipliers: self.multipliers,
+            credentials: self.credentials,
+            evidence: self.evidence,
+            capabilities: self.capabilities,
+            translation: self.translation,
+            endpoint: self.endpoint,
+            allow_degrade: self.allow_degrade,
+            protocol: self.protocol,
+            streaming: self.streaming,
+            now_unix: self.now_unix,
+            now: self.now,
+            bound_credential: digest,
+        }
+    }
 }
 
 /// 判定单个目标是否可以参与本次请求（§9.1）。
@@ -235,6 +286,10 @@ pub fn check_eligibility(
         return Err(Ineligible::MultiplierExceeded);
     }
 
+    // Key 级资格：账号必须至少有一把启用的 Key。先于端点与能力判定：没有可用
+    // 凭据的账号，谈"能不能表达这个请求"没有意义。
+    let key = resolve_key(context, target, context.bound_credential.as_deref())?;
+
     let choices = endpoints::choices(
         &target.account,
         context.endpoint,
@@ -261,19 +316,92 @@ pub fn check_eligibility(
             )));
         }
     }
-
+    // 三级门限逐级收紧，Key 级取**这一把**的覆盖值。
+    let limits = health::AdmissionLimits {
+        account: target.account.limits,
+        key: key.limits,
+        target: target.target.limits,
+    };
+    // 归类键是**凭据摘要**，不是行 ID：驱动状态的是"哪一把凭据"，而行 ID 在
+    // 改标签、重新粘贴、备份恢复后都会变。传错这里的后果是资格检查看的是一个
+    // 永远新鲜的 KeyState，多 Key 账号的熔断与限额在准入之前形同虚设（§4.2.1）。
+    let caller = health::Caller {
+        account_id: &target.account.id,
+        key_id: Some(key.credential_digest.as_str()),
+        target_id: &target.target.id,
+    };
     context
         .health
-        .check(
-            &target.account.id,
-            &target.target.id,
-            health::AdmissionLimits {
-                account: target.account.limits,
-                target: target.target.limits,
-            },
-        )
-        .map_err(Ineligible::Unavailable)?;
+        .check(caller, limits)
+        .map_err(|reason| Ineligible::Unavailable(reason, Some(key.credential_digest.clone())))?;
     Ok((effective.value, choices))
+}
+
+/// 这次请求该用账号里的哪把 Key 做**资格判定**（§4.2.1）。
+///
+/// 三种情形：
+///
+/// * 账号一把启用的 Key 都没有 → `NoKey`，账号整体不合格。
+/// * 调用方**钉住**了某把（响应链、粘性绑定）→ 只认它：它被停用或不在池里
+///   就是不合格，绝不静默换一把。上游的 `resp_xxx` 是凭据隔离的资源，
+///   静默换 Key 只会得到一个 404，把真正的原因藏起来。
+/// * 没有钉住 → **逐把试到有一把能过为止**。只看第一把是错的：池里第一把刚好
+///   熔断时，整个目标会退出候选，而同账号里健康的那些 Key 就永远没有机会被
+///   用到——这正是 Key 池存在的意义（§4.2.1）。
+///
+/// 真正用哪把由发请求那一刻的 [`crate::credential::select_key`] 决定（那里才有
+/// 并发与限额的实时状态）；这里只回答"这个账号此刻还有没有可用的凭据"。
+fn resolve_key<'a>(
+    context: &'a Context<'_>,
+    target: &TargetView,
+    pinned: Option<&str>,
+) -> Result<&'a Arc<crate::credential::Credential>, Ineligible> {
+    let keys = context.credentials.keys_of(&target.account.id);
+    let enabled = || keys.iter().filter(|key| key.enabled);
+
+    // 钉住时只认那一把，连"退而求其次"都不允许：换 Key 续一条链在上游必然
+    // 404，静默重试只会把真正的原因藏起来。
+    if let Some(digest) = pinned {
+        return enabled()
+            .find(|key| key.credential_digest == digest)
+            .ok_or_else(|| {
+                Ineligible::Unavailable(health::Unavailable::KeyInvalid, Some(digest.to_string()))
+            });
+    }
+
+    if enabled().next().is_none() {
+        return Err(Ineligible::Unavailable(health::Unavailable::NoKey, None));
+    }
+
+    // 未钉住：任意一把通过硬性检查就算这个目标合格。
+    //
+    // 全部失败时优先报"忙"：那意味着等一会儿可能就好了，调用方应当排队而不是
+    // 下沉到下一层；只有每一把都是硬性不合格才报"坏"（§13.6）。
+    let mut queueable: Option<(health::Unavailable, String)> = None;
+    let mut hard: Option<(health::Unavailable, String)> = None;
+    for key in enabled() {
+        let limits = health::AdmissionLimits {
+            account: target.account.limits,
+            key: key.limits,
+            target: target.target.limits,
+        };
+        let caller = health::Caller {
+            account_id: &target.account.id,
+            key_id: Some(key.credential_digest.as_str()),
+            target_id: &target.target.id,
+        };
+        match context.health.check(caller, limits) {
+            Ok(()) => return Ok(key),
+            Err(reason) if reason.is_queueable() => {
+                queueable.get_or_insert_with(|| (reason, key.credential_digest.clone()));
+            }
+            Err(reason) => {
+                hard.get_or_insert_with(|| (reason, key.credential_digest.clone()));
+            }
+        }
+    }
+    let (reason, digest) = queueable.or(hard).expect("至少有一把启用的 Key");
+    Err(Ineligible::Unavailable(reason, Some(digest)))
 }
 
 /// 为一个逻辑模型排出完整的尝试计划。
@@ -539,9 +667,45 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
             ErrorCode::UnsupportedParameter => {
                 unsupported.unwrap_or_else(|| format!("逻辑模型 {model_name} 无法表达本次请求"))
             }
-            _ => format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
+            // 带上第一个具体原因：只说"没有可用的调度目标"会让"账号一把 Key 都
+            // 没有"和"全部账号都在冷却"看起来一模一样，而管理员要做的事完全不同
+            // （§4.2.1、§18.3）。
+            _ => match reasons.first() {
+                Some(reason) => {
+                    format!(
+                        "逻辑模型 {model_name} 当前没有可用的调度目标：{}",
+                        reason.describe()
+                    )
+                }
+                None => format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
+            },
         },
     }
+}
+
+/// 在计划里找粘性绑定指向的目标。
+///
+/// 与资格判定无关：绑定里的 Key 已经不在池里时，绑定本身仍然成立——请求
+/// 照样打到这个目标，只是要重新选一把 Key 并改写绑定（§4.2.1）。
+///
+/// `scoped_to_first_layer` 对应 §9.5 的硬边界：普通粘性只在**当前最高合格层**
+/// 内生效。传 `true` 时低层绑定会被忽略，于是请求重新走层内抽签，回到已经
+/// 恢复的高层。传 `false` 时任何层都能找到绑定，用于显式钉住目标的路径
+/// （响应链续写）。
+pub fn binding_target<'a>(
+    plan: &'a Plan,
+    target_id: &str,
+    scoped_to_first_layer: bool,
+) -> Option<&'a Candidate> {
+    let layers = if scoped_to_first_layer {
+        &plan.layers[..plan.layers.len().min(1)]
+    } else {
+        &plan.layers[..]
+    };
+    layers
+        .iter()
+        .flat_map(|layer| layer.candidates.iter())
+        .find(|candidate| candidate.target.target.id == target_id)
 }
 
 /// 粘性绑定是否还能继续使用（§10.2）。
@@ -687,18 +851,32 @@ mod tests {
         multipliers: multiplier::Registry,
         evidence: Evidence,
         capabilities: capability::Capabilities,
+        /// 账号内 Key 池。测试账号各带一把健康的 Key，与引入 Key 池之前的
+        /// 行为等价：凭据从不不合格，Key 级状态不参与调度（§4.2.1）。
+        credentials: crate::credential::CredentialPool,
         /// 一个普通的 Chat 请求体，三个协议都能无损表达。
         body: serde_json::Value,
     }
 
     impl Fixture {
         fn new() -> Self {
+            // 测试里出现的账号名是固定的几个；各给一把健康的 Key。
+            let mut credentials = crate::credential::CredentialPool::default();
+            // a0–a11：失控保护那个用例会一次造十几个账号（§13.1）。
+            for index in 0..12 {
+                let account = format!("a{index}");
+                credentials.insert(
+                    &account,
+                    vec![crate::credential::test_credential(&account, "k1")],
+                );
+            }
             Self {
                 health: health::Registry::new(),
                 perf: score::Registry::new(),
                 multipliers: multiplier::Registry::new(),
                 evidence: Evidence::new(),
                 capabilities: capability::Capabilities::new(),
+                credentials,
                 body: serde_json::json!({
                     "model": "glm-4.6",
                     "messages": [{"role": "user", "content": "hi"}],
@@ -726,6 +904,7 @@ mod tests {
                 health: &$fixture.health,
                 perf: &$fixture.perf,
                 multipliers: &$view,
+                credentials: &$fixture.credentials,
                 evidence: &$fixture.evidence,
                 capabilities: &$fixture.capabilities,
                 translation: &$translation,
@@ -733,6 +912,7 @@ mod tests {
                 allow_degrade: true,
                 protocol: Protocol::OpenAiChat,
                 streaming: false,
+                bound_credential: None,
                 now_unix: 0,
                 now: std::time::Instant::now(),
             }
@@ -902,6 +1082,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -909,6 +1090,7 @@ mod tests {
             allow_degrade: true,
             protocol: Protocol::AnthropicMessages,
             streaming: false,
+            bound_credential: None,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -948,6 +1130,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -955,6 +1138,7 @@ mod tests {
             allow_degrade: true,
             protocol: Protocol::OpenAiChat,
             streaming: false,
+            bound_credential: None,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -996,6 +1180,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -1003,6 +1188,7 @@ mod tests {
             allow_degrade,
             protocol: Protocol::AnthropicMessages,
             streaming: false,
+            bound_credential: None,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1079,7 +1265,15 @@ mod tests {
         for _ in 0..5 {
             fixture
                 .health
-                .try_admit("a1", "cooling", Limits::default(), 0)
+                .try_admit(
+                    health::Caller {
+                        account_id: "a1",
+                        key_id: None,
+                        target_id: "cooling",
+                    },
+                    Limits::default(),
+                    0,
+                )
                 .unwrap()
                 .settle(health::Outcome::Fault, None);
         }
@@ -1090,7 +1284,15 @@ mod tests {
         };
         let _held = fixture
             .health
-            .try_admit("a2", "busy", busy_limits, 0)
+            .try_admit(
+                health::Caller {
+                    account_id: "a2",
+                    key_id: None,
+                    target_id: "busy",
+                },
+                busy_limits,
+                0,
+            )
             .unwrap();
 
         let mut group = group;
@@ -1135,6 +1337,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -1142,6 +1345,7 @@ mod tests {
             allow_degrade: true,
             protocol: Protocol::OpenAiChat,
             streaming: false,
+            bound_credential: None,
             now_unix: 1,
             now: std::time::Instant::now(),
         };
@@ -1196,12 +1400,28 @@ mod tests {
 
         let _held = fixture
             .health
-            .try_admit("a1", "busy", busy_limits, 0)
+            .try_admit(
+                health::Caller {
+                    account_id: "a1",
+                    key_id: None,
+                    target_id: "busy",
+                },
+                busy_limits,
+                0,
+            )
             .unwrap();
         for _ in 0..5 {
             fixture
                 .health
-                .try_admit("a2", "cooling", Limits::default(), 0)
+                .try_admit(
+                    health::Caller {
+                        account_id: "a2",
+                        key_id: None,
+                        target_id: "cooling",
+                    },
+                    Limits::default(),
+                    0,
+                )
                 .unwrap()
                 .settle(health::Outcome::Fault, None);
         }
@@ -1296,6 +1516,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -1303,6 +1524,7 @@ mod tests {
             allow_degrade: true,
             protocol: Protocol::OpenAiChat,
             streaming: false,
+            bound_credential: None,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1354,6 +1576,7 @@ mod tests {
             health: &fixture.health,
             perf: &fixture.perf,
             multipliers: &view,
+            credentials: &fixture.credentials,
             evidence: &fixture.evidence,
             capabilities: &fixture.capabilities,
             translation: &translation,
@@ -1361,6 +1584,7 @@ mod tests {
             allow_degrade: true,
             protocol: Protocol::OpenAiChat,
             streaming: false,
+            bound_credential: None,
             now_unix: 0,
             now,
         };
