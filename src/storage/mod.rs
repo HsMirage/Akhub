@@ -40,7 +40,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
 /// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
 /// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -459,6 +459,16 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         // bootstrap 里：内存库、测试与任何直接 open 的路径都走同一条路，
         // 不会有"某些调用方建出来的库里 Key 池是空的"这种状态。
         backfill_account_keys(pool).await?;
+    }
+    if from < 15 {
+        // v15：请求记录补"粘性键来源"，让守门放行的比例可以按级统计（§24.1）。
+        let record_columns = table_columns(pool, "request_records").await?;
+        if !record_columns.contains("sticky_origin") {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN sticky_origin TEXT")
+                .execute(pool)
+                .await
+                .context("迁移 request_records.sticky_origin 失败")?;
+        }
     }
     if from < 5 {
         // v5：分钟级性能聚合表。老库需要补建；新库已由 schema.sql 建好，

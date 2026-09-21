@@ -259,6 +259,10 @@ CREATE TABLE IF NOT EXISTS request_records (
     sticky_wait_ms   INTEGER,
     -- 缓存新鲜度系数（§10.3 的三档），解释这次为什么愿意等/不愿意等。
     sticky_freshness REAL,
+    -- 这次命中的粘性键来自哪一级（chain/session_header/cache_key/stable_prefix）。
+    -- 没有它就无法回答"守门到底放行了多少第 2/3 级的请求"——硬粘性与软亲和
+    -- 在记录里长得一模一样（§24.1）。
+    sticky_origin    TEXT,
     -- 输出速度（token/秒），流式与非流式都算得出（§24.1）。
     output_tps       REAL,
     -- 倍率来源（auto/manual）与本次资格的判定结果（§24.1）。

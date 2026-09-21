@@ -188,6 +188,9 @@ struct Telemetry {
     sticky_wait: Option<Duration>,
     /// 这次粘性等待用到的缓存新鲜度系数（§10.3）。
     sticky_freshness: Option<f64>,
+    /// 这次命中的粘性键来自哪一级（§24.1）。硬粘性、软亲和与守门放行在请求
+    /// 记录里只差这一个字段，没有它就无法按级统计守门放行的比例。
+    sticky_origin: Option<&'static str>,
     sticky_hit: bool,
     cheapest: Option<Multiplier>,
     dearest: Option<Multiplier>,
@@ -403,6 +406,7 @@ async fn forward_inner<'a>(
     // 弱绑定改为**软亲和**：只把绑定目标在层内抽签里的权重放大若干倍，不再
     // 短路抽签。这既保住"同一个项目倾向于落在同一个账号"（前缀缓存的价值），
     // 又让每个前缀在每次请求都有一次重新分配的机会（负载均衡的价值）。
+    walk.telemetry.sticky_origin = sticky_key.as_ref().map(|(_, origin)| origin.as_str());
     let soft = sticky_key
         .as_ref()
         .is_some_and(|(_, origin)| *origin == sticky::Origin::StablePrefix);
@@ -1695,6 +1699,7 @@ impl Walk<'_> {
             config_version: Some(forward.state.config.current().version as i64),
             sticky_wait_ms: self.telemetry.sticky_wait.map(|d| d.as_millis() as i64),
             sticky_freshness: self.telemetry.sticky_freshness,
+            sticky_origin: self.telemetry.sticky_origin.map(str::to_string),
             output_tps: self.output_tps(),
             // Token 细分只有拿到 usage 才知道；流式在结算时补写（§11.6）。
             cache_read_tokens: self

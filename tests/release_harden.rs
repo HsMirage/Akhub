@@ -610,7 +610,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "14");
+    assert_eq!(version, "15");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

@@ -75,6 +75,17 @@ pub enum Origin {
     /// 稳定前缀摘要（system prompt + 工具定义）。
     StablePrefix,
 }
+impl Origin {
+    /// 稳定字符串，写进请求记录供按级统计（§24.1）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseChain => "chain",
+            Self::SessionHeader => "session_header",
+            Self::CacheKey => "cache_key",
+            Self::StablePrefix => "stable_prefix",
+        }
+    }
+}
 
 /// 推导粘性键（§10.1）。按优先级依次尝试，全部落空时返回 `None`。
 pub fn derive(
@@ -593,6 +604,26 @@ mod tests {
     }
 
     /// ④ 迁移门槛：绝对分差、随上下文体积上升、缓存半凉时减半（§10.1 修订）。
+    /// 粘性键来源的稳定字符串：请求记录按它统计守门放行的比例（§24.1）。
+    #[test]
+    fn every_origin_has_a_stable_record_label() {
+        assert_eq!(Origin::ResponseChain.as_str(), "chain");
+        assert_eq!(Origin::SessionHeader.as_str(), "session_header");
+        assert_eq!(Origin::CacheKey.as_str(), "cache_key");
+        assert_eq!(Origin::StablePrefix.as_str(), "stable_prefix");
+        // 四个标签互不相同，否则按级统计会把两级混在一起。
+        let mut labels = vec![
+            Origin::ResponseChain.as_str(),
+            Origin::SessionHeader.as_str(),
+            Origin::CacheKey.as_str(),
+            Origin::StablePrefix.as_str(),
+        ];
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "标签必须互不相同：{labels:?}");
+    }
+
     #[test]
     fn the_migration_margin_grows_with_the_context_worth() {
         // 小请求最便宜：只要对方明显更好就该走。

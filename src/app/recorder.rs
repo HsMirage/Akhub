@@ -144,6 +144,7 @@ mod tests {
             reasoning_tokens: None,
             sticky_wait_ms: None,
             sticky_freshness: None,
+            sticky_origin: None,
             output_tps: None,
             multiplier_source: None,
             quota_status: None,

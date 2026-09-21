@@ -4275,49 +4275,50 @@ pub async fn list_requests(
                 })
                 .collect();
             json!({
-                "request_id": record.request_id,
-                "started_at": record.started_at,
-                "duration_ms": record.duration_ms,
-                "protocol": record.protocol.as_str(),
-                "streaming": record.streaming,
-                "group_id": record.group_id,
-                "logical_model": record.logical_model,
-                "target_id": record.target_id,
-                "account_id": record.account_id,
-                "upstream_model": record.upstream_model,
-                "request_bytes": record.request_bytes,
-                "upstream_status": record.upstream_status,
-                "http_status": record.http_status,
-                "error_code": record.error_code,
-                "endpoint": record.endpoint,
-                "degraded": record.degraded,
-                "effective_multiplier": record.effective_multiplier,
-                "cheapest_multiplier": record.cheapest_multiplier,
-                "dearest_multiplier": record.dearest_multiplier,
-                "attempts": record.attempts,
-                "queued_ms": record.queued_ms,
-                "sticky_hit": record.sticky_hit,
-                // 用量与时机（§6.6）；上游没上报时是 null，不估算。
-                "first_token_ms": record.first_token_ms,
-                "input_tokens": record.input_tokens,
-                "output_tokens": record.output_tokens,
-                "config_version": record.config_version,
-                // 粘性等待与新鲜度单独给出，和普通排队区分开（§6.6、§24.1）。
-                "sticky_wait_ms": record.sticky_wait_ms,
-                "sticky_freshness": record.sticky_freshness,
-                "output_tps": record.output_tps,
-                // Token 细分：缓存读/写与思考。上游没上报就是 null（§11.6）。
-                "cache_read_tokens": record.cache_read_tokens,
-                "cache_write_tokens": record.cache_write_tokens,
-                "reasoning_tokens": record.reasoning_tokens,
-                // 倍率来源、额度状态、候选过滤原因与选中的层（§24.1）。
-                "multiplier_source": record.multiplier_source,
-                "quota_status": record.quota_status,
-                "filter_summary": record.filter_summary,
-                "selected_layer": record.selected_layer,
-                // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
-                "attempts_detail": attempts_detail,
-            })
+                    "request_id": record.request_id,
+                    "started_at": record.started_at,
+                    "duration_ms": record.duration_ms,
+                    "protocol": record.protocol.as_str(),
+                    "streaming": record.streaming,
+                    "group_id": record.group_id,
+                    "logical_model": record.logical_model,
+                    "target_id": record.target_id,
+                    "account_id": record.account_id,
+                    "upstream_model": record.upstream_model,
+                    "request_bytes": record.request_bytes,
+                    "upstream_status": record.upstream_status,
+                    "http_status": record.http_status,
+                    "error_code": record.error_code,
+                    "endpoint": record.endpoint,
+                    "degraded": record.degraded,
+                    "effective_multiplier": record.effective_multiplier,
+                    "cheapest_multiplier": record.cheapest_multiplier,
+                    "dearest_multiplier": record.dearest_multiplier,
+                    "attempts": record.attempts,
+                    "queued_ms": record.queued_ms,
+                    "sticky_hit": record.sticky_hit,
+                    // 用量与时机（§6.6）；上游没上报时是 null，不估算。
+                    "first_token_ms": record.first_token_ms,
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "config_version": record.config_version,
+                    // 粘性等待与新鲜度单独给出，和普通排队区分开（§6.6、§24.1）。
+                    "sticky_wait_ms": record.sticky_wait_ms,
+                    "sticky_freshness": record.sticky_freshness,
+            "sticky_origin": record.sticky_origin,
+                    "output_tps": record.output_tps,
+                    // Token 细分：缓存读/写与思考。上游没上报就是 null（§11.6）。
+                    "cache_read_tokens": record.cache_read_tokens,
+                    "cache_write_tokens": record.cache_write_tokens,
+                    "reasoning_tokens": record.reasoning_tokens,
+                    // 倍率来源、额度状态、候选过滤原因与选中的层（§24.1）。
+                    "multiplier_source": record.multiplier_source,
+                    "quota_status": record.quota_status,
+                    "filter_summary": record.filter_summary,
+                    "selected_layer": record.selected_layer,
+                    // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
+                    "attempts_detail": attempts_detail,
+                })
         })
         .collect();
     Ok(Json(json!({ "data": items, "total": total })))

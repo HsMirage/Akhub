@@ -1457,10 +1457,10 @@ impl Store {
                     effective_multiplier, cheapest_multiplier, dearest_multiplier,
                     attempts, queued_ms, sticky_hit,
                     first_token_ms, input_tokens, output_tokens, config_version,
-                    sticky_wait_ms, sticky_freshness, output_tps, multiplier_source,
+                    sticky_wait_ms, sticky_freshness, sticky_origin, output_tps, multiplier_source,
                     quota_status, filter_summary, selected_layer,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -1490,6 +1490,7 @@ impl Store {
             .bind(record.config_version)
             .bind(record.sticky_wait_ms)
             .bind(record.sticky_freshness)
+            .bind(&record.sticky_origin)
             .bind(record.output_tps)
             .bind(&record.multiplier_source)
             .bind(&record.quota_status)
@@ -2717,6 +2718,8 @@ pub struct RequestRecord {
     pub sticky_wait_ms: Option<i64>,
     /// 这次粘性等待用到的缓存新鲜度系数（§10.3 的三档）。
     pub sticky_freshness: Option<f64>,
+    /// 这次命中的粘性键来自哪一级（§24.1）。
+    pub sticky_origin: Option<String>,
     /// 输出速度（token/秒），流式与非流式都算得出（§24.1）。
     pub output_tps: Option<f64>,
     /// 缓存读/写与思考 Token（§11.6）。上游没上报就是 None，绝不估算。
@@ -3235,6 +3238,7 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         config_version: row.try_get("config_version")?,
         sticky_wait_ms: row.try_get("sticky_wait_ms")?,
         sticky_freshness: row.try_get("sticky_freshness")?,
+        sticky_origin: row.try_get("sticky_origin")?,
         output_tps: row.try_get("output_tps")?,
         cache_read_tokens: row.try_get("cache_read_tokens")?,
         cache_write_tokens: row.try_get("cache_write_tokens")?,
@@ -3496,6 +3500,7 @@ mod tests {
                 reasoning_tokens: None,
                 sticky_wait_ms: None,
                 sticky_freshness: None,
+                sticky_origin: None,
                 output_tps: None,
                 multiplier_source: None,
                 quota_status: None,
@@ -3568,6 +3573,7 @@ mod tests {
                 reasoning_tokens: None,
                 sticky_wait_ms: None,
                 sticky_freshness: None,
+                sticky_origin: None,
                 output_tps: None,
                 multiplier_source: None,
                 quota_status: None,
@@ -3775,6 +3781,7 @@ mod tests {
             reasoning_tokens: None,
             sticky_wait_ms: None,
             sticky_freshness: None,
+            sticky_origin: None,
             output_tps: None,
             multiplier_source: None,
             quota_status: None,

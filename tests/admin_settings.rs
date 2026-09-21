@@ -326,6 +326,7 @@ async fn insert_record(
             attempts_detail: Vec::new(),
             sticky_wait_ms: None,
             sticky_freshness: None,
+            sticky_origin: None,
             output_tps: None,
             multiplier_source: None,
             quota_status: None,
@@ -669,6 +670,7 @@ async fn request_records_expose_scheduling_diagnostics() {
         attempts_detail: Vec::new(),
         sticky_wait_ms: Some(80),
         sticky_freshness: Some(0.75),
+        sticky_origin: Some("cache_key".to_string()),
         output_tps: Some(200.0),
         // Token 细分（§11.6）：缓存与思考各自留痕。
         cache_read_tokens: Some(700),
@@ -698,6 +700,7 @@ async fn request_records_expose_scheduling_diagnostics() {
     let row = &page["data"][0];
     assert_eq!(row["sticky_wait_ms"], 80, "{row}");
     assert_eq!(row["sticky_freshness"], 0.75, "{row}");
+    assert_eq!(row["sticky_origin"], "cache_key", "{row}");
     assert_eq!(row["output_tps"], 200.0, "{row}");
     assert_eq!(row["multiplier_source"], "manual", "{row}");
     assert_eq!(row["quota_status"], "ok", "{row}");
