@@ -30,6 +30,32 @@ const STALE_PENALTY: f64 = 0.8;
 const POWER: i32 = 8;
 /// 评分下限。0 分会让权重变成 0，合格目标就再也拿不到任何流量。
 const MIN_SCORE: f64 = 0.01;
+/// 层内抽签的**探索口粮**：每个候选在 `score^k` 之外额外分到的固定底权（§9.5）。
+///
+/// 只用 `score^k` 时冷目标永远拿不到样本，拿不到样本又永远是保守中性分，
+/// 于是它永远排在热目标之后。这里还有一层**正反馈**：一个目标只要被抽中一次
+/// 就变热、权重再涨一档，"越被选中越被选中"。现场（gpt-boom / gpt-5.6-sol，
+/// 5 个同层候选）的期望分布退化成了单一账号：
+///
+/// | 目标 | 综合评分 | score^8 | 原始占比 |
+/// |---|---|---|---|
+/// | 唯一热目标 | 0.982 | 0.851 | 63.6% |
+/// | 冷目标（中性 0.6） | 0.802 | 0.168 | 12.6% |
+/// | 冷目标（最贵） | 0.669 | 0.040 | 3.0% |
+///
+/// 这份底权把每个候选抬到同一量级的下限。它不是平均分配（上表里 63.6% →
+/// 56.4%）：分数仍是主导项，只是不再是唯一的项。改动后的效果是最差的目标
+/// 也有约 3% 的期望流量，于是它能在可接受的时间内攒够 §9.4 要求的 20 个样本，
+/// 真正进入评分——这正是 §9.5 所说的"保命口粮"在数量级差距下真正生效。
+const EXPLORATION: f64 = 0.03;
+/// 定义性能参照系所需的最少热目标数（§9.4）。
+///
+/// 只有一个热目标时，它就是参照系里"最快的""吞吐最高的"，三项性能分自动
+/// 拉满——而这与它实际有多慢无关。它因此永远比拼分只有中性 0.6 的冷目标高
+/// 一截，形成第二个正反馈：最先拿到样本的目标从此赢家通吃。
+/// 一个数据点不构成参照系；不足两个热目标时全体退回中性分，让流量先按倍率
+/// 与探索口粮铺开，等样本够了再让性能说话。
+const MIN_FRAME_TARGETS: usize = 2;
 
 /// 一次真实用户请求的性能采样。
 ///
@@ -288,6 +314,17 @@ impl Reference {
         // 只有样本够多的目标才有资格定义参照系：拿一个跑过两次的目标当
         // "全组最快"，会把所有成熟目标都压成低分。
         let warm = || candidates.iter().filter(|c| c.stats.is_warm());
+        // 但**一个**热目标同样不构成参照系：它自动成为"最快"与"吞吐最高"，
+        // 三项性能分全部拉满，而冷目标一律中性 0.6——差距与它实际快慢无关。
+        // 现场表现就是"最先被抽中的那个账号从此赢家通吃"。不足两个热目标时
+        // 放弃参照系，全体按中性分处理，等样本攒够再让性能说话（§9.4）。
+        if warm().count() < MIN_FRAME_TARGETS {
+            return Self {
+                cheapest,
+                fastest_first_token: f64::INFINITY,
+                highest_tps: 0.0,
+            };
+        }
         let fastest_first_token = warm()
             .map(|c| c.stats.first_token_ms)
             .filter(|v| *v > 0.0)
@@ -374,9 +411,11 @@ fn score_one(candidate: &Candidate, reference: &Reference, weights: SchedulingWe
 /// 返回的是**顺序**而不是单个选择：第一个是本次抽中的目标，后面是它失败后
 /// 依次尝试的备选。不放回抽样天然满足"层内先耗尽再降层"（§13.1）。
 pub fn weighted_order(scores: &[Score], random: &mut impl FnMut() -> f64) -> Vec<usize> {
+    // 底权在幂次**之外**相加：它保证的是"每个候选都有一份与分数无关的口粮"，
+    // 而不是把分数拉平。
     let mut weights: Vec<f64> = scores
         .iter()
-        .map(|score| score.total.max(MIN_SCORE).powi(POWER))
+        .map(|score| score.total.max(MIN_SCORE).powi(POWER) + EXPLORATION)
         .collect();
     let mut order = Vec::with_capacity(scores.len());
     let mut remaining: Vec<usize> = (0..scores.len()).collect();
@@ -507,10 +546,75 @@ mod tests {
         // 一个只跑过两次、恰好很快的目标不该把所有成熟目标压成低分。
         let mut lucky = warm("0.5", 1.0, 10.0, 500.0);
         lucky.stats.samples = 2;
-        let candidates = vec![lucky, warm("0.5", 1.0, 1000.0, 50.0)];
+        // 另有两个成熟目标，参照系才成立（只有一个热目标时全体中性，见下一个测试）。
+        let candidates = vec![
+            lucky,
+            warm("0.5", 1.0, 1000.0, 50.0),
+            warm("0.5", 1.0, 2000.0, 25.0),
+        ];
         let scores = score_all(&candidates, SchedulingWeights::default(), None);
         assert_eq!(scores[1].first_token, 1.0, "成熟目标仍是参照系里最快的");
         assert_eq!(scores[1].throughput, 1.0);
+        // 跑过两次的那个目标（10ms、500tps）没有资格参与参照系。
+        assert!(scores[0].first_token < 1.0);
+    }
+
+    /// **一个**热目标不构成参照系（§9.4 修订）。
+    ///
+    /// 只把自己算成"全组最快"，三项性能分就会自动拉满，与它实际快慢无关；
+    /// 这会把"最先拿到样本的目标"永久钉在榜首，形成赢家通吃。不足两个热目标
+    /// 时全体退回中性分，先按倍率与探索口粮铺开流量，等样本够了再让性能说话。
+    #[test]
+    fn a_single_warm_target_does_not_become_the_whole_reference_frame() {
+        // 唯一的热目标速度其实很平庸（5 秒首字、5 tps），冷目标连样本都没有。
+        let only_warm = warm("0.5", 1.0, 5000.0, 5.0);
+        let cold = Candidate {
+            stats: Stats::default(),
+            ..only_warm.clone()
+        };
+
+        let scores = score_all(&[only_warm, cold], SchedulingWeights::default(), None);
+        // 它是参照系里唯一的点，但一个点不构成参照系：不给它满分。
+        assert_eq!(
+            scores[0].first_token, NEUTRAL,
+            "一个热目标不足以定义最快的参照系"
+        );
+        assert_eq!(scores[0].throughput, NEUTRAL);
+        // 冷目标同样中性：两者在性能维度上被拉平，只剩可靠性与倍率说话。
+        assert_eq!(scores[1].first_token, NEUTRAL);
+        assert_eq!(scores[1].throughput, NEUTRAL);
+        assert_eq!(scores[0].first_token, scores[1].first_token);
+        assert_eq!(scores[0].throughput, scores[1].throughput);
+    }
+
+    /// 两个热目标时参照系恢复正常：快的那一个拿到性能满分。
+    #[test]
+    fn two_warm_targets_restore_the_reference_frame() {
+        let candidates = vec![
+            warm("0.5", 1.0, 10.0, 500.0),
+            warm("0.5", 1.0, 1000.0, 50.0),
+        ];
+        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        assert_eq!(scores[0].first_token, 1.0);
+        assert_eq!(scores[0].throughput, 1.0);
+        assert!(scores[1].first_token < 1.0);
+    }
+
+    /// 探索口粮：分数差距悬殊时，弱者仍拿得到足以攒样本的流量（§9.5）。
+    ///
+    /// 这正是口径里"保命口粮"的量化含义——不是好看，而是**能不能攒够
+    /// `MIN_SAMPLES` 个样本回到评分里**。分数 0.55 的目标若无口粮，占比不到
+    /// 1%，在真实流量下几天都攒不够 20 个样本，于是永远停在保守中性分。
+    #[test]
+    fn the_exploration_floor_keeps_every_candidate_fed() {
+        let share = simulate(&[score(0.95), score(0.55)], 40_000);
+        // 主力仍然拿走绝大多数流量：底权不是平均分配。
+        assert!(share[0] > 0.9, "主力应当拿到绝大多数流量：{share:?}");
+        // 但弱者必须拿得到足够的样本量级：>3% 意味着 600 次请求就能攒到 20 个。
+        assert!(
+            share[1] > 0.03,
+            "弱者必须攒得到样本，否则永远回不到评分里：{share:?}"
+        );
     }
 
     #[test]

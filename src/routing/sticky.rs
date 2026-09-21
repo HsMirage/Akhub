@@ -239,17 +239,27 @@ impl Bindings {
         Self::default()
     }
 
-    /// 查询绑定。命中时顺带刷新滑动过期时间。
+    /// 查询绑定，**不修改任何状态**。
+    ///
+    /// 调用方需要区分"距上次真正使用过了多久"（决定缓存新鲜度与等待预算，
+    /// §10.3）与"这个绑定还活着吗"。在这里顺手把 `last_used_at` 推到当前时刻
+    /// 会把前者抹掉：`get` 自己刷新了一次，`freshness_for(now - last_used_at)`
+    /// 就永远算出 0 秒，新鲜度系数恒为 1.0、等待预算恒取满档。
+    /// 现场（gpt-boom / gpt-5.6-sol）389 条粘性命中的 `sticky_freshness` 全部是
+    /// 1.0、`sticky_wait_ms` 全部是 0——那个"缓存早就凉了，不值得为它排队"的
+    /// 三档衰减从未生效过。
+    ///
+    /// 刷新由真正使用了这个绑定的路径负责：[`Self::bind`]（这次调用成功）与
+    /// [`Self::rebind_credential`]（同一账号内换了 Key）都会把时间推到现在。
     pub fn get(&self, key: &Key, now: i64) -> Option<Binding> {
         let entry = {
             let guard = self.inner.read().ok()?;
             Arc::clone(guard.get(key)?)
         };
-        let mut state = entry.state.lock().ok()?;
+        let state = entry.state.lock().ok()?;
         if now - state.last_used_at >= TTL.as_secs() as i64 {
             return None;
         }
-        state.last_used_at = now;
         Some(state.clone())
     }
 
@@ -586,15 +596,18 @@ mod tests {
     }
 
     #[test]
-    fn bindings_slide_their_expiry_on_every_hit() {
+    fn bindings_slide_their_expiry_on_every_real_use() {
         let bindings = Bindings::new();
         let (key, _) = derive_prefix(&json!({"system": "s"})).unwrap();
         bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000);
 
-        // 3000 秒后仍在，且这次命中把过期时间往后推。
+        // 一次真正使用（调用成功之后重新绑定）把过期时间往后推。
         assert_eq!(bindings.get(&key, 4_000).unwrap().target_id, "tgt-a");
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 4_000);
         assert!(bindings.get(&key, 4_000 + 3_500).is_some());
-        // 从上次命中起超过 1 小时才真正过期。
+        // 从**上次真正使用**起超过 1 小时才过期。光查询不算使用——否则
+        // "距上次使用多久"这个量会被查询本身抹掉（见
+        // `get_never_mutates_the_binding_timestamps`）。
         assert!(bindings.get(&key, 4_000 + 3_500 + 3_601).is_none());
     }
 
@@ -654,6 +667,36 @@ mod tests {
     fn a_cold_cache_makes_waiting_nearly_worthless() {
         let big = 1024 * 1024;
         assert!(wait_budget(big, 20 * 60) < wait_budget(big, 60) / 5);
+    }
+
+    /// `get` 必须**只读**：它读出的 `last_used_at` 决定了缓存新鲜度（§10.3）。
+    ///
+    /// 在这里顺手刷新时间戳会让 `now - last_used_at` 永远等于 0，新鲜度恒为
+    /// 1.0、等待预算恒取满档——三档衰减彻底失效。现场 389 条粘性命中的
+    /// `sticky_freshness` 全部是 1.0，正是这个 bug。
+    #[test]
+    fn get_never_mutates_the_binding_timestamps() {
+        let bindings = Bindings::new();
+        let key = derive_prefix(&json!({"system": "前缀"})).unwrap().0;
+        bindings.bind(key.clone(), "g1", "m1", "t1", None, 1_000);
+
+        // 15 分钟后再查：必须如实报告"15 分钟前用过"，而不是把时间推到此刻。
+        let later = 1_000 + 15 * 60;
+        let binding = bindings.get(&key, later).unwrap();
+        assert_eq!(binding.last_used_at, 1_000, "get 不能刷新时间戳");
+        assert_eq!(binding.bound_at, 1_000);
+        // 于是新鲜度如实衰减，等待预算跟着缩水（§10.3 的三档）。
+        assert_eq!(freshness_for(later - binding.last_used_at), 0.1);
+        assert!(
+            wait_budget(400 * 1024, later - binding.last_used_at) < wait_budget(400 * 1024, 60)
+        );
+
+        // 再查一次仍然是同一个答案：get 可以被反复调用而不改变任何状态。
+        assert_eq!(bindings.get(&key, later).unwrap().last_used_at, 1_000);
+
+        // 真正的使用（成功之后重新 bind）才把时间推到现在。
+        bindings.bind(key.clone(), "g1", "m1", "t1", None, later);
+        assert_eq!(bindings.get(&key, later).unwrap().last_used_at, later);
     }
 
     /// 绑定表到上限时淘汰最久未使用的条目，而不是无限增长（§19.4）。
