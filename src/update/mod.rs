@@ -714,7 +714,7 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// 公开出去是为了让测试能拼出与真实发行包同构的资产名；生产代码只用它挑文件。
 pub fn asset_suffix() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Some("linux-x86_64-musl"),
+        ("linux", "x86_64") => Some("linux-x86_64"),
         ("linux", "aarch64") => Some("linux-aarch64"),
         ("macos", "aarch64") => Some("macos-aarch64"),
         ("macos", "x86_64") => Some("macos-x86_64"),
@@ -726,18 +726,19 @@ fn platform_label() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// 按平台挑资产；Linux x86_64 优先静态链接的 musl 版，没有就退回 glibc 版。
+/// 按平台挑资产。
+///
+/// Linux x86_64 历史上同时发过 musl 与 glibc 两个包（现已只发 glibc），所以这里
+/// 保留一个备用名：装的是老版本、或者被固定到老 tag 时，仍然找得到对应的包。
 fn pick_asset<'a>(assets: &'a [Asset], version: &str) -> Option<&'a Asset> {
     let suffix = asset_suffix()?;
-    let wanted = format!("akhub-v{version}-{suffix}.tar.gz");
-    if let Some(asset) = assets.iter().find(|item| item.name == wanted) {
-        return Some(asset);
+    let mut wanted = vec![format!("akhub-v{version}-{suffix}.tar.gz")];
+    if suffix == "linux-x86_64" {
+        wanted.push(format!("akhub-v{version}-linux-x86_64-musl.tar.gz"));
     }
-    if suffix == "linux-x86_64-musl" {
-        let fallback = format!("akhub-v{version}-linux-x86_64.tar.gz");
-        return assets.iter().find(|item| item.name == fallback);
-    }
-    None
+    wanted
+        .iter()
+        .find_map(|name| assets.iter().find(|item| item.name == *name))
 }
 
 // ------------------------------------------------------------------ 下载与校验
@@ -1091,8 +1092,16 @@ mod tests {
             },
         ];
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            // 现在只发 glibc，所以优先挑它的包（不是 musl）。
             let picked = pick_asset(&assets, "1.1.2").unwrap();
-            assert_eq!(picked.name, "akhub-v1.1.2-linux-x86_64-musl.tar.gz");
+            assert_eq!(picked.name, "akhub-v1.1.2-linux-x86_64.tar.gz");
+            // 只有 musl 的老 Release 仍然能更新：备用名兜底。
+            let musl_only = vec![Asset {
+                name: "akhub-v1.1.0-linux-x86_64-musl.tar.gz".into(),
+                browser_download_url: "https://example.invalid/old".into(),
+            }];
+            let picked = pick_asset(&musl_only, "1.1.0").unwrap();
+            assert_eq!(picked.name, "akhub-v1.1.0-linux-x86_64-musl.tar.gz");
         }
         assert!(pick_asset(&assets, "1.1.9").is_none());
     }

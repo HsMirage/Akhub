@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/release.sh                     # 全量：校验 + 全部平台 + 校验和
 #   ./scripts/release.sh --skip-tests        # 跳过 cargo test（仍然跑 fmt/clippy）
-#   ./scripts/release.sh --only linux-x86_64-musl,macos-aarch64
+#   ./scripts/release.sh --only linux-aarch64,macos-aarch64
 #   ./scripts/release.sh --no-checksums
 #
 # 交叉编译依赖：
@@ -44,8 +44,7 @@ done
 PLATFORMS=(
     "linux-x86_64:x86_64-unknown-linux-gnu"
     "linux-aarch64:aarch64-unknown-linux-gnu"
-    "linux-x86_64-musl:x86_64-unknown-linux-musl"
-    "macos-aarch64:aarch64-apple-darwin"
+        "macos-aarch64:aarch64-apple-darwin"
     "macos-x86_64:x86_64-apple-darwin"
     "windows-x86_64:x86_64-pc-windows-gnu"
 )
@@ -129,13 +128,22 @@ echo "==> 4/4 校验和"
 if [[ "$CHECKSUMS" == true ]]; then
     (
         cd dist
-        # 只对发行包做校验和；上次遗留的裸二进制不算。
         rm -f checksums.txt
+        # 用 nullglob 收集产物：`--only linux-x86_64` 这类只构建部分平台的
+        # 调用里，`./*.exe` 会一个都匹配不到；未开启 nullglob 时它保持字面量，
+        # sha256sum 会报 "No such file" 并让整个发版脚本失败。
+        shopt -s nullglob
+        targets=(./*.tar.gz ./*.exe)
+        shopt -u nullglob
+        if [ ${#targets[@]} -eq 0 ]; then
+            echo "    dist/ 里没有可校验的产物，跳过" >&2
+            exit 0
+        fi
         # macOS 自带 shasum，Linux 用 sha256sum。两者输出格式一致。
         if have sha256sum; then
-            sha256sum ./*.tar.gz ./*.zip > checksums.txt
+            sha256sum "${targets[@]}" > checksums.txt
         elif have shasum; then
-            shasum -a 256 ./*.tar.gz ./*.zip > checksums.txt
+            shasum -a 256 "${targets[@]}" > checksums.txt
         else
             echo "    找不到 sha256sum / shasum，跳过" >&2
             exit 0
@@ -157,7 +165,7 @@ cat <<EOF
       1. 确认 Cargo.toml 的版本是 $VERSION，tag 必须打 v$VERSION
          （release.yml 里有一道校验，对不上直接失败）
       2. git tag v$VERSION && git push origin v$VERSION
-         CI 会自动构建 6 个平台并推送多架构镜像到 ghcr.io/hsmirage/akhub（镜像路径全小写）
+         CI 会自动构建 5 个平台并推送多架构镜像到 ghcr.io/hsmirage/akhub（镜像路径全小写）
       3. 本地产物要手工上传时：
          gh release create v$VERSION dist/*.tar.gz dist/*.zip dist/checksums.txt
 

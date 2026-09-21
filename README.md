@@ -290,8 +290,8 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 ```
 
 每个 `v*` 标签会触发 [release.yml](.github/workflows/release.yml)，在各自平台的原生 runner 上
-构建 6 个平台的单文件二进制（`linux-x86_64-musl`、`linux-x86_64`、`linux-aarch64`、
-`macos-aarch64`、`macos-x86_64`、`windows-x86_64`，Windows 另附免解压的裸 `.exe`），
+构建 5 个平台的单文件二进制（`linux-x86_64`、`linux-aarch64`、
+`macos-aarch64`、`macos-x86_64`、`windows-x86_64`；Windows 只发免解压的裸 `.exe`），
 并合成多架构镜像推送到 GHCR，附 `checksums.txt`。本地发版用 `scripts/release.sh`，打包规则由
 [scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
 

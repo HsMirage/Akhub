@@ -62,7 +62,8 @@ if (-not $Version) { Fail '拿不到版本号' 3 }
 # 允许 -Version 1.0.0 与 -Version v1.0.0 两种写法。
 $tag = if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
 
-$asset = "akhub-$tag-$platform.zip"
+# Windows 只发裸 exe（v1.1.7 起不再打 zip），下载下来就是可执行文件。
+$asset = "akhub-$tag-$platform.exe"
 $base = "https://github.com/$Repo/releases/download/$tag"
 
 Write-Info "平台：windows/$arch（$platform）"
@@ -109,12 +110,9 @@ try {
         Write-Warn '已按 -NoVerify 跳过 sha256 校验'
     }
 
-    # ------------------------------------------------------------ 解包
-    Write-Info '解包'
-    Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath $tmp -Force
-    $inner = Join-Path $tmp "akhub-$tag-$platform"
-    $exe = Join-Path $inner 'akhub.exe'
-    if (-not (Test-Path $exe)) { Fail "归档结构与预期不符，找不到 $exe" 4 }
+    # 裸 exe 不需要解包：下载下来的那个文件就是二进制本体。
+    $exe = Join-Path $tmp $asset
+    if (-not (Test-Path $exe)) { Fail "下载的 exe 不见了：$exe" 4 }
 
     # ------------------------------------------------------------ 安装
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null

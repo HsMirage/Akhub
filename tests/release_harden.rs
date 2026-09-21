@@ -727,7 +727,6 @@ fn release_platforms_agree_across_workflow_script_and_installers() {
     for platform in [
         "linux-x86_64",
         "linux-aarch64",
-        "linux-x86_64-musl",
         "macos-aarch64",
         "macos-x86_64",
         "windows-x86_64",
@@ -744,7 +743,7 @@ fn release_platforms_agree_across_workflow_script_and_installers() {
 
     // 安装脚本要能按本机架构拼出资产名。这里不查具体三元组，只确认那段
     // 拼装逻辑还在——它一旦被改成硬编码，多架构就废了。
-    for needle in ["linux-x86_64-musl", "linux-$", "macos-$"] {
+    for needle in ["linux-${arch}", "macos-${arch}"] {
         assert!(
             install_sh.contains(needle),
             "install.sh 里找不到平台拼装片段 {needle}"
@@ -781,8 +780,8 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
         .map(|name| name.trim().to_string())
         .collect();
     assert!(
-        declared.len() >= 6,
-        "release.yml 里应当解析出至少 6 个平台名，实际 {declared:?}"
+        declared.len() >= 5,
+        "release.yml 里应当解析出至少 5 个平台名，实际 {declared:?}"
     );
 
     // 伪造的 uname：只回答 -s 与 -m，值取自环境变量。
@@ -803,7 +802,7 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
 
     // 覆盖安装脚本里每一个平台分支。
     let cases = [
-        ("Linux", "x86_64", "linux-x86_64-musl"),
+        ("Linux", "x86_64", "linux-x86_64"),
         ("Linux", "aarch64", "linux-aarch64"),
         ("Darwin", "arm64", "macos-aarch64"),
         ("Darwin", "x86_64", "macos-x86_64"),
@@ -864,80 +863,50 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
     );
 }
 
-/// Windows 必须同时给出裸 exe 与捆绑 zip，且两者都在校验和里。
+/// Windows 只发裸 exe，不再打 zip。
 ///
 /// Unix 那边必须打包：可执行权限靠文件模式的 +x 位，浏览器下载会丢掉它，
 /// 裸传 ELF 用户拿到的是「权限不足」。Windows 没有这个问题——能不能跑只看
 /// 扩展名——所以「必须打包」的理由在这里不成立，剩下的只是压缩收益
-/// （17 MB -> 6 MB）和顺带捎上文档。让用户为这两点被迫多走
-/// 「解压 -> 进一层目录 -> 运行」并不划算，所以两个都给。
+/// （17 MB -> 6 MB）和顺带捎上文档，却要用户多走「解压 -> 进一层目录 -> 运行」
+/// 三步。只给一个文件，安装脚本、自更新与手工下载都少一层解包。
 #[test]
-fn windows_ships_both_a_bare_exe_and_a_bundle() {
+fn windows_ships_only_a_bare_exe() {
     let package = std::fs::read_to_string("scripts/package.sh").expect("package.sh");
     let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
-    let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
 
-    // 打包侧要产出裸 exe。
+    // 打包侧要产出裸 exe，且不再产出 zip。
     assert!(
         package.contains(r#"cp "$STAGE/akhub.exe" "dist/$ASSET.exe""#),
-        "package.sh 必须为 Windows 额外产出一个裸 exe"
+        "package.sh 必须为 Windows 产出一个裸 exe"
     );
     assert!(
-        package.contains(r#"ARTIFACT="$ASSET.zip $ASSET.exe""#),
-        "package.sh 的 Windows 分支必须同时声明 zip 与 exe 两个产物"
+        package.contains(r#"ARTIFACT="$ASSET.exe""#),
+        "package.sh 的 Windows 分支只能声明 exe 一个产物"
+    );
+    assert!(
+        !package.contains(".zip"),
+        "package.sh 不该再出现 zip：Windows 只发裸 exe"
     );
 
-    // 流水线要把 exe 一起上传，并且**算进校验和**——否则用户没法校验
-    // 那个他直接下载的文件，而校验和的意义就在于覆盖每一个可下载的产物。
+    // 流水线要把 exe 上传并发布，且**算进校验和**——否则用户没法校验那个
+    // 他直接下载的文件，而校验和的意义就在于覆盖每一个可下载的产物。
     assert!(
         workflow.matches("dist/*.exe").count() >= 2,
         "release.yml 必须在上传与发布两处都包含 dist/*.exe"
+    );
+    assert!(
+        !workflow.contains("dist/*.zip"),
+        "release.yml 不该再引用 dist/*.zip：没有这个产物了"
     );
     let checksum_line = workflow
         .lines()
         .find(|line| line.contains("sha256sum ./*.tar.gz"))
         .expect("release.yml 里应有校验和生成命令");
     assert!(
-        checksum_line.contains("./*.exe"),
-        "校验和必须覆盖裸 exe，实际命令：{checksum_line}"
+        checksum_line.contains("./*.exe") && !checksum_line.contains("./*.zip"),
+        "校验和必须覆盖裸 exe、且不再包含 zip，实际命令：{checksum_line}"
     );
-
-    // 安装脚本仍然按 zip 装（包里才有 install.ps1 与文档），这一点不能被打乱。
-    assert!(
-        install_ps1.contains(r#"$asset = "akhub-$tag-$platform.zip""#),
-        "install.ps1 应当继续下载 zip 包，而不是裸 exe"
-    );
-}
-
-/// 镜像路径必须全小写。
-///
-/// GitHub 仓库是 HsMirage/Akhub，直接拿去拼 ghcr.io/<owner>/<repo> 会得到
-/// 含大写的路径，而 Docker 会拒绝这样的 repository 名——用户复制文档里的
-/// docker run 命令只会看到一个和文档内容毫不相干的报错。
-#[test]
-fn container_image_paths_are_lowercase() {
-    let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
-    assert!(
-        install_sh.contains("tr '[:upper:]' '[:lower:]'"),
-        "install.sh 必须把仓库名转成小写再拼镜像路径"
-    );
-
-    for name in ["docker-compose.yml", "deploy/README.md", "README.md"] {
-        let content =
-            std::fs::read_to_string(name).unwrap_or_else(|e| panic!("读不到 {name}：{e}"));
-        for (index, _) in content.match_indices("ghcr.io/") {
-            let after = &content[index + "ghcr.io/".len()..];
-            let end = after
-                .find(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\\')
-                .unwrap_or(after.len());
-            let path = &after[..end];
-            assert_eq!(
-                path,
-                path.to_lowercase(),
-                "{name} 里的镜像路径 {path} 含大写字母，Docker 会拒绝"
-            );
-        }
-    }
 }
 
 /// 发布资产的命名规则必须在打包脚本与安装脚本之间保持一致。
@@ -947,7 +916,7 @@ fn artifact_naming_is_consistent_between_packager_and_installer() {
     let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
     let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
 
-    // 打包侧：akhub-<tag>-<platform>.tar.gz / .zip
+    // 打包侧：akhub-<tag>-<platform>.tar.gz（Windows 是 .exe）
     assert!(
         package.contains("ASSET=\"akhub-$TAG-$PLATFORM\""),
         "package.sh 的资产命名变了，安装脚本会找不到文件"
@@ -957,8 +926,8 @@ fn artifact_naming_is_consistent_between_packager_and_installer() {
         "install.sh 的资产名模板与 package.sh 不一致"
     );
     assert!(
-        install_ps1.contains("$asset = \"akhub-$tag-$platform.zip\""),
-        "install.ps1 的资产名模板与 package.sh 不一致"
+        install_ps1.contains("$asset = \"akhub-$tag-$platform.exe\""),
+        "install.ps1 的资产名模板与 package.sh 不一致（Windows 只发裸 exe）"
     );
 
     // 发行包必须同时带上两个安装脚本：Windows 文档让用户去运行

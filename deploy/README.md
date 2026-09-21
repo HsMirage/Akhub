@@ -46,7 +46,7 @@
 ```bash
 docker compose up -d
 # 或指定版本
-AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.6 docker compose up -d
+AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.7 docker compose up -d
 ```
 
 没有 compose 时用裸 `docker run`：
@@ -139,7 +139,7 @@ docker exec akhub /usr/local/bin/akhub --healthcheck        # 手动跑一次
 |---|---|---|
 | `/health/live` | 进程事件循环正常 | liveness 探针 |
 | `/health/ready` | 数据库、配置与主密钥已就绪 | readiness 探针、升级后的验收点 |
-| `/health/version` | `{"status":"ok","version":"1.1.6"}` | 确认部署的是哪个版本 |
+| `/health/version` | `{"status":"ok","version":"1.1.7"}` | 确认部署的是哪个版本 |
 
 三个端点都不需要凭据，也不暴露账号、模型或倍率信息。
 
@@ -158,7 +158,7 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh
 less install.sh
-sh install.sh --version v1.1.6 --service
+sh install.sh --version v1.1.7 --service
 ```
 
 脚本做这些事：探测平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 →
@@ -171,14 +171,15 @@ sh install.sh --version v1.1.6 --service
 |---|---|
 | `--version vX.Y.Z` | 装指定版本，默认取最新 Release |
 | `--dir <path>` | 安装目录，默认 `/usr/local/bin` |
-| `--libc glibc` | Linux 上改用 glibc 版本（默认 `musl` 静态链接） |
+| `--libc <glibc\|musl>` | 兼容旧参数；现在只发布 glibc 版，写 `musl` 会给出警告 |
 | `--service` | 额外安装并启用 systemd 单元 |
 | `--dry-run` | 只打印将要做什么 |
 | `AKHUB_BASE_URL` | 改用自建镜像下载根，目录结构为 `<根>/<tag>/<资产名>` |
 
-**为什么 Linux 默认给 musl 版**：静态链接，不依赖目标机器的 glibc 版本，
-在任何发行版上都是拷过去就能跑。发行包同时提供 glibc 版
-（`linux-x86_64`、`linux-aarch64`），装完跑不起来时用 `--libc glibc` 换一个。
+**Linux 只发 glibc 版**（`linux-x86_64`、`linux-aarch64`）：构建镜像与运行环境
+都是 Debian bookworm，需要 glibc 2.34+。此前同时发过静态链接的 musl 版，v1.1.7 起
+停发——两条 libc 线让自更新要在两个资产之间挑，而它们装出来的其实是两个不同的二进制。
+`--libc` 参数保留下来只是不让旧脚本直接报错。
 
 ### 2.2 macOS
 
@@ -251,8 +252,8 @@ irm https://raw.githubusercontent.com/HsMirage/Akhub/master/install.ps1 | iex
 
 ```bash
 # 1. 二进制
-tar -xzf akhub-v1.1.6-linux-x86_64-musl.tar.gz
-sudo install -m755 akhub-v1.1.6-linux-x86_64-musl/akhub /usr/local/bin/akhub
+tar -xzf akhub-v1.1.7-linux-x86_64.tar.gz
+sudo install -m755 akhub-v1.1.7-linux-x86_64/akhub /usr/local/bin/akhub
 
 # 2. 系统用户（单元里写死了 User=akhub）
 sudo useradd --system --home-dir /var/lib/akhub --create-home akhub
@@ -340,7 +341,7 @@ sudo systemctl start akhub
 ```bash
 docker compose pull && docker compose up -d
 # 指定版本
-AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.6 docker compose up -d
+AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.7 docker compose up -d
 ```
 
 回滚就是换回旧 tag。数据卷不动，SQLite 结构会在需要时自动迁移。
@@ -489,4 +490,4 @@ HTTPS 部署下没转发 `X-Forwarded-Proto`，会话 Cookie 的 `Secure` 判定
 | `scripts/release.sh` | 本地发版：多平台交叉编译 + 打包 + 校验和 |
 | `scripts/package.sh` | 打包单个平台（CI 与本地共用） |
 | `scripts/docker-build.sh` | 本地多架构镜像构建 |
-| `.github/workflows/release.yml` | CI 发版：6 个平台 + 多架构镜像 |
+| `.github/workflows/release.yml` | CI 发版：5 个平台 + 多架构镜像 |

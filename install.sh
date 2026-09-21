@@ -11,7 +11,7 @@
 #   --version <tag>     安装指定版本（默认取最新 Release）
 #   --dir <path>        安装目录（默认 /usr/local/bin，权限不足时自动 sudo）
 #   --no-verify         跳过 sha256 校验（不推荐）
-#   --libc <musl|glibc> Linux 上的 C 运行库偏好；默认 musl（静态链接，不挑发行版）
+#   --libc <glibc|musl> 兼容旧参数；现在只发布 glibc 版，musl 已停发（会给出警告）
 #   --service           额外安装 systemd 单元并启用（仅 Linux + root）
 #   --dry-run           只打印将要做什么
 #
@@ -30,7 +30,7 @@ IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 BASE_URL="${AKHUB_BASE_URL:-}"
 VERSION="${AKHUB_VERSION:-}"
 INSTALL_DIR="${AKHUB_INSTALL_DIR:-/usr/local/bin}"
-LIBC_PREF="musl"
+LIBC_PREF="glibc"
 VERIFY=1
 WITH_SERVICE=0
 DRY_RUN=0
@@ -77,14 +77,16 @@ case "$uname_m" in
 esac
 
 # 资产命名与 .github/workflows/release.yml 的 matrix.name 一一对应：
-#   linux-x86_64 / linux-aarch64 / linux-x86_64-musl / macos-aarch64 / macos-x86_64
+#   linux-x86_64 / linux-aarch64
+#   macos-aarch64 / macos-x86_64
+#
+# Linux 现在只有 glibc 版（静态链接的 musl 版已停发）。--libc 保留是为了不让
+# 旧脚本直接报参数错误，但选了 musl 也只能拿到 glibc 资产，所以明确警告一句。
+if [ "$LIBC_PREF" = "musl" ]; then
+    warn "--libc musl 已不再发布；本次安装 glibc 版（需要 glibc 2.34+）"
+fi
 if [ "$os_family" = "linux" ]; then
-    if [ "$arch" = "x86_64" ] && [ "$LIBC_PREF" = "musl" ]; then
-        platform="linux-x86_64-musl"
-    else
-        # aarch64 暂时只有 glibc 资产；musl 静态链接留给后续按需补充。
-        platform="linux-${arch}"
-    fi
+    platform="linux-${arch}"
 else
     platform="macos-${arch}"
 fi
@@ -191,7 +193,7 @@ inner="${tmp}/akhub-${tag}-${platform}"
 
 # 先确认这个二进制真的能在本机跑起来，再动 /usr/local/bin。
 "${inner}/akhub" --version >/dev/null 2>&1 \
-    || warn "制品无法在当前系统执行（可能是 C 运行库不匹配）；若启动失败，试试 --libc glibc"
+    || warn "制品无法在当前系统执行（多半是 glibc 版本太旧；本机 glibc: $(ldd --version 2>/dev/null | head -n1 || echo 未知)）"
 
 # ---------------------------------------------------------------- 安装
 # 目录还不存在时先尝试直接创建：/tmp 下的路径、~/.local/bin 这类都在
