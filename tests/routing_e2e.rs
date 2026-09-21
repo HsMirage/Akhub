@@ -722,6 +722,12 @@ async fn a_pin_yields_when_another_target_is_clearly_better() {
     );
 
     for round in 0..8 {
+        // 每轮都重新喂一遍样本：假上游是亚毫秒的，一旦它真的服务了几次，
+        // 它的实测延迟就会把"参考系最快/最高吞吐"抢过去（X 反而成了标杆），
+        // 于是 Y 的归一分崩塌、"X 明显更差"这个前提就不成立了。
+        // 测试要验证的是守门判定本身，所以把前提按住。
+        prime_target(&akhub, &wx.target_id, 800, 40, akhub::storage::now_unix());
+        prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
         let body = strong_body("项目", &format!("第 {round} 轮"), "会话-守门");
         assert_eq!(chat(&akhub, body).await.status(), 200);
     }
@@ -833,16 +839,25 @@ async fn a_context_rewrite_makes_migration_free() {
 
     let now = akhub::storage::now_unix();
     // 刚迁移过（在冷却里），但绑定时记录的是一个 1MB 的上下文。
-    install_binding(
-        &akhub,
-        MODEL,
-        "会话-压缩",
-        &wx.target_id,
-        Some(now),
-        Some(1_000_000),
-    );
-
     for round in 0..8 {
+        // 每轮都把绑定重置成"刚压缩完"的状态。
+        //
+        // 这不是在迁就实现：重写只在**压缩后的第一次请求**上成立——那一次成功
+        // 之后 `bind()` 会把 context_bytes 刷新成新的（小）体积，之后就不再是
+        // "刚压缩过"了。所以只发一轮的话，结论取决于那一次抽签（约 6% 会正常
+        // 抽回原目标），测出来的就是随机数。这里每轮重建前提，让判据本身可测。
+        install_binding(
+            &akhub,
+            MODEL,
+            "会话-压缩",
+            &wx.target_id,
+            Some(now),
+            Some(1_000_000),
+        );
+        // 同时按住"X 明显更差"这个前提，否则假上游的亚毫秒延迟会把参考系
+        // 抢过去，守门判定就测不到了。
+        prime_target(&akhub, &wx.target_id, 2000, 20, akhub::storage::now_unix());
+        prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
         let body = strong_body("项目", &format!("第 {round} 轮"), "会话-压缩");
         assert_eq!(chat(&akhub, body).await.status(), 200);
     }
