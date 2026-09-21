@@ -102,10 +102,6 @@ function formatFirstToken(ms: number | null): string {
   return ms === null ? "未到达" : `${(ms / 1000).toFixed(1)}s`;
 }
 
-function attemptTarget(attempt: AttemptRecord): string {
-  return attempt.account_id ?? attempt.upstream_model ?? "—";
-}
-
 function attemptOutcomeTone(outcome: string): "success" | "danger" | "neutral" {
   switch (outcome) {
     case "ok":
@@ -300,6 +296,15 @@ export function Requests({
 
   const accountName = (id: string | null) =>
     id ? (data.accounts.find((account) => account.id === id)?.name ?? id) : "—";
+
+  /**
+   * 尝试明细里的「目标」：显示上游账号名，不是内部 ULID。
+   *
+   * account_id 形如 acc_01J…，管理员读完也认不出是谁；只有账号已经删除、
+   * 或这条老记录根本没留下账号时，才退回上游模型名（§6.6）。
+   */
+  const attemptTarget = (attempt: AttemptRecord) =>
+    attempt.account_id ? accountName(attempt.account_id) : (attempt.upstream_model ?? "—");
 
   const toggleExpanded = (requestId: string) => {
     setExpandedRequestIds((current) => {
@@ -897,11 +902,11 @@ export function Requests({
                                     {record.attempts_detail.map((attempt) => (
                                       <tr key={`${record.request_id}-${attempt.seq}`}>
                                         <td className="mono cell-dim">{attempt.seq}</td>
-                                        <td className="mono cell-dim">
+                                        <td className="cell-dim">
                                           {attempt.target_id ? (
                                             <button
                                               type="button"
-                                              className="link-button mono"
+                                              className="link-button"
                                               title={`在「调度目标」里定位 ${attemptTarget(attempt)}`}
                                               onClick={() =>
                                                 navigateTo("targets", {
@@ -913,6 +918,15 @@ export function Requests({
                                             </button>
                                           ) : (
                                             attemptTarget(attempt)
+                                          )}
+                                          {/* 上游模型名降到第二行：账号名认人，模型名认路，两样都要有。 */}
+                                          {attempt.account_id && attempt.upstream_model && (
+                                            <div
+                                              className="mono text-faint"
+                                              style={{ fontSize: 11, marginTop: 2 }}
+                                            >
+                                              {attempt.upstream_model}
+                                            </div>
                                           )}
                                         </td>
                                         <td className="cell-dim">
