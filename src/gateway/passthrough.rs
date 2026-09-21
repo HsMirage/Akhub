@@ -410,6 +410,35 @@ async fn forward_inner<'a>(
         .as_ref()
         .and_then(|(key, _)| forward.state.runtime.sticky.get(key, now_unix));
 
+    // ① 缓存已凉的绑定不再钉住（§10.1 修订）。
+    //
+    // 粘性命中的价值全部来自上游的前缀缓存；缓存凉了之后，继续钉住只是让
+    // 首次抽签的结果永久固化——上游已经变慢变贵，流量却一分都挪不动。此时
+    // 把它当成"没有绑定"重新按分数抽签，成功后用新赢家重绑：这是一次**零
+    // 成本**的再平衡机会（缓存本来就要重建）。
+    //
+    // **响应链（第 1 级）例外**：那一级的粘性保护的不是缓存，而是"上游的响应
+    // 状态真的存在那个账号上"。换号必须重放合并后的正文，而 store:false 的
+    // 客户端没有正文可重放，挪过去只会 404。所以它永远保持硬钉住。
+    let chain_bound = sticky_key
+        .as_ref()
+        .is_some_and(|(_, origin)| *origin == sticky::Origin::ResponseChain);
+    // 记下被丢弃的那条绑定的新鲜度：sticky_hit=false 而 sticky_freshness 有值，
+    // 就是"有绑定、但凉到不值得钉"的签名，便于在请求记录里解释这次为什么换了号。
+    let cold_binding = existing
+        .as_ref()
+        .filter(|binding| !chain_bound && sticky::cache_is_cold(now_unix - binding.last_used_at));
+    let cold_freshness =
+        cold_binding.map(|binding| sticky::freshness_for(now_unix - binding.last_used_at));
+    let existing = if cold_freshness.is_some() {
+        None
+    } else {
+        existing
+    };
+    if let Some(freshness) = cold_freshness {
+        walk.telemetry.sticky_freshness = Some(freshness);
+    }
+
     let plan = match routing::plan(
         forward.group,
         &forward.logical_model,
@@ -433,10 +462,47 @@ async fn forward_inner<'a>(
         .and_then(|layer| layer.candidates.first())
         .map(|candidate| candidate.target.account.multiplier_mode.as_str());
 
+    // ③ 守门式钉住（§10.1 修订）。
+    //
+    // 第 2/3 级（会话头、prompt_cache_key）以前是"永远钉死"：首次抽签落在谁
+    // 身上，这条会话就再也不会换号，哪怕那个账号后來慢了一倍、贵了一倍。现场
+    // 形态正是如此——一条 prompt_cache_key 连打 520 次全在同一个账号上。
+    //
+    // 现在改成"只要它还守得住分数就一直钉着"：同层里有别人领先超过 margin 时，
+    // 这一次请求放弃钉住，直接走层内正常顺序（那本身就是按分数抽签的结果）。
+    // 钉住带来的缓存收益因此只在它真的还划算时才保留。
+    //
+    // 两道闸门防止抖动：
+    //   * margin 随缓存重建的代价上升（④，见 sticky::migrate_margin）；
+    //   * 每会话每 MIGRATE_COOLDOWN 只允许翻盘一次（迟滞）。
+    // 第 1 级（响应链）不在其列：它保护的是上游状态，不是缓存。
+    let escaped = !soft
+        && !chain_bound
+        && existing.as_ref().is_some_and(|binding| {
+            !sticky::migrate_cooling_down(now_unix, binding.migrated_at)
+                && routing::pin_is_outpaced(
+                    &plan,
+                    &binding.target_id,
+                    sticky::migrate_margin(forward.request_bytes, now_unix - binding.last_used_at),
+                )
+        });
+    if escaped {
+        // 没走绑定，就不是粘性命中；但仍然把新鲜度写下来，这样请求记录里
+        // "hit=false 且 freshness>0.1" 就是"守门放行"的签名（§24.1）。
+        walk.telemetry.sticky_freshness = existing
+            .as_ref()
+            .map(|binding| sticky::freshness_for(now_unix - binding.last_used_at));
+    }
+
     // 强身份粘性命中的请求不参与抽签，直接走已绑定目标（§9.5）；弱身份
     // （稳定前缀）的绑定也在这里取出来，但只是为了拿到它的 Key 亲和——
     // 下面会把它清成 None、不抢占第一步。
     let bound = sticky_key.as_ref().and_then(|_| {
+        if escaped {
+            // 放弃钉住：返回 None 会走层内正常顺序。注意不能让下面那条
+            // "目标已不合格"的清绑逻辑误伤它——绑定依然有效，只是这次不划算。
+            return None;
+        }
         let binding = existing?;
         // 普通粘性只能在当前最高合格层内生效：低层绑定不能绕过已恢复的高层
         // （§9.5）。这条硬边界与凭据无关，不能被 Key 池改掉。
@@ -462,9 +528,12 @@ async fn forward_inner<'a>(
         (target_ok && key_gone).then_some((candidate, binding, None))
     });
     if bound.is_none()
+        && !escaped
         && let Some((key, _)) = &sticky_key
     {
         // 绑定还在但目标已经不合格：清除，重新抽签（§10.2）。
+        // 守门放行（escaped）不走这里：绑定依然有效，只是这一次不划算，
+        // 清掉它会顺手把迁移迟滞的锚点也一起丢掉。
         forward.state.runtime.sticky.clear(key);
     }
 
@@ -1135,6 +1204,7 @@ impl Walk<'_> {
                             total: started.elapsed(),
                             output_tokens: success.output_tokens,
                         },
+                        self.now_unix,
                     );
                     Attempted::Done(Flow::Done(self.finish(
                         Some(candidate),
@@ -1213,6 +1283,7 @@ impl Walk<'_> {
                             total: started.elapsed(),
                             output_tokens: None,
                         },
+                        self.now_unix,
                     );
                 }
                 tracing::warn!(

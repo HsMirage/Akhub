@@ -161,7 +161,11 @@ CREATE TABLE IF NOT EXISTS sticky_bindings (
     -- （§4.2.1 的不变量 B）。旧快照里为 NULL，下一次使用即补齐。
     credential_digest TEXT,
     bound_at      INTEGER NOT NULL,
-    last_used_at  INTEGER NOT NULL
+    last_used_at  INTEGER NOT NULL,
+    -- 最近一次**真正换过目标**的时刻（不是"最近一次被使用"）。迁移冷却用它，
+    -- 所以不能在每次成功重绑时刷新：否则迟滞窗口永远走不完（§10.1 修订）。
+    -- 旧快照为 NULL，表示"还没迁移过"，下一次使用即补齐。
+    migrated_at   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_sticky_used ON sticky_bindings(last_used_at);

@@ -60,6 +60,7 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
             total: Duration::from_millis(500),
             output_tokens: Some(10),
         },
+        akhub::storage::now_unix(),
     );
 
     // 模拟收到停止信号：立即触发的 future。
@@ -567,6 +568,11 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         sticky_columns.contains("credential_digest"),
         "迁移后 sticky_bindings 缺少 credential_digest"
     );
+    // v13：粘性绑定补"最近一次迁移时刻"，供迁移冷却用（§10.1 修订）。
+    assert!(
+        sticky_columns.contains("migrated_at"),
+        "迁移后 sticky_bindings 缺少 migrated_at：{sticky_columns:?}"
+    );
     // v11/v12：上游类型先归一、再整个停用（§4.2）。这一列现在是历史遗留，
     // 旧值不该让账号加载失败，新写入也不该再碰它。
     let stored: String =
@@ -598,8 +604,8 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .fetch_one(reopened.store.pool())
             .await
             .unwrap();
-    // v11 是当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "12");
+    // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
+    assert_eq!(version, "13");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

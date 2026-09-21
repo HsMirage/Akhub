@@ -41,6 +41,11 @@ pub struct Binding {
     pub bound_at: i64,
     /// 上次真正使用该目标的时间，同时用于滑动过期与缓存新鲜度系数。
     pub last_used_at: i64,
+    /// 最近一次**真正换过目标**的时刻，`None` 表示还没迁移过。
+    ///
+    /// 注意它和 `bound_at`/`last_used_at` 的区别：后两者每次成功调用都会刷新，
+    /// 所以拿它们做迁移迟滞等于没有迟滞（每次都被推到现在）。
+    pub migrated_at: Option<i64>,
 }
 
 /// 粘性键：分组 + 逻辑模型 + 推导出的标识摘要。
@@ -280,6 +285,18 @@ impl Bindings {
         if guard.len() >= MAX_BINDINGS && !guard.contains_key(&key) {
             evict_oldest(&mut guard);
         }
+        // 迁移迟滞的锚点必须只在**目标真的变了**的时候推进。每次成功都重绑
+        // 会把 bound_at/last_used_at 一起刷到现在，用它们做迟滞等于没做。
+        let migrated_at = match guard.get(&key).and_then(|entry| {
+            entry
+                .state
+                .lock()
+                .ok()
+                .map(|state| (state.target_id.clone(), state.migrated_at))
+        }) {
+            Some((previous, migrated_at)) if previous == target_id => migrated_at,
+            _ => Some(now),
+        };
         guard.insert(
             key,
             Arc::new(BindingEntry {
@@ -290,6 +307,7 @@ impl Bindings {
                     credential_digest: credential_digest.map(str::to_string),
                     bound_at: now,
                     last_used_at: now,
+                    migrated_at,
                 }),
             }),
         );
@@ -335,6 +353,7 @@ impl Bindings {
                     credential_digest: state.credential_digest.clone(),
                     bound_at: state.bound_at,
                     last_used_at: state.last_used_at,
+                    migrated_at: state.migrated_at,
                 })
             })
             .collect()
@@ -354,6 +373,7 @@ impl Bindings {
                         credential_digest: row.credential_digest.clone(),
                         bound_at: row.bound_at,
                         last_used_at: row.last_used_at,
+                        migrated_at: row.migrated_at,
                     }),
                 }),
             );
@@ -436,6 +456,51 @@ fn freshness(since_last_hit: i64) -> f64 {
         s if s < 4 * 60 => 1.0,
         s if s <= 6 * 60 => 0.5,
         _ => 0.1,
+    }
+}
+
+/// 上游缓存确定已经不在的那条线（§10.3）。
+///
+/// 与 `freshness()` 的 0.1 档同源：越过它，粘性等待的预算降到最低，/// "留在原账号"不再保护任何缓存。
+pub const CACHE_COLD_AFTER_SECS: i64 = 6 * 60;
+
+/// 这条绑定是不是已经凉到没有必要再钉住了。
+///
+/// 冷绑定继续钉住是有害的：它保护不了任何缓存，却让一个已经变慢的账号继续/// 独占整条会话（现场：265 次粘性命中把首次抽签固化了一整天）。
+pub fn cache_is_cold(since_last_hit: i64) -> bool {
+    since_last_hit > CACHE_COLD_AFTER_SECS
+}
+
+/// 两次迁移之间至少要隔多久（§10.1 修订）。
+///
+/// 一次迁移的代价是整份前缀缓存重建，所以不允许分数一波动就翻盘。这条冷却
+/// 把"翻盘"的频率限制在每会话每 10 分钟一次，最坏情况的缓存损失因此有上界。
+pub const MIGRATE_COOLDOWN: i64 = 10 * 60;
+
+/// 这条绑定现在还在迁移冷却里吗（§10.1 修订）。
+pub fn migrate_cooling_down(now: i64, migrated_at: Option<i64>) -> bool {
+    match migrated_at {
+        Some(at) => now - at < MIGRATE_COOLDOWN,
+        None => false,
+    }
+}
+
+/// 允许迁移所需的分数领先幅度（§10.1 修订）。
+///
+/// 门槛跟着"缓存重建的代价"走：上下文越大，重建一次越贵，就越不该为了
+/// 一点点速度差搬家；缓存已经半凉（4~6 分钟没命中）时只剩一半代价，门槛减半。
+/// 完全凉透的情形由 cache_is_cold 直接重新抽签，走不到这里。
+pub fn migrate_margin(request_bytes: usize, since_last_hit: i64) -> f64 {
+    let base = match request_bytes {
+        bytes if bytes < 32 * 1024 => 0.10,
+        bytes if bytes < 160 * 1024 => 0.15,
+        bytes if bytes < 640 * 1024 => 0.25,
+        _ => 0.35,
+    };
+    if freshness(since_last_hit) <= 0.5 {
+        base * 0.5
+    } else {
+        base
     }
 }
 

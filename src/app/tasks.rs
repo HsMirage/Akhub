@@ -353,6 +353,7 @@ mod tests {
                 total: Duration::from_millis(1200),
                 output_tokens: Some(100),
             },
+            crate::storage::now_unix(),
         );
 
         flush_snapshots(&state).await;

@@ -518,7 +518,12 @@ pub fn plan(
             ),
         })
         .collect();
-    let scores = score::score_all(&scoring, group.group.weights, cheapest_in_group);
+    let scores = score::score_all(
+        &scoring,
+        group.group.weights,
+        cheapest_in_group,
+        context.now_unix,
+    );
 
     // 本次请求真正需要的能力（§14.2 的 requested_capabilities）。
     let requested = context.translation.requested_capabilities();
@@ -745,6 +750,33 @@ pub fn binding_target<'a>(
         .iter()
         .flat_map(|layer| layer.candidates.iter())
         .find(|candidate| candidate.target.target.id == target_id)
+}
+
+/// 被钉住的目标是不是已经被同层的别人明显超过了（§10.1 修订）。
+///
+/// 只看**最高偏好档**（preference()==0）：那一档才是"无损且目录无异议"的可比
+/// 对象；拿它跟一个需要降级表达的目标比分数没有意义。
+///
+/// 返回 false 也可能是"被钉的目标根本不在计划里"，那种情况会走原来的
+/// "目标不合格"路径，不在这里处理。
+pub fn pin_is_outpaced(plan: &Plan, pinned_id: &str, margin: f64) -> bool {
+    let Some(layer) = plan.layers.first() else {
+        return false;
+    };
+    let best = layer
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.preference() == 0)
+        .map(|candidate| candidate.score.total)
+        .fold(f64::MIN, f64::max);
+    match layer
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target.target.id == pinned_id)
+    {
+        Some(pinned) => best > pinned.score.total * (1.0 + margin),
+        None => false,
+    }
 }
 
 /// 粘性绑定是否还能继续使用（§10.2）。

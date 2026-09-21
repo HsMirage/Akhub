@@ -2271,6 +2271,11 @@ pub struct ScoreDto {
     pub reliability: f64,
     pub first_token: f64,
     pub throughput: f64,
+    /// 这个目标此刻的探索口粮，已含"多久没被采样"的放大（§9.5）。
+    ///
+    /// 它解释了"为什么一个分数不高的目标还在拿流量"：不是因为分高，而是因为
+    /// 它的分数已经旧到不足为凭，需要重新采样。
+    pub exploration: f64,
     pub samples: u64,
     /// 样本不足 20 时性能三维用的是保守中性分（§9.4）。
     pub warm: bool,
@@ -2513,7 +2518,12 @@ fn model_scores(
                 .unwrap_or_default(),
         })
         .collect();
-    let scores = crate::routing::score::score_all(&candidates, weights, cheapest);
+    let scores = crate::routing::score::score_all(
+        &candidates,
+        weights,
+        cheapest,
+        crate::storage::now_unix(),
+    );
 
     model
         .targets
@@ -2531,6 +2541,7 @@ fn model_scores(
                     first_token: crate::routing::score::NEUTRAL,
                     throughput: crate::routing::score::NEUTRAL,
                     total: crate::routing::score::NEUTRAL,
+                    exploration: crate::routing::score::NEUTRAL,
                 });
             let stats = dimension
                 .map(|dimension| state.runtime.perf.stats(&target.target.id, dimension))
@@ -2541,6 +2552,7 @@ fn model_scores(
                 reliability: round4(score.reliability),
                 first_token: round4(score.first_token),
                 throughput: round4(score.throughput),
+                exploration: round4(score.exploration),
                 samples: stats.samples,
                 warm: stats.is_warm(),
                 contribution: ScoreContributionDto {

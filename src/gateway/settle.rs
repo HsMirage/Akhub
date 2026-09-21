@@ -191,6 +191,7 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
             total: settlement.started.elapsed(),
             output_tokens: accounting.output_tokens(),
         },
+        crate::storage::now_unix(),
     );
 
     let mut record = settlement.record;

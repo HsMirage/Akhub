@@ -48,6 +48,10 @@ const MIN_SCORE: f64 = 0.01;
 /// 也有约 3% 的期望流量，于是它能在可接受的时间内攒够 §9.4 要求的 20 个样本，
 /// 真正进入评分——这正是 §9.5 所说的"保命口粮"在数量级差距下真正生效。
 const EXPLORATION: f64 = 0.03;
+/// 目标多久没被采样就算"陈旧"，探索口粮按这个尺度放大（§9.5）。
+const STALE_UNIT_SECS: f64 = 600.0;
+/// 陈旧换来的探索口粮上限倍数（相对 `EXPLORATION`）。
+const MAX_STALE_FACTOR: f64 = 4.0;
 /// 定义性能参照系所需的最少热目标数（§9.4）。
 ///
 /// 只有一个热目标时，它就是参照系里"最快的""吞吐最高的"，三项性能分自动
@@ -89,6 +93,11 @@ pub struct Stats {
     pub first_token_ms: f64,
     pub total_ms: f64,
     pub output_tps: f64,
+    /// 最近一次**进统计**的采样时刻（Unix 秒）。0 表示从来没采样过。
+    ///
+    /// 评分本身是无时间衰减的 EWMA，所以"分数是多少"和"这个分数有多旧"
+    /// 必须分开看：一个几小时前的 0.9 只是历史，不是现在的证据（§9.5）。
+    pub last_sample_at: i64,
 }
 
 impl Default for Stats {
@@ -100,6 +109,7 @@ impl Default for Stats {
             first_token_ms: 0.0,
             total_ms: 0.0,
             output_tps: 0.0,
+            last_sample_at: 0,
         }
     }
 }
@@ -110,13 +120,14 @@ impl Stats {
         self.samples >= MIN_SAMPLES
     }
 
-    fn observe(&mut self, sample: &Sample) {
+    fn observe(&mut self, sample: &Sample, now: i64) {
         // 客户端断开连样本都不算：它既不代表目标成功，也不代表目标失败，
         // 混进样本数还会让 `is_warm` 提前成立（§9.3）。
         if !sample.counts {
             return;
         }
         self.samples = self.samples.saturating_add(1);
+        self.last_sample_at = now;
         self.success_rate = ewma(self.success_rate, if sample.success { 1.0 } else { 0.0 });
 
         // 失败请求的延迟没有意义：一个 0.2 秒就 500 的目标不该因此显得"很快"。
@@ -179,10 +190,10 @@ impl Registry {
     }
 
     /// 记录一次真实请求的采样。
-    pub fn observe(&self, target_id: &str, dimension: Dimension, sample: &Sample) {
+    pub fn observe(&self, target_id: &str, dimension: Dimension, sample: &Sample, now: i64) {
         let entry = self.entry(target_id);
         let mut stats = crate::sync::lock(&entry);
-        stats.entry(dimension).or_default().observe(sample);
+        stats.entry(dimension).or_default().observe(sample, now);
     }
 
     /// 读取一个目标在某个维度上的当前统计。
@@ -254,6 +265,9 @@ impl Registry {
                     first_token_ms: row.first_token_ms,
                     total_ms: row.total_ms,
                     output_tps: row.output_tps,
+                    // 快照本身就是"当时的一份证据"，所以以它的写入时刻为起点算
+                    // 陈旧度：重启不该让所有目标瞬间变成"从没采样过"。
+                    last_sample_at: row.updated_at,
                 },
             );
         }
@@ -295,6 +309,8 @@ pub struct Score {
     pub first_token: f64,
     pub throughput: f64,
     pub total: f64,
+    /// 这个候选此刻的探索口粮，已经含陈旧度放大（§9.5）。
+    pub exploration: f64,
 }
 
 /// 归一化的参照系。
@@ -353,6 +369,25 @@ impl Reference {
     }
 }
 
+/// 这个目标此刻的探索口粮（§9.5）。
+///
+/// 底权的本意是"每个候选都有一份与分数无关的口粮"，让弱者攒得到样本回到评分里。
+/// 但固定底权有个漏洞：**越久没被采样，越说明我们对它的判断已经过时**。一个
+/// 两小时前的 0.9 只是历史，不是现在的证据；而它没被采样，恰恰是因为某个赢家
+/// 把流量全吃掉了。
+///
+/// 所以口粮随"距上次采样多久"放大，被采样一次就立刻回落。真正差的目标不会因此
+/// 长期占流量：采到样本、分数掉下去，口粮就恢复成基础值。
+pub fn exploration_floor(stats: &Stats, now: i64) -> f64 {
+    if stats.last_sample_at == 0 {
+        // 从没被采样过：口粮直接给满，否则新账号永远攒不到 `MIN_SAMPLES`。
+        return EXPLORATION * MAX_STALE_FACTOR;
+    }
+    let idle = (now - stats.last_sample_at).max(0) as f64;
+    let factor = (1.0 + idle / STALE_UNIT_SECS).min(MAX_STALE_FACTOR);
+    EXPLORATION * factor
+}
+
 /// 按 §9.4 给一组候选打分。
 ///
 /// `cheapest_in_group` 是整个分组内最低的有效倍率；倍率是账号级属性，用分组
@@ -361,15 +396,21 @@ pub fn score_all(
     candidates: &[Candidate],
     weights: SchedulingWeights,
     cheapest_in_group: Option<Multiplier>,
+    now: i64,
 ) -> Vec<Score> {
     let reference = Reference::of(candidates, cheapest_in_group);
     candidates
         .iter()
-        .map(|candidate| score_one(candidate, &reference, weights))
+        .map(|candidate| score_one(candidate, &reference, weights, now))
         .collect()
 }
 
-fn score_one(candidate: &Candidate, reference: &Reference, weights: SchedulingWeights) -> Score {
+fn score_one(
+    candidate: &Candidate,
+    reference: &Reference,
+    weights: SchedulingWeights,
+    now: i64,
+) -> Score {
     let own = candidate.multiplier.to_f64();
     // 免费或倍率为 0 时没有比值可言，直接给满分。
     let multiplier = if own <= 0.0 {
@@ -417,6 +458,7 @@ fn score_one(candidate: &Candidate, reference: &Reference, weights: SchedulingWe
         first_token,
         throughput,
         total: total.clamp(MIN_SCORE, 1.0),
+        exploration: exploration_floor(&candidate.stats, now),
     }
 }
 
@@ -447,7 +489,7 @@ pub fn weighted_order_with(
         .iter()
         .enumerate()
         .map(|(index, score)| {
-            let base = score.total.max(MIN_SCORE).powi(POWER) + EXPLORATION;
+            let base = score.total.max(MIN_SCORE).powi(POWER) + score.exploration;
             base * boost.get(index).copied().unwrap_or(1.0).max(0.0)
         })
         .collect();
@@ -505,6 +547,7 @@ mod tests {
                 first_token_ms,
                 total_ms: first_token_ms * 4.0,
                 output_tps: tps,
+                last_sample_at: 0,
             },
         }
     }
@@ -523,7 +566,7 @@ mod tests {
             warm("0.50", 1.0, 1000.0, 50.0),
             warm("0.51", 1.0, 1000.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert!(
             (scores[2].multiplier - 0.98).abs() < 0.01,
             "{:?}",
@@ -539,7 +582,7 @@ mod tests {
             warm("0.5", 1.0, 800.0, 60.0),
             warm("0.50", 1.0, 800.0, 60.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert_eq!(scores[0].multiplier, 1.0);
         assert_eq!(scores[1].multiplier, 1.0);
         assert_eq!(scores[0].first_token, 1.0);
@@ -552,7 +595,7 @@ mod tests {
             warm("0.05", 1.0, 900.0, 40.0),
             warm("0.08", 1.0, 900.0, 40.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert!(
             (scores[1].multiplier - 0.625).abs() < 0.01,
             "{:?}",
@@ -565,7 +608,7 @@ mod tests {
         let mut cold = warm("0.1", 1.0, 100.0, 100.0);
         cold.stats.samples = MIN_SAMPLES - 1;
         let candidates = vec![cold, warm("0.2", 1.0, 900.0, 40.0)];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
 
         assert_eq!(scores[0].reliability, NEUTRAL);
         assert_eq!(scores[0].first_token, NEUTRAL);
@@ -586,7 +629,7 @@ mod tests {
             warm("0.5", 1.0, 1000.0, 50.0),
             warm("0.5", 1.0, 2000.0, 25.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert_eq!(scores[1].first_token, 1.0, "成熟目标仍是参照系里最快的");
         assert_eq!(scores[1].throughput, 1.0);
         // 跑过两次的那个目标（10ms、500tps）没有资格参与参照系。
@@ -607,7 +650,7 @@ mod tests {
             ..only_warm.clone()
         };
 
-        let scores = score_all(&[only_warm, cold], SchedulingWeights::default(), None);
+        let scores = score_all(&[only_warm, cold], SchedulingWeights::default(), None, 0);
         // 它是参照系里唯一的点，但一个点不构成参照系：不给它满分。
         assert_eq!(
             scores[0].first_token, NEUTRAL,
@@ -628,7 +671,7 @@ mod tests {
             warm("0.5", 1.0, 10.0, 500.0),
             warm("0.5", 1.0, 1000.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert_eq!(scores[0].first_token, 1.0);
         assert_eq!(scores[0].throughput, 1.0);
         assert!(scores[1].first_token < 1.0);
@@ -639,6 +682,47 @@ mod tests {
     /// 这正是口径里"保命口粮"的量化含义——不是好看，而是**能不能攒够
     /// `MIN_SAMPLES` 个样本回到评分里**。分数 0.55 的目标若无口粮，占比不到
     /// 1%，在真实流量下几天都攒不够 20 个样本，于是永远停在保守中性分。
+    /// ⑤ 探索口粮随"距上次采样多久"放大，被采样一次就回落（§9.5）。
+    #[test]
+    fn a_stale_target_earns_a_bigger_exploration_allowance() {
+        let stats = Stats {
+            samples: MIN_SAMPLES,
+            last_sample_at: 1_000,
+            ..Stats::default()
+        };
+        // 刚刚采过样：只有基础口粮。
+        assert!((exploration_floor(&stats, 1_000) - EXPLORATION).abs() < 1e-12);
+        // 十分钟没采样：翻倍。
+        assert!((exploration_floor(&stats, 1_600) - EXPLORATION * 2.0).abs() < 1e-12);
+        // 再久就封顶，不能让一个老目标把流量全吸走。
+        assert!(
+            (exploration_floor(&stats, 100_000) - EXPLORATION * MAX_STALE_FACTOR).abs() < 1e-12
+        );
+        // 从没采样过的新目标直接给满，否则永远攒不到 MIN_SAMPLES。
+        assert!(
+            (exploration_floor(&Stats::default(), 1_000) - EXPLORATION * MAX_STALE_FACTOR).abs()
+                < 1e-12
+        );
+    }
+
+    /// 上半条的效果：陈旧目标的份额确实被抬起来，但仍然抢不走主力。
+    #[test]
+    fn the_stale_allowance_shifts_share_toward_the_unmeasured_target() {
+        let hot = score(0.95);
+        let stale_but_untouched = score(0.55);
+        let stale_with_allowance = Score {
+            exploration: EXPLORATION * MAX_STALE_FACTOR,
+            ..stale_but_untouched
+        };
+        let without = simulate(&[hot, stale_but_untouched], 40_000);
+        let with = simulate(&[hot, stale_with_allowance], 40_000);
+        assert!(
+            with[1] > without[1] * 1.5,
+            "陈旧目标必须拿到明显更多口粮：{without:?} -> {with:?}"
+        );
+        assert!(with[1] < 0.5, "但主力仍然拿走大多数流量：{with:?}");
+    }
+
     #[test]
     fn the_exploration_floor_keeps_every_candidate_fed() {
         let share = simulate(&[score(0.95), score(0.55)], 40_000);
@@ -658,7 +742,7 @@ mod tests {
             warm("0.5", 1.0, 900.0, 50.0),
             warm("0.50", 0.85, 900.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert!(scores[1].total < scores[0].total);
     }
 
@@ -667,7 +751,7 @@ mod tests {
         let mut stale = warm("0.5", 1.0, 900.0, 50.0);
         stale.multiplier_stale = true;
         let candidates = vec![warm("0.5", 1.0, 900.0, 50.0), stale];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
         assert!(scores[1].total < scores[0].total);
         assert!(scores[1].total > 0.0, "宽限期内仍可参与调度");
     }
@@ -681,6 +765,7 @@ mod tests {
             &candidates,
             SchedulingWeights::default(),
             Some(multiplier("0.1")),
+            0,
         );
         assert!((scores[0].multiplier - 0.2).abs() < 1e-9);
     }
@@ -701,6 +786,7 @@ mod tests {
                 throughput: 0,
             },
             None,
+            0,
         );
         assert!(cost_first[0].total > cost_first[1].total);
 
@@ -713,6 +799,7 @@ mod tests {
                 throughput: 0,
             },
             None,
+            0,
         );
         assert!(latency_first[1].total > latency_first[0].total);
     }
@@ -814,6 +901,7 @@ mod tests {
                 first_token: 0.0,
                 throughput: 0.0,
                 total: 0.0,
+                exploration: EXPLORATION,
             },
             score(0.9),
         ];
@@ -829,6 +917,7 @@ mod tests {
             first_token: total,
             throughput: total,
             total,
+            exploration: EXPLORATION,
         }
     }
 
@@ -877,26 +966,32 @@ mod tests {
     fn ewma_weights_recent_requests_more_heavily() {
         let mut stats = Stats::default();
         for _ in 0..50 {
-            stats.observe(&Sample {
-                success: true,
-                counts: true,
-                first_token: Some(Duration::from_millis(1000)),
-                total: Duration::from_millis(4000),
-                output_tokens: Some(400),
-            });
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(1000)),
+                    total: Duration::from_millis(4000),
+                    output_tokens: Some(400),
+                },
+                0,
+            );
         }
         assert!((stats.first_token_ms - 1000.0).abs() < 1.0);
         assert!((stats.output_tps - 100.0).abs() < 1.0);
 
         // 变快之后要在几十个样本内跟上，而不是被历史拖住。
         for _ in 0..20 {
-            stats.observe(&Sample {
-                success: true,
-                counts: true,
-                first_token: Some(Duration::from_millis(200)),
-                total: Duration::from_millis(1000),
-                output_tokens: Some(400),
-            });
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(200)),
+                    total: Duration::from_millis(1000),
+                    output_tokens: Some(400),
+                },
+                0,
+            );
         }
         assert!(stats.first_token_ms < 400.0, "{}", stats.first_token_ms);
     }
@@ -904,23 +999,29 @@ mod tests {
     #[test]
     fn a_failed_request_lowers_reliability_without_faking_speed() {
         let mut stats = Stats::default();
-        stats.observe(&Sample {
-            success: true,
-            counts: true,
-            first_token: Some(Duration::from_millis(1000)),
-            total: Duration::from_millis(4000),
-            output_tokens: Some(400),
-        });
+        stats.observe(
+            &Sample {
+                success: true,
+                counts: true,
+                first_token: Some(Duration::from_millis(1000)),
+                total: Duration::from_millis(4000),
+                output_tokens: Some(400),
+            },
+            0,
+        );
         let fast_first_token = stats.first_token_ms;
 
         // 0.2 秒就 500 的失败请求不该让这个目标显得"很快"。
-        stats.observe(&Sample {
-            success: false,
-            counts: true,
-            first_token: Some(Duration::from_millis(1)),
-            total: Duration::from_millis(200),
-            output_tokens: None,
-        });
+        stats.observe(
+            &Sample {
+                success: false,
+                counts: true,
+                first_token: Some(Duration::from_millis(1)),
+                total: Duration::from_millis(200),
+                output_tokens: None,
+            },
+            0,
+        );
         assert_eq!(stats.first_token_ms, fast_first_token);
         assert!(stats.success_rate < 1.0);
     }
@@ -943,6 +1044,7 @@ mod tests {
                     total: Duration::from_millis(3000),
                     output_tokens: Some(300),
                 },
+                0,
             );
         }
         let exported = registry.export(1_000);
@@ -987,6 +1089,7 @@ mod tests {
                     total: Duration::from_millis(10),
                     output_tokens: None,
                 },
+                0,
             );
         }
         assert!(

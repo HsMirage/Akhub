@@ -2412,8 +2412,8 @@ impl Store {
         for row in rows {
             sqlx::query(
                 "INSERT OR REPLACE INTO sticky_bindings (sticky_key, group_id, logical_model,
-                    target_id, credential_digest, bound_at, last_used_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    target_id, credential_digest, bound_at, last_used_at, migrated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&row.sticky_key)
             .bind(&row.group_id)
@@ -2422,6 +2422,7 @@ impl Store {
             .bind(&row.credential_digest)
             .bind(row.bound_at)
             .bind(row.last_used_at)
+            .bind(row.migrated_at)
             .execute(&mut *tx)
             .await?;
         }
@@ -2445,6 +2446,7 @@ impl Store {
                     credential_digest: row.try_get("credential_digest")?,
                     bound_at: row.try_get("bound_at")?,
                     last_used_at: row.try_get("last_used_at")?,
+                    migrated_at: row.try_get("migrated_at")?,
                 })
             })
             .collect()
@@ -2961,6 +2963,8 @@ pub struct StickyBindingRow {
     pub credential_digest: Option<String>,
     pub bound_at: i64,
     pub last_used_at: i64,
+    /// 最近一次真正换过目标的时刻；`None` 来自升级前的快照（§10.1 修订）。
+    pub migrated_at: Option<i64>,
 }
 
 /// 一条持久化的性能 EWMA 快照（§9.3）。
@@ -3702,6 +3706,7 @@ mod tests {
                     credential_digest: Some("d1".into()),
                     bound_at: 9_000,
                     last_used_at: 10_000,
+                    migrated_at: Some(8_000),
                 },
                 StickyBindingRow {
                     sticky_key: "prefix-old".into(),
@@ -3711,6 +3716,7 @@ mod tests {
                     credential_digest: None,
                     bound_at: 10,
                     last_used_at: 20,
+                    migrated_at: None,
                 },
             ])
             .await

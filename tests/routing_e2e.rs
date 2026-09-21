@@ -512,6 +512,286 @@ async fn stable_prefix_stickiness_is_soft_and_still_allows_redistribution() {
     );
 }
 
+/// 把一个 `prompt_cache_key` 直接绑到某个目标上，绑定时间由调用方指定。
+///
+/// 用来制造"绑定还在（没到 TTL）、但上游缓存已经凉了"的现场：真实时间没法在
+/// 测试里快进 6 分钟，所以直接把 `last_used_at` 写成过去。
+fn bind_cache_key(
+    akhub: &common::Akhub,
+    logical_model: &str,
+    cache_key: &str,
+    target_id: &str,
+    at: i64,
+) {
+    let state = Arc::clone(&akhub.state);
+    let (key, origin) = akhub::routing::sticky::derive(
+        &state.key_digest,
+        &akhub.group_id,
+        logical_model,
+        &axum::http::HeaderMap::new(),
+        &json!({"prompt_cache_key": cache_key}),
+    )
+    .expect("prompt_cache_key 必须能推导出粘性键");
+    assert_eq!(origin, akhub::routing::sticky::Origin::CacheKey);
+    state
+        .runtime
+        .sticky
+        .bind(key, &akhub.group_id, logical_model, target_id, None, at);
+}
+
+/// 缓存已凉的绑定不再钉住会话（§10.1 修订）。
+///
+/// 现场形态：一条 `prompt_cache_key` 连续跑了 520 次，首次抽签落在谁身上就再也
+/// 没变过——上游后来变慢变贵，流量一分都挪不动。上游缓存的 TTL 只有 5–10 分钟，
+/// 凉掉之后钉住保护不了任何东西，此时必须允许重新抽签。
+#[tokio::test]
+async fn a_cold_binding_stops_pinning_the_conversation() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let stale_at = akhub::storage::now_unix() - 10 * 60;
+    // 每个前缀各绑一次、都是凉的：于是每一次首请求都会重新抽签。
+    // 修之前这里 40 次全部硬钉在 X 上，Y 一次都拿不到。
+    for index in 0..40 {
+        let cache_key = format!("会话-冷绑定-{index}");
+        bind_cache_key(&akhub, MODEL, &cache_key, &wx.target_id, stale_at);
+        let body = strong_body("项目", &format!("第 {index} 轮"), &cache_key);
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert!(
+        y.requests() > 0,
+        "凉掉的绑定不该继续独占（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+    assert_eq!(
+        x.requests() + y.requests(),
+        40,
+        "每次调用都必须只打一个上游"
+    );
+}
+
+/// 新鲜的绑定仍然照旧硬钉住（上一条的护栏，防止矫枉过正）。
+#[tokio::test]
+async fn a_fresh_binding_still_pins_the_conversation() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let now = akhub::storage::now_unix();
+    for index in 0..12 {
+        let cache_key = format!("会话-热绑定-{index}");
+        bind_cache_key(&akhub, MODEL, &cache_key, &wx.target_id, now);
+        let body = strong_body("项目", &format!("第 {index} 轮"), &cache_key);
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert_eq!(
+        y.requests(),
+        0,
+        "新鲜的绑定必须继续钉在原目标上（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+    assert_eq!(x.requests(), 12);
+}
+
+/// 直接喂性能样本，把某个目标的分数固化成"很快"或"很慢"。
+///
+/// 走 `perf.observe` 而不是真发慢请求：评分是 EWMA，喂够 `MIN_SAMPLES` 个样本
+/// 就等价于"这个目标已经稳定跑了这么久"，比在测试里真等 800ms × 24 次快得多。
+fn prime_target(akhub: &common::Akhub, target_id: &str, first_token_ms: u64, tokens: u64, at: i64) {
+    let state = Arc::clone(&akhub.state);
+    for _ in 0..akhub::routing::score::MIN_SAMPLES + 4 {
+        state.runtime.perf.observe(
+            target_id,
+            Dimension {
+                protocol: CHAT,
+                streaming: false,
+            },
+            &akhub::routing::score::Sample {
+                success: true,
+                counts: true,
+                first_token: Some(Duration::from_millis(first_token_ms)),
+                total: Duration::from_millis(1000),
+                output_tokens: Some(tokens),
+            },
+            at,
+        );
+    }
+}
+
+/// 装一条粘性绑定，绑定时刻与"最近一次迁移时刻"都由调用方指定。
+///
+/// 用 `restore` 而不是 `bind`：`bind` 会把迁移时刻写成"现在"，那样永远在
+/// 冷却期里，测不到守门放行。
+fn install_binding(
+    akhub: &common::Akhub,
+    logical_model: &str,
+    cache_key: &str,
+    target_id: &str,
+    migrated_at: Option<i64>,
+) {
+    let state = Arc::clone(&akhub.state);
+    let (key, origin) = akhub::routing::sticky::derive(
+        &state.key_digest,
+        &akhub.group_id,
+        logical_model,
+        &axum::http::HeaderMap::new(),
+        &json!({"prompt_cache_key": cache_key}),
+    )
+    .expect("prompt_cache_key 必须能推导出粘性键");
+    assert_eq!(origin, akhub::routing::sticky::Origin::CacheKey);
+    let now = akhub::storage::now_unix();
+    state
+        .runtime
+        .sticky
+        .restore(&[akhub::storage::store::StickyBindingRow {
+            sticky_key: key.as_str().to_string(),
+            group_id: akhub.group_id.clone(),
+            logical_model: logical_model.to_string(),
+            target_id: target_id.to_string(),
+            credential_digest: None,
+            bound_at: now - 600,
+            // 新鲜：不能被"缓存已凉"那条规则先收走。
+            last_used_at: now,
+            migrated_at,
+        }]);
+}
+
+/// ③ 被钉住的目标一旦明显落后，这一次请求就放弃钉住（§10.1 修订）。
+///
+/// 现场形态：一条 prompt_cache_key 连打 520 次全在同一个账号上，那个账号后来
+/// 慢了一倍也不会换。守门之后，钉住只在"它还守得住分数"时保留。
+#[tokio::test]
+async fn a_pin_yields_when_another_target_is_clearly_better() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    let wy = wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    // X 慢、Y 快，两边都 warm：倍率分相同，差距全在性能上。
+    prime_target(&akhub, &wx.target_id, 800, 40, akhub::storage::now_unix());
+    prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
+
+    let now = akhub::storage::now_unix();
+    install_binding(&akhub, MODEL, "会话-守门", &wx.target_id, Some(now - 700));
+
+    for round in 0..8 {
+        let body = strong_body("项目", &format!("第 {round} 轮"), "会话-守门");
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert!(
+        y.requests() > 0,
+        "明显更快的目标该拿到流量（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+}
+
+/// ③ 的护栏：冷却期内的绑定不许再翻盘（迟滞）。
+///
+/// 与上一条同样的分数格局，只把"最近一次迁移"设成刚刚——于是守门不放行，
+/// 全程仍然钉在 X 上。没有这条，分数一抖就会来回搬家、把缓存反复重建。
+#[tokio::test]
+async fn a_recent_migration_blocks_another_one() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    let wy = wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    prime_target(&akhub, &wx.target_id, 800, 40, akhub::storage::now_unix());
+    prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
+
+    let now = akhub::storage::now_unix();
+    install_binding(&akhub, MODEL, "会话-冷却", &wx.target_id, Some(now));
+
+    for round in 0..8 {
+        let body = strong_body("项目", &format!("第 {round} 轮"), "会话-冷却");
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert_eq!(
+        y.requests(),
+        0,
+        "冷却期内不该翻盘（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+    assert_eq!(x.requests(), 8);
+}
+
+/// ⑤ 的接线：真实请求必须把"最近采样时刻"推到真实时间。
+///
+/// 这条守的是整条 ⑤ 的前提。如果 `observe` 拿到的时间是 0（或任何常量），
+/// 每个目标都会被算成"几百万秒没采样过"，探索口粮全部给满，流量会被平均
+/// 撒开。所以它必须是一个真钱的时间戳。
+#[tokio::test]
+async fn serving_a_request_refreshes_the_sample_clock() {
+    let x = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let before = akhub::storage::now_unix();
+    assert_eq!(chat(&akhub, small_body("项目", "你好")).await.status(), 200);
+    let after = akhub::storage::now_unix();
+
+    let stats = akhub.state.runtime.perf.stats(
+        &wx.target_id,
+        Dimension {
+            protocol: CHAT,
+            streaming: false,
+        },
+    );
+    assert!(stats.samples > 0, "这次调用必须留下样本");
+    assert!(
+        stats.last_sample_at >= before && stats.last_sample_at <= after,
+        "采样时刻必须是真实时间（before={before} after={after} got={}）",
+        stats.last_sample_at
+    );
+}
+
 /// 一个持续失败的账号必须被流量真正绕开：软粘性不能妨碍故障切换（§10.2）。
 #[tokio::test]
 async fn a_failing_bound_target_is_abandoned_by_soft_stickiness() {
