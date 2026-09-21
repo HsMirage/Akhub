@@ -2,12 +2,24 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use akhub::app::{AppState, Settings};
+use akhub::domain::Protocol;
+use akhub::routing::score::Dimension;
 use serde_json::{Value, json};
 
 /// 启动一台空数据目录的 Akhub。
 async fn spawn() -> (String, reqwest::Client, tempfile::TempDir) {
+    let (base, client, dir, _state) = spawn_with_state().await;
+    (base, client, dir)
+}
+
+/// 同上，但把状态句柄一并交出来。
+///
+/// 性能样本只能从进程内喂（`perf.observe`）：这条路径没有 HTTP 入口，而真实
+/// 请求攒够 20 个样本又太慢——见 tests/routing_e2e.rs 的同名做法。
+async fn spawn_with_state() -> (String, reqwest::Client, tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::bootstrap(dir.path(), Settings::default())
         .await
@@ -22,7 +34,7 @@ async fn spawn() -> (String, reqwest::Client, tempfile::TempDir) {
         .cookie_store(true)
         .build()
         .unwrap();
-    (format!("http://{addr}"), client, dir)
+    (format!("http://{addr}"), client, dir, state)
 }
 
 /// 带上 CSRF 头的写请求。
@@ -1585,4 +1597,180 @@ async fn configuration_lists_page_with_a_stable_total() {
     let beyond = page("limit=2&offset=99").await;
     assert_eq!(beyond["total"], 3);
     assert!(beyond["data"].as_array().unwrap().is_empty());
+}
+
+/// 直接喂性能样本，把某个目标在指定维度上喂热（同 tests/routing_e2e.rs 的做法）。
+///
+/// 总耗时固定 1 秒，所以 `output_tokens` 就是 tok/s。
+#[allow(clippy::too_many_arguments)]
+fn prime_target(
+    state: &Arc<AppState>,
+    target_id: &str,
+    protocol: Protocol,
+    streaming: bool,
+    samples: usize,
+    first_token_ms: u64,
+    output_tokens: u64,
+    at: i64,
+) {
+    for _ in 0..samples {
+        state.runtime.perf.observe(
+            target_id,
+            Dimension {
+                protocol,
+                streaming,
+            },
+            &akhub::routing::score::Sample {
+                success: true,
+                counts: true,
+                first_token: Some(Duration::from_millis(first_token_ms)),
+                total: Duration::from_secs(1),
+                output_tokens: Some(output_tokens),
+            },
+            at,
+        );
+    }
+}
+
+/// 调度视图的「首字 / 速度」必须逐目标取样本（§6.5）。
+///
+/// 现场形状：同一个逻辑模型下，跑得最多的那个账号决定了"模型维度"，其余账号
+/// 只要请求落在别的维度上（换了入口协议、或只跑非流式），首字 / 速度就永远留白，
+/// 看起来像这些账号没有数据。它们的样本一直都在，只是取错了维度。
+#[tokio::test]
+async fn target_ewma_columns_are_per_target_not_per_model() {
+    let (base, client, _dir, state) = spawn_with_state().await;
+    setup_admin(&base, &client).await;
+
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "10"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let model_id = model["id"].as_str().unwrap().to_string();
+
+    // 两个账号接同一个逻辑模型，同层同倍率——只有"请求落在哪个维度"不同。
+    let mut targets = Vec::new();
+    for name in ["A", "B"] {
+        let account: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/accounts"),
+        )
+        .json(&json!({
+            "group_id": group_id,
+            "name": format!("账号{name}"),
+            "base_url": "https://api.example.com",
+            "api_key": "sk-x",
+            "preferred_protocol": "openai_chat",
+            "manual_multiplier": "1",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let target: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/targets"),
+        )
+        .json(&json!({
+            "logical_model_id": model_id,
+            "account_id": account["id"],
+            "upstream_model": format!("glm-4.6-{name}"),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        targets.push(target["id"].as_str().unwrap().to_string());
+    }
+
+    // A 只跑 OpenAI Chat 流式，样本最多 → 它就是整个模型的统一维度。
+    // B 只跑 Anthropic Messages 流式：同样够热，但落在另一个维度上。
+    let now = akhub::storage::now_unix();
+    prime_target(
+        &state,
+        &targets[0],
+        Protocol::OpenAiChat,
+        true,
+        30,
+        900,
+        40,
+        now,
+    );
+    prime_target(
+        &state,
+        &targets[1],
+        Protocol::AnthropicMessages,
+        true,
+        24,
+        300,
+        80,
+        now,
+    );
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = listed["data"].as_array().unwrap();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("目标 {id} 必须出现在列表里"))
+    };
+    let (a, b) = (row(&targets[0]), row(&targets[1]));
+
+    // 两个账号都有样本，两行都必须显示出数字——这正是原先只显示一个账号的地方。
+    assert_eq!(a["first_token_ms"], 900.0, "{a}");
+    assert_eq!(a["output_tps"], 40.0, "{a}");
+    assert_eq!(
+        b["first_token_ms"], 300.0,
+        "另一个维度的账号也必须显示首字：{b}"
+    );
+    assert_eq!(b["output_tps"], 80.0, "另一个维度的账号也必须显示速度：{b}");
+
+    // 数字来自哪一批请求要说清楚，否则没人知道它和评分是不是一个口径。
+    assert_eq!(a["stats"]["protocol"], "openai_chat", "{a}");
+    assert_eq!(a["stats"]["streaming"], true, "{a}");
+    assert_eq!(a["stats"]["samples"], 30, "{a}");
+    assert_eq!(a["stats"]["warm"], true, "{a}");
+    assert_eq!(b["stats"]["protocol"], "anthropic_messages", "{b}");
+    assert_eq!(b["stats"]["samples"], 24, "{b}");
+    assert_eq!(b["stats"]["warm"], true, "{b}");
+
+    // 评分仍统一走模型维度（跨行可比），所以 B 在评分口径里没有样本。
+    // 这是有意的：归一化分数共用一套参照系，原始测量值各看各的。
+    assert_eq!(a["score"]["samples"], 30, "{a}");
+    assert_eq!(b["score"]["samples"], 0, "{b}");
 }

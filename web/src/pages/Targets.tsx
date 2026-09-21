@@ -9,8 +9,8 @@
  * 账号上，数字相同即同层；层内按综合评分加权，跨层仍然严格阶梯。
  */
 import { useEffect, useMemo, useState } from "react";
-import type { Account, DispatchTarget, LogicalModel } from "../lib/types";
-import { TARGET_STATUS_LABELS } from "../lib/types";
+import type { Account, DispatchTarget, LogicalModel, TargetStatsSample } from "../lib/types";
+import { PROTOCOL_LABELS, TARGET_STATUS_LABELS } from "../lib/types";
 import { formatLimits } from "../lib/format";
 import type { Data } from "../lib/store";
 import { useRouteParams } from "../lib/store";
@@ -327,6 +327,22 @@ function targetHasIssue(target: DispatchTarget, account: Account | undefined): b
   );
 }
 
+/**
+ * 「首字 / 速度」两列的悬停说明（§6.5）。
+ *
+ * 这两个数是 EWMA，可信度取决于"哪一批请求"与"有多少条样本"。维度必须
+ * 说出来：同一个账号的流式与非流式是两份互不相干的统计，分不清就会拿 A 批
+ * 的样本去解释 B 批的体感。样本不足 20 条时明说是冷的，评分也还没采信它。
+ */
+function statsHint(stats: TargetStatsSample | null): string | undefined {
+  if (!stats) return undefined;
+  const source = `${PROTOCOL_LABELS[stats.protocol]} · ${stats.streaming ? "流式" : "非流式"}`;
+  const base = `来自 ${source} 的 ${stats.samples} 个样本`;
+  return stats.warm
+    ? base
+    : `${base}，不足 20 条：只作参考，评分仍按中性分`;
+}
+
 function ModelBlock({
   entry,
   highlight,
@@ -477,7 +493,11 @@ function ModelBlock({
                           </div>
                         )}
                       </td>
-                      <td className="mono cell-dim" style={{ fontSize: 12 }}>
+                      <td
+                        className="mono cell-dim"
+                        style={{ fontSize: 12 }}
+                        title={statsHint(target.stats)}
+                      >
                         {target.first_token_ms == null && target.output_tps == null ? (
                           "—"
                         ) : (
@@ -493,6 +513,12 @@ function ModelBlock({
                                 : `${target.output_tps.toFixed(1)} tok/s`}
                             </div>
                           </>
+                        )}
+                        {/* 样本不足 20 条的数字要明说是冷的，别让人当成稳定值。 */}
+                        {target.stats && !target.stats.warm && (
+                          <div className="text-faint" style={{ fontSize: 11 }}>
+                            样本 {target.stats.samples}/20
+                          </div>
                         )}
                       </td>
                       <td className="mono cell-dim" style={{ fontSize: 12 }}>

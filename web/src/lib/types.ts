@@ -233,6 +233,18 @@ export interface Score {
   };
 }
 
+/** 调度视图「首字 / 速度」两列背后的样本（§6.5）。 */
+export interface TargetStatsSample {
+  /** 该目标在这个维度上采到的样本数。 */
+  samples: number;
+  /** 样本是否已够 20 条；不够时数字只作参考（§9.4）。 */
+  warm: boolean;
+  /** 这些样本来自哪种下游协议。 */
+  protocol: Protocol;
+  /** 是否流式请求的样本。 */
+  streaming: boolean;
+}
+
 export interface DispatchTarget {
   id: string;
   logical_model_id: string;
@@ -252,12 +264,19 @@ export interface DispatchTarget {
   cooldown_secs: number | null;
   inflight: number;
   score: Score | null;
-  /** 首字延迟的当前 EWMA（毫秒）；冷启动或没数据时为 null（§6.5）。 */
+  /** 首字延迟的当前 EWMA（毫秒）；一项样本都没采到时为 null（§6.5）。 */
   first_token_ms: number | null;
   /** 输出速度的当前 EWMA（token/秒）（§6.5）。 */
   output_tps: number | null;
   /** 非流式总延迟的当前 EWMA（毫秒）（§6.5）。 */
   total_ms: number | null;
+  /**
+   * 上面三列背后的样本口径；一个样本都没有时为 null。
+   *
+   * 样本不足 20 条时三列照样给值，界面必须把样本数标出来——只给热目标显示，
+   * 等于让刚开始拿流量的账号永远没有数据可看（§6.5）。
+   */
+  stats: TargetStatsSample | null;
   /** 暂停原因；正常参与调度时为 null（§6.5）。 */
   pause_reason: string | null;
 }

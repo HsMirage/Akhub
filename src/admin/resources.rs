@@ -21,6 +21,7 @@ use crate::domain::{
     Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
     Protocol, SchedulingWeights,
 };
+use crate::routing::score::{Dimension, Stats};
 use crate::security::url_guard;
 use crate::storage::store::{AccountSecrets, ids};
 
@@ -2253,12 +2254,17 @@ pub struct TargetDto {
     pub inflight: u32,
     /// 综合评分与四个分维得分。权重调错时靠这一列自我诊断（§6.9）。
     pub score: Option<ScoreDto>,
-    /// 首字延迟的当前 EWMA（毫秒）；样本不足或没数据时为 None（§6.5）。
+    /// 首字延迟的当前 EWMA（毫秒）；一项样本都没采到时为 None（§6.5）。
     pub first_token_ms: Option<f64>,
     /// 输出速度的当前 EWMA（token/秒）；没数据时为 None（§6.5）。
     pub output_tps: Option<f64>,
     /// 非流式总延迟的当前 EWMA（毫秒），作为首字的补充（§6.5）。
     pub total_ms: Option<f64>,
+    /// 上面三列背后的样本口径；一个样本都没有时为 None。
+    ///
+    /// 界面靠它把"样本不足 20 条"的数字标出来：只有冷目标留白，等于让刚开始
+    /// 拿流量的账号永远显示不出数据（§6.5）。
+    pub stats: Option<TargetStatsDto>,
     /// 暂停原因：有则给出可读原因，正常参与调度时为 None（§6.5）。
     pub pause_reason: Option<String>,
 }
@@ -2295,6 +2301,22 @@ pub struct ScoreContributionDto {
     pub throughput: f64,
 }
 
+/// 「首字 / 速度」两列背后的样本口径（§6.5）。
+///
+/// 与 `score` 的口径可能不同：评分统一用模型级维度保证跨行可比，而这两列是
+/// 原始测量值，逐目标取它自己样本最多的维度，免得"有数据的账号显示不出来"。
+#[derive(Serialize, Clone, Copy)]
+pub struct TargetStatsDto {
+    /// 该目标在这个维度上采到的样本数。
+    pub samples: u64,
+    /// 样本是否已够 20 条；不够时数字只作参考（§9.4）。
+    pub warm: bool,
+    /// 这些样本来自哪种下游协议。
+    pub protocol: Protocol,
+    /// 是否流式请求的样本。
+    pub streaming: bool,
+}
+
 fn target_dto(
     state: &SharedState,
     config: &crate::config::RuntimeConfig,
@@ -2303,6 +2325,8 @@ fn target_dto(
 ) -> TargetDto {
     let row = rows.get(target.id.as_str());
     let view = row.and_then(|row| row.view);
+    // 首字 / 速度三列走该目标自己的样本；没有行（理论上不该发生）时是空统计。
+    let stats = row.map(|row| row.stats).unwrap_or_default();
 
     let (priority, effective_limits) = view
         .map(|view| (view.priority, view.limits()))
@@ -2337,23 +2361,31 @@ fn target_dto(
             .map(|d| d.as_secs()),
         inflight: health.inflight(),
         score: row.and_then(|row| row.score.clone()),
-        first_token_ms: ewma_metric(row, |stats| stats.first_token_ms),
-        output_tps: ewma_metric(row, |stats| stats.output_tps),
-        total_ms: ewma_metric(row, |stats| stats.total_ms),
+        first_token_ms: ewma_metric(&stats, |value| value.first_token_ms),
+        output_tps: ewma_metric(&stats, |value| value.output_tps),
+        total_ms: ewma_metric(&stats, |value| value.total_ms),
+        stats: row
+            .and_then(|row| row.stats_dimension)
+            .map(|dimension| TargetStatsDto {
+                samples: stats.samples,
+                warm: stats.is_warm(),
+                protocol: dimension.protocol,
+                streaming: dimension.streaming,
+            }),
         pause_reason: pause_reason(state, target, view),
     }
 }
 
-/// 取某个目标的 EWMA 指标。样本不足（冷启动）时返回 None 而不是 0——0 会被
-/// 误读成"这个目标很快"（§6.5、§9.4）。
-fn ewma_metric(
-    row: Option<&TargetRow<'_>>,
-    pick: impl Fn(&crate::routing::score::Stats) -> f64,
-) -> Option<f64> {
-    let row = row?;
-    row.dimension?;
-    let stats = row.stats;
-    stats.is_warm().then(|| pick(&stats))
+/// 取某个目标的 EWMA 指标。
+///
+/// 两种情况返回 None：一个样本都没采到，或这一项从来没被成功采到过（值还是
+/// 0，例如非流式请求没有首字）。0 会被误读成"这个目标很快"，必须留白（§6.5）。
+///
+/// 样本不足 20 条时照样给值，由界面把样本数一起标出来。只给热目标显示，等于让
+/// "刚开始拿流量的账号"永远没有数据可看——那正是这个视图最需要回答的问题。
+fn ewma_metric(stats: &Stats, pick: impl Fn(&Stats) -> f64) -> Option<f64> {
+    let value = pick(stats);
+    (stats.samples > 0 && value > 0.0).then_some(value)
 }
 
 /// 暂停原因（§6.5）。只有真正"不能参与调度"的状态才给原因，正常或仅降权的
@@ -2425,18 +2457,49 @@ fn multiplier_pause_reason(
     }
 }
 
-/// 展示用的统计维度：取这个逻辑模型下样本最多的"协议 + 是否流式"组合。
+/// 全部展示维度：三种下游协议 × 是否流式（§9.4）。
 ///
-/// 跨协议之后一个目标可能同时服务三种下游协议，展示时整个模型统一用同一维，
-/// 否则参照系不一致，分数就不可比了（§9.4）。评分和 EWMA 列共用它。
+/// 网关按"这次请求的协议 + 是否流式"分别记 EWMA，所以一个目标最多有六份
+/// 互不相干的样本。展示时必须挑一份，挑错了就会出现"明明有数据却显示 —"。
+const DISPLAY_DIMENSIONS: [Dimension; 6] = [
+    Dimension {
+        protocol: Protocol::OpenAiChat,
+        streaming: true,
+    },
+    Dimension {
+        protocol: Protocol::OpenAiChat,
+        streaming: false,
+    },
+    Dimension {
+        protocol: Protocol::OpenAiResponses,
+        streaming: true,
+    },
+    Dimension {
+        protocol: Protocol::OpenAiResponses,
+        streaming: false,
+    },
+    Dimension {
+        protocol: Protocol::AnthropicMessages,
+        streaming: true,
+    },
+    Dimension {
+        protocol: Protocol::AnthropicMessages,
+        streaming: false,
+    },
+];
+
+/// 综合评分用的统计维度：取这个逻辑模型下样本最多的"协议 + 是否流式"组合。
+///
+/// 跨协议之后一个目标可能同时服务三种下游协议，评分时整个模型统一用同一维，
+/// 否则归一化参照系不一致，分数就不可比了（§9.4）。
 ///
 /// 它只依赖逻辑模型，与具体目标无关，所以按模型算一次即可——原先按目标逐行
 /// 计算时，500 个目标的列表要把同样的 6 次统计查表重复上百遍。
-fn model_dimension(
-    state: &SharedState,
-    model: &LogicalModelView,
-) -> Option<crate::routing::score::Dimension> {
-    let samples_of = |dimension: crate::routing::score::Dimension| -> u64 {
+///
+/// 注意它只管评分：首字 / 速度这两列是原始测量值，走 `target_display_stats`
+/// 逐目标挑维度，否则模型里只有跑到这一维的账号才看得见数字。
+fn model_dimension(state: &SharedState, model: &LogicalModelView) -> Dimension {
+    let samples_of = |dimension: Dimension| -> u64 {
         model
             .targets
             .iter()
@@ -2449,25 +2512,54 @@ fn model_dimension(
             })
             .sum()
     };
-    Some(
-        [
-            Protocol::OpenAiChat,
-            Protocol::OpenAiResponses,
-            Protocol::AnthropicMessages,
-        ]
+    DISPLAY_DIMENSIONS
         .into_iter()
-        .flat_map(|protocol| {
-            [true, false].map(|streaming| crate::routing::score::Dimension {
-                protocol,
-                streaming,
-            })
-        })
         .max_by_key(|dimension| samples_of(*dimension))
-        .unwrap_or(crate::routing::score::Dimension {
-            protocol: Protocol::OpenAiChat,
-            streaming: false,
-        }),
-    )
+        .unwrap_or(DIMENSION_FALLBACK)
+}
+
+/// 全无样本时的兜底维度：`max_by_key` 只在数组为空时才可能落空。
+const DIMENSION_FALLBACK: Dimension = Dimension {
+    protocol: Protocol::OpenAiChat,
+    streaming: false,
+};
+
+/// 一行的首字 / 速度 / 总延迟三列背后该看哪份样本。
+///
+/// 优先级：模型统一维度（这个目标在它上面已经够热 → 与综合评分同口径）→
+/// 该目标自己样本最多的维度 → 空（一个样本都没有，界面显示 —）。
+///
+/// 必须有中间那层回退：整个模型共用一个维度只在"所有人都走同一种请求"时成立。
+/// 某个账号换了入口协议、或者一直在跑非流式，它的样本就全落在别的维度上，
+/// 于是首字 / 速度永远留白，看起来像这个账号没有数据——其实它只是没跑那一种
+/// 请求（§6.5）。
+///
+/// 而"够热"这道门槛不能省：模型维度是全模型最忙的那一维，不是这个账号最忙的
+/// 那一维。只要求"有样本"的话，这个账号偶尔被另一种请求打到一次，展示就会从
+/// 几百条样本切到那一条上（非流式还没有首字，于是又变回留白）。
+fn target_display_stats(
+    state: &SharedState,
+    target_id: &str,
+    model_dimension: Dimension,
+) -> (Option<Dimension>, Stats) {
+    let perf = &state.runtime.perf;
+    let preferred = perf.stats(target_id, model_dimension);
+    if preferred.is_warm() {
+        return (Some(model_dimension), preferred);
+    }
+    // 平手时保住模型维度：从它起步，只在样本严格更多时才换。
+    let mut best = (model_dimension, preferred);
+    for dimension in DISPLAY_DIMENSIONS {
+        let stats = perf.stats(target_id, dimension);
+        if stats.samples > best.1.samples {
+            best = (dimension, stats);
+        }
+    }
+    if best.1.samples > 0 {
+        (Some(best.0), best.1)
+    } else {
+        (None, preferred)
+    }
 }
 
 /// 一个逻辑模型下全部目标的评分，顺序与 `model.targets` 一致（§9.4）。
@@ -2479,7 +2571,7 @@ fn model_scores(
     state: &SharedState,
     group: &GroupView,
     model: &LogicalModelView,
-    dimension: Option<crate::routing::score::Dimension>,
+    dimension: Dimension,
 ) -> Vec<ScoreDto> {
     let multipliers = state.runtime.multipliers.view();
     let now = crate::storage::now_unix();
@@ -2513,9 +2605,7 @@ fn model_scores(
             target_id: id.clone(),
             multiplier: *multiplier,
             multiplier_stale: *stale,
-            stats: dimension
-                .map(|dimension| state.runtime.perf.stats(id, dimension))
-                .unwrap_or_default(),
+            stats: state.runtime.perf.stats(id, dimension),
         })
         .collect();
     let scores = crate::routing::score::score_all(
@@ -2543,9 +2633,7 @@ fn model_scores(
                     total: crate::routing::score::NEUTRAL,
                     exploration: crate::routing::score::NEUTRAL,
                 });
-            let stats = dimension
-                .map(|dimension| state.runtime.perf.stats(&target.target.id, dimension))
-                .unwrap_or_default();
+            let stats = state.runtime.perf.stats(&target.target.id, dimension);
             ScoreDto {
                 total: round4(score.total),
                 multiplier: round4(score.multiplier),
@@ -2572,13 +2660,14 @@ fn round4(value: f64) -> f64 {
 
 /// 列表里一行的**预计算结果**（§9.4）。
 ///
-/// 评分、展示维度与 EWMA 都只依赖"逻辑模型"，按模型算一次即可。行的 DTO 只
-/// 从中取自己那一份——这正是原先按目标重算时最贵的地方：500 个目标会把同一个
-/// 模型算 500 遍，接口要 60 毫秒以上，而每次写操作之后界面都会立刻重拉它。
+/// 评分按逻辑模型算一次（全模型统一维度，跨行可比）；首字 / 速度三列的样本
+/// 逐目标挑维度——那三列是原始测量值，不参与归一化，用不着统一口径。
 struct TargetRow<'a> {
     view: Option<&'a Arc<crate::config::TargetView>>,
-    dimension: Option<crate::routing::score::Dimension>,
-    stats: crate::routing::score::Stats,
+    /// 首字 / 速度 / 总延迟三列看的样本。
+    stats: Stats,
+    /// 这些样本对应的维度；一个样本都没有时为 None。
+    stats_dimension: Option<Dimension>,
     score: Option<ScoreDto>,
 }
 
@@ -2596,15 +2685,14 @@ fn target_rows<'a>(
             let dimension = model_dimension(state, model);
             let scores = model_scores(state, group, model, dimension);
             for (index, target) in model.targets.iter().enumerate() {
-                let stats = dimension
-                    .map(|dimension| state.runtime.perf.stats(&target.target.id, dimension))
-                    .unwrap_or_default();
+                let (stats_dimension, stats) =
+                    target_display_stats(state, &target.target.id, dimension);
                 rows.insert(
                     target.target.id.as_str(),
                     TargetRow {
                         view: Some(target),
-                        dimension,
                         stats,
+                        stats_dimension,
                         score: scores.get(index).cloned(),
                     },
                 );
