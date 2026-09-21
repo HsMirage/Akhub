@@ -29,7 +29,52 @@ pub enum ErrorCode {
     InternalError,
 }
 
+/// 客户端在流结束前断开连接（§18.1、§24.1）。
+///
+/// 与 New API / sub2api 的 `end_reason=client_gone` 同义。它只会写进请求记录，
+/// 不会作为响应返回给任何客户端——下游已经走了，没有收件人。
+pub const CLIENT_GONE: &str = "client_gone";
+
 impl ErrorCode {
+    /// 全部稳定错误码。
+    ///
+    /// 后台按它校验请求记录的 `error_code` 筛选参数：有了这份清单，填错一个码
+    /// 会拿到明确的 400 与可选值列表，而不是一个看起来"就是没有记录"的空列表。
+    pub const ALL: &'static [Self] = &[
+        Self::AuthInvalid,
+        Self::ModelNotFound,
+        Self::NoEligibleTarget,
+        Self::MultiplierUnknown,
+        Self::MultiplierExceeded,
+        Self::QueueFull,
+        Self::QueueTimeout,
+        Self::RequestTooLarge,
+        Self::UnsupportedParameter,
+        Self::UpstreamTimeout,
+        Self::UpstreamExhausted,
+        Self::ResponseStateExpired,
+        Self::RateLimited,
+        Self::UpstreamProtocolError,
+        Self::InternalError,
+    ];
+
+    /// 只会出现在请求记录里、不会作为响应返回的结局标识（§24.1）。
+    pub const RECORD_ONLY: &'static [&'static str] = &[CLIENT_GONE];
+
+    /// 请求记录 `error_code` 列的全部合法取值（稳定错误码 + 只进记录的标识）。
+    pub fn record_codes() -> Vec<&'static str> {
+        ErrorCode::ALL
+            .iter()
+            .map(|code| code.as_str())
+            .chain(ErrorCode::RECORD_ONLY.iter().copied())
+            .collect()
+    }
+
+    /// 这个字符串是不是一个合法的记录错误码。
+    pub fn is_record_code(code: &str) -> bool {
+        ErrorCode::record_codes().contains(&code)
+    }
+
     /// 对外稳定的错误码字符串。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -229,6 +274,46 @@ fn default_retry_after(code: ErrorCode) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每个错误码都必须登记进 [`ErrorCode::ALL`]。
+    ///
+    /// 后台的 `error_code` 筛选按 `ALL` 校验，漏登记会让一个合法的筛选值被
+    /// 400 拒掉。这里的 match 是穷尽的：新增错误码时它会编译失败，提醒同步。
+    #[test]
+    fn every_error_code_is_registered_for_the_record_filter() {
+        for code in ErrorCode::ALL {
+            let registered: &[ErrorCode] = match *code {
+                ErrorCode::AuthInvalid
+                | ErrorCode::ModelNotFound
+                | ErrorCode::NoEligibleTarget
+                | ErrorCode::MultiplierUnknown
+                | ErrorCode::MultiplierExceeded
+                | ErrorCode::QueueFull
+                | ErrorCode::QueueTimeout
+                | ErrorCode::RequestTooLarge
+                | ErrorCode::UnsupportedParameter
+                | ErrorCode::UpstreamTimeout
+                | ErrorCode::UpstreamExhausted
+                | ErrorCode::ResponseStateExpired
+                | ErrorCode::RateLimited
+                | ErrorCode::UpstreamProtocolError
+                | ErrorCode::InternalError => ErrorCode::ALL,
+            };
+            assert!(registered.contains(code), "{code:?} 未登记进 ALL");
+        }
+    }
+
+    /// 记录错误码清单必须包含流式结算写入的 `client_gone`（§24.1）。
+    #[test]
+    fn the_record_filter_accepts_the_abort_marker() {
+        assert!(ErrorCode::is_record_code(CLIENT_GONE));
+        assert!(ErrorCode::is_record_code("upstream_timeout"));
+        assert!(
+            !ErrorCode::is_record_code("upstream_timout"),
+            "拼错的码必须被拒"
+        );
+        assert_eq!(ErrorCode::record_codes().len(), ErrorCode::ALL.len() + 1);
+    }
 
     #[test]
     fn status_mapping_matches_the_specification() {

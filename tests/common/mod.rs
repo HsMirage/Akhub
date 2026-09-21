@@ -880,8 +880,18 @@ pub async fn wire_extra_target(
     target.id
 }
 
+/// 测试用的 HTTP 客户端：**全进程复用同一个连接池**。
+///
+/// 每发一个请求就新建一个 reqwest Client，就等于每个请求换一个新的连接池，
+/// 于是每次调用都占用一条新的本地端口。像粘性分配那种几百轮 × 多轮迭代的
+/// 用例会把临时端口耗光，报 "Can't assign requested address"——看起来像
+/// 偶发的产品故障，其实是压测把端口用尽了。reqwest 的 Client 本来就设计成
+/// 共享：内部连接池线程安全，克隆只是 Arc 计数。
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder().build().unwrap()
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| reqwest::Client::builder().build().unwrap())
+        .clone()
 }
 
 /// 发一个 OpenAI Chat 请求。返回的 future 不借用 `akhub`，可以直接 `spawn`。

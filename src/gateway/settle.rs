@@ -99,7 +99,7 @@ impl Ending {
         match self {
             Self::Completed => None,
             Self::Failed(code) => Some(code),
-            Self::Aborted => Some("client_gone"),
+            Self::Aborted => Some(crate::gateway::error::CLIENT_GONE),
         }
     }
 }

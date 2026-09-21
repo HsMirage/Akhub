@@ -437,6 +437,23 @@ async fn sticky_requests_follow_the_first_target_and_move_when_it_breaks() {
 /// 这是现场事故的回归测试。修复前：第 4 级粘性键（稳定前缀）直接短路抽签，
 /// 于是 700 次同前缀请求会 100% 落在一个账号上——不管它多慢、多差。
 /// 修复后：绑定只把该账号的抽签权重放大 4 倍，流量可以重新分配。
+///
+/// # 为什么是这三个判据
+///
+/// 绑定会跟着**上一次的赢家**走（成功即重绑），所以"偏向"是短窗口现象：
+/// 窗口越长分布越对称，少数侧占比向 0.42 附近收敛，`bigger > smaller`
+/// 在长窗口下会退化成一次抛硬币，**不能**拿来当判据。
+///
+/// 实测（240 轮 × 210 次采样，两个同优先级同倍率的假上游）：
+///
+/// - 少数侧占比：p50 ≈ 0.43，p1 ≈ 0.23，最坏 0.158
+/// - 相邻同目标率：mean ≈ 0.81，sd ≈ 0.028，最坏 0.745
+///
+/// 相邻同目标率是最稳的判据：它直接量出 4 倍权重有没有生效——没有倾斜时
+/// 应接近 0.5，实测 0.81，阈值 0.60 在均值下方 7.5 个标准差。
+///
+/// 窗口也不能太短：80 轮时少数侧占比的最坏值会掉到 0.06，任何固定阈值都
+/// 会有约 5% 的偶发失败（这正是本用例原先的形态）。240 轮下尾部才收得住。
 #[tokio::test]
 async fn stable_prefix_stickiness_is_soft_and_still_allows_redistribution() {
     let x = FakeUpstream::spawn().await;
@@ -454,36 +471,44 @@ async fn stable_prefix_stickiness_is_soft_and_still_allows_redistribution() {
     )
     .await;
 
+    const ROUNDS: usize = 240;
     let system = "你是项目 Gamma 的编码助手";
-    for round in 0..80 {
+    // 逐轮记录这次落在谁身上：只看总数会丢掉"粘性"这个序列特征。
+    let mut sequence = Vec::with_capacity(ROUNDS);
+    for round in 0..ROUNDS {
+        let before = x.requests();
         let body = small_body(system, &format!("第 {round} 轮"));
         assert_eq!(chat(&akhub, body).await.status(), 200);
+        sequence.push(x.requests() > before);
     }
+    let nx = sequence.iter().filter(|hit_x| **hit_x).count();
+    let ny = ROUNDS - nx;
 
-    // 软粘性下两个账号都必须拿到流量：绑定不再是"永久独占"。
+    // 1) 软粘性下两个账号都必须拿到流量：绑定不再是"永久独占"。
+    //    这正是原事故的判据（当时是 700:0），也是最稳的一条。
     assert!(
-        x.requests() > 0 && y.requests() > 0,
-        "软粘性必须允许流量重新分配（X={} Y={}）",
-        x.requests(),
-        y.requests()
+        nx > 0 && ny > 0,
+        "软粘性必须允许流量重新分配（X={nx} Y={ny}）"
     );
-    // 但仍然明显偏向绑定：不能退化成完全无视前缀缓存的纯轮询。
-    let (bigger, smaller) = if x.requests() >= y.requests() {
-        (x.requests(), y.requests())
-    } else {
-        (y.requests(), x.requests())
-    };
+
+    // 2) 4 倍权重确实在起作用：相邻两次请求更常回到同一个目标。
+    //    没有任何倾斜时这个值应该接近 0.5。
+    let same = sequence
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .count();
+    let stickiness = same as f64 / (ROUNDS - 1) as f64;
     assert!(
-        bigger > smaller,
-        "绑定目标应当拿到更多流量（X={} Y={}）",
-        x.requests(),
-        y.requests()
+        stickiness > 0.60,
+        "软粘性应当让相邻请求更常落在同一目标（相邻同目标率 {stickiness:.3}，X={nx} Y={ny}）"
     );
+
+    // 3) 少数侧不该被饿死。实测最坏 0.158，阈值取 0.10 留出充分余量；
+    //    而原事故的形态是 0，所以这个下界依然抓得住回归。
+    let minority = nx.min(ny) as f64 / ROUNDS as f64;
     assert!(
-        smaller as f64 / (bigger + smaller) as f64 > 0.15,
-        "少数侧不该被饿死（X={} Y={}）",
-        x.requests(),
-        y.requests()
+        minority > 0.10,
+        "少数侧不该被饿死（少数侧占比 {minority:.3}，X={nx} Y={ny}）"
     );
 }
 

@@ -4208,6 +4208,17 @@ pub async fn list_requests(
     _: Admin,
     Query(query): Query<RequestQuery>,
 ) -> AdminResult<Json<Value>> {
+    // 错误码筛选只接受已知的错误码。自由文本 + 等值匹配的旧行为里，打错一个字
+    // 会得到一个空列表，看起来像"这段时间没有失败"——比报错危险得多。
+    let error_code = trimmed_opt(&query.error_code).map(str::to_string);
+    if let Some(code) = error_code.as_deref()
+        && !crate::gateway::error::ErrorCode::is_record_code(code)
+    {
+        return Err(AdminError::bad_request(format!(
+            "未知的错误码「{code}」。可用值：{}",
+            crate::gateway::error::ErrorCode::record_codes().join("、")
+        )));
+    }
     let filter = crate::storage::store::RequestFilter {
         since: query.since,
         until: query.until,
@@ -4217,7 +4228,7 @@ pub async fn list_requests(
         target_id: trimmed_opt(&query.target_id).map(str::to_string),
         account_id: trimmed_opt(&query.account_id).map(str::to_string),
         status: trimmed_opt(&query.status).map(str::to_string),
-        error_code: trimmed_opt(&query.error_code).map(str::to_string),
+        error_code,
     };
     let (records, total) = state
         .store

@@ -208,8 +208,10 @@ async fn wire_target(
     state.reload_config().await.unwrap();
 }
 
+/// 复用 `common::client` 的连接池：每次调用都新建 Client 会把本地临时端口
+/// 耗光（见 `tests/common/mod.rs` 里那段说明）。
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().build().unwrap()
+    common::client()
 }
 
 #[tokio::test]

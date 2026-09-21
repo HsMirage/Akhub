@@ -412,6 +412,21 @@ async fn request_records_support_filters_and_total() {
         .unwrap();
     assert_eq!(body["total"], 1, "{body}");
 
+    // 拼错的错误码必须明确报错，而不是返回一个"看起来没有失败"的空列表。
+    let response = get("error_code=upstream_exausted").await.unwrap();
+    assert_eq!(response.status(), 400, "未知错误码必须被拒");
+    let body: Value = response.json().await.unwrap();
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("upstream_exausted"), "{body}");
+    assert!(
+        message.contains("upstream_exhausted"),
+        "必须列出可用值：{body}"
+    );
+
+    // 只进请求记录的结局标识（客户端断开）也必须能筛。
+    let response = get("error_code=client_gone").await.unwrap();
+    assert_eq!(response.status(), 200, "client_gone 是合法筛选值");
+
     // 按请求 ID 精确命中。
     let body: Value = get("request_id=req-b1")
         .await

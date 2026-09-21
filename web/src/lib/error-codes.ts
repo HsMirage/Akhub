@@ -113,6 +113,14 @@ const CODES: Record<string, ErrorCodeInfo> = {
   },
 };
 
+/**
+ * 全部错误码，按 [CODES] 的书写顺序。
+ *
+ * 请求记录的筛选下拉直接用它：自由文本 + 等值匹配时，打错一个字会得到一份
+ * 空列表，看起来像"这段时间没有失败"——比直接报错危险得多。
+ */
+export const ERROR_CODES: string[] = Object.keys(CODES);
+
 export function errorCodeInfo(code: string | null | undefined): ErrorCodeInfo | null {
   if (!code) return null;
   return CODES[code] ?? null;

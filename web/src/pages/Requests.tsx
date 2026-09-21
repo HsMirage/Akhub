@@ -29,7 +29,7 @@ import {
   InfoTip,
   useToast,
 } from "../components/ui";
-import { errorCodeInfo } from "../lib/error-codes";
+import { ERROR_CODES, errorCodeInfo } from "../lib/error-codes";
 import { IconDownload, IconInbox, IconX } from "../components/Icons";
 
 type TimeRange = "1h" | "24h" | "7d" | "all";
@@ -542,13 +542,19 @@ export function Requests({
           </Field>
           <Field label="错误码">
             {(id) => (
-              <input
+              <select
                 id={id}
-                className="input mono"
+                className="select"
                 value={filters.errorCode}
-                placeholder="如 upstream_timeout"
                 onChange={(event) => updateFilter("errorCode", event.target.value)}
-              />
+              >
+                <option value="">全部</option>
+                {ERROR_CODES.map((code) => (
+                  <option key={code} value={code}>
+                    {errorCodeInfo(code)?.label ?? code}（{code}）
+                  </option>
+                ))}
+              </select>
             )}
           </Field>
           <Field label="请求 ID">
