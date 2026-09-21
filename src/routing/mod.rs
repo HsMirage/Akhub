@@ -619,16 +619,19 @@ fn into_layers(
     layers
 }
 
-/// 软粘性（弱身份）在层内抽签里的权重倍数。
+/// 软粘性（弱身份）在层内抽签里的**权重**倍数。
 ///
-/// 4 倍而不是"必中"：绑定目标拿到约 4 倍权重，在同分候选之间意味着约八成
-/// 流量仍留在原账号——前缀缓存的价值基本保住——但每五次里总有一次会重新分配。
+/// 4 倍而不是"必中"：绑定目标拿到约 4 倍权重，意味着同分候选之间约八成流量
+/// 仍留在原账号——前缀缓存的价值基本保住——但每五次里总有一次会重新分配。
 /// 这个比例直接决定"某个账号变慢或变差之后，多久能被评分发现并真正让出流量"。
+///
+/// 注意它是**权重**倍数而不是分数倍数：分数被夹在 1.0，乘在分数上会撞上限，
+/// 让倍数失真（`weighted_order_with` 的注释里有完整说明）。
 const AFFINITY_BOOST: f64 = 4.0;
 
 /// 按综合评分加权随机排出一组候选的尝试顺序。
 ///
-/// `affinity` 命中时把那个候选的权重乘以 [`AFFINITY_BOOST`]（§10.1 修订的
+/// `affinity` 命中时把那个候选的**权重**乘以 [`AFFINITY_BOOST`]（§10.1 修订的
 /// 软粘性）。它只影响**层内**顺序，不跨层。
 fn shuffle(
     candidates: Vec<Candidate>,
@@ -636,20 +639,20 @@ fn shuffle(
     random: &mut impl FnMut() -> f64,
 ) -> Vec<Candidate> {
     let scores: Vec<score::Score> = candidates.iter().map(|c| c.score).collect();
-    let boosted: Vec<score::Score> = match affinity {
+    let boost: Vec<f64> = match affinity {
         Some(id) => candidates
             .iter()
             .map(|candidate| {
-                let mut value = candidate.score;
                 if candidate.target.target.id == id {
-                    value.total = (value.total * AFFINITY_BOOST).min(1.0);
+                    AFFINITY_BOOST
+                } else {
+                    1.0
                 }
-                value
             })
             .collect(),
-        None => scores.clone(),
+        None => Vec::new(),
     };
-    let order = score::weighted_order(&boosted, random);
+    let order = score::weighted_order_with(&scores, &boost, random);
     let mut slots: Vec<Option<Candidate>> = candidates.into_iter().map(Some).collect();
     order
         .into_iter()

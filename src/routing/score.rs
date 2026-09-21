@@ -408,14 +408,34 @@ fn score_one(candidate: &Candidate, reference: &Reference, weights: SchedulingWe
 
 /// 按 `score^k` 加权随机排出层内的尝试顺序（§9.5）。
 ///
+/// `boost` 与 `scores` 等长，是**逐候选的权重倍数**（软粘性用，见 §10.1 修订）。
+/// 它必须作用在**权重**上而不是分数上：分数被 `total.clamp(.., 1.0)` 夹在 1.0，
+/// 若先把分数乘以倍数再夹，任何大于 1 的分数都会撞到同一个上限，倍数形同虚设，
+/// 甚至会让一个已经变差的绑定目标与健康目标并列。
+///
 /// 返回的是**顺序**而不是单个选择：第一个是本次抽中的目标，后面是它失败后
 /// 依次尝试的备选。不放回抽样天然满足"层内先耗尽再降层"（§13.1）。
 pub fn weighted_order(scores: &[Score], random: &mut impl FnMut() -> f64) -> Vec<usize> {
+    weighted_order_with(scores, &[], random)
+}
+
+/// 带逐候选权重倍数的加权随机排序（软粘性用）。
+///
+/// `boost` 为空表示没有倾斜；否则 `boost[i]` 是 `scores[i]` 的权重倍数。
+pub fn weighted_order_with(
+    scores: &[Score],
+    boost: &[f64],
+    random: &mut impl FnMut() -> f64,
+) -> Vec<usize> {
     // 底权在幂次**之外**相加：它保证的是"每个候选都有一份与分数无关的口粮"，
     // 而不是把分数拉平。
     let mut weights: Vec<f64> = scores
         .iter()
-        .map(|score| score.total.max(MIN_SCORE).powi(POWER) + EXPLORATION)
+        .enumerate()
+        .map(|(index, score)| {
+            let base = score.total.max(MIN_SCORE).powi(POWER) + EXPLORATION;
+            base * boost.get(index).copied().unwrap_or(1.0).max(0.0)
+        })
         .collect();
     let mut order = Vec::with_capacity(scores.len());
     let mut remaining: Vec<usize> = (0..scores.len()).collect();
@@ -712,6 +732,55 @@ mod tests {
         assert!((share[0] - 0.74).abs() < 0.03, "{share:?}");
     }
 
+    /// 软粘性的倍数必须作用在**权重**上，不能作用在分数上（§10.1 修订）。
+    ///
+    /// 这条测试钉的是这个修复里最危险的一个坑。分数被 `total.clamp(MIN_SCORE, 1.0)`
+    /// 夹在 1.0，把倍数乘在**分数**上再夹会得到一个**非单调**的有效倍数：
+    ///
+    /// | 绑定目标分数 | 乘分数再夹的有效倍数 |
+    /// |---|---|
+    /// | 0.90 | 2.3x |
+    /// | 0.80 | 6.0x |
+    /// | 0.40 | **1526x** |
+    /// | ≤0.25 | 65536x（撞满分） |
+    ///
+    /// 也就是说**越差的绑定目标反而被放大得越狠**：一个已经掉到 0.40 的账号会
+    /// 从健康的 0.90 手里抢走约七成流量——正是本修复要解决的问题换了个形式复发。
+    /// 正确做法是让倍数与分数无关，这里用两个不同分数段验证有效倍数恒定。
+    #[test]
+    fn the_soft_affinity_boost_scales_weights_not_scores() {
+        // 有效倍数 = (权重比) / (分数^k 比)，应当恒等于声明的 4 倍。
+        let effective = |bound_score: f64, other_score: f64| {
+            let scores = vec![score(other_score), score(bound_score)];
+            let plain = simulate_with_boost(&scores, &[], 200_000);
+            let boosted = simulate_with_boost(&scores, &[1.0, 4.0], 200_000);
+            (boosted[1] / plain[1]) * (plain[0] / boosted[0])
+        };
+
+        // 分数高低完全不影响有效倍数——这正是"作用在权重上"的定义。
+        for (bound, other) in [(0.85, 0.80), (0.60, 0.90), (0.40, 0.90), (0.30, 0.95)] {
+            let ratio = effective(bound, other);
+            assert!(
+                (ratio - 4.0).abs() < 0.6,
+                "分数 {bound}/{other} 的有效倍数应当恒为 4 倍，实际 {ratio:.2}"
+            );
+        }
+
+        // 同分候选：约八成流量留在绑定目标（4 倍权重的直观含义）。
+        let equal = simulate_with_boost(&[score(0.8), score(0.8)], &[1.0, 4.0], 40_000);
+        assert!(
+            (equal[1] - 0.8).abs() < 0.05,
+            "同分时绑定目标应当拿到约八成：{equal:?}"
+        );
+
+        // 一个**已经变差**的绑定目标不该靠倍数反超健康目标。
+        let degraded = simulate_with_boost(&[score(0.90), score(0.40)], &[1.0, 4.0], 40_000);
+        assert!(
+            degraded[0] > degraded[1],
+            "健康目标必须仍然占优，变差的绑定目标不能反超：{degraded:?}"
+        );
+    }
+
     #[test]
     fn every_candidate_appears_exactly_once_in_the_attempt_order() {
         let scores = vec![score(0.9), score(0.5), score(0.1)];
@@ -747,6 +816,26 @@ mod tests {
             throughput: total,
             total,
         }
+    }
+
+    /// 同 `simulate`，但可以给每个候选一个权重倍数（软粘性）。
+    fn simulate_with_boost(scores: &[Score], boost: &[f64], rounds: usize) -> Vec<f64> {
+        let mut counts = vec![0usize; scores.len()];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..rounds {
+            let order = weighted_order_with(scores, boost, &mut random);
+            counts[order[0]] += 1;
+        }
+        counts
+            .into_iter()
+            .map(|count| count as f64 / rounds as f64)
+            .collect()
     }
 
     /// 用均匀随机源模拟多轮抽签，返回每个候选被抽为第一名的比例。
