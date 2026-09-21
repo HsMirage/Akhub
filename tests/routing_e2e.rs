@@ -977,6 +977,79 @@ async fn new_api_probe_uses_the_groups_endpoint_with_both_credentials() {
     assert!(!error.contains("tok-123"));
 }
 
+/// 管理接口是**站点级**的：Base URL 末尾的 `/v1` 属于推理端点，必须剥掉。
+///
+/// 现场症状（2026-09-21 迁移后的实测）：账号 Base URL 按面板约定填成
+/// `https://ai.hsnb.fun/v1`，New API 探针于是每一轮都在打
+/// `/v1/api/user/self/groups` —— 那是上游**推理网关**的 404，不是"这个站不认
+/// 这个接口"。探针如实报"倍率探测失败：探针返回 HTTP 404"，识别动作也会因为
+/// 两个候选都 404 而误判成"两种接口都不认"。真正该打的是 `/api/user/self/groups`。
+#[tokio::test]
+async fn probe_endpoints_do_not_inherit_the_inference_version_segment() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    // 与现场一致：Base URL 带上推理端点需要的版本段。
+    let base_url = format!("{}/v1", upstream.base_url);
+    wire_target(
+        &akhub,
+        TargetSpec::new("带版本段", &base_url, CHAT, MODEL, MODEL, 50)
+            .multiplier(MultiplierMode::Sub2Api, "1"),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("带版本段-NewAPI", &base_url, CHAT, MODEL, MODEL, 50)
+            .multiplier(MultiplierMode::NewApi, "1")
+            .new_api("tok-123", "42", Some("vip")),
+    )
+    .await;
+    let accounts = akhub.state.store.list_accounts().await.unwrap();
+    let context = refresh_context(&akhub);
+    let now = akhub::storage::now_unix();
+
+    upstream.set_billing(Some(billing(0.5)));
+    upstream.set_groups(Some(
+        json!({"success": true, "data": {"vip": {"ratio": 0.3}}}),
+    ));
+    let stats = refresh::run_round(&context, &accounts.iter().collect::<Vec<_>>(), now).await;
+    assert_eq!(
+        (stats.attempted, stats.failed),
+        (2, 0),
+        "带 /v1 的 Base URL 不该影响探测"
+    );
+
+    let paths: Vec<String> = upstream
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|seen| seen.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&"/v1/sub2api/billing".to_string()),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"/api/user/self/groups".to_string()),
+        "版本段必须剥掉，不能拼出 /v1/api/user/self/groups：{paths:?}"
+    );
+
+    // 404 也许只是地址拼错了。错误文本里要给出**实际请求的地址**，否则管理员
+    // 只能看到一句"探针返回 HTTP 404"，无从判断该改上游还是改 Base URL。
+    let mut stray = accounts[0].clone();
+    stray.base_url = format!("{}/v9", upstream.base_url);
+    let stats = refresh::run_round(&context, &[&stray], now).await;
+    assert_eq!(stats.failed, 1);
+    let view = akhub.state.runtime.multipliers.view();
+    let (_, entry) = view.entries().find(|(id, _)| **id == stray.id).unwrap();
+    let error = entry.last_error.clone().unwrap();
+    assert!(error.contains("404"), "{error}");
+    assert!(
+        error.contains("/v9/v1/sub2api/billing"),
+        "错误里要带实际请求的地址：{error}"
+    );
+}
+
 #[tokio::test]
 async fn a_systemic_probe_failure_extends_every_grace_period() {
     let upstream = FakeUpstream::spawn().await;

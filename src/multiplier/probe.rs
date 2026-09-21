@@ -241,8 +241,11 @@ pub async fn detect(
             Detected::NewApi.probe_label(),
             sanitize_probe_error(&error)
         ),
+        // 走到这里说明两个候选都明确回了"没有这个接口"。给管理员两个最可能的
+        // 解释，而不是只丢一句"都不认"——地址拼错（比如上游把管理接口放在某个
+        // 子路径下）与站点确实不是这两家，处理方式完全不同。
         Verdict::NoMatch => bail!(
-            "这个站点既不认{}，也不认{}",
+            "这个站点既不认{}，也不认{}；如果确认它属于其中之一，请检查 Base URL 的路径部分（探测地址由 Base URL 的站点根加接口路径拼成）",
             Detected::Sub2Api.probe_label(),
             Detected::NewApi.probe_label()
         ),
@@ -333,8 +336,9 @@ pub async fn sub2api(
     api_key: &str,
     allow_private: bool,
 ) -> Result<Reading> {
-    let url = join(base_url, "v1/sub2api/billing")?;
+    let url = probe_url(base_url, "v1/sub2api/billing")?;
     url_guard::assert_resolvable(&url, allow_private).await?;
+    let endpoint = url.to_string();
 
     let response = client
         .http_for(allow_private)
@@ -344,7 +348,7 @@ pub async fn sub2api(
         .send()
         .await
         .context("Sub2API 计费接口请求失败")?;
-    let body = read_json_body(response).await?;
+    let body = read_json_body(&endpoint, response).await?;
     let billing: Sub2ApiBilling = serde_json::from_slice(&body).map_err(|error| {
         anyhow::Error::new(error)
             .context(NotThisApi)
@@ -486,8 +490,9 @@ async fn fetch_new_api_groups(
     user_id: &str,
     allow_private: bool,
 ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-    let url = join(base_url, "api/user/self/groups")?;
+    let url = probe_url(base_url, "api/user/self/groups")?;
     url_guard::assert_resolvable(&url, allow_private).await?;
+    let endpoint = url.to_string();
 
     let response = client
         .http_for(allow_private)
@@ -499,7 +504,7 @@ async fn fetch_new_api_groups(
         .send()
         .await
         .context("New API 分组接口请求失败")?;
-    let body = read_json_body(response).await?;
+    let body = read_json_body(&endpoint, response).await?;
     let groups: NewApiGroups = serde_json::from_slice(&body).map_err(|error| {
         anyhow::Error::new(error)
             .context(NotThisApi)
@@ -562,18 +567,52 @@ fn normalize_decimal(text: &str) -> Result<String> {
     }
 }
 
-fn join(base_url: &str, path: &str) -> Result<reqwest::Url> {
+/// 拼出管理接口的地址：**去掉 Base URL 上的 `/v1` 版本段**，再拼
+/// `/api/...` 或 `/v1/sub2api/billing`。
+///
+/// 与推理端点（[crate::upstream::build_url]）的规则刻意不同。推理端点把
+/// `https://host/v1` 读作"已经带上版本段"，所以问模型列表时补的是 `/models`；
+/// 而这两条管理接口是**站点级**的：New API 挂在 `/api/...`（不在 `/v1` 之下），
+/// sub2api 挂在 `/{base_path}/v1/sub2api/billing`。管理员照面板上的约定把 Base URL
+/// 填成 `https://host/v1` 时，照抄推理端点的规则会拼出
+/// `https://host/v1/api/user/self/groups`——那是上游**推理网关**在回 404，不是
+/// "这个站不认这个接口"，于是识别动作误判成"两种接口都不认"，普通刷新则每一轮
+/// 都拿一个 404 回来（现场症状：倍率探测失败：探针返回 HTTP 404）。
+///
+/// 规则只有一条：末段正好是 `v1` 才剥掉，其余路径原样当作前缀。所以
+/// `https://host/proxy` 与 `https://host/api/v1` 都会保留前缀（后者留下 `/api`），
+/// 这两种填法本来就少见，而错误文本里带着实际请求的完整地址，猜错一次就能看清。
+fn probe_url(base_url: &str, path: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let mut url = reqwest::Url::parse(trimmed).context("账号 Base URL 非法")?;
-    let base_path = url.path().trim_end_matches('/').to_string();
-    url.set_path(&format!("{base_path}/{path}"));
+    // 查询串与片段不属于路径的一部分，在拼之前就去掉。
     url.set_query(None);
     url.set_fragment(None);
+    let root = api_root_path(&url);
+    url.set_path(&format!("{root}/{path}"));
     Ok(url)
 }
 
+/// 去掉末尾版本段后的站点前缀：形如 `` 或 `/api`，**不带结尾斜杠**。
+///
+/// 三段判定合在一起才不漏：`/v1` 是纯粹的版本段，剥完就是站点根（空串）；
+/// `/api/v1` 剥掉后还剩前缀 `/api`；其余路径（`/proxy`、`/v1beta`）原样保留。
+/// 少了最后那次 trim，`/api/v1` 会留下 `/api/`，拼出来就是
+/// `/api//api/user/self/groups` 这种上游肯定不认的地址。
+fn api_root_path(url: &reqwest::Url) -> String {
+    let path = url.path().trim_end_matches('/');
+    path.strip_suffix("/v1")
+        .unwrap_or(path)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// 读取响应体，校验状态码与 Content-Type，并施加大小上限（§23.3）。
-async fn read_json_body(response: reqwest::Response) -> Result<Vec<u8>> {
+///
+/// 错误里带上探针地址：404 有两种完全不同的成因——“这个站点没有这个接口”
+/// 与“地址拼错了”，而管理员能看到的只有这一行文本。给出实际请求的地址，
+/// 才能一眼分辨是上游不认还是 Base URL 填得不对。
+async fn read_json_body(endpoint: &str, response: reqwest::Response) -> Result<Vec<u8>> {
     let status = response.status();
     let content_type = response
         .headers()
@@ -585,8 +624,12 @@ async fn read_json_body(response: reqwest::Response) -> Result<Vec<u8>> {
     if !status.is_success() {
         // 状态码单独挂一层：识别动作靠它区分“端点不存在”与“这次没到上游”，
         // 用错误文本判断太脆。
-        return Err(anyhow::Error::new(HttpStatus(status.as_u16()))
-            .context(format!("探针返回 HTTP {}", status.as_u16())));
+        return Err(
+            anyhow::Error::new(HttpStatus(status.as_u16())).context(format!(
+                "探针返回 HTTP {}（GET {endpoint}）",
+                status.as_u16()
+            )),
+        );
     }
     if !content_type.contains("json") {
         bail!("探针响应的 Content-Type 不是 JSON：{content_type}");
@@ -811,16 +854,69 @@ mod tests {
     #[test]
     fn probe_urls_respect_an_existing_base_path() {
         assert_eq!(
-            join("https://host/proxy/", "v1/sub2api/billing")
+            probe_url("https://host/proxy/", "v1/sub2api/billing")
                 .unwrap()
                 .as_str(),
             "https://host/proxy/v1/sub2api/billing"
         );
         assert_eq!(
-            join("https://host", "api/user/self/groups")
+            probe_url("https://host", "api/user/self/groups")
                 .unwrap()
                 .as_str(),
             "https://host/api/user/self/groups"
         );
+        assert_eq!(
+            probe_url("https://host/proxy/", "api/user/self/groups")
+                .unwrap()
+                .as_str(),
+            "https://host/proxy/api/user/self/groups"
+        );
+    }
+
+    /// 管理接口是站点级的：Base URL 末尾的 `/v1` 属于推理端点，必须剥掉。
+    ///
+    /// 现场症状就是这条规则缺失：Base URL 填成 `https://ai.hsnb.fun/v1` 的账号，
+    /// New API 探针每天都在打 `/v1/api/user/self/groups`，拿回推理网关的 404，
+    /// 探针报"倍率探测失败：探针返回 HTTP 404"，而真正该打的是
+    /// `/api/user/self/groups`。
+    #[test]
+    fn a_v1_base_url_is_stripped_for_site_wide_probe_endpoints() {
+        assert_eq!(
+            probe_url("https://host/v1", "api/user/self/groups")
+                .unwrap()
+                .as_str(),
+            "https://host/api/user/self/groups"
+        );
+        assert_eq!(
+            probe_url("https://host/v1/", "v1/sub2api/billing")
+                .unwrap()
+                .as_str(),
+            "https://host/v1/sub2api/billing"
+        );
+        // `/api/v1` 去掉版本段后还剩挂载前缀 `/api`（与 `https://host/proxy/`
+        // 同一条规则）：前缀是"上游把服务挂在哪里"，而 `api/user/self/groups` 是
+        // 应用自身的路由，两者叠加才是真实地址。猜错的代价只是这一次 404，而
+        // 错误文本里带着实际请求的完整地址，管理员一眼能看出该把 Base URL 怎么改。
+        assert_eq!(
+            probe_url("https://host/api/v1", "api/user/self/groups")
+                .unwrap()
+                .as_str(),
+            "https://host/api/api/user/self/groups"
+        );
+        // 只有末段正好是 `v1` 才剥；别的路径原样保留。
+        assert_eq!(
+            probe_url("https://host/v1beta", "api/user/self/groups")
+                .unwrap()
+                .as_str(),
+            "https://host/v1beta/api/user/self/groups"
+        );
+        // 查询串与片段不参与拼接。
+        assert_eq!(
+            probe_url("https://host/v1?debug=1#x", "v1/sub2api/billing")
+                .unwrap()
+                .as_str(),
+            "https://host/v1/sub2api/billing"
+        );
+        assert!(probe_url("不是地址", "v1/sub2api/billing").is_err());
     }
 }

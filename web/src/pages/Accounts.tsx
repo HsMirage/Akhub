@@ -776,12 +776,23 @@ function MultiplierCell({
         )}
       </div>
       {account.multiplier_error && account.multiplier_status !== "known" && (
-        <div
-          className="text-faint cell-truncate"
-          style={{ fontSize: 11, maxWidth: 220 }}
-          title={account.multiplier_error}
-        >
-          {account.multiplier_error}
+        // 探测失败的原因可能很长（开启后带上了实际请求的地址），列表里只放
+        // 一行截断文本，完整的原文点旁边的说明看——那里也是唯一能看清
+        // "到底打到了哪个地址"的地方。
+        <div className="row" style={{ gap: 4, alignItems: "center" }}>
+          <span
+            className="text-faint cell-truncate"
+            style={{ fontSize: 11, maxWidth: 190 }}
+            title={account.multiplier_error}
+          >
+            {account.multiplier_error}
+          </span>
+          <InfoTip label={`「${account.name}」的倍率探测失败原因`}>
+            <p style={{ margin: "0 0 6px" }}>{account.multiplier_error}</p>
+            <p style={{ margin: 0 }} className="text-faint">
+              先照这里给出的地址确认上游是否真的有这个接口，再决定改上游还是改 Base URL。
+            </p>
+          </InfoTip>
         </div>
       )}
     </div>
@@ -1073,7 +1084,7 @@ function AccountDrawer({
       onClose={onClose}
       dirty={dirty}
       title={editing ? `编辑「${account.name}」` : "新建上游账号"}
-      description="不需要填写上下文长度、多模态、工具或思考等模型能力字段。"
+      description="连接上游、Key 池与倍率来源；模型能力由自动发现决定，不用手填。"
       footer={
         <>
           <Button onClick={onClose}>取消</Button>
@@ -1141,7 +1152,7 @@ function AccountDrawer({
 
         <Field
           label="Base URL"
-          hint="以 /v1 结尾会被识别为已含版本段，不会拼出 /v1/v1/messages。"
+          hint="填站点地址即可；以 /v1 结尾会识别为已含版本段，不会拼出 /v1/v1/messages。"
         >
           {(id) => (
             <input
@@ -1166,7 +1177,7 @@ function AccountDrawer({
         <Field
           label="默认人工优先级"
           error={priorityError ?? undefined}
-          hint="账号级人工优先级，默认 0。相同数字同属一层，层内完全按综合评分分配；只有需要「硬保底顺序」时才把某几个账号调高。"
+          hint="数值越大越先被使用，默认 0；相同的数字同属一层，层内按综合评分分配。"
         >
           {(id) => (
             <input
@@ -1183,16 +1194,28 @@ function AccountDrawer({
 
         </FormSection>
 
-        <FormSection title="倍率与校准" description="有效倍率由上游倍率与校准系数共同决定。">
+        <FormSection title="倍率与校准" description="有效倍率 = 上游倍率 × 校准系数。">
         <div className="form-row-2">
         <Field
           label="倍率来源"
           hint={
-            form.multiplier_mode === "manual"
-              ? "手动倍率始终视为已知，不受自动刷新失败影响。"
-              : form.multiplier_mode === "sub2api"
-                ? "调用 Key 级 /v1/sub2api/billing，用上面的 API Key 即可。刷新失败后按风险余量进入宽限期。"
-                : "调用 /api/user/self/groups，需要额外的访问令牌与用户 ID——推理用的 sk-xxx 不被这个接口接受。"
+            form.multiplier_mode === "manual" ? (
+              "固定值，永远视为已知，不受自动刷新影响。"
+            ) : (
+              <>
+                后台按刷新间隔自动探测；失败保留最后已知值并进入宽限期。
+                <InfoTip label="探测接口与地址">
+                  <p style={{ margin: "0 0 6px" }}>
+                    Sub2API 走 /v1/sub2api/billing，New API 走 /api/user/self/groups。
+                  </p>
+                  <p style={{ margin: "0 0 6px" }}>
+                    两条都是站点级接口，拼在 Base URL 的站点根上：Base URL 末尾的 /v1
+                    属于推理端点，探测时会去掉。
+                  </p>
+                  <p style={{ margin: 0 }}>探测失败时错误里会回显实际请求的完整地址。</p>
+                </InfoTip>
+              </>
+            )
           }
         >
           {(id) => (
@@ -1210,21 +1233,30 @@ function AccountDrawer({
             </select>
           )}
         </Field>
-
-        <Field
-          label="不知道这个站是哪一种？"
-          hint="先探测 /v1/sub2api/billing（只要一把 API Key），被 404 拒了再试 /api/user/self/groups（需要访问令牌与用户 ID）。命中哪个就把倍率来源写成哪个；网络或鉴权失败会如实报错，不擅自改来源。"
-        >
+        {/* 「识别」不是常规字段，但放在倍率来源旁边最好找；用 Field 只是为了
+            对齐右半格。 */}
+        <Field label="不知道是哪种自动来源">
           {(id) => (
-            <button
-              id={id}
-              type="button"
-              className="btn"
-              disabled={!editing || detecting}
-              onClick={() => void detectSource()}
-            >
-              {detecting ? "识别中…" : "识别倍率来源"}
-            </button>
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                id={id}
+                type="button"
+                className="btn"
+                disabled={!editing || detecting}
+                onClick={() => void detectSource()}
+              >
+                {detecting ? "识别中…" : "识别倍率来源"}
+              </button>
+              <InfoTip label="识别倍率来源怎么工作">
+                <p style={{ margin: "0 0 6px" }}>
+                  依次问 Sub2API 计费接口与 New API 分组接口，命中哪个就把来源写成哪个。
+                </p>
+                <p style={{ margin: 0 }}>
+                  只有"接口不存在"才换下一个；网络或鉴权失败会如实报错，不会擅自改来源。
+                  识别需要先把账号保存好。
+                </p>
+              </InfoTip>
+            </div>
           )}
         </Field>
         </div>
@@ -1241,8 +1273,8 @@ function AccountDrawer({
                 label={
                   account?.has_new_api_token ? "访问令牌（留空则不变）" : "访问令牌"
                 }
-                error={needsNewApiToken ? "New API 自动倍率需要访问令牌" : undefined}
-                hint="在 New API 的个人设置页生成，与 API Key 是两把不同的凭据。"
+                error={needsNewApiToken ? "自动倍率需要访问令牌" : undefined}
+                hint="New API 个人设置页生成，不是登录密码。"
               >
                 {(id) => (
                   <input
@@ -1258,7 +1290,8 @@ function AccountDrawer({
               </Field>
               <Field
                 label="用户 ID"
-                error={needsNewApiUser ? "New-Api-User 请求头必填" : undefined}
+                error={needsNewApiUser ? "自动倍率需要用户 ID" : undefined}
+                hint="New API 个人设置页里的数字 ID。"
               >
                 {(id) => (
                   <input
@@ -1273,7 +1306,7 @@ function AccountDrawer({
             </div>
             <Field
               label="分组名"
-              hint="这把 Key 在 New API 上所属的分组；点「拉取分组」从账号里选。留空会按可用分组的最高倍率保守估算。"
+              hint="去「拉取分组」里挑；留空就按最高倍率保守估算。"
             >
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
@@ -1322,8 +1355,8 @@ function AccountDrawer({
             error={multiplierError ?? undefined}
             hint={
               form.multiplier_mode === "manual"
-                ? "这把 Key 在上游的折扣档，直接参与调度门控；不知道就先去问站点，别随手填 1。"
-                : "首次自动刷新成功前先用这个值顶着，同时立即开始计宽限期。留空按 1 处理。"
+                ? "上游给这把 Key 的折扣档，直接参与门控；不知道就先问站点。"
+                : "首次探测成功前先用它顶着，留空按 1 处理。"
             }
           >
             {(id) => (
@@ -1336,7 +1369,11 @@ function AccountDrawer({
               />
             )}
           </Field>
-          <Field label="校准系数" error={calibrationError ?? undefined}>
+          <Field
+            label="校准系数"
+            error={calibrationError ?? undefined}
+            hint="把不同站点的口径对齐到同一把尺子上。"
+          >
             {(id) => (
               <input
                 id={id}
@@ -1348,10 +1385,13 @@ function AccountDrawer({
           </Field>
         </div>
         <p className="field-hint" style={{ marginTop: -8 }}>
-          有效倍率 = 上游倍率 × 校准系数，必须不高于分组上限。校准系数用来编码
-          「站 A 的 x1 大约相当于站 B 的 x0.7」这类跨站点差异。
+          有效倍率必须不高于分组上限，否则目标不会被调度。
           <InfoTip label="什么是校准系数">
-            倍率是上游的计费折扣；校准系数把不同站点的口径对齐到同一把尺子上。
+            <p style={{ margin: "0 0 6px" }}>
+              上游倍率是站点的计费折扣；校准系数用来编码「站 A 的 x1 大约相当于站 B
+              的 x0.7」这类跨站点差异。
+            </p>
+            <p style={{ margin: "0" }}>有效倍率 = 上游倍率 × 校准系数。</p>
           </InfoTip>
         </p>
 
@@ -1359,13 +1399,13 @@ function AccountDrawer({
 
         <FormSection
           title="限制与运行时"
-          description="账号级默认限制与运行时适配；不确定时保持默认即可。"
+          description="账号级默认限制与运行时适配；不确定时保持默认。"
           collapsible
           defaultOpen={false}
         >
         <Field
           label="限制（账号默认值）"
-          hint="留空表示不限。最大并发与额度由同一把 Key 下的所有模型共享；调度目标可以逐项覆盖得更严。TPM 按请求体保守估算，是「估算限流」。"
+          hint="留空表示不限；同一把 Key 下的所有模型共享这些限制。TPM 按请求体估算。"
         >
           {() => (
             <div className="weights" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
@@ -1404,8 +1444,8 @@ function AccountDrawer({
           label="运行时自动适配端点"
           hint={
             form.adaptive_protocol
-              ? "按端点证据依次尝试：能无损表达请求的端点优先，猜错会自动回退。"
-              : "只用首选端点，不做任何推断。上游只接受一种协议、或回退会造成副作用时关闭。"
+              ? "在首选端点之外按端点证据依次尝试，猜错会自动回退。"
+              : "只用首选端点。上游只认一种协议，或回退有副作用时关闭。"
           }
         />
 
@@ -1413,7 +1453,7 @@ function AccountDrawer({
           checked={form.allow_private_network}
           onChange={(value) => set("allow_private_network", value)}
           label="允许访问内网地址"
-          hint="默认阻止环回、内网与云元数据地址。上游确实部署在局域网时才打开。"
+          hint="默认禁止环回、内网与云元数据地址；上游在局域网里时才打开。"
         />
 
         <Switch
@@ -1422,8 +1462,8 @@ function AccountDrawer({
           label="模型自动同步"
           hint={
             form.auto_sync
-              ? "已托管：上游全部模型进入调度，选择集被忽略。关闭后回到之前勾选的模型。"
-              : "开启后忽略模型选择集，按设置页的同步间隔（默认 30 分钟）全量托管上游模型。"
+              ? "上游全部模型进入调度，之前的模型选择集被忽略。"
+              : "按设置页的同步间隔（默认 30 分钟）全量托管上游模型，忽略选择集。"
           }
         />
         <Switch
@@ -1432,7 +1472,7 @@ function AccountDrawer({
           label="隐藏原始模型名"
           hint={
             form.hide_original
-              ? "只暴露在「模型管理」里填写了下游模型名的模型；没填的模型下游无法获取。"
+              ? "只暴露在「模型管理」里填了下游模型名的模型。"
               : "下游既能用下游模型名，也能用上游原模型名。"
           }
         />
