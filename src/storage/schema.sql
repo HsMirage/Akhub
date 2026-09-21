@@ -165,7 +165,10 @@ CREATE TABLE IF NOT EXISTS sticky_bindings (
     -- 最近一次**真正换过目标**的时刻（不是"最近一次被使用"）。迁移冷却用它，
     -- 所以不能在每次成功重绑时刷新：否则迟滞窗口永远走不完（§10.1 修订）。
     -- 旧快照为 NULL，表示"还没迁移过"，下一次使用即补齐。
-    migrated_at   INTEGER
+    migrated_at   INTEGER,
+    -- 上次绑定时请求体有多大。上下文被压缩（/compact）会把它砍掉一大截，
+    -- 那一刻上游的前缀缓存整段失效，迁移因此不该再受冷却约束（§10.1 修订）。
+    context_bytes INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_sticky_used ON sticky_bindings(last_used_at);

@@ -51,7 +51,15 @@ const EXPLORATION: f64 = 0.03;
 /// 目标多久没被采样就算"陈旧"，探索口粮按这个尺度放大（§9.5）。
 const STALE_UNIT_SECS: f64 = 600.0;
 /// 陈旧换来的探索口粮上限倍数（相对 `EXPLORATION`）。
-const MAX_STALE_FACTOR: f64 = 4.0;
+///
+/// 取 8 而不是更小：口粮要能把一个"分低但只是很久没测过"的目标拉回到能攒够
+/// `MIN_SAMPLES` 的量级。按 300 请求/小时、5 个目标估算，4 倍（0.12）在对手
+/// 分数 0.95 时只够 4% 上下，攒 20 个样本要两个多小时；8 倍（0.24）能到 10%
+/// 量级，二十多分钟就重新有数。
+///
+/// 不抬高基础值 `EXPLORATION` 本身：那是所有目标（含主力）都吃的水位，抬高它
+/// 会把"主力仍然拿走绝大多数流量"这条不变量一起改掉。
+const MAX_STALE_FACTOR: f64 = 8.0;
 /// 定义性能参照系所需的最少热目标数（§9.4）。
 ///
 /// 只有一个热目标时，它就是参照系里"最快的""吞吐最高的"，三项性能分自动
@@ -265,9 +273,12 @@ impl Registry {
                     first_token_ms: row.first_token_ms,
                     total_ms: row.total_ms,
                     output_tps: row.output_tps,
-                    // 快照本身就是"当时的一份证据"，所以以它的写入时刻为起点算
-                    // 陈旧度：重启不该让所有目标瞬间变成"从没采样过"。
-                    last_sample_at: row.updated_at,
+                    // 快照里**没有**"这条统计最后一次被真实采样是什么时候"——
+                    // `export()` 每 60 秒会把所有行的 `updated_at` 都写成当前时间，
+                    // 一个几天没请求的目标看起来也一样新鲜。所以不能拿它充当采样
+                    // 时刻：那会让陈旧目标在重启后依旧拿不到探索口粮，⑤ 直接失效。
+                    // 诚实的读法是"不知道有多旧"——按陈旧处理，让它们重新被采样。
+                    last_sample_at: 0,
                 },
             );
         }
@@ -682,6 +693,41 @@ mod tests {
     /// 这正是口径里"保命口粮"的量化含义——不是好看，而是**能不能攒够
     /// `MIN_SAMPLES` 个样本回到评分里**。分数 0.55 的目标若无口粮，占比不到
     /// 1%，在真实流量下几天都攒不够 20 个样本，于是永远停在保守中性分。
+    /// 恢复快照不能把"快照写入时刻"冒充成"最近采样时刻"（§9.5）。
+    ///
+    /// `export()` 每 60 秒把所有行的 `updated_at` 刷成当前时间，所以一个几天没
+    /// 请求的目标也会看起来刚更新过。如果拿它当采样时刻，陈旧目标在重启后就
+    /// 拿不到探索口粮，⑤ 等于没做。
+    #[test]
+    fn a_restored_snapshot_counts_as_stale_not_fresh() {
+        let registry = Registry::new();
+        registry.restore(&[PerfSnapshotRow {
+            target_id: "t1".into(),
+            protocol: crate::domain::Protocol::OpenAiChat,
+            streaming: false,
+            samples: 500,
+            success_rate: 1.0,
+            first_token_ms: 100.0,
+            total_ms: 400.0,
+            output_tps: 50.0,
+            updated_at: 1_000_000,
+        }]);
+        let stats = registry.stats(
+            "t1",
+            Dimension {
+                protocol: crate::domain::Protocol::OpenAiChat,
+                streaming: false,
+            },
+        );
+        assert_eq!(stats.samples, 500);
+        assert!(stats.is_warm());
+        assert_eq!(stats.last_sample_at, 0, "快照没有采样时刻，必须按陈旧处理");
+        assert!(
+            exploration_floor(&stats, 1_000_000) > EXPLORATION,
+            "陈旧目标必须拿到放大的口粮"
+        );
+    }
+
     /// ⑤ 探索口粮随"距上次采样多久"放大，被采样一次就回落（§9.5）。
     #[test]
     fn a_stale_target_earns_a_bigger_exploration_allowance() {

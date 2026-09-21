@@ -533,10 +533,15 @@ fn bind_cache_key(
     )
     .expect("prompt_cache_key 必须能推导出粘性键");
     assert_eq!(origin, akhub::routing::sticky::Origin::CacheKey);
-    state
-        .runtime
-        .sticky
-        .bind(key, &akhub.group_id, logical_model, target_id, None, at);
+    state.runtime.sticky.bind(
+        key,
+        &akhub.group_id,
+        logical_model,
+        target_id,
+        None,
+        at,
+        4096,
+    );
 }
 
 /// 缓存已凉的绑定不再钉住会话（§10.1 修订）。
@@ -651,6 +656,7 @@ fn install_binding(
     cache_key: &str,
     target_id: &str,
     migrated_at: Option<i64>,
+    context_bytes: Option<i64>,
 ) {
     let state = Arc::clone(&akhub.state);
     let (key, origin) = akhub::routing::sticky::derive(
@@ -676,6 +682,7 @@ fn install_binding(
             // 新鲜：不能被"缓存已凉"那条规则先收走。
             last_used_at: now,
             migrated_at,
+            context_bytes,
         }]);
 }
 
@@ -704,7 +711,15 @@ async fn a_pin_yields_when_another_target_is_clearly_better() {
     prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
 
     let now = akhub::storage::now_unix();
-    install_binding(&akhub, MODEL, "会话-守门", &wx.target_id, Some(now - 700));
+    install_binding(
+        &akhub,
+        MODEL,
+        "会话-守门",
+        &wx.target_id,
+        // 冷却（10 分钟）与"刚搬完"的沉降窗口（60 分钟）都过了。
+        Some(now - 4000),
+        None,
+    );
 
     for round in 0..8 {
         let body = strong_body("项目", &format!("第 {round} 轮"), "会话-守门");
@@ -742,7 +757,7 @@ async fn a_recent_migration_blocks_another_one() {
     prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
 
     let now = akhub::storage::now_unix();
-    install_binding(&akhub, MODEL, "会话-冷却", &wx.target_id, Some(now));
+    install_binding(&akhub, MODEL, "会话-冷却", &wx.target_id, Some(now), None);
 
     for round in 0..8 {
         let body = strong_body("项目", &format!("第 {round} 轮"), "会话-冷却");
@@ -789,6 +804,53 @@ async fn serving_a_request_refreshes_the_sample_clock() {
         stats.last_sample_at >= before && stats.last_sample_at <= after,
         "采样时刻必须是真实时间（before={before} after={after} got={}）",
         stats.last_sample_at
+    );
+}
+
+/// ② 上下文被压缩过 → 换号是免费的，迁移冷却不再挡着（§10.1 修订）。
+///
+/// 与"冷却期内不许翻盘"用完全相同的分数格局与迁移时刻，唯一的差别是绑定时
+/// 记录的请求体积：一个是 None（不知道），一个是 1MB（而这次请求只有几百字节）。
+/// 后者说明上下文刚被 /compact 砍过，上游那份前缀缓存整段失效。
+#[tokio::test]
+async fn a_context_rewrite_makes_migration_free() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wx = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    let wy = wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    prime_target(&akhub, &wx.target_id, 2000, 20, akhub::storage::now_unix());
+    prime_target(&akhub, &wy.target_id, 120, 900, akhub::storage::now_unix());
+
+    let now = akhub::storage::now_unix();
+    // 刚迁移过（在冷却里），但绑定时记录的是一个 1MB 的上下文。
+    install_binding(
+        &akhub,
+        MODEL,
+        "会话-压缩",
+        &wx.target_id,
+        Some(now),
+        Some(1_000_000),
+    );
+
+    for round in 0..8 {
+        let body = strong_body("项目", &format!("第 {round} 轮"), "会话-压缩");
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert!(
+        y.requests() > 0,
+        "压缩之后迁移应当是免费的（X={} Y={}）",
+        x.requests(),
+        y.requests()
     );
 }
 

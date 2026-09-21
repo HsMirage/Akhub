@@ -774,9 +774,20 @@ pub fn pin_is_outpaced(plan: &Plan, pinned_id: &str, margin: f64) -> bool {
         .iter()
         .find(|candidate| candidate.target.target.id == pinned_id)
     {
-        Some(pinned) => best > pinned.score.total * (1.0 + margin),
+        Some(pinned) => score_is_outpaced(pinned.score.total, best, margin),
         None => false,
     }
+}
+
+/// 挑战者是不是已经明显超过在位者（§10.1 修订的纯数值部分）。
+///
+/// 用**绝对分差**，不用相对比值：总分被 clamp 在 [0.01, 1.0]，比值在分数接近
+/// 1.0 时会给出一个永远够不到的门槛（0.944 × 1.10 = 1.038），于是钉住又变成
+/// 绝对钉子。这里还额外把门槛截断到"离满分还剩多少"的 90%，保证一个接近满分
+/// 的挑战者始终抢得走。
+pub fn score_is_outpaced(pinned: f64, best: f64, margin: f64) -> bool {
+    let headroom = (1.0 - pinned).max(0.0) * 0.9;
+    best > pinned + margin.min(headroom)
 }
 
 /// 粘性绑定是否还能继续使用（§10.2）。
@@ -987,6 +998,23 @@ mod tests {
                 now: std::time::Instant::now(),
             }
         };
+    }
+
+    /// ③ 的守门判定：绝对分差，且门槛永远不高于"离满分还剩多少"（§10.1 修订）。
+    #[test]
+    fn the_escape_margin_is_absolute_and_never_unreachable() {
+        // 小幅领先不够。
+        assert!(!score_is_outpaced(0.90, 0.92, 0.03));
+        // 领先超过绝对门槛就够。
+        assert!(score_is_outpaced(0.90, 0.94, 0.03));
+        // 关键回归：在位者分数很高时，相对比值会给出够不到的门槛
+        // （0.944 × 1.10 = 1.038 > 1.0），于是钉住永远打不破。绝对分差没有
+        // 这个问题，而且天花板截断保证满分挑战者一定抢得走。
+        assert!(score_is_outpaced(0.944, 1.0, 0.09));
+        // 在位者已经接近满分时，挑战者至多也就 1.0，抢不走是合理的。
+        assert!(!score_is_outpaced(1.0, 1.0, 0.03));
+        // 门槛再大也不会高过天花板：0.99 的在位者配 0.5 的门槛，1.0 仍然抢得走。
+        assert!(score_is_outpaced(0.99, 1.0, 0.5));
     }
 
     #[test]

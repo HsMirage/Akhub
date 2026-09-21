@@ -479,12 +479,20 @@ async fn forward_inner<'a>(
     let escaped = !soft
         && !chain_bound
         && existing.as_ref().is_some_and(|binding| {
-            !sticky::migrate_cooling_down(now_unix, binding.migrated_at)
-                && routing::pin_is_outpaced(
-                    &plan,
-                    &binding.target_id,
-                    sticky::migrate_margin(forward.request_bytes, now_unix - binding.last_used_at),
-                )
+            // ② 上下文刚被压缩过（输入体积掉了一半以上）：上游那份前缀缓存整段
+            // 失效，这一刻换号是免费的，所以不再让迁移冷却挡着。
+            let rewritten =
+                sticky::context_was_rewritten(binding.context_bytes, forward.request_bytes);
+            let cooling = sticky::migrate_cooling_down(now_unix, binding.migrated_at);
+            let mut margin =
+                sticky::migrate_margin(forward.request_bytes, now_unix - binding.last_used_at);
+            // 冷却只限制"多久能搬一次"，不阻止"搬回去"。刚迁移过的键把门槛抬高
+            // 三倍，让这段窗口只容得下真正悬殊的差距，避免两个接近的目标隔一个
+            // 冷却期就互相翻盘、反复重建前缀缓存。
+            if sticky::recently_migrated(now_unix, binding.migrated_at) {
+                margin *= sticky::SETTLE_MARGIN_FACTOR;
+            }
+            (rewritten || !cooling) && routing::pin_is_outpaced(&plan, &binding.target_id, margin)
         });
     if escaped {
         // 没走绑定，就不是粘性命中；但仍然把新鲜度写下来，这样请求记录里
@@ -1135,6 +1143,7 @@ impl Walk<'_> {
                         &candidate.target.target.id,
                         digest.as_deref(),
                         self.now_unix,
+                        self.forward.request_bytes,
                     );
                 }
                 if self.streaming {

@@ -46,6 +46,7 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
         &wired.target_id,
         None,
         akhub::storage::now_unix(),
+        4096,
     );
     state.runtime.perf.observe(
         &wired.target_id,
@@ -568,10 +569,14 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         sticky_columns.contains("credential_digest"),
         "迁移后 sticky_bindings 缺少 credential_digest"
     );
-    // v13：粘性绑定补"最近一次迁移时刻"，供迁移冷却用（§10.1 修订）。
+    // v13/v14：粘性绑定补"最近一次迁移时刻"与"绑定时请求体大小"（§10.1 修订）。
     assert!(
         sticky_columns.contains("migrated_at"),
         "迁移后 sticky_bindings 缺少 migrated_at：{sticky_columns:?}"
+    );
+    assert!(
+        sticky_columns.contains("context_bytes"),
+        "迁移后 sticky_bindings 缺少 context_bytes：{sticky_columns:?}"
     );
     // v11/v12：上游类型先归一、再整个停用（§4.2）。这一列现在是历史遗留，
     // 旧值不该让账号加载失败，新写入也不该再碰它。
@@ -605,7 +610,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

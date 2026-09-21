@@ -46,6 +46,9 @@ pub struct Binding {
     /// 注意它和 `bound_at`/`last_used_at` 的区别：后两者每次成功调用都会刷新，
     /// 所以拿它们做迁移迟滞等于没有迟滞（每次都被推到现在）。
     pub migrated_at: Option<i64>,
+    /// 上次绑定时请求体有多大。上下文被压缩（/compact）会把它砍掉一大截，
+    /// 那一刻上游的前缀缓存整段失效，迁移不该再受冷却约束（§10.1 修订）。
+    pub context_bytes: Option<i64>,
 }
 
 /// 粘性键：分组 + 逻辑模型 + 推导出的标识摘要。
@@ -272,6 +275,8 @@ impl Bindings {
     ///
     /// `credential_digest` 是这次真正使用的 Key 的摘要，`None` 表示这次
     /// 调用没有凭据语义。
+    // 8 个参数都是"绑定身份"的不同事实，拆成结构体只会把同一个东西搬两次。
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &self,
         key: Key,
@@ -280,6 +285,7 @@ impl Bindings {
         target_id: &str,
         credential_digest: Option<&str>,
         now: i64,
+        context_bytes: usize,
     ) {
         let mut guard = crate::sync::write(&self.inner);
         if guard.len() >= MAX_BINDINGS && !guard.contains_key(&key) {
@@ -287,16 +293,26 @@ impl Bindings {
         }
         // 迁移迟滞的锚点必须只在**目标真的变了**的时候推进。每次成功都重绑
         // 会把 bound_at/last_used_at 一起刷到现在，用它们做迟滞等于没做。
-        let migrated_at = match guard.get(&key).and_then(|entry| {
+        let previous = guard.get(&key).and_then(|entry| {
             entry
                 .state
                 .lock()
                 .ok()
                 .map(|state| (state.target_id.clone(), state.migrated_at))
-        }) {
-            Some((previous, migrated_at)) if previous == target_id => migrated_at,
+        });
+        let migrated_at = match &previous {
+            Some((previous, migrated_at)) if *previous == target_id => *migrated_at,
             _ => Some(now),
         };
+        if let Some((previous, _)) = &previous
+            && previous != target_id
+        {
+            tracing::info!(
+                target = target_id,
+                from = previous.as_str(),
+                "粘性绑定迁移到另一个目标（§10.1 修订）"
+            );
+        }
         guard.insert(
             key,
             Arc::new(BindingEntry {
@@ -308,6 +324,7 @@ impl Bindings {
                     bound_at: now,
                     last_used_at: now,
                     migrated_at,
+                    context_bytes: Some(context_bytes as i64),
                 }),
             }),
         );
@@ -354,6 +371,7 @@ impl Bindings {
                     bound_at: state.bound_at,
                     last_used_at: state.last_used_at,
                     migrated_at: state.migrated_at,
+                    context_bytes: state.context_bytes,
                 })
             })
             .collect()
@@ -374,6 +392,7 @@ impl Bindings {
                         bound_at: row.bound_at,
                         last_used_at: row.last_used_at,
                         migrated_at: row.migrated_at,
+                        context_bytes: row.context_bytes,
                     }),
                 }),
             );
@@ -477,6 +496,34 @@ pub fn cache_is_cold(since_last_hit: i64) -> bool {
 /// 把"翻盘"的频率限制在每会话每 10 分钟一次，最坏情况的缓存损失因此有上界。
 pub const MIGRATE_COOLDOWN: i64 = 10 * 60;
 
+/// 上下文被压缩之后，这次请求的输入会明显小于绑定时记录的那个体积。
+///
+/// 压缩把上下文从几十万 Token 砍到几万，上游那份前缀缓存随之整段失效——
+/// 这一刻换号是**免费**的，所以不该再被迁移冷却挡住（§10.1 修订）。
+///
+/// 只在体积**掉到一半以下**时才算：体积随对话单调增长，只有压缩会让它倒退。
+pub fn context_was_rewritten(bound_bytes: Option<i64>, request_bytes: usize) -> bool {
+    match bound_bytes {
+        Some(previous) if previous > 0 => (request_bytes as i64) * 2 < previous,
+        _ => false,
+    }
+}
+
+/// 刚刚迁移过的键要额外忍多久（§10.1 修订）。
+///
+/// 冷却只限制"多久能搬一次"，不阻止"搬回去"：两个分数接近的目标可能每隔一个
+/// 冷却期就互相翻盘一次，每次都把前缀缓存重建一遍。所以迁移后的一段时间里把
+/// 门槛抬高三倍，让这段"刚搬完"的窗口只容得下真正悬殊的差距。
+pub const MIGRATE_SETTLE: i64 = 60 * 60;
+
+/// 这条绑定是不是刚刚才迁移过（§10.1 修订）。
+pub fn recently_migrated(now: i64, migrated_at: Option<i64>) -> bool {
+    matches!(migrated_at, Some(at) if now - at < MIGRATE_SETTLE)
+}
+
+/// 刚迁移过时门槛要乘的倍数。
+pub const SETTLE_MARGIN_FACTOR: f64 = 3.0;
+
 /// 这条绑定现在还在迁移冷却里吗（§10.1 修订）。
 pub fn migrate_cooling_down(now: i64, migrated_at: Option<i64>) -> bool {
     match migrated_at {
@@ -487,15 +534,19 @@ pub fn migrate_cooling_down(now: i64, migrated_at: Option<i64>) -> bool {
 
 /// 允许迁移所需的分数领先幅度（§10.1 修订）。
 ///
+/// **是绝对分差，不是相对比值。** 总分被 clamp 在 [0.01, 1.0]，用比值的话，
+/// 在位者 0.944（现场就是这么多）配 10% 门槛会得到 1.038——一个永远够不到的
+/// 数，钉住等于没放开，正是要修的那个病。绝对分差没有这个上界问题。
+///
 /// 门槛跟着"缓存重建的代价"走：上下文越大，重建一次越贵，就越不该为了
 /// 一点点速度差搬家；缓存已经半凉（4~6 分钟没命中）时只剩一半代价，门槛减半。
 /// 完全凉透的情形由 cache_is_cold 直接重新抽签，走不到这里。
 pub fn migrate_margin(request_bytes: usize, since_last_hit: i64) -> f64 {
     let base = match request_bytes {
-        bytes if bytes < 32 * 1024 => 0.10,
-        bytes if bytes < 160 * 1024 => 0.15,
-        bytes if bytes < 640 * 1024 => 0.25,
-        _ => 0.35,
+        bytes if bytes < 32 * 1024 => 0.03,
+        bytes if bytes < 160 * 1024 => 0.045,
+        bytes if bytes < 640 * 1024 => 0.075,
+        _ => 0.105,
     };
     if freshness(since_last_hit) <= 0.5 {
         base * 0.5
@@ -539,6 +590,52 @@ mod tests {
             &HeaderMap::new(),
             body,
         )
+    }
+
+    /// ④ 迁移门槛：绝对分差、随上下文体积上升、缓存半凉时减半（§10.1 修订）。
+    #[test]
+    fn the_migration_margin_grows_with_the_context_worth() {
+        // 小请求最便宜：只要对方明显更好就该走。
+        assert!((migrate_margin(4 * 1024, 0) - 0.03).abs() < 1e-12);
+        // 上下文越大，重建一次越贵，门槛越高，且单调。
+        let small = migrate_margin(4 * 1024, 0);
+        let medium = migrate_margin(100 * 1024, 0);
+        let large = migrate_margin(1024 * 1024, 0);
+        assert!(small < medium && medium < large, "{small} {medium} {large}");
+        // 缓存半凉（4 分钟以上没命中）：剩下的那点缓存不值得继续忍，门槛减半。
+        assert!((migrate_margin(4 * 1024, 5 * 60) - small / 2.0).abs() < 1e-12);
+        // 门槛必须始终小于 1：它跟分数同量纲，超过 1 就等于永远够不到。
+        assert!(large < 1.0);
+    }
+
+    /// ② 上下文被压缩后体积会倒退，据此识别重写（§10.1 修订）。
+    #[test]
+    fn a_shrinking_context_counts_as_a_rewrite() {
+        // 体积随对话单调增长：没掉一半就不算重写。
+        assert!(!context_was_rewritten(Some(100_000), 90_000));
+        assert!(!context_was_rewritten(Some(100_000), 60_000));
+        // 掉到一半以下：压缩把上下文砍掉了。
+        assert!(context_was_rewritten(Some(100_000), 40_000));
+        // 升上来的旧快照（None）不触发任何重平衡。
+        assert!(!context_was_rewritten(None, 1_000));
+        assert!(!context_was_rewritten(Some(0), 1_000));
+    }
+
+    /// ③ 的沉降窗口：刚搬完的一小时内要额外忍（§10.1 修订）。
+    #[test]
+    fn a_just_migrated_key_keeps_settling() {
+        assert!(recently_migrated(10_000, Some(10_000 - 700)));
+        assert!(recently_migrated(10_000, Some(10_000 - MIGRATE_SETTLE + 1)));
+        assert!(!recently_migrated(
+            10_000,
+            Some(10_000 - MIGRATE_SETTLE - 1)
+        ));
+        // 从没迁移过的绑定不在沉降期。
+        assert!(!recently_migrated(10_000, None));
+        // 沉降窗口必须比迁移冷却长，否则它没有意义（常量断言交给编译器，
+        // 这里只钉住语义上的关系，避免 clippy 的 assertions_on_constants）。
+        const _: () = assert!(MIGRATE_SETTLE > MIGRATE_COOLDOWN);
+        const _: () = assert!(SETTLE_MARGIN_FACTOR > 1.0);
     }
 
     #[test]
@@ -664,11 +761,11 @@ mod tests {
     fn bindings_slide_their_expiry_on_every_real_use() {
         let bindings = Bindings::new();
         let (key, _) = derive_prefix(&json!({"system": "s"})).unwrap();
-        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000);
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000, 4096);
 
         // 一次真正使用（调用成功之后重新绑定）把过期时间往后推。
         assert_eq!(bindings.get(&key, 4_000).unwrap().target_id, "tgt-a");
-        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 4_000);
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 4_000, 4096);
         assert!(bindings.get(&key, 4_000 + 3_500).is_some());
         // 从**上次真正使用**起超过 1 小时才过期。光查询不算使用——否则
         // "距上次使用多久"这个量会被查询本身抹掉（见
@@ -680,7 +777,7 @@ mod tests {
     fn bindings_survive_a_restart_and_lose_deleted_targets() {
         let bindings = Bindings::new();
         let (key, _) = derive_prefix(&json!({"system": "s"})).unwrap();
-        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000);
+        bindings.bind(key.clone(), "g1", "m1", "tgt-a", None, 1_000, 4096);
 
         let exported = bindings.export();
         assert_eq!(exported.len(), 1);
@@ -743,7 +840,7 @@ mod tests {
     fn get_never_mutates_the_binding_timestamps() {
         let bindings = Bindings::new();
         let key = derive_prefix(&json!({"system": "前缀"})).unwrap().0;
-        bindings.bind(key.clone(), "g1", "m1", "t1", None, 1_000);
+        bindings.bind(key.clone(), "g1", "m1", "t1", None, 1_000, 4096);
 
         // 15 分钟后再查：必须如实报告"15 分钟前用过"，而不是把时间推到此刻。
         let later = 1_000 + 15 * 60;
@@ -760,7 +857,7 @@ mod tests {
         assert_eq!(bindings.get(&key, later).unwrap().last_used_at, 1_000);
 
         // 真正的使用（成功之后重新 bind）才把时间推到现在。
-        bindings.bind(key.clone(), "g1", "m1", "t1", None, later);
+        bindings.bind(key.clone(), "g1", "m1", "t1", None, later, 4096);
         assert_eq!(bindings.get(&key, later).unwrap().last_used_at, later);
     }
 
@@ -771,13 +868,13 @@ mod tests {
         // 填满到上限，每条的最后使用时间依次递增：最先写入的最旧。
         for i in 0..MAX_BINDINGS {
             let (key, _) = derive_prefix(&json!({"system": format!("项目 {i}")})).unwrap();
-            bindings.bind(key, "g1", "m1", "t1", None, i as i64);
+            bindings.bind(key, "g1", "m1", "t1", None, i as i64, 4096);
         }
         assert_eq!(bindings.len(), MAX_BINDINGS);
 
         // 再写一条，触发按批淘汰。
         let (fresh, _) = derive_prefix(&json!({"system": "新项目"})).unwrap();
-        bindings.bind(fresh.clone(), "g1", "m1", "t2", None, 1_000_000);
+        bindings.bind(fresh.clone(), "g1", "m1", "t2", None, 1_000_000, 4096);
         assert!(
             bindings.len() <= MAX_BINDINGS,
             "淘汰后不该超过上限：{}",

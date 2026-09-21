@@ -40,7 +40,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
 /// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
 /// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -441,6 +441,17 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .execute(pool)
                 .await
                 .context("迁移 sticky_bindings.migrated_at 失败")?;
+        }
+    }
+    if from < 14 {
+        // v14：粘性绑定补"上次绑定时请求体有多大"，用来识别上下文重写（§10.1 修订）。
+        // 旧快照为 NULL，含义是"不知道"，不触发任何重平衡。
+        let sticky_columns = table_columns(pool, "sticky_bindings").await?;
+        if !sticky_columns.contains("context_bytes") {
+            sqlx::query("ALTER TABLE sticky_bindings ADD COLUMN context_bytes INTEGER")
+                .execute(pool)
+                .await
+                .context("迁移 sticky_bindings.context_bytes 失败")?;
         }
     }
     if from < 10 {
