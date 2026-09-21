@@ -348,6 +348,7 @@ mod tests {
             },
             &crate::routing::score::Sample {
                 success: true,
+                counts: true,
                 first_token: None,
                 total: Duration::from_millis(1200),
                 output_tokens: Some(100),

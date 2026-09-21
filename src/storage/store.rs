@@ -18,6 +18,16 @@ use crate::domain::{
 /// 于是整个删掉。列本身留着：老库上的 NOT NULL 约束拿不掉，直接删列还会破坏
 /// 不认识新结构的旧二进制。空串即“这台实例已经不管理这一列”。
 const LEGACY_UPSTREAM_TYPE: &str = "";
+
+/// "一次请求成功"的统一 SQL 口径（§6.2、§6.8、§22）。
+///
+/// 成功 = 2xx **且**没有留下任何网关错误码。两个条件缺一不可：客户端中途断开
+/// 时响应头早就是 200 了（`client_gone`），流内错误同理——只看状态码会把它们
+/// 算进成功率，概览与成本页就会拿出比实际乐观的成绩单。
+///
+/// 用一次 [`format!`] 拼进各条聚合查询：`sqlx::query` 只接受字面量 SQL，而
+/// 拼接进去的只有这个常量，不含任何外部输入。
+const SUCCESS: &str = "http_status >= 200 AND http_status < 300 AND error_code IS NULL";
 /// 一个账号的全部加密凭据信封。
 ///
 /// 更新时 `None` 表示"保持原值"——后台不提供读取完整 Key 的接口（§23.2），
@@ -1561,15 +1571,16 @@ impl Store {
 
     /// 概览统计（§6.2）：窗口内的请求数、成功数、队列超时数与耗时样本。
     pub async fn request_stats(&self, since: i64, samples: i64) -> Result<RequestStats> {
-        let (total, success, queue_timeouts): (i64, i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*),
-                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END),
+        let (total, success, queue_timeouts): (i64, i64, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*),
+                    SUM(CASE WHEN {SUCCESS} THEN 1 ELSE 0 END),
                     SUM(CASE WHEN error_code = 'queue_timeout' THEN 1 ELSE 0 END)
-             FROM request_records WHERE started_at >= ?",
-        )
-        .bind(since)
-        .fetch_one(&self.pool)
-        .await?;
+             FROM request_records WHERE started_at >= ?"
+            )))
+            .bind(since)
+            .fetch_one(&self.pool)
+            .await?;
         let durations: Vec<i64> = sqlx::query_scalar(
             "SELECT duration_ms FROM request_records
              WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?",
@@ -1597,14 +1608,14 @@ impl Store {
         now: i64,
     ) -> Result<Vec<TrendPoint>> {
         let bucket = bucket_secs.max(1);
-        let rows = sqlx::query(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT (started_at / ?) * ? AS bucket,
                     COUNT(*) AS requests,
-                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END) AS success
+                    SUM(CASE WHEN {SUCCESS} THEN 1 ELSE 0 END) AS success
              FROM request_records
              WHERE started_at >= ? AND started_at <= ?
-             GROUP BY bucket ORDER BY bucket",
-        )
+             GROUP BY bucket ORDER BY bucket"
+        )))
         .bind(bucket)
         .bind(bucket)
         .bind(since)
@@ -1766,23 +1777,23 @@ impl Store {
 
     /// 成本页聚合（§6.8）：按"逻辑模型 + 账号"统计成功的请求数与 Token 用量。
     ///
-    /// 只统计成功请求（HTTP 2xx）：失败请求没有产生任何上游消耗，把它算进
-    /// 流量占比会扭曲加权倍率。聚合在 SQL 里完成，成本页不拉明细行。
+    /// 只统计成功请求（2xx 且无错误码）：失败请求没有产生任何上游消耗，
+    /// 把它算进流量占比会扭曲加权倍率。聚合在 SQL 里完成，成本页不拉明细行。
     ///
     /// Token 口径说明：`request_records` 有意不存正文与 usage（§6.6），所以
     /// 这里的 Token 用量以响应侧上报的输出 Token 之和为准——它已经随健康
     /// 评分进入内存，但按元数据表可得的口径只有请求数。Token 列当前恒为 0，
     /// 前端在缺 Token 时退化为按请求数占比展示，绝不虚构 token 数。
     pub async fn cost_usage(&self, since: i64) -> Result<Vec<CostUsageRow>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT group_id, logical_model, account_id, COUNT(*) AS requests,
                     SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) AS tokens
              FROM request_records
-             WHERE started_at >= ? AND http_status >= 200 AND http_status < 300
+             WHERE started_at >= ? AND {SUCCESS}
                AND group_id IS NOT NULL AND logical_model IS NOT NULL
                AND account_id IS NOT NULL
-             GROUP BY group_id, logical_model, account_id",
-        )
+             GROUP BY group_id, logical_model, account_id"
+        )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
@@ -1806,14 +1817,14 @@ impl Store {
     /// 加权均倍率必须按请求级样本平均，而不是按账号倍率平均——后者会被
     /// 流量占比扭曲（§6.8 的口径要求）。SQL 聚合给出 (模型, 倍率, 次数)。
     pub async fn cost_multiplier_samples(&self, since: i64) -> Result<Vec<CostSampleRow>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT group_id, logical_model, effective_multiplier, COUNT(*) AS requests
              FROM request_records
-             WHERE started_at >= ? AND http_status >= 200 AND http_status < 300
+             WHERE started_at >= ? AND {SUCCESS}
                AND group_id IS NOT NULL AND logical_model IS NOT NULL
                AND effective_multiplier IS NOT NULL
-             GROUP BY group_id, logical_model, effective_multiplier",
-        )
+             GROUP BY group_id, logical_model, effective_multiplier"
+        )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
@@ -2471,14 +2482,14 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         // 按（桶、目标、协议、流式）聚合；target_id 为空的记录不参与目标维度聚合。
-        let result = sqlx::query(
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO performance_buckets (bucket_start, target_id, protocol, streaming,
                 requests, success, total_ms_sum, first_token_sum, first_token_count,
                 output_tokens_sum, rate_limited, server_errors, protocol_errors)
              SELECT (started_at / ?) * ? AS bucket_start,
                     target_id, protocol, streaming,
                     COUNT(*),
-                    SUM(CASE WHEN http_status >= 200 AND http_status < 300 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN {SUCCESS} THEN 1 ELSE 0 END),
                     SUM(duration_ms),
                     SUM(COALESCE(first_token_ms, 0)),
                     SUM(CASE WHEN first_token_ms IS NULL THEN 0 ELSE 1 END),
@@ -2488,8 +2499,8 @@ impl Store {
                     SUM(CASE WHEN error_code = 'upstream_exhausted' THEN 1 ELSE 0 END)
              FROM request_records
              WHERE started_at >= ? AND started_at < ? AND target_id IS NOT NULL
-             GROUP BY bucket_start, target_id, protocol, streaming",
-        )
+             GROUP BY bucket_start, target_id, protocol, streaming"
+        )))
         .bind(bucket)
         .bind(bucket)
         .bind(since)
@@ -3499,6 +3510,97 @@ mod tests {
 
         assert_eq!(store.prune_request_records(1_002, 100).await.unwrap(), 2);
         assert_eq!(store.list_request_records(10, 0).await.unwrap().len(), 1);
+    }
+
+    /// 中断的请求（响应头 200、但带错误码）不得被算成成功（§6.2、§6.8、§22）。
+    ///
+    /// 线上真实故障：Codex 掉线时 Akhub 记成 200 成功，概览的成功率与成本页
+    /// 的流量占比因此长期偏高。判定必须同时看状态码与错误码。
+    #[tokio::test]
+    async fn an_aborted_request_is_not_counted_as_success() {
+        let store = store().await;
+        let mut records = Vec::new();
+        for (index, (status, error)) in [
+            (200, None),
+            (200, Some("client_gone")),
+            (200, Some("upstream_protocol_error")),
+            (500, Some("internal_error")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            records.push(RequestRecord {
+                request_id: format!("req_{index}"),
+                started_at: 1_000 + index as i64,
+                duration_ms: 20,
+                protocol: Protocol::OpenAiResponses,
+                streaming: true,
+                group_id: Some("g".into()),
+                logical_model: Some("m".into()),
+                target_id: Some("tgt-a".into()),
+                account_id: Some("acc".into()),
+                upstream_model: Some("m".into()),
+                request_bytes: 256,
+                upstream_status: Some(200),
+                http_status: status,
+                error_code: error.map(str::to_string),
+                endpoint: Some("responses".into()),
+                degraded: None,
+                effective_multiplier: Some(Multiplier::ONE),
+                cheapest_multiplier: Some(Multiplier::ONE),
+                dearest_multiplier: Some(Multiplier::ONE),
+                attempts: 1,
+                first_token_ms: None,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                config_version: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                sticky_wait_ms: None,
+                sticky_freshness: None,
+                output_tps: None,
+                multiplier_source: None,
+                quota_status: None,
+                filter_summary: None,
+                selected_layer: None,
+                attempts_detail: Vec::new(),
+                queued_ms: 0,
+                sticky_hit: false,
+            });
+        }
+        store.insert_request_records(&records).await.unwrap();
+
+        // 只有第一条（2xx 且无错误码）算成功。
+        let stats = store.request_stats(0, 10).await.unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.success, 1, "带错误码的 200 不是成功");
+
+        let trend = store.request_trend(0, 3_600, 2_000).await.unwrap();
+        assert_eq!(trend.iter().map(|p| p.success).sum::<i64>(), 1);
+
+        // 成本口径：中断的请求没有产生可归因的消耗，不得进流量占比。
+        let usage = store.cost_usage(0).await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].requests, 1);
+        let samples = store.cost_multiplier_samples(0).await.unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].requests, 1);
+
+        // 分钟桶与上面同一口径（§22）。
+        store
+            .rollup_performance_buckets(0, 4_000, 3_600)
+            .await
+            .unwrap();
+        let buckets = store
+            .list_performance_buckets(0, 4_000, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            buckets.iter().map(|bucket| bucket.success).sum::<i64>(),
+            1,
+            "分钟桶也必须把中断排除在成功之外：{buckets:?}"
+        );
     }
 
     #[tokio::test]

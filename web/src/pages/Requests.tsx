@@ -85,13 +85,21 @@ function toRequestFilters(form: RequestFilterForm): RequestFilters {
   return filters;
 }
 
+/** 上游没上报用量时的提示：说清"是没人报"，而不是"没记录"。 */
+const USAGE_MISSING_HINT =
+  "上游没有在这次响应里上报 usage（或流没走到收尾事件）。Akhub 不估算 Token，缺就是空。" +
+  "如果整个上游都不上报，请确认它的 OpenAI/Anthropic 兼容实现是否返回 usage。" +
+  "请求记录里已点的行会显示这次流的结尾状态（中断的记 client_gone）。";
+
+/** Token 一栏：缺失时不留白，明确说"上游未上报"（§6.6、§6.8）。 */
 function formatTokenPair(input: number | null, output: number | null): string {
-  if (input === null || output === null) return "—";
+  if (input === null || output === null) return "上游未上报";
   return `${input.toLocaleString()} / ${output.toLocaleString()}`;
 }
 
+/** 首字延迟：没等到首个语义事件时是"未到达"，不是 0 秒。 */
 function formatFirstToken(ms: number | null): string {
-  return ms === null ? "—" : `${(ms / 1000).toFixed(1)}s`;
+  return ms === null ? "未到达" : `${(ms / 1000).toFixed(1)}s`;
 }
 
 function attemptTarget(attempt: AttemptRecord): string {
@@ -325,6 +333,7 @@ export function Requests({
       "请求体积",
       "输入Token",
       "输出Token",
+      // 上游未上报时留空，并在错误码列同时出现 client_gone 之类的结局标识（§18.1）。
       "首字ms",
       "耗时ms",
       "状态码",
@@ -741,7 +750,16 @@ export function Requests({
                         </span>
                       </td>
                       <td className="cell-dim">{formatBytes(record.request_bytes)}</td>
-                      <td className="mono cell-dim">{formatTokenPair(record.input_tokens, record.output_tokens)}</td>
+                      <td
+                        className="mono cell-dim"
+                        title={
+                          record.input_tokens === null || record.output_tokens === null
+                            ? USAGE_MISSING_HINT
+                            : `输入 ${record.input_tokens.toLocaleString()} · 输出 ${record.output_tokens.toLocaleString()}`
+                        }
+                      >
+                        {formatTokenPair(record.input_tokens, record.output_tokens)}
+                      </td>
                       <td className="mono cell-dim">{formatFirstToken(record.first_token_ms)}</td>
                       <td className="cell-dim">{formatDuration(record.duration_ms)}</td>
                       <td className="cell-dim" style={{ fontSize: 12 }}>
@@ -844,7 +862,9 @@ export function Requests({
                               </span>
                               <span>
                                 <b>思考 Token</b>{" "}
-                                <span className="mono">{record.reasoning_tokens ?? "—"}</span>
+                                <span className="mono">
+                                  {record.reasoning_tokens ?? "未上报"}
+                                </span>
                               </span>
                               <span className="request-diagnostics-filter">
                                 <b>候选过滤</b>{" "}

@@ -13,7 +13,9 @@ use akhub::domain::{Limits, Protocol};
 use axum::Router;
 use axum::response::IntoResponse;
 use axum::routing::post;
-use common::{TargetSpec, client, spawn_akhub, spawn_akhub_with, wire_target};
+use common::{
+    Behavior, FakeUpstream, TargetSpec, client, spawn_akhub, spawn_akhub_with, wire_target,
+};
 use serde_json::{Value, json};
 
 /// 假上游返回的流式脚本。
@@ -327,4 +329,117 @@ async fn a_cross_protocol_stream_into_responses_uses_a_gateway_id() {
     }
     let row = found.expect("跨协议流也必须登记状态链");
     assert!(row.upstream_id.is_none(), "跨协议没有原生上游 ID");
+}
+
+/// 客户端在流中途断开：状态不是"未知"而是 `client_gone`（§18.1、§24.1）。
+///
+/// 这是线上真实故障的回归：Codex 侧掉线时 Akhub 记录成绿色的 200 成功、
+/// 输入/输出与首字全是空，事后完全看不出这次为什么没有用量。
+#[tokio::test]
+async fn a_client_that_disconnects_mid_stream_is_recorded_as_client_gone() {
+    // `StreamThenHang`：语义增量送出后挂住。只有上游还挂着的时候断开连接，
+    // 才会走到 `Ending::Aborted`；瞬间跑完的流在断开前就结算成 `Completed` 了。
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamThenHang);
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    // 上游吐完第一块语义内容就挂住；此时丢弃响应体 = 客户端掉线，
+    // 生成器被 drop，结算走 `Ending::Aborted`。
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(response);
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("client_gone"),
+        "客户端断开必须留下可排查的稳定标识，而不是伪装成 200 成功：{record:?}"
+    );
+    assert_eq!(record.http_status, 200, "响应头确实已经发出去了");
+    // 这个夹具送出了第一个语义事件，所以首字延迟是真实值；关键是不再凭空
+    // 写一个 0（"未知"与"0 毫秒"在记录页是两种不同的结论）。
+    assert!(record.first_token_ms.is_some(), "{record:?}");
+    assert!(
+        record.input_tokens.is_none() && record.output_tokens.is_none(),
+        "上游没来得及上报用量：这一栏必须是空，而不是 0"
+    );
+}
+
+/// 断开也不能污染目标的可靠性评分（§9.3、§12.3）。
+///
+/// 上游什么都没做错，却因为调用方掉线被扣掉两成成功率，要连着十次成功
+/// 才爬得回来——那是拿一个健康账号给客户端的网络问题买单。
+#[tokio::test]
+async fn a_disconnect_does_not_lower_the_targets_reliability() {
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamThenHang);
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let dimension = akhub::routing::score::Dimension {
+        protocol: Protocol::OpenAiResponses,
+        streaming: true,
+    };
+    let before = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
+    assert_eq!(before.samples, 0, "还没有任何样本");
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(response);
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(record.error_code.as_deref(), Some("client_gone"));
+    let after = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
+    assert_eq!(after.samples, 0, "客户端断开不该进性能样本");
+    assert_eq!(after.success_rate, 1.0, "可靠性不得被断开拉低");
+}
+
+/// 等请求记录真正落库（写入是攒批的，最多 1 秒刷一次）。
+async fn wait_for_record(
+    akhub: &common::Akhub,
+    wanted: usize,
+) -> akhub::storage::store::RequestRecord {
+    for _ in 0..100 {
+        let records = akhub.state.store.list_request_records(5, 0).await.unwrap();
+        if records.len() >= wanted {
+            return records[0].clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    panic!("请求记录没有在预期时间内落库");
 }

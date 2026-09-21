@@ -1104,12 +1104,12 @@ impl Walk<'_> {
                             dimension,
                             started,
                             request_started: self.forward.started_at,
-                            first_token: success.first_token.unwrap_or_default(),
+                            first_token: success.first_token,
                             // 首字节：排队的 20 秒也会体现在评分里，而不是只记
                             // 上游吐第一个事件用掉的那 1 毫秒（§9.3）。
-                            first_byte: success
-                                .first_byte
-                                .unwrap_or_else(|| success.first_token.unwrap_or_default()),
+                            // 一个字节都没送出去时留空，让记录如实显示"流中断"
+                            // 而不是"0 毫秒就出字了"。
+                            first_byte: success.first_byte.or(success.first_token),
                             record,
                             admission: Some(admission),
                             responses,
@@ -1126,6 +1126,8 @@ impl Walk<'_> {
                         dimension,
                         &score::Sample {
                             success: true,
+                            // 走到这里的都是真正成功的非流式响应，必须进统计。
+                            counts: true,
                             // 用客户端体感的首字节时间，而不是"响应头之后到首个
                             // 语义事件"那一段：上游先憋响应头时后者接近 0（§9.3）。
                             // 非流式没有首字，退回 None，由总耗时代言。
@@ -1204,6 +1206,9 @@ impl Walk<'_> {
                         dimension,
                         &score::Sample {
                             success: false,
+                            // 走到这里已经排除了"与目标健康无关"的中性失败，
+                            // 所以这一次必须反映在可靠性上（§12.1）。
+                            counts: true,
                             first_token: None,
                             total: started.elapsed(),
                             output_tokens: None,
@@ -2039,7 +2044,7 @@ async fn commit_stream(
                             return Ok(Success {
                                 status,
                                 response: build_response(forward, status, &headers, prepared, body),
-                                first_token: Some(started.elapsed()),
+                                first_token: first_token_of(started.elapsed()),
                                 first_byte: Some(headers_wait + started.elapsed()),
                                 output_tokens: None,
                                 usage_tokens: None,
@@ -2111,7 +2116,7 @@ async fn commit_stream(
                     return Ok(Success {
                         status,
                         response: build_response(forward, status, &headers, prepared, body),
-                        first_token: Some(started.elapsed()),
+                        first_token: first_token_of(started.elapsed()),
                         first_byte: Some(headers_wait + started.elapsed()),
                         output_tokens: None,
                         usage_tokens: None,
@@ -2477,6 +2482,15 @@ fn build_response(
         .header("x-akhub-request-id", forward.request_id)
         .body(body)
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// 首个语义事件是否真的送达过客户端（§6.6、§9.3）。
+///
+/// 流在产出任何语义内容之前就结束（上游断流、或客户端提前断开）时没有
+/// 这一项：那种情况下记录里的"首字延迟 0 毫秒"是一句谎话，用量的缺失也
+/// 就无从解释。
+fn first_token_of(elapsed: Duration) -> Option<Duration> {
+    (!elapsed.is_zero()).then_some(elapsed)
 }
 
 fn copy_response_headers(
@@ -3021,6 +3035,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedParameter);
         assert!(!error.code.is_retryable(), "下游请求本身非法，重试没有意义");
+    }
+
+    /// 没等到首个语义事件时，首字延迟必须是"未知"而不是 0（§6.6）。
+    ///
+    /// 线上真实故障：客户端断开后记录里 `first_token_ms = 0`，看起来像
+    /// "立刻出字了"，实际上是从来没等到。
+    #[test]
+    fn an_unreached_first_event_is_unknown_not_zero() {
+        assert_eq!(first_token_of(Duration::ZERO), None);
+        assert_eq!(
+            first_token_of(Duration::from_millis(920)),
+            Some(Duration::from_millis(920))
+        );
     }
 
     #[tokio::test]

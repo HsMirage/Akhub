@@ -98,6 +98,14 @@ const CODES: Record<string, ErrorCodeInfo> = {
     hint: "请求进行时 Akhub 进程重启，连接被中断。可重试。",
     retryable: true,
   },
+  client_gone: {
+    label: "客户端断开",
+    hint:
+      "下游客户端在流结束前断开了连接（响应头已发送，正文可能只发了一半）。" +
+      "这不是上游故障，重试也救不回这次回答；输入/输出 Token 会因此为空——上游还没上报就断了。" +
+      "若客户端是 New API / sub2api，它们的日志里会看到同名的 end_reason=client_gone。",
+    retryable: true,
+  },
   internal_error: {
     label: "网关内部错误",
     hint: "Akhub 自身处理失败。请查看服务端日志；若可复现请携带请求 ID 反馈。",

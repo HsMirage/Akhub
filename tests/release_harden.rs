@@ -55,6 +55,7 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
         },
         &akhub::routing::score::Sample {
             success: true,
+            counts: true,
             first_token: None,
             total: Duration::from_millis(500),
             output_tokens: Some(10),

@@ -11,8 +11,10 @@
 //! - TPM：只在字节流里真的带回了完整 usage 时按实际值回补；拿不到就保持
 //!   保守预留，绝不估算（§17.2）。
 //! - 性能：首字延迟取提交时刻，总耗时取流结束时刻——首段提交时记的"总耗时"
-//!   只是首字时间，用它喂 EWMA 会系统性高估吞吐。
-//! - 请求记录：流结束才落库，错误流的 `error_code` 不再伪装成成功。
+//!   只是首字时间，用它喂 EWMA 会系统性高估吞吐。客户端断开不进性能样本。
+//! - 请求记录：流结束才落库，错误流的 `error_code` 不再伪装成成功；客户端
+//!   断开记 `client_gone`，与"上游没上报用量"区分开，记录页才说得清这一次
+//!   为什么没有输入/输出。
 //! - Responses：完成后用 `response.completed` 的最终对象补写输出项；流失败
 //!   或客户端中断时删除状态链，让后续引用得到明确的 `response_state_expired`，
 //!   而不是拿到缺失历史后静默继续（§15.2）。
@@ -44,9 +46,12 @@ pub struct StreamSettlement {
     /// 请求开始时间，用于请求记录里的端到端耗时。
     pub request_started: Instant,
     /// 首个语义块时间（首字延迟）。
-    pub first_token: Duration,
+    pub first_token: Option<Duration>,
     /// 客户端体感的首字节时间：排队 + 上游响应头 + 首个语义块（§6.6、§9.3）。
-    pub first_byte: Duration,
+    ///
+    /// 一个字节都没送出去（客户端在首个事件前就断开）时为空——那种情况下
+    /// "首字延迟 0 毫秒"是一句谎话，而记录页正是靠这一项解释流为什么没有用量。
+    pub first_byte: Option<Duration>,
     /// 提交那一刻生成的记录，流结束后才真正落库。
     pub record: RequestRecord,
     /// 健康与限额准入；流结束时释放。
@@ -78,7 +83,25 @@ enum Ending {
     /// 传输中断或流内错误事件。
     Failed(&'static str),
     /// 客户端断开，流被丢弃。
+    ///
+    /// 这不是上游的故障，重试也救不回来：响应头早就发出去了，正文可能已经
+    /// 推了一半，而放弃连接的就是客户端自己。把它与"上游没上报用量"分成两种
+    /// 结局，记录页才回答得了"这次为什么没有输入/输出"。
     Aborted,
+}
+
+impl Ending {
+    /// 落进请求记录 `error_code` 的稳定标识。
+    ///
+    /// `client_gone` 与 New API / sub2api 的同名字段同义：**下游客户端断开**。
+    /// 有了它，记录页不会再把它显示成绿色的 200 成功（§18.1）。
+    fn error_code(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => None,
+            Self::Failed(code) => Some(code),
+            Self::Aborted => Some("client_gone"),
+        }
+    }
 }
 
 /// 把结算绑定到响应体的完整生命周期。
@@ -159,8 +182,11 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
         settlement.dimension,
         &score::Sample {
             success: ending == Ending::Completed,
+            // 客户端断开不是目标的质量信号：它既不算成功也不算失败，
+            // 连样本都不进（§9.3、§12.3）。
+            counts: ending != Ending::Aborted,
             // 样本用首字节而不是首字：评分要反映用户实际等了多久（§9.3）。
-            first_token: Some(settlement.first_byte),
+            first_token: settlement.first_byte,
             // 现在才是真正的"流结束时间"，不是首段提交时间。
             total: settlement.started.elapsed(),
             output_tokens: accounting.output_tokens(),
@@ -172,7 +198,10 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     // 流式的用量与首字延迟只有在这里才拿得到（§6.6、§6.8）。
     // 记录里写**首字节**：一次排了 20 秒队、首个事件随即到达的请求，
     // 首字延迟是 1 毫秒，只有这一项能如实反映那次等待（§24.1）。
-    record.first_token_ms = Some(settlement.first_byte.as_millis() as i64);
+    //
+    // 一个字节都没发出去时留空：不把"没等到"写成 0 毫秒（§6.6 的口径
+    // 与用量一致——不知道就是不知道，绝不编造）。
+    record.first_token_ms = settlement.first_byte.map(|value| value.as_millis() as i64);
     record.input_tokens = accounting.input_tokens().map(|value| value as i64);
     record.output_tokens = accounting.output_tokens().map(|value| value as i64);
     // Token 细分同样只有流结束才拿得到（§11.6）。
@@ -180,7 +209,9 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     record.cache_read_tokens = usage.cache_read.map(|value| value as i64);
     record.cache_write_tokens = usage.cache_write.map(|value| value as i64);
     record.reasoning_tokens = usage.reasoning.map(|value| value as i64);
-    if let Ending::Failed(code) = ending {
+    // 结局写进 `error_code`：客户端断开记 `client_gone`，不再伪装成 200 成功
+    // （§18.1、§24.1）。这是"这次为什么没有输入/输出"的第一手答案。
+    if let Some(code) = ending.error_code() {
         record.error_code = Some(code.to_string());
     }
     // 把流中途记下的能力降级并进请求记录（§14.8）。去重后与发射阶段的
@@ -205,14 +236,16 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     let Some(completion) = settlement.responses else {
         return;
     };
-    match ending {
-        Ending::Completed => {
-            // 用最终响应对象里的输出项补写完整历史；没有最终对象就不补写，
-            // 宁可由后续引用报过期，也不能保存残缺历史。
-            let Some(finished) = accounting.finished_response().cloned() else {
-                delete_state(completion);
-                return;
-            };
+    // 客户端断开要分两种：上游的最终对象已经完整送达（正文早就吐完，只是
+    // 下游没等到收尾就关了连接），这次回答其实是完整的——删掉状态链会让
+    // 用户下一次引用凭空得到 `response_state_expired`。只有真的没有最终对象
+    // 时才删除：宁可由后续引用报过期，也不能保存残缺历史（§15.2）。
+    let finished = match ending {
+        Ending::Failed(_) => None,
+        Ending::Completed | Ending::Aborted => accounting.finished_response().cloned(),
+    };
+    match finished {
+        Some(finished) => {
             let output_items = finished.get("output").cloned();
             let state = completion.state.clone();
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -233,9 +266,9 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
                 .await;
             });
         }
-        // 流失败或客户端中断：删除骨架状态，后续引用会得到明确的过期错误，
-        // 而不是缺了助手轮次却继续发送（§15.2）。
-        Ending::Failed(_) | Ending::Aborted => delete_state(completion),
+        // 流失败、或者断开时连最终对象都没等到：删除骨架状态，后续引用会得到
+        // 明确的过期错误，而不是缺了助手轮次却继续发送（§15.2）。
+        None => delete_state(completion),
     }
 }
 

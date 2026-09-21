@@ -64,6 +64,15 @@ const MIN_FRAME_TARGETS: usize = 2;
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
     pub success: bool,
+    /// 这次采样是否应该影响**目标质量**的判断。
+    ///
+    /// 客户端中途断开（`client_gone`）时它是 `false`：这次请求是下游自己
+    /// 放弃的，上游没有做错任何事。若把它当成失败喂进成功率 EWMA，一次
+    /// 掉线就按 `ALPHA` 扣掉两成可靠性，要连着十次成功才爬得回来——那等于
+    /// 因为调用方掉线而惩罚一个健康账号（§9.3、§12.3）。
+    ///
+    /// 与健康状态机的 `Neutral` 是同一个口径：不进统计。
+    pub counts: bool,
     /// 首字或首个语义事件延迟。非流式请求没有这一项。
     pub first_token: Option<Duration>,
     /// 端到端总耗时。
@@ -102,6 +111,11 @@ impl Stats {
     }
 
     fn observe(&mut self, sample: &Sample) {
+        // 客户端断开连样本都不算：它既不代表目标成功，也不代表目标失败，
+        // 混进样本数还会让 `is_warm` 提前成立（§9.3）。
+        if !sample.counts {
+            return;
+        }
         self.samples = self.samples.saturating_add(1);
         self.success_rate = ewma(self.success_rate, if sample.success { 1.0 } else { 0.0 });
 
@@ -865,6 +879,7 @@ mod tests {
         for _ in 0..50 {
             stats.observe(&Sample {
                 success: true,
+                counts: true,
                 first_token: Some(Duration::from_millis(1000)),
                 total: Duration::from_millis(4000),
                 output_tokens: Some(400),
@@ -877,6 +892,7 @@ mod tests {
         for _ in 0..20 {
             stats.observe(&Sample {
                 success: true,
+                counts: true,
                 first_token: Some(Duration::from_millis(200)),
                 total: Duration::from_millis(1000),
                 output_tokens: Some(400),
@@ -890,6 +906,7 @@ mod tests {
         let mut stats = Stats::default();
         stats.observe(&Sample {
             success: true,
+            counts: true,
             first_token: Some(Duration::from_millis(1000)),
             total: Duration::from_millis(4000),
             output_tokens: Some(400),
@@ -899,6 +916,7 @@ mod tests {
         // 0.2 秒就 500 的失败请求不该让这个目标显得"很快"。
         stats.observe(&Sample {
             success: false,
+            counts: true,
             first_token: Some(Duration::from_millis(1)),
             total: Duration::from_millis(200),
             output_tokens: None,
@@ -920,6 +938,7 @@ mod tests {
                 dimension,
                 &Sample {
                     success: true,
+                    counts: true,
                     first_token: Some(Duration::from_millis(700)),
                     total: Duration::from_millis(3000),
                     output_tokens: Some(300),
@@ -963,6 +982,7 @@ mod tests {
                 dimension,
                 &Sample {
                     success: true,
+                    counts: true,
                     first_token: None,
                     total: Duration::from_millis(10),
                     output_tokens: None,
