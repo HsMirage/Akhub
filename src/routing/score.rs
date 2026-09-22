@@ -13,8 +13,34 @@ use crate::storage::store::PerfSnapshotRow;
 
 /// EWMA 的平滑系数。0.2 大约相当于"最近 10 次请求主导当前值"。
 const ALPHA: f64 = 0.2;
-/// 样本数低于此值时性能三维使用保守中性分（§9.4 的冷启动规则）。
-pub const MIN_SAMPLES: u64 = 20;
+/// 有效样本量低于此值时性能三维使用保守中性分（§9.4 的冷启动规则）。
+///
+/// 它数的是**时间衰减后的**样本权重，不是累计条数：一个几百条样本但全是
+/// 上周的账号，有效样本量会衰减到阈值以下，于是自动退出"可信"状态、回到
+/// 中性分，并把参照系让给当下有数据的账号（§9.4 修订）。
+///
+/// 取 10 而不是 20：加上时间衰减之后，这个数字**只影响首次接入**——一旦有稳定
+/// 流量，有效样本量会在远高于阈值的地方达到稳态（现场主力约 610，慢账号约 20），
+/// 10 与 20 的差别只剩"新账号多快被采信"。EWMA 的 α=0.2 意味着约 5 次观测就
+/// 主导当前值，10 条已经足够覆盖两个完整的主导窗口。
+pub const MIN_SAMPLES: u64 = 10;
+
+/// 样本权重的半衰期（秒）。
+///
+/// 有效样本量按 `0.5^(闲置时长 / 半衰期)` 衰减。24 小时这个取值由**真实观测速率**
+/// 反推出来，两端都要满足：
+///
+/// - **下界**（慢账号不能被时间衰减踢出参照系）：稳态下 `权重 ≈ 速率 × 半衰期/ln2`，
+///   门槛 10 对应的最低速率是 `10 × ln2 / 半衰期`。现场（gpt-boom / gpt-5.6-sol）
+///   除主力外四个账号的实测速率是 0.71 ~ 2.30 条/小时，半衰期必须 ≥ 10 小时才能让
+///   最慢的那个仍然算"有持续证据"。取 24 小时即门槛 0.29 条/小时，留了约 2.4 倍
+///   余量，同时仍能把"超过一天没有任何观测"判为证据过期。
+/// - **上界**（陈旧证据必须真的过期）：300 条样本的账号闲置约 5 天后跌到门槛以下，
+///   不再以"上周很快"的身份定义参照系、压住当下正常的账号。
+///
+/// 两个约束把取值夹在 10~120 小时之间；24 小时居中，且"最后采样超过一天"本身
+/// 就是值得复核的信号。
+const SAMPLE_HALF_LIFE_SECS: f64 = 24.0 * 3600.0;
 /// 冷启动与缺失数据时的保守中性分。
 ///
 /// 取 0.6 而不是 0 或 1：新目标既不该凭空压过已证明很好的老目标，也不该被
@@ -96,22 +122,36 @@ pub struct Sample {
 /// 一个目标在某个协议、某种流式模式下的 EWMA 当前值。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stats {
+    /// 累计采样条数（只增不减）。用于展示"采了多少条"，不再是可信判据。
     pub samples: u64,
+    /// **带时间衰减的样本权重**：最后一次观测那一刻的有效样本量。
+    ///
+    /// 读取时必须经 `effective_samples` 按闲置时长继续衰减，否则一个几小时
+    /// 没被采样的账号会带着旧权重装作新鲜（§9.4 修订）。
+    pub weight: f64,
     pub success_rate: f64,
     pub first_token_ms: f64,
     pub total_ms: f64,
     pub output_tps: f64,
     /// 最近一次**进统计**的采样时刻（Unix 秒）。0 表示从来没采样过。
     ///
-    /// 评分本身是无时间衰减的 EWMA，所以"分数是多少"和"这个分数有多旧"
-    /// 必须分开看：一个几小时前的 0.9 只是历史，不是现在的证据（§9.5）。
+    /// 它同时是权重的衰减起点（见 `weight`）与探索口粮的陈旧度依据（§9.5）。
     pub last_sample_at: i64,
+}
+
+/// 闲置 `idle_secs` 之后样本权重的残留比例（半衰期见 `SAMPLE_HALF_LIFE_SECS`）。
+fn decay_factor(idle_secs: f64) -> f64 {
+    if idle_secs <= 0.0 {
+        return 1.0;
+    }
+    0.5f64.powf(idle_secs / SAMPLE_HALF_LIFE_SECS)
 }
 
 impl Default for Stats {
     fn default() -> Self {
         Self {
             samples: 0,
+            weight: 0.0,
             // 没有任何样本时先假设一切正常，让新目标有机会拿到第一批流量。
             success_rate: 1.0,
             first_token_ms: 0.0,
@@ -123,17 +163,47 @@ impl Default for Stats {
 }
 
 impl Stats {
-    /// 样本是否已经多到可以信任性能三维（§9.4）。
-    pub fn is_warm(&self) -> bool {
-        self.samples >= MIN_SAMPLES
+    /// 到 `now` 为止的**有效样本量**：按闲置时长对 `weight` 继续衰减。
+    ///
+    /// 从没被采样过时是 0——这是"没有证据"，与"证据过期"区分开（后者仍可能
+    /// 略大于 0，只是不够可信）。
+    pub fn effective_samples(&self, now: i64) -> f64 {
+        if self.weight <= 0.0 {
+            return 0.0;
+        }
+        // 采样时刻未知（老库快照）时按"完全过期"处理，而不是拿当前时间当基准：
+        // 那会让一个几天没请求的目标看起来刚被采样过，正是要修的那个毛病。
+        if self.last_sample_at <= 0 {
+            return 0.0;
+        }
+        self.weight * decay_factor((now - self.last_sample_at).max(0) as f64)
     }
 
+    /// 有效样本量是否够信任性能三维（§9.4 修订）。
+    ///
+    /// 判据是**时间衰减后的**证据量，不是累计条数：一个几百条样本但全是上周的
+    /// 账号会失去可信状态，不再定义参照系、也不再压住当下正常的账号。
+    pub fn is_warm(&self, now: i64) -> bool {
+        self.effective_samples(now) >= MIN_SAMPLES as f64
+    }
+
+    /// 把所有观测按闲置时长一次性衰减掉，然后按观测更新其余 EWMA。
+    ///
+    /// 只在 `observe` 里调用：这样 `Stats` 的其它读取路径全部是纯函数，
+    /// 不需要 `&mut self`，也就不会在"评分时顺手改写状态"这种地方引入竞态。
     fn observe(&mut self, sample: &Sample, now: i64) {
         // 客户端断开连样本都不算：它既不代表目标成功，也不代表目标失败，
         // 混进样本数还会让 `is_warm` 提前成立（§9.3）。
         if !sample.counts {
             return;
         }
+        // 先把已有权重按"距上次采样过了多久"衰减，再补上这一次观测。
+        // 递减式：稳定状态下权重收敛到观测速率的量级（见 SAMPLE_HALF_LIFE_SECS）。
+        //
+        // 走 effective_samples 而不是就地乘衰减因子：这样"不知道有多旧"
+        // （last_sample_at == 0，例如老库快照）会自然归零——它必须重新采样
+        // 才能回到可信状态，而不是靠一次观测就把几百条旧权重全部复活。
+        self.weight = self.effective_samples(now) + 1.0;
         self.samples = self.samples.saturating_add(1);
         self.last_sample_at = now;
         self.success_rate = ewma(self.success_rate, if sample.success { 1.0 } else { 0.0 });
@@ -245,10 +315,12 @@ impl Registry {
                     protocol: dimension.protocol,
                     streaming: dimension.streaming,
                     samples: value.samples as i64,
+                    weight: value.weight,
                     success_rate: value.success_rate,
                     first_token_ms: value.first_token_ms,
                     total_ms: value.total_ms,
                     output_tps: value.output_tps,
+                    last_sample_at: value.last_sample_at,
                     updated_at: now,
                 });
             }
@@ -269,16 +341,25 @@ impl Registry {
                 },
                 Stats {
                     samples: row.samples.max(0) as u64,
+                    // 权重与采样时刻都按真实值恢复，重启才不会凭空"洗白"一个
+                    // 陈旧账号：`last_sample_at` 是**真正的采样时刻**（不是快照的
+                    // `updated_at`——那个每 60 秒就被刷成当前时间，拿它当采样时刻
+                    // 会让几天没请求的目标看起来刚被采样过，陈旧判定与探索口粮
+                    // 一起失效）。
+                    //
+                    // 老库没有 weight 时用累计条数兜底（等价于旧语义）。注意
+                    // last_sample_at 为 0 的行走 effective_samples 会直接归零：
+                    // 兜底的 weight 只用于展示，不会让旧分数重新变得可信。
+                    weight: if row.weight > 0.0 {
+                        row.weight
+                    } else {
+                        row.samples.max(0) as f64
+                    },
                     success_rate: row.success_rate,
                     first_token_ms: row.first_token_ms,
                     total_ms: row.total_ms,
                     output_tps: row.output_tps,
-                    // 快照里**没有**"这条统计最后一次被真实采样是什么时候"——
-                    // `export()` 每 60 秒会把所有行的 `updated_at` 都写成当前时间，
-                    // 一个几天没请求的目标看起来也一样新鲜。所以不能拿它充当采样
-                    // 时刻：那会让陈旧目标在重启后依旧拿不到探索口粮，⑤ 直接失效。
-                    // 诚实的读法是"不知道有多旧"——按陈旧处理，让它们重新被采样。
-                    last_sample_at: 0,
+                    last_sample_at: row.last_sample_at,
                 },
             );
         }
@@ -339,7 +420,7 @@ struct Reference {
 }
 
 impl Reference {
-    fn of(candidates: &[Candidate], cheapest_in_group: Option<Multiplier>) -> Self {
+    fn of(candidates: &[Candidate], cheapest_in_group: Option<Multiplier>, now: i64) -> Self {
         let cheapest = cheapest_in_group
             .map(|m| m.to_f64())
             .or_else(|| {
@@ -354,7 +435,11 @@ impl Reference {
 
         // 只有样本够多的目标才有资格定义参照系：拿一个跑过两次的目标当
         // "全组最快"，会把所有成熟目标都压成低分。
-        let warm = || candidates.iter().filter(|c| c.stats.is_warm());
+        //
+        // "够多"是**时间衰减后**的够多：一个上周很快、此后没人打过的目标不算
+        // 参照系成员，否则它会把"全组最快"这个位置长期占住，让所有当下正常的
+        // 账号得分被压到 0.2 量级（§9.4 修订）。
+        let warm = || candidates.iter().filter(|c| c.stats.is_warm(now));
         // 但**一个**热目标同样不构成参照系：它自动成为"最快"与"吞吐最高"，
         // 三项性能分全部拉满，而冷目标一律中性 0.6——差距与它实际快慢无关。
         // 现场表现就是"最先被抽中的那个账号从此赢家通吃"。不足两个热目标时
@@ -409,7 +494,7 @@ pub fn score_all(
     cheapest_in_group: Option<Multiplier>,
     now: i64,
 ) -> Vec<Score> {
-    let reference = Reference::of(candidates, cheapest_in_group);
+    let reference = Reference::of(candidates, cheapest_in_group, now);
     candidates
         .iter()
         .map(|candidate| score_one(candidate, &reference, weights, now))
@@ -433,8 +518,8 @@ fn score_one(
         (reference.cheapest / own).clamp(0.0, 1.0)
     };
 
-    // 冷启动：真实样本不足时性能三维用保守中性分，倍率维正常参与（§9.4）。
-    let (reliability, first_token, throughput) = if candidate.stats.is_warm() {
+    // 冷启动：有效样本不足时性能三维用保守中性分，倍率维正常参与（§9.4）。
+    let (reliability, first_token, throughput) = if candidate.stats.is_warm(now) {
         let reliability = candidate.stats.success_rate.clamp(0.0, 1.0);
         let first_token =
             if candidate.stats.first_token_ms > 0.0 && reference.fastest_first_token.is_finite() {
@@ -547,6 +632,10 @@ mod tests {
         Multiplier::parse(raw).unwrap()
     }
 
+    /// 测试统一的时间基准：样本都"刚刚采到"，于是时间衰减不起作用，
+    /// 各用例只考察它本来要考察的那条规则。
+    const NOW: i64 = 1_000;
+
     fn warm(multiplier_raw: &str, success: f64, first_token_ms: f64, tps: f64) -> Candidate {
         Candidate {
             target_id: multiplier_raw.into(),
@@ -554,11 +643,15 @@ mod tests {
             multiplier_stale: false,
             stats: Stats {
                 samples: MIN_SAMPLES,
+                // 权重给足以跨过门槛；采样时刻就是测试用的 NOW，于是此刻
+                // （now = NOW）判定为新鲜。last_sample_at 为 0 在新语义里是
+                // "采样时刻未知"，等价于完全过期，不能拿来当"刚采过"。
+                weight: MIN_SAMPLES as f64,
                 success_rate: success,
                 first_token_ms,
                 total_ms: first_token_ms * 4.0,
                 output_tps: tps,
-                last_sample_at: 0,
+                last_sample_at: NOW,
             },
         }
     }
@@ -577,7 +670,7 @@ mod tests {
             warm("0.50", 1.0, 1000.0, 50.0),
             warm("0.51", 1.0, 1000.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert!(
             (scores[2].multiplier - 0.98).abs() < 0.01,
             "{:?}",
@@ -593,7 +686,7 @@ mod tests {
             warm("0.5", 1.0, 800.0, 60.0),
             warm("0.50", 1.0, 800.0, 60.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert_eq!(scores[0].multiplier, 1.0);
         assert_eq!(scores[1].multiplier, 1.0);
         assert_eq!(scores[0].first_token, 1.0);
@@ -606,7 +699,7 @@ mod tests {
             warm("0.05", 1.0, 900.0, 40.0),
             warm("0.08", 1.0, 900.0, 40.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert!(
             (scores[1].multiplier - 0.625).abs() < 0.01,
             "{:?}",
@@ -617,9 +710,10 @@ mod tests {
     #[test]
     fn cold_targets_use_a_neutral_performance_score_but_a_real_multiplier_score() {
         let mut cold = warm("0.1", 1.0, 100.0, 100.0);
-        cold.stats.samples = MIN_SAMPLES - 1;
+        // 可信判据是**有效样本量**（时间衰减后的 weight），不是累计条数。
+        cold.stats.weight = (MIN_SAMPLES - 1) as f64;
         let candidates = vec![cold, warm("0.2", 1.0, 900.0, 40.0)];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
 
         assert_eq!(scores[0].reliability, NEUTRAL);
         assert_eq!(scores[0].first_token, NEUTRAL);
@@ -633,14 +727,14 @@ mod tests {
     fn a_cold_target_cannot_define_the_reference_frame() {
         // 一个只跑过两次、恰好很快的目标不该把所有成熟目标压成低分。
         let mut lucky = warm("0.5", 1.0, 10.0, 500.0);
-        lucky.stats.samples = 2;
+        lucky.stats.weight = 2.0;
         // 另有两个成熟目标，参照系才成立（只有一个热目标时全体中性，见下一个测试）。
         let candidates = vec![
             lucky,
             warm("0.5", 1.0, 1000.0, 50.0),
             warm("0.5", 1.0, 2000.0, 25.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert_eq!(scores[1].first_token, 1.0, "成熟目标仍是参照系里最快的");
         assert_eq!(scores[1].throughput, 1.0);
         // 跑过两次的那个目标（10ms、500tps）没有资格参与参照系。
@@ -661,7 +755,7 @@ mod tests {
             ..only_warm.clone()
         };
 
-        let scores = score_all(&[only_warm, cold], SchedulingWeights::default(), None, 0);
+        let scores = score_all(&[only_warm, cold], SchedulingWeights::default(), None, NOW);
         // 它是参照系里唯一的点，但一个点不构成参照系：不给它满分。
         assert_eq!(
             scores[0].first_token, NEUTRAL,
@@ -682,22 +776,278 @@ mod tests {
             warm("0.5", 1.0, 10.0, 500.0),
             warm("0.5", 1.0, 1000.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert_eq!(scores[0].first_token, 1.0);
         assert_eq!(scores[0].throughput, 1.0);
         assert!(scores[1].first_token < 1.0);
     }
 
-    /// 探索口粮：分数差距悬殊时，弱者仍拿得到足以攒样本的流量（§9.5）。
+    /// 有效样本量随时间衰减：半衰期处恰好剩一半。
+    #[test]
+    fn evidence_decays_with_a_half_life() {
+        let mut stats = Stats::default();
+        // 一瞬间喂 10 条（此刻 weight = 10）。
+        for _ in 0..10 {
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(100)),
+                    total: Duration::from_millis(400),
+                    output_tokens: Some(30),
+                },
+                NOW,
+            );
+        }
+        assert!((stats.effective_samples(NOW) - 10.0).abs() < 1e-9);
+        let half = NOW + SAMPLE_HALF_LIFE_SECS as i64;
+        assert!(
+            (stats.effective_samples(half) - 5.0).abs() < 1e-6,
+            "半衰期处应剩一半，实际 {}",
+            stats.effective_samples(half)
+        );
+        // 两个半衰期后剩四分之一。
+        let two = NOW + 2 * SAMPLE_HALF_LIFE_SECS as i64;
+        assert!((stats.effective_samples(two) - 2.5).abs() < 1e-6);
+        // 累计条数不受衰减影响（它只是"采过多少条"的展示值）。
+        assert_eq!(stats.samples, 10);
+    }
+
+    /// 持续观测会收敛到一个与阈值无关的高位：门槛只影响"多久被采信"，
+    /// 不影响稳定态。这正是"10 与 20 差别不大"的量化依据。
+    #[test]
+    fn steady_state_evidence_dwarfs_the_threshold() {
+        let mut stats = Stats::default();
+        // 每 60 秒一次，跑 30 分钟。
+        let mut at = NOW;
+        for _ in 0..30 {
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(100)),
+                    total: Duration::from_millis(400),
+                    output_tokens: Some(30),
+                },
+                at,
+            );
+            at += 60;
+        }
+        let effective = stats.effective_samples(at);
+        assert!(
+            effective > 25.0,
+            "每分钟一次时稳态有效样本量应当远高于门槛，实际 {effective}"
+        );
+        assert!(stats.is_warm(at));
+    }
+
+    /// **核心回归**：一个上周很快、此后没被采样的账号，必须退出参照系，
+    /// 不能继续把当下正常的账号压成低分（§9.4 修订）。
+    #[test]
+    fn a_stale_target_stops_defining_the_reference_frame() {
+        let week = 7 * 24 * 3600;
+        // 三个账号：一个"陈旧很快"（从未参与本次评分的时间窗口），
+        // 两个当下正常。
+        let stale = Candidate {
+            target_id: "stale".into(),
+            multiplier: multiplier("0.5"),
+            multiplier_stale: false,
+            stats: Stats {
+                samples: 300,
+                weight: 300.0,
+                success_rate: 1.0,
+                first_token_ms: 200.0,
+                total_ms: 1_000.0,
+                output_tps: 80.0,
+                // 一周前采样过。
+                last_sample_at: NOW - week,
+            },
+        };
+        let normal = |id: &str, first_ms: f64| Candidate {
+            target_id: id.into(),
+            multiplier: multiplier("0.5"),
+            multiplier_stale: false,
+            stats: Stats {
+                samples: 300,
+                weight: 300.0,
+                success_rate: 1.0,
+                first_token_ms: first_ms,
+                total_ms: 4_000.0,
+                output_tps: 30.0,
+                last_sample_at: NOW,
+            },
+        };
+
+        let candidates = vec![stale, normal("b", 800.0), normal("c", 1000.0)];
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
+
+        // 陈旧账号退回中性分，不再以"全组最快"的身份出现。
+        assert_eq!(
+            scores[0].first_token, NEUTRAL,
+            "一周前的证据不得继续定义参照系"
+        );
+        assert_eq!(scores[0].throughput, NEUTRAL);
+        // 当下正常的账号之间仍然正常比较：最快的拿满分。
+        assert_eq!(scores[1].first_token, 1.0, "当下最快的就是参照系里最快的");
+        assert!(scores[2].first_token < 1.0);
+        assert!(
+            scores[1].first_token > scores[0].first_token,
+            "正常账号必须高于陈旧账号，否则旧分数会一直压住它们"
+        );
+    }
+
+    /// **现场回归**：慢账号不能被时间衰减踢出参照系。
     ///
-    /// 这正是口径里"保命口粮"的量化含义——不是好看，而是**能不能攒够
-    /// `MIN_SAMPLES` 个样本回到评分里**。分数 0.55 的目标若无口粮，占比不到
-    /// 1%，在真实流量下几天都攒不够 20 个样本，于是永远停在保守中性分。
+    /// 现场（gpt-boom / gpt-5.6-sol）除主力外四个账号的实测速率是
+    /// 0.71~2.30 条/小时；半衰期如果取得太短（例如最初写的 3 小时，门槛速率
+    /// 2.31 条/小时），三个慢账号会被判成"冷"，参照系重新退化回"只有主力一个
+    /// 热目标"——那正是要修的那个病，而且会被这个参数变相放大。
+    ///
+    /// 这里按现场最慢的实际速率（0.71 条/小时 ≈ 每 85 分钟一条）喂一整天的
+    /// 样本，断言它仍然算"热"。
+    #[test]
+    fn the_half_life_keeps_a_slow_but_steady_target_warm() {
+        // 0.71 条/小时 —— 现场最慢账号的实测速率。
+        let interval = (3600.0 / 0.71) as i64;
+        let mut stats = Stats::default();
+        let mut at = NOW;
+        // 连续观测 48 小时（远超一个半衰期，进入稳态）。
+        let mut fed = 0;
+        while at < NOW + 48 * 3600 {
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(900)),
+                    total: Duration::from_millis(4_000),
+                    output_tokens: Some(30),
+                },
+                at,
+            );
+            fed += 1;
+            at += interval;
+        }
+        let effective = stats.effective_samples(at);
+        assert!(
+            fed > 30,
+            "48 小时里按 0.71/小时应当采到 30 条以上，实际 {fed}"
+        );
+        assert!(
+            stats.is_warm(at),
+            "0.71 条/小时的稳定账号必须仍然算热，否则它会被踢出参照系；             稳态有效样本量 = {effective}（门槛 {MIN_SAMPLES}）"
+        );
+    }
+
+    /// 反面：真正的闲置必须让证据过期。
+    #[test]
+    fn sustained_idleness_does_expire_the_evidence() {
+        let mut stats = Stats::default();
+        for _ in 0..300 {
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(200)),
+                    total: Duration::from_millis(1_000),
+                    output_tokens: Some(80),
+                },
+                NOW,
+            );
+        }
+        assert!(stats.is_warm(NOW));
+        // 一个半衰期后还剩一半（150），仍然可信——这是有意的容忍度。
+        assert!(stats.is_warm(NOW + SAMPLE_HALF_LIFE_SECS as i64));
+        // 五天之后彻底过期：不再以旧分数占住参照系。
+        assert!(!stats.is_warm(NOW + 5 * 24 * 3600));
+    }
+
+    /// 反面：同一个账号只要**重新被采样**，就立刻回到参照系。
+    ///
+    /// 这保证衰减不会变成"永久惩罚"——它只是要求证据保持新鲜。
+    #[test]
+    fn a_refreshed_target_rejoins_the_reference_frame() {
+        let week = 7 * 24 * 3600;
+        let mut stats = Stats {
+            samples: 300,
+            weight: 300.0,
+            success_rate: 1.0,
+            first_token_ms: 200.0,
+            total_ms: 1_000.0,
+            output_tps: 80.0,
+            last_sample_at: NOW - week,
+        };
+        assert!(!stats.is_warm(NOW), "一周没采样时不可信");
+
+        // 采一次：权重从 0 重新累积（旧权重已经完全过期）。
+        stats.observe(
+            &Sample {
+                success: true,
+                counts: true,
+                first_token: Some(Duration::from_millis(200)),
+                total: Duration::from_millis(1_000),
+                output_tokens: Some(80),
+            },
+            NOW,
+        );
+        assert!(
+            (stats.effective_samples(NOW) - 1.0).abs() < 1e-9,
+            "过期权重不得复活"
+        );
+        assert!(!stats.is_warm(NOW), "一条新样本还不够回到可信");
+
+        // 继续采样直到重新可信。注意不能断言"恰好 N 条就够"：有效样本量是
+        // **带衰减累加**的量，观测之间总要衰减掉一点，因此跨时间的 N 条会
+        // 略小于 N。门槛量的是"当下证据有多厚"，不是"采过多少条"。
+        let mut at = NOW;
+        let mut fed = 1;
+        while !stats.is_warm(at) {
+            at += 60;
+            fed += 1;
+            stats.observe(
+                &Sample {
+                    success: true,
+                    counts: true,
+                    first_token: Some(Duration::from_millis(200)),
+                    total: Duration::from_millis(1_000),
+                    output_tokens: Some(80),
+                },
+                at,
+            );
+            assert!(fed < 30, "重新采样后应当很快回到可信，实际喂了 {fed} 条");
+        }
+        assert!(
+            fed >= MIN_SAMPLES as usize,
+            "至少要有门槛那么多条证据，实际 {fed}"
+        );
+    }
+
+    /// 采样时刻未知（老库快照）按完全过期处理，不得靠一次观测复活旧权重。
+    #[test]
+    fn unknown_sample_time_never_claims_freshness() {
+        let stats = Stats {
+            samples: 500,
+            weight: 500.0,
+            success_rate: 1.0,
+            first_token_ms: 100.0,
+            total_ms: 400.0,
+            output_tps: 50.0,
+            last_sample_at: 0,
+        };
+        assert_eq!(stats.effective_samples(1_000_000), 0.0);
+        assert!(!stats.is_warm(1_000_000));
+    }
+
+    /// 门槛本身是 10（§9.4 修订）：滑动证据下它只影响首次接入。
+    #[test]
+    fn the_warm_threshold_is_the_documented_value() {
+        assert_eq!(MIN_SAMPLES, 10);
+    }
+
     /// 恢复快照不能把"快照写入时刻"冒充成"最近采样时刻"（§9.5）。
     ///
     /// `export()` 每 60 秒把所有行的 `updated_at` 刷成当前时间，所以一个几天没
-    /// 请求的目标也会看起来刚更新过。如果拿它当采样时刻，陈旧目标在重启后就
-    /// 拿不到探索口粮，⑤ 等于没做。
+    /// 请求的目标也会看起来刚更新过。如果拿它当采样时刻，陈旧目标在重启后既
+    /// 拿不到放大的口粮，又会带着旧分数继续占着参照系（§9.4 修订）。
     #[test]
     fn a_restored_snapshot_counts_as_stale_not_fresh() {
         let registry = Registry::new();
@@ -706,10 +1056,14 @@ mod tests {
             protocol: crate::domain::Protocol::OpenAiChat,
             streaming: false,
             samples: 500,
+            // 老库没有 weight 列，兜底用累计条数。
+            weight: 0.0,
             success_rate: 1.0,
             first_token_ms: 100.0,
             total_ms: 400.0,
             output_tps: 50.0,
+            // 老库也没有"真正的采样时刻"。
+            last_sample_at: 0,
             updated_at: 1_000_000,
         }]);
         let stats = registry.stats(
@@ -720,8 +1074,16 @@ mod tests {
             },
         );
         assert_eq!(stats.samples, 500);
-        assert!(stats.is_warm());
         assert_eq!(stats.last_sample_at, 0, "快照没有采样时刻，必须按陈旧处理");
+        assert!(
+            !stats.is_warm(1_000_000),
+            "采样时刻未知时不得声称可信，否则它会带着旧分数占住参照系"
+        );
+        assert_eq!(
+            stats.effective_samples(1_000_000),
+            0.0,
+            "采样时刻未知等于完全过期"
+        );
         assert!(
             exploration_floor(&stats, 1_000_000) > EXPLORATION,
             "陈旧目标必须拿到放大的口粮"
@@ -788,7 +1150,7 @@ mod tests {
             warm("0.5", 1.0, 900.0, 50.0),
             warm("0.50", 0.85, 900.0, 50.0),
         ];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert!(scores[1].total < scores[0].total);
     }
 
@@ -797,7 +1159,7 @@ mod tests {
         let mut stale = warm("0.5", 1.0, 900.0, 50.0);
         stale.multiplier_stale = true;
         let candidates = vec![warm("0.5", 1.0, 900.0, 50.0), stale];
-        let scores = score_all(&candidates, SchedulingWeights::default(), None, 0);
+        let scores = score_all(&candidates, SchedulingWeights::default(), None, NOW);
         assert!(scores[1].total < scores[0].total);
         assert!(scores[1].total > 0.0, "宽限期内仍可参与调度");
     }
@@ -1079,7 +1441,11 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             streaming: true,
         };
-        for _ in 0..MIN_SAMPLES {
+        // 模拟半小时内每分钟一次的真实流量（30 条），而不是把 30 条挤在同一
+        // 瞬间——`weight` 是**速率**量纲的量（稳态约等于 观测速率 × 半衰期 /
+        // ln2），同一瞬间堆出来的条数并不代表持续的观测速率。
+        let mut at = 1_000;
+        for _ in 0..30 {
             registry.observe(
                 "tgt",
                 dimension,
@@ -1090,21 +1456,37 @@ mod tests {
                     total: Duration::from_millis(3000),
                     output_tokens: Some(300),
                 },
-                0,
+                at,
             );
+            at += 60;
         }
-        let exported = registry.export(1_000);
+        let exported = registry.export(at);
         assert_eq!(exported.len(), 1);
 
         // 重启：新表从快照恢复，评分不从零开始（§26.7）。
         let restored = Registry::new();
         restored.restore(&exported);
         let stats = restored.stats("tgt", dimension);
-        assert!(stats.is_warm());
+        assert!(
+            stats.is_warm(at + 60),
+            "刚导出的快照紧接着恢复，仍然新鲜：{}",
+            stats.effective_samples(at + 60)
+        );
         assert!((stats.first_token_ms - 700.0).abs() < 1.0);
 
+        // 一周不采样：证据彻底过期，必须重新采样才能回到可信状态。
+        //
+        // 不能只放一天——一天恰好是一个半衰期，30 条样本衰减到 15 条仍在门槛
+        // 之上，那正是"半衰期要能容忍慢账号"的设计意图（见
+        // `SAMPLE_HALF_LIFE_SECS` 的下界推导）。
+        assert!(
+            !stats.is_warm(at + 7 * 24 * 3600),
+            "一周不采样的证据不得继续声称可信：{}",
+            stats.effective_samples(at + 7 * 24 * 3600)
+        );
+
         restored.retain(&[]);
-        assert!(!restored.stats("tgt", dimension).is_warm());
+        assert!(!restored.stats("tgt", dimension).is_warm(1_000));
     }
 
     #[test]

@@ -40,7 +40,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
 /// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
 /// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -453,6 +453,39 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .await
                 .context("迁移 sticky_bindings.context_bytes 失败")?;
         }
+    }
+    if from < 16 {
+        // v16：性能快照补"时间衰减权重"与"真正的采样时刻"（§9.4 修订）。
+        // 老库没有这两列时：weight 用 samples 兜底（等价于"按累计条数"的旧
+        // 语义），last_sample_at 留 0 表示"不知道有多旧"——按陈旧处理，让这些
+        // 目标必须重新被采样才能回到参照系，而不是拿旧分数一直占着位置。
+        let perf_columns = table_columns(pool, "target_perf_snapshot").await?;
+        for (column, ddl) in [
+            (
+                "weight",
+                "ALTER TABLE target_perf_snapshot ADD COLUMN weight REAL NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_sample_at",
+                "ALTER TABLE target_perf_snapshot ADD COLUMN last_sample_at INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !perf_columns.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 target_perf_snapshot.{column} 失败"))?;
+            }
+        }
+        // weight 用累计条数兜底（等价于旧语义）。last_sample_at 保持 0 =
+        // "采样时刻未知"，读取时会按完全过期处理，于是这些目标必须重新被采样
+        // 才能回到参照系——不会拿上个月的分数占着"全组最快"的位置。
+        sqlx::query(
+            "UPDATE target_perf_snapshot SET weight = samples WHERE weight <= 0 AND samples > 0",
+        )
+        .execute(pool)
+        .await
+        .context("回填 target_perf_snapshot.weight 失败")?;
     }
     if from < 10 {
         // 老库的单把凭据展开成"一把 Key 的池"（§4.2.1）。放在迁移里而不是

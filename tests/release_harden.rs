@@ -578,6 +578,24 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         sticky_columns.contains("context_bytes"),
         "迁移后 sticky_bindings 缺少 context_bytes：{sticky_columns:?}"
     );
+    // v16：性能快照补"时间衰减权重"与"真正的采样时刻"（§9.4 修订）。
+    // 缺了它们，老库升级后要么拿累计条数假装可信，要么拿 updated_at 冒充
+    // 采样时刻——两者都会让陈旧账号继续占着参照系。
+    let perf_columns: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(target_perf_snapshot)")
+            .fetch_all(reopened.store.pool())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    for column in ["weight", "last_sample_at"] {
+        assert!(
+            perf_columns.contains(column),
+            "迁移后 target_perf_snapshot 缺少 {column}：{perf_columns:?}"
+        );
+    }
+
     // v11/v12：上游类型先归一、再整个停用（§4.2）。这一列现在是历史遗留，
     // 旧值不该让账号加载失败，新写入也不该再碰它。
     let stored: String =
@@ -610,7 +628,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

@@ -918,7 +918,10 @@ export function ScoreMeter({ score }: { score: Score }) {
     { key: "first_token", label: "首字延迟" },
     { key: "throughput", label: "输出速度" },
   ];
-  const cold = score.warm ? "" : `；样本 ${score.samples}/20，性能三维暂用中性分`;
+  // 门槛与有效样本量都来自后端：界面写死数字会在调参之后开始说谎（§9.4）。
+  const cold = score.warm
+    ? ""
+    : `；有效样本 ${score.effective_samples.toFixed(1)}/${score.warm_threshold}，性能三维暂用中性分`;
   return (
     <span className="score">
       <span

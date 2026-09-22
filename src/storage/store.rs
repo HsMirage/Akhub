@@ -2592,17 +2592,20 @@ impl Store {
         for row in rows {
             sqlx::query(
                 "INSERT OR REPLACE INTO target_perf_snapshot (target_id, protocol, streaming,
-                    samples, success_rate, first_token_ms, total_ms, output_tps, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    samples, weight, success_rate, first_token_ms, total_ms, output_tps,
+                    last_sample_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&row.target_id)
             .bind(row.protocol.as_str())
             .bind(row.streaming)
             .bind(row.samples)
+            .bind(row.weight)
             .bind(row.success_rate)
             .bind(row.first_token_ms)
             .bind(row.total_ms)
             .bind(row.output_tps)
+            .bind(row.last_sample_at)
             .bind(row.updated_at)
             .execute(&mut *tx)
             .await?;
@@ -2630,10 +2633,12 @@ impl Store {
                         .with_context(|| format!("数据库中的协议无法识别：{protocol}"))?,
                     streaming: row.try_get("streaming")?,
                     samples: row.try_get("samples")?,
+                    weight: row.try_get("weight")?,
                     success_rate: row.try_get("success_rate")?,
                     first_token_ms: row.try_get("first_token_ms")?,
                     total_ms: row.try_get("total_ms")?,
                     output_tps: row.try_get("output_tps")?,
+                    last_sample_at: row.try_get("last_sample_at")?,
                     updated_at: row.try_get("updated_at")?,
                 })
             })
@@ -2981,11 +2986,20 @@ pub struct PerfSnapshotRow {
     pub target_id: String,
     pub protocol: Protocol,
     pub streaming: bool,
+    /// 累计采样条数（展示用）。
     pub samples: i64,
+    /// 时间衰减后的样本权重（评分可信度判据，§9.4 修订）。
+    pub weight: f64,
     pub success_rate: f64,
     pub first_token_ms: f64,
     pub total_ms: f64,
     pub output_tps: f64,
+    /// **真正的**最近一次采样时刻（不是快照写入时刻）。
+    ///
+    /// 必须单独存：`updated_at` 每 60 秒被刷成当前时间，拿它当采样时刻会让
+    /// 几天没请求的目标看起来刚被采样过，时间衰减与探索口粮一起失效。
+    /// 0 表示"不知道有多旧"，按陈旧处理。
+    pub last_sample_at: i64,
     pub updated_at: i64,
 }
 
@@ -3655,10 +3669,12 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             streaming: true,
             samples: 30,
+            weight: 28.5,
             success_rate: 0.98,
             first_token_ms: 900.0,
             total_ms: 4_000.0,
             output_tps: 42.0,
+            last_sample_at: 9_990,
             updated_at: 10_000,
         };
         let stale = PerfSnapshotRow {
@@ -3672,6 +3688,10 @@ mod tests {
         let loaded = store.load_perf_snapshots(1_000).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].streaming);
+        // 时间衰减权重与**真正的**采样时刻必须往返（§9.4 修订）：拿
+        // updated_at 冒充采样时刻会让陈旧目标在重启后假装新鲜。
+        assert!((loaded[0].weight - 28.5).abs() < 1e-9);
+        assert_eq!(loaded[0].last_sample_at, 9_990);
         assert_eq!(store.prune_perf_snapshots(1_000).await.unwrap(), 1);
     }
 

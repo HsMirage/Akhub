@@ -178,11 +178,17 @@ CREATE TABLE IF NOT EXISTS target_perf_snapshot (
     target_id      TEXT NOT NULL,
     protocol       TEXT NOT NULL,
     streaming      INTEGER NOT NULL,
+    -- 累计采样条数（展示用）。可信度判据是下面的 weight，不是这个数字。
     samples        INTEGER NOT NULL,
+    -- 时间衰减后的样本权重（§9.4 修订）。老库迁移时用 samples 兜底。
+    weight         REAL NOT NULL DEFAULT 0,
     success_rate   REAL NOT NULL,
     first_token_ms REAL NOT NULL,
     total_ms       REAL NOT NULL,
     output_tps     REAL NOT NULL,
+    -- **真正的**最近一次采样时刻。不能拿 updated_at 代替：它每 60 秒被刷成
+    -- 当前时间，会让陈旧目标看起来刚被采样过，时间衰减与探索口粮一起失效。
+    last_sample_at INTEGER NOT NULL DEFAULT 0,
     updated_at     INTEGER NOT NULL,
     PRIMARY KEY (target_id, protocol, streaming)
 );

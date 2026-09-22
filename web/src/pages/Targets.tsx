@@ -332,7 +332,7 @@ function targetHasIssue(target: DispatchTarget, account: Account | undefined): b
  *
  * 这两个数是 EWMA，可信度取决于"哪一批请求"与"有多少条样本"。维度必须
  * 说出来：同一个账号的流式与非流式是两份互不相干的统计，分不清就会拿 A 批
- * 的样本去解释 B 批的体感。样本不足 20 条时明说是冷的，评分也还没采信它。
+ * 的样本去解释 B 批的体感。有效样本不足门槛时明说是冷的，评分也还没采信它。
  */
 function statsHint(stats: TargetStatsSample | null): string | undefined {
   if (!stats) return undefined;
@@ -340,7 +340,7 @@ function statsHint(stats: TargetStatsSample | null): string | undefined {
   const base = `来自 ${source} 的 ${stats.samples} 个样本`;
   return stats.warm
     ? base
-    : `${base}，不足 20 条：只作参考，评分仍按中性分`;
+    : `${base}，有效 ${stats.effective_samples.toFixed(1)} 条（门槛 ${stats.warm_threshold}）：只作参考，评分仍按中性分`;
 }
 
 function ModelBlock({
@@ -475,7 +475,9 @@ function ModelBlock({
                                 <span>首字延迟 {target.score.first_token.toFixed(2)}</span>
                                 <span>输出速度 {target.score.throughput.toFixed(2)}</span>
                                 <span>
-                                  综合 {target.score.total.toFixed(2)} · 样本 {target.score.samples}/20
+                                  综合 {target.score.total.toFixed(2)} · 有效样本{" "}
+                                  {target.score.effective_samples.toFixed(1)}/
+                                  {target.score.warm_threshold}
                                   {target.score.warm ? "" : "（冷启动）"}
                                 </span>
                               </span>
@@ -514,10 +516,13 @@ function ModelBlock({
                             </div>
                           </>
                         )}
-                        {/* 样本不足 20 条的数字要明说是冷的，别让人当成稳定值。 */}
+                        {/* 有效样本不足门槛的数字要明说是冷的，别让人当成稳定值。
+                            显示有效样本量而不是累计条数：后者会被时间衰减打折，
+                            一个几百条陈旧样本的账号看起来会比实际可信得多。 */}
                         {target.stats && !target.stats.warm && (
                           <div className="text-faint" style={{ fontSize: 11 }}>
-                            样本 {target.stats.samples}/20
+                            有效样本 {target.stats.effective_samples.toFixed(1)}/
+                            {target.stats.warm_threshold}
                           </div>
                         )}
                       </td>

@@ -1649,7 +1649,7 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
             .runtime
             .perf
             .stats(bound_target, dimension)
-            .is_warm()
+            .is_warm(akhub::storage::now_unix())
     );
 
     // 60 秒快照任务的工作在关闭前也会做一次。
@@ -1661,7 +1661,11 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
         .unwrap();
     assert_eq!(restarted.runtime.sticky.len(), 1, "粘性绑定重启后恢复");
     let stats = restarted.runtime.perf.stats(bound_target, dimension);
-    assert!(stats.is_warm(), "评分从快照继续，不从零开始");
+    assert!(
+        stats.is_warm(akhub::storage::now_unix()),
+        "评分从快照继续，不从零开始（有效样本 {}）",
+        stats.effective_samples(akhub::storage::now_unix())
+    );
     assert_eq!(stats.samples, 25);
 
     // 同一个强身份会话重启后仍打到原目标（§26.7）。
@@ -1691,7 +1695,13 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
     let stale = AppState::bootstrap(akhub.data_dir(), Settings::default())
         .await
         .unwrap();
-    assert!(!stale.runtime.perf.stats(bound_target, dimension).is_warm());
+    assert!(
+        !stale
+            .runtime
+            .perf
+            .stats(bound_target, dimension)
+            .is_warm(akhub::storage::now_unix())
+    );
     assert_eq!(stale.runtime.sticky.len(), 0);
 }
 

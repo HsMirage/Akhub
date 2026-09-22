@@ -2262,7 +2262,7 @@ pub struct TargetDto {
     pub total_ms: Option<f64>,
     /// 上面三列背后的样本口径；一个样本都没有时为 None。
     ///
-    /// 界面靠它把"样本不足 20 条"的数字标出来：只有冷目标留白，等于让刚开始
+    /// 界面靠它把"有效样本不足门槛"的数字标出来：只有冷目标留白，等于让刚开始
     /// 拿流量的账号永远显示不出数据（§6.5）。
     pub stats: Option<TargetStatsDto>,
     /// 暂停原因：有则给出可读原因，正常参与调度时为 None（§6.5）。
@@ -2277,13 +2277,17 @@ pub struct ScoreDto {
     pub reliability: f64,
     pub first_token: f64,
     pub throughput: f64,
+    /// 该目标在这个评分维度上的**有效**样本量（时间衰减后）。
+    pub effective_samples: f64,
+    /// 判定"可信"的有效样本量门槛，由后端下发（§9.4）。
+    pub warm_threshold: f64,
     /// 这个目标此刻的探索口粮，已含"多久没被采样"的放大（§9.5）。
     ///
     /// 它解释了"为什么一个分数不高的目标还在拿流量"：不是因为分高，而是因为
     /// 它的分数已经旧到不足为凭，需要重新采样。
     pub exploration: f64,
     pub samples: u64,
-    /// 样本不足 20 时性能三维用的是保守中性分（§9.4）。
+    /// 有效样本不足门槛时性能三维用的是保守中性分（§9.4）。
     pub warm: bool,
     /// 各维度的加权贡献（得分 × 权重 ÷ 100），四个加起来就是总分（§6.5）。
     ///
@@ -2307,9 +2311,15 @@ pub struct ScoreContributionDto {
 /// 原始测量值，逐目标取它自己样本最多的维度，免得"有数据的账号显示不出来"。
 #[derive(Serialize, Clone, Copy)]
 pub struct TargetStatsDto {
-    /// 该目标在这个维度上采到的样本数。
+    /// 该目标在这个维度上采到的**累计**样本条数。
     pub samples: u64,
-    /// 样本是否已够 20 条；不够时数字只作参考（§9.4）。
+    /// 时间衰减后的有效样本量（§9.4 修订）。界面显示它，因为它才是评分
+    /// 真正采信的那个数字；陈旧的累计条数会高估可信度。
+    pub effective_samples: f64,
+    /// 判定"可信"的有效样本量门槛。由后端下发，界面不得写死——否则调参之后
+    /// 界面会开始说谎（§9.4）。
+    pub warm_threshold: f64,
+    /// 有效样本量是否已够门槛；不够时数字只作参考（§9.4）。
     pub warm: bool,
     /// 这些样本来自哪种下游协议。
     pub protocol: Protocol,
@@ -2323,6 +2333,7 @@ fn target_dto(
     rows: &HashMap<&str, TargetRow<'_>>,
     target: &DispatchTarget,
 ) -> TargetDto {
+    let now = crate::storage::now_unix();
     let row = rows.get(target.id.as_str());
     let view = row.and_then(|row| row.view);
     // 首字 / 速度三列走该目标自己的样本；没有行（理论上不该发生）时是空统计。
@@ -2368,7 +2379,12 @@ fn target_dto(
             .and_then(|row| row.stats_dimension)
             .map(|dimension| TargetStatsDto {
                 samples: stats.samples,
-                warm: stats.is_warm(),
+                // 展示的是"有效样本量"：累计条数会被时间衰减打折，界面必须
+                // 显示真正参与判断的那个数字，否则几百条陈旧样本的账号看起来
+                // 比实际可信得多（§9.4 修订）。
+                effective_samples: stats.effective_samples(now),
+                warm_threshold: crate::routing::score::MIN_SAMPLES as f64,
+                warm: stats.is_warm(now),
                 protocol: dimension.protocol,
                 streaming: dimension.streaming,
             }),
@@ -2381,7 +2397,7 @@ fn target_dto(
 /// 两种情况返回 None：一个样本都没采到，或这一项从来没被成功采到过（值还是
 /// 0，例如非流式请求没有首字）。0 会被误读成"这个目标很快"，必须留白（§6.5）。
 ///
-/// 样本不足 20 条时照样给值，由界面把样本数一起标出来。只给热目标显示，等于让
+/// 有效样本不足门槛时照样给值，由界面把样本数一起标出来。只给热目标显示，等于让
 /// "刚开始拿流量的账号"永远没有数据可看——那正是这个视图最需要回答的问题。
 fn ewma_metric(stats: &Stats, pick: impl Fn(&Stats) -> f64) -> Option<f64> {
     let value = pick(stats);
@@ -2499,7 +2515,11 @@ const DISPLAY_DIMENSIONS: [Dimension; 6] = [
 /// 注意它只管评分：首字 / 速度这两列是原始测量值，走 `target_display_stats`
 /// 逐目标挑维度，否则模型里只有跑到这一维的账号才看得见数字。
 fn model_dimension(state: &SharedState, model: &LogicalModelView) -> Dimension {
-    let samples_of = |dimension: Dimension| -> u64 {
+    // 按**有效**样本量挑，不按累计条数：流量从一个入口迁到另一个入口之后，
+    // 累计条数会一直指着早已停用的旧维度，评分也就跟着用陈旧那一维的数据
+    // （§9.4 修订）。
+    let now = crate::storage::now_unix();
+    let samples_of = |dimension: Dimension| -> f64 {
         model
             .targets
             .iter()
@@ -2508,13 +2528,13 @@ fn model_dimension(state: &SharedState, model: &LogicalModelView) -> Dimension {
                     .runtime
                     .perf
                     .stats(&target.target.id, dimension)
-                    .samples
+                    .effective_samples(now)
             })
             .sum()
     };
     DISPLAY_DIMENSIONS
         .into_iter()
-        .max_by_key(|dimension| samples_of(*dimension))
+        .max_by(|a, b| samples_of(*a).total_cmp(&samples_of(*b)))
         .unwrap_or(DIMENSION_FALLBACK)
 }
 
@@ -2544,7 +2564,8 @@ fn target_display_stats(
 ) -> (Option<Dimension>, Stats) {
     let perf = &state.runtime.perf;
     let preferred = perf.stats(target_id, model_dimension);
-    if preferred.is_warm() {
+    let now = crate::storage::now_unix();
+    if preferred.is_warm(now) {
         return (Some(model_dimension), preferred);
     }
     // 平手时保住模型维度：从它起步，只在样本严格更多时才换。
@@ -2642,7 +2663,9 @@ fn model_scores(
                 throughput: round4(score.throughput),
                 exploration: round4(score.exploration),
                 samples: stats.samples,
-                warm: stats.is_warm(),
+                effective_samples: round4(stats.effective_samples(now)),
+                warm_threshold: crate::routing::score::MIN_SAMPLES as f64,
+                warm: stats.is_warm(now),
                 contribution: ScoreContributionDto {
                     multiplier: share(score.multiplier, weights.multiplier),
                     reliability: share(score.reliability, weights.reliability),

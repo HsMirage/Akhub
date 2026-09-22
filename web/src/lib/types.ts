@@ -217,7 +217,11 @@ export interface Score {
   first_token: number;
   throughput: number;
   samples: number;
-  /** 样本不足 20 时性能三维用的是保守中性分。 */
+  /** 时间衰减后的有效样本量。评分采信的是它，不是累计条数。 */
+  effective_samples: number;
+  /** 判定可信的有效样本量门槛，由后端下发，界面不得写死。 */
+  warm_threshold: number;
+  /** 有效样本量不足门槛时性能三维用的是保守中性分。 */
   warm: boolean;
   /**
    * 各维度的加权贡献（得分 × 权重 ÷ 100），四项之和即总分（§6.5）。
@@ -235,9 +239,13 @@ export interface Score {
 
 /** 调度视图「首字 / 速度」两列背后的样本（§6.5）。 */
 export interface TargetStatsSample {
-  /** 该目标在这个维度上采到的样本数。 */
+  /** 该目标在这个维度上采到的**累计**样本条数。 */
   samples: number;
-  /** 样本是否已够 20 条；不够时数字只作参考（§9.4）。 */
+  /** 时间衰减后的有效样本量；它才是评分采信的数字（§9.4）。 */
+  effective_samples: number;
+  /** 可信门槛，由后端下发（§9.4）。 */
+  warm_threshold: number;
+  /** 有效样本量是否已够门槛；不够时数字只作参考（§9.4）。 */
   warm: boolean;
   /** 这些样本来自哪种下游协议。 */
   protocol: Protocol;
@@ -273,7 +281,7 @@ export interface DispatchTarget {
   /**
    * 上面三列背后的样本口径；一个样本都没有时为 null。
    *
-   * 样本不足 20 条时三列照样给值，界面必须把样本数标出来——只给热目标显示，
+   * 有效样本不足门槛时三列照样给值，界面必须把样本数标出来——只给热目标显示，
    * 等于让刚开始拿流量的账号永远没有数据可看（§6.5）。
    */
   stats: TargetStatsSample | null;
