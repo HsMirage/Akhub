@@ -349,6 +349,144 @@ async fn a_database_written_by_a_newer_binary_refuses_to_open() {
     assert!(message.contains("升级"), "错误信息要提示升级：{message}");
 }
 
+/// v17 必须用**真实请求记录**回填采样时刻（§9.4 修订）。
+///
+/// v16 只加列，老库一律是 0 = "不知道有多旧"。这是诚实的默认值，但对升级者是
+/// 个陷阱：升级后所有账号瞬间变冷，低流量账号（现场实测 0.71 条/小时）要等十
+/// 几个小时才回到参照系，而这段时间性能三维又全是 0.6——把这次要修的症状重新
+/// 制造一遍。request_records 里存着真实的请求时刻，能查到就不该假装不知道。
+#[tokio::test]
+async fn the_sample_time_is_backfilled_from_real_request_records() {
+    // 建一个 v16 形态的库：快照有 weight/last_sample_at，但采样时刻全是 0。
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+
+    // 空库里没有目标，而快照读取是按 dispatch_targets 做 JOIN 过滤的，所以必须
+    // 真的建出「分组 → 账号 → 逻辑模型 → 调度目标」这条链，用例才碰得到回填。
+    let now = akhub::storage::now_unix();
+    let group_id = "grp_backfill";
+    let account_id = "acc_backfill";
+    let model_id = "lm_backfill";
+    let target_id = "tgt_backfill";
+    for (table, sql) in [
+        (
+            "groups",
+            "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
+                weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+                queue_capacity, max_wait_secs, allow_degrade, allow_managed_background, created_at)
+             VALUES (?, '回填用例', 'bf', 'bf', '1', 40, 25, 20, 15, 100, 0, 0, 0, ?)",
+        ),
+        (
+            "upstream_accounts",
+            "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+                preferred_protocol, adaptive_protocol, default_priority, calibration,
+                multiplier_mode, manual_multiplier, allow_private_network, enabled,
+                auto_sync, hide_original, created_at)
+             VALUES (?, ?, '回填账号', 'openai', 'https://example.com', 'openai_chat', 1, 0,
+                '1', 'manual', '1', 0, 1, 0, 0, ?)",
+        ),
+        (
+            "logical_models",
+            "INSERT INTO logical_models (id, group_id, name, origin, enabled, created_at)
+             VALUES (?, ?, '回填模型', 'manual', 1, ?)",
+        ),
+        (
+            "dispatch_targets",
+            "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
+                hide_original, priority_override, enabled, created_at)
+             VALUES (?, ?, ?, 'm', 0, NULL, 1, ?)",
+        ),
+    ] {
+        let mut query = sqlx::query(sql).bind(if table == "groups" {
+            group_id
+        } else {
+            match table {
+                "upstream_accounts" => account_id,
+                "logical_models" => model_id,
+                _ => target_id,
+            }
+        });
+        if table == "upstream_accounts" {
+            query = query.bind(group_id);
+        }
+        if table == "logical_models" {
+            query = query.bind(group_id);
+        }
+        if table == "dispatch_targets" {
+            query = query.bind(model_id).bind(account_id);
+        }
+        query
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("建 {table} 失败：{e}"));
+    }
+    let sampled_at = 1_700_000_000i64;
+    sqlx::query(
+        "INSERT INTO target_perf_snapshot
+            (target_id, protocol, streaming, samples, weight, success_rate,
+             first_token_ms, total_ms, output_tps, last_sample_at, updated_at)
+         VALUES (?, 'openai_chat', 0, 40, 40, 1.0, 120, 400, 50, 0, ?)",
+    )
+    .bind(target_id)
+    .bind(sampled_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 一条真实请求：它就是"最近一次采样"的来源。
+    insert_request_record_at(&pool, target_id, "openai_chat", false, sampled_at).await;
+
+    // 回到 v16 的版本号，逼下一次打开重跑 v17。
+    sqlx::query("UPDATE app_settings SET value = '16' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(state);
+
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let restored: i64 = sqlx::query_scalar(
+        "SELECT last_sample_at FROM target_perf_snapshot
+          WHERE target_id = ? AND protocol = 'openai_chat' AND streaming = 0",
+    )
+    .bind(target_id)
+    .fetch_one(reopened.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        restored, sampled_at,
+        "采样时刻必须由真实请求记录回填，而不是留 0 让账号在升级后集体变冷"
+    );
+}
+
+/// 造一条指定时刻的请求记录。只填回填查询用得到的列。
+async fn insert_request_record_at(
+    pool: &sqlx::SqlitePool,
+    target_id: &str,
+    protocol: &str,
+    streaming: bool,
+    started_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO request_records
+            (request_id, started_at, duration_ms, protocol, streaming, target_id,
+             request_bytes, http_status, attempts, queued_ms, sticky_hit)
+         VALUES (?, ?, 0, ?, ?, ?, 0, 200, 1, 0, 0)",
+    )
+    .bind(format!("req_backfill_{started_at}"))
+    .bind(started_at)
+    .bind(protocol)
+    .bind(streaming)
+    .bind(target_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// v1 的老库打开时必须自动迁移到 v2：补上用量/时机列与尝试明细表（§27）。
 #[tokio::test]
 async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
@@ -595,6 +733,16 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             "迁移后 target_perf_snapshot 缺少 {column}：{perf_columns:?}"
         );
     }
+    // v17 的回填子查询按 (target_id, protocol, streaming) 取最近请求，索引必须
+    // 存在，否则迁移会在请求记录表上全表扫描 × 快照行数。
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'index' AND name = 'idx_records_target_dimension'",
+    )
+    .fetch_one(reopened.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(index_count, 1, "缺少维度索引 idx_records_target_dimension");
 
     // v11/v12：上游类型先归一、再整个停用（§4.2）。这一列现在是历史遗留，
     // 旧值不该让账号加载失败，新写入也不该再碰它。
@@ -628,7 +776,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "16");
+    assert_eq!(version, "17");
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

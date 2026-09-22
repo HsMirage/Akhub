@@ -40,7 +40,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
 /// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
 /// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -486,6 +486,46 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         .execute(pool)
         .await
         .context("回填 target_perf_snapshot.weight 失败")?;
+    }
+    if from < 17 {
+        // v17：把 v16 留下的"采样时刻未知"用**真实请求记录**补回来（§9.4 修订）。
+        //
+        // v16 只加了列，老库的 last_sample_at 一律是 0 = "不知道有多旧"，读取时
+        // 按完全过期处理。这是诚实的默认值，但对**升级者**是个陷阱：升级后所有
+        // 账号都会瞬间变成"冷"，要等重新采样才回到参照系；低流量账号（现场实测
+        // 0.71 条/小时）得等十几个小时，而这期间所有人的性能三维又是 0.6——正是
+        // 这次要修的那个症状被升级动作重新制造了一遍。
+        //
+        // 而 request_records 里就存着每个 (目标, 协议, 是否流式) 的真实请求时刻，
+        // 也就是采样时刻本身。能查到就不该假装不知道：拿真实数据回填，比丢弃强。
+        // 查不到（记录已被清理、或该维度从无请求）的保持 0，仍然按过期处理。
+        //
+        // 只碰 last_sample_at <= 0 的行：新版本已经写过的行有真实值，不能被覆盖。
+        // 幂等，可重复运行。
+        //
+        // 这条子查询按 (target_id, protocol, streaming) 过滤。schema.sql 里有对应
+        // 索引，但老库执行到这里时索引可能还没建（CREATE INDEX 在 open 流程的
+        // 另一步），所以显式保证一次，避免在请求记录表上做全表扫描 × 快照行数。
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_records_target_dimension
+                ON request_records(target_id, protocol, streaming, started_at DESC)",
+        )
+        .execute(pool)
+        .await
+        .context("创建 request_records 维度索引失败")?;
+        sqlx::query(
+            "UPDATE target_perf_snapshot
+                SET last_sample_at = COALESCE((
+                    SELECT MAX(r.started_at) FROM request_records r
+                    WHERE r.target_id = target_perf_snapshot.target_id
+                      AND r.protocol  = target_perf_snapshot.protocol
+                      AND r.streaming = target_perf_snapshot.streaming
+                ), 0)
+              WHERE last_sample_at <= 0",
+        )
+        .execute(pool)
+        .await
+        .context("回填 target_perf_snapshot.last_sample_at 失败")?;
     }
     if from < 10 {
         // 老库的单把凭据展开成"一把 Key 的池"（§4.2.1）。放在迁移里而不是

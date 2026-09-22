@@ -281,6 +281,11 @@ CREATE TABLE IF NOT EXISTS request_records (
 
 CREATE INDEX IF NOT EXISTS idx_records_started ON request_records(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_records_group ON request_records(group_id, started_at DESC);
+-- 「这个目标在这个维度上最后一次请求是什么时候」（§9.4 修订的采样时刻回填、
+-- 以及任何按维度取最近样本的诊断）。没有它，v17 迁移要在请求记录表上做一次
+-- 全表扫描 × 快照行数。
+CREATE INDEX IF NOT EXISTS idx_records_target_dimension
+    ON request_records(target_id, protocol, streaming, started_at DESC);
 
 -- 每次上游尝试的明细（§6.6）：换了几个目标、各自用了哪个端点、耗时多久、
 -- 为什么失败、这次失败是否计入尝试预算。与请求记录按 request_id 关联。
