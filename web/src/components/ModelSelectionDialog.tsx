@@ -140,6 +140,11 @@ export function ModelSelectionDialog({
 
   const loadGroupNames = useCallback(async () => {
     if (!account) return;
+    // 未分配账号没有分组，也就没有"同组已有模型"可以挑（§4.2.3）。
+    if (account.group_id === null) {
+      setGroupModels([]);
+      return;
+    }
     try {
       const result = await api.availableGroupModels(account.group_id);
       setGroupModels(result.models);
@@ -492,6 +497,13 @@ export function ModelSelectionDialog({
         }
       >
         <div className="stack model-dialog-content">
+          {account?.group_id === null && (
+            <div className="callout callout-info">
+              该账号还没有分配到分组：可以在这里整理模型目录、设好下游模型名，但
+              <strong>不会生成调度目标</strong>，下游暂时用不到这些模型。去「编辑」
+              里选一个分组，模型会按对外名一起迁过去并立即生效。
+            </div>
+          )}
           {managed && (
             <div className="callout callout-info">
               该账号已开启模型自动同步：上游全部模型由后台托管，删除 / 停用 /

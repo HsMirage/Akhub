@@ -202,7 +202,7 @@ mod tests {
     fn account(preferred: Protocol, adaptive: bool) -> Account {
         Account {
             id: "acc".into(),
-            group_id: "g".into(),
+            group_id: Some("g".into()),
             name: "账号A".into(),
             base_url: "https://api.example.com".into(),
             preferred_protocol: preferred,

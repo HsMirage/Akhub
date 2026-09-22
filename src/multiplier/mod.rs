@@ -314,7 +314,7 @@ mod tests {
     fn account(mode: MultiplierMode, manual: &str) -> Account {
         Account {
             id: "acc".into(),
-            group_id: "g1".into(),
+            group_id: Some("g1".into()),
             name: "账号A".into(),
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,

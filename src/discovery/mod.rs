@@ -119,17 +119,17 @@ pub async fn refresh_catalog(state: &SharedState, account: &Account) -> Result<V
 
     // 多账号行为（§16.2）：全新账号的列表里，分组内已存在的同名逻辑模型
     // 默认勾选——你已经表达过"我要这个模型"。
-    let group_models: HashSet<String> = if previous.is_empty() {
-        state
+    // 未分配账号没有分组，也就没有"同组已有的逻辑模型"可以默认勾选（§4.2.3）。
+    let group_models: HashSet<String> = match (previous.is_empty(), account.group_id.as_deref()) {
+        (true, Some(group_id)) => state
             .store
             .list_logical_models()
             .await?
             .iter()
-            .filter(|m| m.group_id == account.group_id)
+            .filter(|m| m.group_id == group_id)
             .map(|m| m.name.clone())
-            .collect()
-    } else {
-        HashSet::new()
+            .collect(),
+        _ => HashSet::new(),
     };
 
     let now = now_unix();
@@ -657,6 +657,15 @@ pub async fn reconcile_account(
     account: &Account,
     include_all: bool,
 ) -> Result<bool> {
+    // 未分配账号不参与调度（§4.2.3）：它没有任何目标可调和，已有的目标也要
+    // 撤下。走同一条撤下路径，是因为"分配进分组"时目标不能凭空复活——那是
+    // `move_account_targets` 的职责（在那里按目录重建）。
+    let Some(group_id) = account.group_id.as_deref() else {
+        // 返回值是"配置是否变过"：撤下 0 个目标时什么都没变，不能谎报。
+        return detach_account_targets(state, account)
+            .await
+            .map(|removed| removed > 0);
+    };
     let catalog = state.store.list_account_models(&account.id).await?;
     let mut targets = state.store.list_targets().await?;
     let mut models = state.store.list_logical_models().await?;
@@ -752,7 +761,7 @@ pub async fn reconcile_account(
                     &mut models,
                     &mut model_writes,
                     &mut model_index,
-                    &account.group_id,
+                    group_id,
                     &row.public_name,
                     ModelOrigin::Auto,
                 );
@@ -787,7 +796,7 @@ pub async fn reconcile_account(
                     &mut models,
                     &mut model_writes,
                     &mut model_index,
-                    &account.group_id,
+                    group_id,
                     &row.public_name,
                     ModelOrigin::Auto,
                 );
@@ -893,6 +902,11 @@ pub async fn move_account_targets(
         .collect();
     let mut target_writes: Vec<DispatchTarget> = Vec::new();
     let mut moved = 0usize;
+    // 只有"已分配"的账号有去处；未分配账号不该走搬家路径（它的目标会被
+    // `detach_account_targets` 撤下，§4.2.3）。
+    let Some(to_group) = account.group_id.as_deref() else {
+        return Ok(0);
+    };
 
     for target in targets.iter_mut().filter(|t| t.account_id == account.id) {
         let Some((name, group, origin)) = meta.get(&target.logical_model_id) else {
@@ -906,7 +920,7 @@ pub async fn move_account_targets(
             &mut models,
             &mut model_writes,
             &mut model_index,
-            &account.group_id,
+            to_group,
             name,
             *origin,
         );
@@ -980,6 +994,50 @@ fn ensure_logical_model(
     let position = models.len() - 1;
     index.insert(key, position);
     position
+}
+
+/// 把账号名下的调度目标全部撤下（§4.2.3 的"取消分配"）。
+///
+/// 与"删号重建"的区别是：账号行、凭据、模型目录与选择集**原封不动**。
+/// 目标被删除后，空出来的自动逻辑模型按 §16.3 一起清理——这与"取消勾选全部
+/// 模型"是同一条收敛路径，不会留下零目标的孤儿模型。
+///
+/// 返回撤下的目标数。重新分配进分组时，`move_account_targets` 会按目录把
+/// 该有的目标重建出来，所以这一步是可逆的。
+pub async fn detach_account_targets(state: &SharedState, account: &Account) -> Result<usize> {
+    let targets = state.store.list_targets().await?;
+    let owned: Vec<&DispatchTarget> = targets
+        .iter()
+        .filter(|target| target.account_id == account.id)
+        .collect();
+    if owned.is_empty() {
+        return Ok(0);
+    }
+    let removed = owned.len();
+    let ids: Vec<String> = owned.iter().map(|target| target.id.clone()).collect();
+    state.store.apply_config_delta(&[], &[], &ids, &[]).await?;
+    // 模型清理放在删除之后：此刻才能看出哪个自动模型真的没有目标了。
+    let remaining = state.store.list_targets().await?;
+    let live: HashSet<&str> = remaining
+        .iter()
+        .map(|target| target.logical_model_id.as_str())
+        .collect();
+    let model_deletes: Vec<String> = state
+        .store
+        .list_logical_models()
+        .await?
+        .iter()
+        .filter(|model| model.origin == ModelOrigin::Auto && !live.contains(model.id.as_str()))
+        .map(|model| model.id.clone())
+        .collect();
+    if !model_deletes.is_empty() {
+        state
+            .store
+            .apply_config_delta(&[], &[], &[], &model_deletes)
+            .await?;
+    }
+    state.reload_config().await?;
+    Ok(removed)
 }
 
 /// 自动创建的逻辑模型失去最后一个目标时随之清理（§16.3）。

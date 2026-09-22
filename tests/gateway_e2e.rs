@@ -143,7 +143,7 @@ async fn wire_target(
     let group_id = state.store.list_groups().await.unwrap()[0].id.clone();
     let account = Account {
         id: ids::account(),
-        group_id: group_id.clone(),
+        group_id: Some(group_id.clone()),
         name: name.into(),
         base_url: base_url.into(),
         preferred_protocol: protocol,

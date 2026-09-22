@@ -4,14 +4,21 @@
  * 一个账号可以放多把 Key，它们之间的关系与多个账号完全一致：负载均衡、粘性、
  * 熔断、限额都按"每一把 Key"独立生效。这个组件的职责只有两件——
  *
- * 1. 让管理员一次把多把 Key 填进来，而不是为每把 Key 建一个账号；
+ * 1. 让管理员**一次把多把 Key 填进来**，而不是为每把 Key 建一个账号；
  * 2. 如实显示每把 Key 的健康状态，让"哪几把已经死了"一眼可见。
+ *
+ * **粘贴是主路径，不是补充手段。** 手上有十把 Key 的人不会愿意点十次"添加"，
+ * 再逐行粘贴；所以他可以直接把十行糊进一个多行框，一次变成十行。甚至直接
+ * 粘进某一行也行——单行输入框会把换行吃成空格，那一种形态也认。
+ *
+ * 切分规则本身是产品行为，完整定义与理由见 `lib/key-paste.ts`（那里有测试）。
  *
  * **后台从不回吐明文**（§23.2），所以已保存的 Key 在界面上只有标签、摘要前缀与
  * 状态；要换就整把重新粘贴。提交时"有 id、没明文"就是"这一把没动"。
  */
 import { useState } from "react";
 import type { AccountKey, AccountKeyInput, Limits } from "../lib/types";
+import { splitPastedKeys } from "../lib/key-paste";
 import { Badge, Button, Field, InfoTip } from "./ui";
 import { IconPlus, IconTrash } from "./Icons";
 
@@ -159,12 +166,21 @@ export function KeyPoolEditor({
 }) {
   const [showKey, setShowKey] = useState<Record<number, boolean>>({});
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  /** 批量粘贴框的内容。粘完就清空，它只是一条批量入口，不是状态的一部分。 */
+  const [bulk, setBulk] = useState("");
 
   const update = (index: number, patch: Partial<KeyDraft>) => {
     onChange(drafts.map((draft, i) => (i === index ? { ...draft, ...patch } : draft)));
   };
 
   const error = validateDrafts(drafts);
+
+  /** 把粘贴框里的内容切成多行并**追加**到现有池子后面。 */
+  const appendBulk = (text: string) => {
+    const added = splitPastedKeys(text);
+    if (added.length === 0) return;
+    onChange([...drafts, ...added]);
+  };
 
   return (
     <Field
@@ -174,6 +190,55 @@ export function KeyPoolEditor({
     >
       {() => (
         <>
+          {/* 批量入口放在列表**前面**：手上有十把 Key 的人应该先看到它，而不是
+              先看到"添加一把 Key"再逐行粘贴。 */}
+          <div className="key-pool-bulk">
+            <textarea
+              className="input mono key-pool-bulk-input"
+              value={bulk}
+              rows={3}
+              spellCheck={false}
+              aria-label="批量粘贴 API Key"
+              placeholder={"每行一把 Key，直接粘贴即可自动分行；也支持逗号分隔的一行。\nsk-aaaa\nsk-bbbb\nsk-cccc\n带标签也可以：站点A sk-dddd"}
+              onChange={(event) => {
+                const text = event.target.value;
+                // 粘进来自动拆成多行：只要出现了分隔符就相当于"提交这批"。
+                if (/[\r\n,]/.test(text)) {
+                  appendBulk(text);
+                  setBulk("");
+                  return;
+                }
+                setBulk(text);
+              }}
+              // 先切分再插入：不靠 keydown 猜粘贴事件，输入法与拖放都走同一条路。
+              onBlur={(event) => {
+                const text = event.target.value;
+                if (text.trim()) {
+                  appendBulk(text);
+                  setBulk("");
+                }
+              }}
+            />
+            <div className="key-pool-bulk-hint">
+              <span>
+                每行一把；换行与逗号都会自动分开，粘完立刻变成下面的行。
+                只有一行时按「加入」或离开输入框即可。
+              </span>
+              <span className="spacer" />
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={!bulk.trim()}
+                onClick={() => {
+                  appendBulk(bulk);
+                  setBulk("");
+                }}
+              >
+                加入
+              </Button>
+            </div>
+          </div>
+
           <div className="key-pool">
             {drafts.map((draft, index) => {
               const health = draft.health?.health;
@@ -196,9 +261,36 @@ export function KeyPoolEditor({
                         className="input mono"
                         type={showKey[index] ? "text" : "password"}
                         value={draft.api_key}
-                        onChange={(e) => update(index, { api_key: e.target.value })}
+                        onChange={(e) => {
+                          const text = e.target.value;
+                          // 有人会直接点进某一行粘贴一整批。**单行输入框在粘贴时
+                          // 会把换行吃成空格**（HTML 的规定，不是我们的选择），
+                          // 所以这里要能认出"空格连起来的多个 Key"并拆成多行；
+                          // 逗号同理。别把当前行复制一份——它已经在列表里了。
+                          const pieces = splitPastedKeys(text);
+                          if (pieces.length > 1) {
+                            const head = pieces[0]!;
+                            onChange([
+                              ...drafts.map((draft, i) =>
+                                i === index
+                                  ? {
+                                      ...draft,
+                                      api_key: head.api_key,
+                                      // 第一段带标签时（`站点A sk-xxx`）要把它
+                                      // 一起收下，否则那段标签会被静默丢掉，
+                                      // 而后面几段的标签都还在——很难看出少了一个。
+                                      label: head.label || draft.label,
+                                    }
+                                  : draft,
+                              ),
+                              ...pieces.slice(1),
+                            ]);
+                            return;
+                          }
+                          update(index, { api_key: text });
+                        }}
                         placeholder={
-                          draft.id ? "留空则不变（已保存）" : "sk-…"
+                          draft.id ? "留空则不变（已保存）" : "sk-…（可整批粘贴）"
                         }
                         autoComplete="new-password"
                         aria-label={`${position}的 API Key`}
@@ -307,7 +399,8 @@ export function KeyPoolEditor({
 
             {drafts.length === 0 && (
               <div className="key-pool-empty muted">
-                还没有任何 Key。这个账号在填好之前无法承接任何请求。
+                还没有任何 Key。把每把 Key 粘到上面那个框里（一行一把），
+                或者点下面的「添加一把」手动填。这个账号在填好之前无法承接请求。
               </div>
             )}
           </div>

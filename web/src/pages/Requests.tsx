@@ -97,8 +97,26 @@ function formatTokenPair(input: number | null, output: number | null): string {
   return `${input.toLocaleString()} / ${output.toLocaleString()}`;
 }
 
-/** 首字延迟：没等到首个语义事件时是"未到达"，不是 0 秒。 */
-function formatFirstToken(ms: number | null): string {
+/** 命中前缀缓存的那部分 Token（§11.6）。上游一项都没报时返回 null，不写 0。 */
+function formatCacheTokens(
+  read: number | null,
+  write: number | null,
+): string | null {
+  const parts: string[] = [];
+  if (read !== null) parts.push(`缓存读 ${read.toLocaleString()}`);
+  if (write !== null) parts.push(`缓存写 ${write.toLocaleString()}`);
+  return parts.length === 0 ? null : parts.join(" · ");
+}
+
+/**
+ * 首字延迟：**非流式请求没有"首字"这件事**（§6.6）。
+ *
+ * 流式请求一个字节都没发出去时写"未到达"是诚实的；但非流式请求的
+ * `first_token_ms` 本来就该是 null，把它也写成"未到达"会让人以为这次请求
+ * 卡住了。两者必须在界面上分开说。
+ */
+function formatFirstToken(ms: number | null, streaming: boolean): string {
+  if (!streaming) return "非流";
   return ms === null ? "未到达" : `${(ms / 1000).toFixed(1)}s`;
 }
 
@@ -338,6 +356,9 @@ export function Requests({
       "请求体积",
       "输入Token",
       "输出Token",
+      // 缓存读写是可单独计费的一档用量，导出里必须有它，否则对账对不上（§11.6）。
+      "缓存读Token",
+      "缓存写Token",
       // 上游未上报时留空，并在错误码列同时出现 client_gone 之类的结局标识（§18.1）。
       "首字ms",
       "耗时ms",
@@ -356,6 +377,8 @@ export function Requests({
       record.request_bytes,
       record.input_tokens ?? "",
       record.output_tokens ?? "",
+      record.cache_read_tokens ?? "",
+      record.cache_write_tokens ?? "",
       record.first_token_ms ?? "",
       record.duration_ms,
       record.http_status,
@@ -644,8 +667,8 @@ export function Requests({
                 <th>逻辑模型</th>
                 <th>实际目标</th>
                 <th>体积</th>
-                <th>Token</th>
-                <th>首字</th>
+                <th title="输入 / 输出；下面一行是缓存读 / 写（上游没上报就留空）">Token</th>
+                <th title="流式请求的首字节延迟；非流式没有首字，记为「非流」；流式但一个字节都没发出记为「未到达」">首字</th>
                 <th aria-sort={sort.key === "duration_ms" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
                   <button type="button" className="th-sort" onClick={() => toggleSort("duration_ms")}>
                     耗时 {sort.key === "duration_ms" ? (sort.dir === "asc" ? "↑" : "↓") : ""}
@@ -663,6 +686,10 @@ export function Requests({
             <tbody>
               {sortedRecords.map((record) => {
                 const expanded = expandedRequestIds.has(record.request_id);
+                const cacheTokens = formatCacheTokens(
+                  record.cache_read_tokens,
+                  record.cache_write_tokens,
+                );
                 return (
                   <Fragment key={record.request_id}>
                     <tr
@@ -763,15 +790,32 @@ export function Requests({
                       <td className="cell-dim">{formatBytes(record.request_bytes)}</td>
                       <td
                         className="mono cell-dim"
-                        title={
-                          record.input_tokens === null || record.output_tokens === null
-                            ? USAGE_MISSING_HINT
-                            : `输入 ${record.input_tokens.toLocaleString()} · 输出 ${record.output_tokens.toLocaleString()}`
-                        }
+                        title={(() => {
+                          // 悬停说明按"实际有什么"拼，而不是按输入/输出是否齐全来
+                          // 二选一：上游只报了缓存读写的记录，那两行数字恰恰是唯一
+                          // 的用量信号，不能在这一格被藏起来（§6.6、§11.6）。
+                          const parts: string[] = [];
+                          if (record.input_tokens !== null && record.output_tokens !== null) {
+                            parts.push(
+                              `输入 ${record.input_tokens.toLocaleString()} · 输出 ${record.output_tokens.toLocaleString()}`,
+                            );
+                          }
+                          if (cacheTokens) parts.push(cacheTokens);
+                          return parts.length > 0 ? parts.join(" · ") : USAGE_MISSING_HINT;
+                        })()}
                       >
                         {formatTokenPair(record.input_tokens, record.output_tokens)}
+                        {/* 缓存读写单独一行：它既不属于输入也不属于输出，混进
+                            输入里会让"这次到底花了多少钱"完全看不出来（§11.6）。 */}
+                        {cacheTokens && (
+                          <div className="text-faint" style={{ fontSize: 11, fontWeight: 400 }}>
+                            {cacheTokens}
+                          </div>
+                        )}
                       </td>
-                      <td className="mono cell-dim">{formatFirstToken(record.first_token_ms)}</td>
+                      <td className="mono cell-dim">
+                        {formatFirstToken(record.first_token_ms, record.streaming)}
+                      </td>
                       <td className="cell-dim">{formatDuration(record.duration_ms)}</td>
                       <td className="cell-dim" style={{ fontSize: 12 }}>
                         <span className="row" style={{ gap: 6 }}>

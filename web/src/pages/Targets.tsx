@@ -9,7 +9,13 @@
  * 账号上，数字相同即同层；层内按综合评分加权，跨层仍然严格阶梯。
  */
 import { useEffect, useMemo, useState } from "react";
-import type { Account, DispatchTarget, LogicalModel, TargetStatsSample } from "../lib/types";
+import type {
+  Account,
+  DispatchTarget,
+  Limits,
+  LogicalModel,
+  TargetStatsSample,
+} from "../lib/types";
 import { PROTOCOL_LABELS, TARGET_STATUS_LABELS } from "../lib/types";
 import { formatLimits } from "../lib/format";
 import type { Data } from "../lib/store";
@@ -24,7 +30,7 @@ import {
   ScoreMeter,
   useToast,
 } from "../components/ui";
-import { IconRoute, IconSearch, IconSettings } from "../components/Icons";
+import { IconChevronDown, IconRoute, IconSearch, IconSettings } from "../components/Icons";
 
 interface ResolvedTarget {
   target: DispatchTarget;
@@ -54,6 +60,23 @@ export function Targets({
   const [query, setQuery] = useState("");
   const [groupFilter, setGroupFilter] = useState("all");
   const [onlyIssues, setOnlyIssues] = useState(false);
+  /**
+   * 已展开的模型卡片。
+   *
+   * **默认折叠**：一个分组里的模型动辄几十个，全部展开时"哪个账号在哪一层、
+   * 现在忙不忙"要翻好几屏才能看完，而这张表最主要的值就是一眼扫完。
+   * 记的是"展开过"而不是"折叠过"，所以刷新数据不会把用户的选择冲掉。
+   */
+  const [expandedModels, setExpandedModels] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const toggleModel = (modelId: string) =>
+    setExpandedModels((current) => {
+      const next = new Set(current);
+      if (next.has(modelId)) next.delete(modelId);
+      else next.add(modelId);
+      return next;
+    });
   const params = useRouteParams();
   const highlightId = params.get("target");
   const [highlight, setHighlight] = useState<string | null>(highlightId);
@@ -63,17 +86,35 @@ export function Targets({
       setHighlight(null);
       return;
     }
-    if (!data.targets.some((target) => target.id === highlightId)) {
+    const located = data.targets.find((target) => target.id === highlightId);
+    if (!located) {
       toast.error("这条请求记录里的调度目标已经不存在了");
       setHighlight(null);
       return;
     }
     setHighlight(highlightId);
+    // 定位要真的能看见。三件事都会把这一行挡在 DOM 之外，必须一起清掉：
+    //
+    // 1. 卡片默认折叠——先展开这条目标所在的模型；
+    // 2. 搜索词 / 分组筛选 / 「只看异常」——带过来的目标如果被筛掉，
+    //    querySelector 找不到行，滚过去是一片空白，而横幅还在说"已定位到"，
+    //    那是最糟的一种反馈：界面在撒谎；
+    // 3. 因此这里直接把筛选复位，而不是只在高亮失败时报错。定位是一次
+    //    明确的"带我去看那一条"的请求，暂时让位给它是合理的。
+    setExpandedModels((current) =>
+      current.has(located.logical_model_id)
+        ? current
+        : new Set(current).add(located.logical_model_id),
+    );
+    setQuery("");
+    setGroupFilter("all");
+    setOnlyIssues(false);
+    // 筛选复位与展开都要先渲染一帧，行才会真的在 DOM 里。
     const scrollTimer = window.setTimeout(() => {
       document
         .querySelector(`tr[data-target-id="${highlightId}"]`)
         ?.scrollIntoView({ block: "center", behavior: "smooth" });
-    }, 80);
+    }, 120);
     const clearTimer = window.setTimeout(() => setHighlight(null), 2600);
     return () => {
       window.clearTimeout(scrollTimer);
@@ -304,6 +345,8 @@ export function Targets({
                           entry={entry}
                           highlight={highlight}
                           navigate={navigate}
+                          expanded={expandedModels.has(entry.model.id)}
+                          onToggle={() => toggleModel(entry.model.id)}
                         />
                       ))}
                   </div>
@@ -347,10 +390,15 @@ function ModelBlock({
   entry,
   highlight,
   navigate,
+  expanded,
+  onToggle,
 }: {
   entry: ModelEntry;
   highlight: string | null;
   navigate: (route: Route, params?: Record<string, string>) => void;
+  /** 默认折叠；展开状态由父级统一持有，刷新数据不丢。 */
+  expanded: boolean;
+  onToggle: () => void;
 }) {
   const { model, aliases, targets } = entry;
   const issueCount = targets.filter(({ target, account }) => targetHasIssue(target, account)).length;
@@ -361,10 +409,43 @@ function ModelBlock({
       priority: targets.find((item) => item.layer === layer)?.target.priority ?? 0,
       targets: targets.filter((item) => item.layer === layer),
     }));
+  // 折叠时卡片头部要能替代表格："几个账号能用、现在忙不忙"。
+  //
+  // 并发容量按"有限的那部分"求和，另给出不限的个数：只写一个分母会把
+  // "6 个账号里 1 个不限、其余 5 个已经被打满"显示成 忙/∞，正好把这张表
+  // 最想回答的问题答错。
+  const busy = targets.reduce((sum, { target }) => sum + target.inflight, 0);
+  const capped = targets.filter(
+    ({ target }) => target.effective_limits.max_concurrency !== null,
+  );
+  const capacity = capped.reduce(
+    (sum, { target }) => sum + (target.effective_limits.max_concurrency ?? 0),
+    0,
+  );
+  const unlimited = targets.length - capped.length;
 
   return (
-    <section className="routing-model-block">
-      <header className="routing-model-head">
+    <section className={`routing-model-block${expanded ? "" : " is-collapsed"}`}>
+      <header
+        className="routing-model-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        title={expanded ? "收起这张卡片的账号明细" : "展开这张卡片看每个账号的评分与可用性"}
+        onClick={onToggle}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onToggle();
+          }
+        }}
+      >
+        <span
+          className={"routing-model-chevron" + (expanded ? " is-open" : "")}
+          aria-hidden="true"
+        >
+          <IconChevronDown size={15} />
+        </span>
         <div className="routing-model-headline">
           <span className="routing-model-kicker">下游模型名</span>
           <span className="routing-model-name mono" title={model.name}>
@@ -395,9 +476,24 @@ function ModelBlock({
             <b>{targets.length}</b>
             <span>个上游账号</span>
           </span>
+          {/* 折叠时这就是唯一的"忙不忙"信号，展开后与表格里的并发容量对齐。 */}
+          <span
+            className="routing-model-stat"
+            title={
+              "当前并发 = 已经发出上游、还没结束的请求数；分母是所有账号的并发上限之和" +
+              (unlimited > 0 ? `，另有 ${unlimited} 个账号不限并发` : "")
+            }
+          >
+            <b className={busy > 0 ? "is-busy" : undefined}>{busy}</b>
+            <span>
+              / {capped.length === 0 ? "∞" : capacity} 并发
+              {unlimited > 0 && capped.length > 0 && ` +${unlimited} 不限`}
+            </span>
+          </span>
         </div>
       </header>
 
+      {expanded && (
       <div className="routing-layers">
         {layers.map((layer, index) => (
           <div className="routing-layer" key={layer.layer}>
@@ -418,7 +514,7 @@ function ModelBlock({
                   <col style={{ width: "19%" }} />
                   <col style={{ width: "14%" }} />
                   <col style={{ width: "13%" }} />
-                  <col style={{ width: "11%" }} />
+                  <col style={{ width: "13%" }} />
                   <col style={{ width: "8%" }} />
                 </colgroup>
                 <thead>
@@ -428,7 +524,7 @@ function ModelBlock({
                     <th>综合评分</th>
                     <th>可用性</th>
                     <th>首字 / 速度</th>
-                    <th>在途 / 限制</th>
+                    <th title="当前并发 / 并发上限；下面一行是 RPM / TPM 限制">当前并发</th>
                     <th>预计分配</th>
                   </tr>
                 </thead>
@@ -527,9 +623,16 @@ function ModelBlock({
                         )}
                       </td>
                       <td className="mono cell-dim" style={{ fontSize: 12 }}>
-                        <div>{formatLimits(target.effective_limits)}</div>
+                        <div
+                          title="当前并发 = 已经发出上游、还没结束的请求数；右边是并发上限"
+                        >
+                          <span className={target.inflight > 0 ? "is-busy" : undefined}>
+                            {target.inflight}
+                          </span>
+                          /{formatConcurrencyLimit(target.effective_limits)}
+                        </div>
                         <div className="text-faint" style={{ fontSize: 11 }}>
-                          在途 {target.inflight}
+                          {formatLimits(target.effective_limits)}
                         </div>
                       </td>
                       <td className="tabular">{Math.round(share * 100)}%</td>
@@ -541,8 +644,14 @@ function ModelBlock({
           </div>
         ))}
       </div>
+      )}
     </section>
   );
+}
+
+/** 并发上限的展示形式：未设置时是"不限"，用 ∞ 表示（§17.1）。 */
+function formatConcurrencyLimit(limits: Limits): string {
+  return limits.max_concurrency === null ? "∞" : String(limits.max_concurrency);
 }
 
 function TargetStatusBadge({

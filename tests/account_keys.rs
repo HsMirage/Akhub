@@ -56,7 +56,7 @@ async fn wire_account_with_keys(
     let group_id = akhub.state.store.list_groups().await.unwrap()[0].id.clone();
     let account = Account {
         id: ids::account(),
-        group_id,
+        group_id: Some(group_id),
         name: name.into(),
         base_url: base_url.into(),
         preferred_protocol: CHAT,

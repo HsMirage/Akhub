@@ -45,6 +45,8 @@ export function Overview({
   navigate: (route: Route, params?: Record<string, string>) => void;
 }) {
   const { overview, groups, accounts, models, targets } = data;
+  /** 未分配账号不参与调度（§4.2.3）：概览必须把它和"已接入"区分开。 */
+  const unassignedAccounts = accounts.filter((account) => account.group_id === null).length;
 
   // "最近请求"自己拉一小片：请求记录不参与全局刷新（它是全量刷新里最贵的一项，
   // 其他页面又完全用不到），所以这里按需取最近 6 条。
@@ -73,7 +75,7 @@ export function Overview({
     },
     {
       title: "接入上游账号",
-      desc: "填 Base URL 与上游 Key，不需要填任何模型能力字段",
+      desc: "填 Base URL 与上游 Key，不需要填任何模型能力字段；还没想好归属就先建未分配账号",
       done: accounts.length > 0,
       route: "accounts" as const,
     },
@@ -139,7 +141,11 @@ export function Overview({
               icon={<IconServer size={13} />}
               label="上游账号"
               value={accounts.length}
-              hint={`${overview.groups} 个分组内`}
+              hint={
+                unassignedAccounts > 0
+                  ? `${unassignedAccounts} 个未分配（不参与调度）`
+                  : `${overview.groups} 个分组内`
+              }
               onClick={() => navigate("accounts")}
             />
             <Stat

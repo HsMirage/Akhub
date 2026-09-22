@@ -1548,6 +1548,52 @@ table.data td.table-empty-cell {
   gap: 5px;
 }
 
+/* 折叠态：头部就是摘要。展开标志、可点击的头部与"忙不忙"必须先立住 */
+.routing-model-head[role="button"] {
+  cursor: pointer;
+  user-select: none;
+}
+
+.routing-model-head[role="button"]:hover {
+  background: var(--surface-hover);
+}
+
+.routing-model-head[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.routing-model-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.routing-model-head[role="button"]:hover .routing-model-chevron {
+  color: var(--text);
+}
+
+.routing-model-chevron.is-open {
+  transform: rotate(180deg);
+  color: var(--accent);
+}
+
+.routing-model-block.is-collapsed .routing-model-head {
+  border-bottom: none;
+}
+
+/* 当前并发有占用时把数字点亮：一眼看出哪个账号正在吃流量 */
+.routing-model-stat b.is-busy,
+.routing-table .is-busy {
+  color: var(--accent);
+}
+
 .routing-model-stats {
   display: flex;
   align-items: center;
@@ -3666,6 +3712,37 @@ table.data tbody tr.is-clickable:hover {
 }
 
 /* ---------------------------------------------------------- 账号内 Key 池（§4.2.1） */
+
+/* 批量粘贴框：十把 Key 的主入口，必须排在逐行编辑之前 */
+.key-pool-bulk {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.key-pool-bulk-input {
+  width: 100%;
+  min-height: 66px;
+  resize: vertical;
+  line-height: 1.6;
+  font-size: 12.5px;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.key-pool-bulk-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
 
 .key-pool {
   display: flex;

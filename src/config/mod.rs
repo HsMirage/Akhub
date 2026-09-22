@@ -211,12 +211,18 @@ fn build(
         let Some(account) = accounts.get(&target.account_id).cloned() else {
             continue;
         };
+        // 未分配账号不进调度：它没有分组，也就不属于任何下游 Key 的能力
+        // 范围（§4.2.3）。正常路径下它连调度目标都没有，这里再挡一次是
+        // 为了兜住"先建目标、后取消分配"这类中途状态。
+        let Some(account_group) = account.group_id.as_deref() else {
+            continue;
+        };
         // 逻辑模型与账号必须属于同一分组；跨组目标直接丢弃，避免绕过
         // 下游 Key 的分组边界（正常管理 API 也会拒绝此类写入）。
         let Some(model_group) = model_groups.get(target.logical_model_id.as_str()) else {
             continue;
         };
-        if account.group_id != *model_group {
+        if account_group != *model_group {
             continue;
         }
         if let Some(model_name) = model_names.get(target.logical_model_id.as_str()) {
@@ -319,7 +325,7 @@ mod tests {
     fn account(id: &str, group_id: &str, priority: i32) -> Account {
         Account {
             id: id.into(),
-            group_id: group_id.into(),
+            group_id: Some(group_id.into()),
             name: id.into(),
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,

@@ -71,7 +71,8 @@ export interface GroupAlert {
 
 export interface Account {
   id: string;
-  group_id: string;
+  /** 所属分组；`null` 表示未分配，账号不参与任何调度（§4.2.3）。 */
+  group_id: string | null;
   name: string;
   base_url: string;
   preferred_protocol: Protocol;

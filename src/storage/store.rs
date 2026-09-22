@@ -397,6 +397,13 @@ impl Store {
     // ------------------------------------------------------------------ 账号
 
     /// 写入账号及其加密凭据。两者必须同一事务，避免出现无凭据的账号。
+    ///
+    /// `group_id` 为 `None` 表示未分配（§4.2.3）。**同组内账号名唯一**由
+    /// `idx_accounts_group_name` 这个部分唯一索引兜底（`WHERE group_id IS NOT
+    /// NULL`，见 schema.sql）：它同时表达了"未分配之间允许重名"与"同组内必须
+    /// 唯一"这两件事，表级 `UNIQUE (group_id, name)` 表达不了后者。管理端在
+    /// 写入前仍会先查一遍（`ensure_account_name_free`），但那是为了给出可读的
+    /// 报错，正确性不依赖它。
     pub async fn insert_account(&self, account: &Account, secrets: &AccountSecrets) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -408,7 +415,7 @@ impl Store {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&account.id)
-        .bind(&account.group_id)
+        .bind(account.group_id.as_deref())
         .bind(&account.name)
         .bind(LEGACY_UPSTREAM_TYPE)
         .bind(&account.base_url)
@@ -476,7 +483,7 @@ impl Store {
                 allow_private_network = ?, enabled = ?, auto_sync = ?, hide_original = ?
              WHERE id = ?",
         )
-        .bind(&account.group_id)
+        .bind(account.group_id.as_deref())
         .bind(&account.name)
         .bind(LEGACY_UPSTREAM_TYPE)
         .bind(&account.base_url)
@@ -2134,7 +2141,9 @@ impl Store {
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(account, "id"))
-            .bind(str_field(account, "group_id"))
+            // 未分配账号在备份里是 null / 缺字段，不能写成空串——空串会被
+            // 当成一个不存在的分组 id（§4.2.3）。
+            .bind(str_opt_field(account, "group_id"))
             .bind(str_field(account, "name"))
             // 同 insert_account：历史列写占位值（§4.2）。
             .bind(LEGACY_UPSTREAM_TYPE)
@@ -3155,6 +3164,7 @@ fn row_to_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account> {
     let mode: String = row.try_get("multiplier_mode")?;
     Ok(Account {
         id: row.try_get("id")?,
+        // NULL 表示未分配（§4.2.3），不是一个叫 NULL 的分组。
         group_id: row.try_get("group_id")?,
         name: row.try_get("name")?,
         // upstream_type 是历史列：v12 起既不写也不用（§4.2）。库里留着它，
@@ -3317,7 +3327,7 @@ mod tests {
     fn sample_account(group_id: &str) -> Account {
         Account {
             id: ids::account(),
-            group_id: group_id.into(),
+            group_id: Some(group_id.into()),
             name: "账号A".into(),
             base_url: "https://api.anthropic.com".into(),
             preferred_protocol: Protocol::AnthropicMessages,

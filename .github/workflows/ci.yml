@@ -25,6 +25,9 @@ jobs:
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
+          # 纯逻辑的行为断言（批量粘贴 Key 的切分规则）：仓库没有前端测试框架，
+          # 用 tsc + node 直接跑，放在构建之前。
+          npm test
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable

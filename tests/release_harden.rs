@@ -776,7 +776,352 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "17");
+    assert_eq!(version, "18");
+}
+
+/// v18 重建 `upstream_accounts` 时按列名逐列拷贝。历史上有几列是**直接
+/// 加进 schema.sql、从来没有对应迁移**的（`auto_sync` 就是典型：它靠列默认值
+/// 在新库里成立，但比它更老的库升上来时这一列根本不存在）。缺一列就会让整段
+/// 重建失败，而失败发生在启动时——用户看到的是"服务起不来"。
+///
+/// 这条用例把最老的库形态造出来（删掉后续版本加的列、版本号写回 1），断言它
+/// 不仅能升到当前版本，而且账号数据、补回的列、部分唯一索引、子表外键与
+/// PRAGMA foreign_keys 都对。
+#[tokio::test]
+async fn a_very_old_database_migrates_all_the_way_to_the_current_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+
+    // 退回 v1 形态：把后来加的列删掉，并造一个老账号验证数据不丢。
+    for ddl in [
+        "ALTER TABLE upstream_accounts DROP COLUMN hide_original",
+        "ALTER TABLE upstream_accounts DROP COLUMN auto_sync",
+        "ALTER TABLE groups DROP COLUMN max_wait_secs",
+        "ALTER TABLE groups DROP COLUMN allow_managed_background",
+        "ALTER TABLE request_records DROP COLUMN first_token_ms",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
+            weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+            queue_capacity, allow_degrade, created_at)
+         VALUES ('g-old', '老分组', 'akh-old', 'digest-old', 1000000, 40, 25, 20, 15, 10, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+            preferred_protocol, adaptive_protocol, default_priority, calibration,
+            multiplier_mode, manual_multiplier, allow_private_network, enabled, created_at)
+         VALUES ('a-old', 'g-old', '老账号', 'openai', 'https://old.example.com',
+            'openai_chat', 1, 0, 1000000, 'manual', 1000000, 0, 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '1' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(state);
+
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .expect("最老的库必须能一路升到当前版本");
+    let pool = reopened.store.pool();
+
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(version, "18");
+
+    // 老账号还在，归属没变。
+    let account = reopened
+        .store
+        .list_accounts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == "a-old")
+        .expect("老账号必须保住");
+    assert_eq!(account.name, "老账号");
+    assert_eq!(account.group_id.as_deref(), Some("g-old"));
+
+    // 补回来的列必须在，且 group_id 真的可空。
+    let columns: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(upstream_accounts)")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    for column in ["auto_sync", "hide_original", "model_synced_at", "group_id"] {
+        assert!(columns.contains(column), "迁移后缺少列 {column}");
+    }
+    let nullable: i64 = sqlx::query_scalar(
+        "SELECT [notnull] FROM pragma_table_info('upstream_accounts')
+          WHERE name = 'group_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(nullable, 0, "group_id 必须可空（未分配）");
+
+    // 部分唯一索引存在，外键仍指向真表，且 PRAGMA foreign_keys 被恢复。
+    let index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+          AND name = 'idx_accounts_group_name'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(index, 1, "同组内账号名唯一的部分索引必须建好");
+    let parents: Vec<String> = sqlx::query("PRAGMA foreign_key_list(upstream_secrets)")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| sqlx::Row::try_get::<String, _>(row, "table").unwrap())
+        .collect();
+    assert!(
+        parents.iter().any(|parent| parent == "upstream_accounts"),
+        "子表外键必须仍指向重建后的表：{parents:?}"
+    );
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "迁移必须把外键开关恢复成 ON");
+}
+
+/// v18 启用外键检查后，**孤儿行不能让升级拒绝启动**。
+///
+/// 老版本从不做这个检查，谁的库里攒下几条"子行引用了一个已经不存在的父行"
+/// 都不奇怪。这类行按定义不可达（界面上永远打不开它），但"升级后服务起不来"
+/// 是对现有部署最糟的失败模式。所以迁移应当清掉它们并照常启动。
+#[tokio::test]
+async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+
+    // 关着外键写进几条引用不存在账号的行，再把版本退回 v17 逼 v18 重跑。
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO account_models
+            (account_id, upstream_model, public_name, hide_original, selected, missing, discovered_at)
+         VALUES ('acc-ghost', 'm-ghost', 'm-ghost', 0, 1, 0, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO multiplier_snapshots (account_id, multiplier, source, status, refreshed_at)
+         VALUES ('acc-ghost', 1000000, 'manual', 'known', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '17' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(state);
+
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .expect("孤儿行不该让升级拒绝启动");
+    let pool = reopened.store.pool();
+    let ghosts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM account_models WHERE account_id = 'acc-ghost'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(ghosts, 0, "孤儿行应当被清理");
+    let dangling = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(dangling.is_empty(), "清理之后不应再有坏引用");
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(version, "18");
+}
+/// v18 把 upstream_accounts.group_id 改成可空（§4.2.3）。
+///
+/// SQLite 改不了列约束，迁移只能重建表；重建的坑全在**外键**上：
+/// upstream_secrets / upstream_account_keys / account_models 等都显式引用
+/// upstream_accounts(id)。如果按常规的 12 步法把旧表 RENAME 成 _old，SQLite
+/// 会把那些子表的引用一起改写到备份表上——一旦删掉备份表，整个账号体系的外键
+/// 就全指向一张不存在的表。这条用例把这件事钉住：迁移之后每一张子表都必须
+/// 还能正常写入，并且级联删除仍然生效。
+#[tokio::test]
+async fn the_v18_migration_rebuilds_the_account_table_without_breaking_foreign_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+    let now = akhub::storage::now_unix();
+
+    // 造一份 v17 形态的数据：分组 → 账号 →（凭据 / Key 池 / 目录行）。
+    sqlx::query(
+        "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
+            weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+            queue_capacity, max_wait_secs, allow_degrade, allow_managed_background, created_at)
+         VALUES ('g18', 'v18 分组', 'k18', 'd18', 1000000, 40, 25, 20, 15, 10, 60, 1, 0, ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+            preferred_protocol, adaptive_protocol, default_priority, calibration,
+            multiplier_mode, manual_multiplier, allow_private_network, enabled,
+            auto_sync, hide_original, created_at)
+         VALUES ('a18', 'g18', 'v18 账号', 'openai', 'https://v18.example.com',
+            'openai_chat', 1, 0, 1000000, 'manual', 1000000, 0, 1, 0, 0, ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_secrets (account_id, api_key, new_api_token, updated_at)
+         VALUES ('a18', X'00', NULL, ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_keys
+            (id, account_id, label, sealed_key, credential_digest,
+             limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
+         VALUES ('k18', 'a18', '', X'00', '', NULL, NULL, NULL, 1, ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO account_models
+            (account_id, upstream_model, public_name, hide_original, selected, missing, discovered_at)
+         VALUES ('a18', 'glm-4.6', 'glm-4.6', 0, 1, 0, ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 退到 v17，逼下一次打开重跑 v18。
+    sqlx::query("UPDATE app_settings SET value = '17' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(state);
+
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = reopened.store.pool();
+
+    // 1. 迁移后 group_id 真的可空了：插入一个未分配账号必须成功。
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+            preferred_protocol, adaptive_protocol, default_priority, calibration,
+            multiplier_mode, manual_multiplier, allow_private_network, enabled,
+            auto_sync, hide_original, created_at)
+         VALUES ('a18-free', NULL, '未分配账号', 'openai', 'https://free.example.com',
+            'openai_chat', 1, 0, 1000000, 'manual', 1000000, 0, 1, 0, 0, ?)",
+    )
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("v18 之后 group_id 必须可空");
+    // 老账号的数据必须原样保留。
+    let (name, group): (String, String) =
+        sqlx::query_as("SELECT name, group_id FROM upstream_accounts WHERE id = 'a18'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!((name.as_str(), group.as_str()), ("v18 账号", "g18"));
+
+    // 2. 子表的外键必须仍然指向真表。PRAGMA foreign_key_list 是权威答案：
+    //    只看 sqlite_master 的建表语句会漏掉"引用被 RENAME 改写成备份表名"。
+    for table in [
+        "upstream_secrets",
+        "upstream_account_keys",
+        "account_models",
+        "multiplier_snapshots",
+        "calibration_records",
+    ] {
+        let parents: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA foreign_key_list({table})"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| sqlx::Row::try_get::<String, _>(row, "table").unwrap())
+        .collect();
+        assert!(
+            parents.iter().any(|parent| parent == "upstream_accounts"),
+            "{table} 的外键必须指向重建后的 upstream_accounts，实际是 {parents:?}"
+        );
+    }
+
+    // 3. 级联删除仍然生效：删掉账号，子表里的行必须跟着走。
+    sqlx::query("DELETE FROM upstream_accounts WHERE id = 'a18'")
+        .execute(pool)
+        .await
+        .unwrap();
+    for table in [
+        "upstream_secrets",
+        "upstream_account_keys",
+        "account_models",
+    ] {
+        let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE account_id = 'a18'"
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0, "{table} 里的行应随账号级联删除");
+    }
+
+    // 4. 迁移必须把外键恢复成 ON：连接池只有一条连接，关着外键的池子会让
+    //    之后所有写入都失去约束，是比"列不可空"严重得多的后遗症。
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1, "v18 迁移结束前必须把外键打开");
+
+    // 5. 未分配账号能被领域层正常读出（NULL 不是一个叫 "NULL" 的分组）。
+    let accounts = reopened.store.list_accounts().await.unwrap();
+    let unassigned = accounts
+        .iter()
+        .find(|account| account.id == "a18-free")
+        .expect("未分配账号必须能加载");
+    assert_eq!(unassigned.group_id, None);
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

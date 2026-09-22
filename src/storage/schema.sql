@@ -34,9 +34,12 @@ CREATE TABLE IF NOT EXISTS groups (
     created_at        INTEGER NOT NULL
 );
 
+-- group_id 为 NULL 表示"未分配"：账号建好了、还没决定放进哪个分组。
+-- 未分配账号可以配置凭据、模型目录与倍率，但没有调度目标、不参与任何调度；
+-- 在界面上把它分配给某个分组时才按对外名把模型一起迁过去（§4.2.3）。
 CREATE TABLE IF NOT EXISTS upstream_accounts (
     id                    TEXT PRIMARY KEY,
-    group_id              TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    group_id              TEXT REFERENCES groups(id) ON DELETE CASCADE,
     name                  TEXT NOT NULL,
     -- 历史列：早期用来区分官方直连、中转站与“OpenAI 兼容”，但全仓没有一处
     -- 按它分支——端点由协议决定，倍率来源由 multiplier_mode 决定。v12 起不再
@@ -63,11 +66,19 @@ CREATE TABLE IF NOT EXISTS upstream_accounts (
     hide_original         INTEGER NOT NULL DEFAULT 0,
     -- 上一次自动同步完成的时间；下一次同步时刻在此基础上加间隔与抖动。
     model_synced_at       INTEGER,
-    created_at            INTEGER NOT NULL,
-    UNIQUE (group_id, name)
+    created_at            INTEGER NOT NULL
+    -- 表级 UNIQUE (group_id, name) 在这里**不能用**：SQLite 把每个 NULL 都当成
+    -- 互不相等，所以它拦不住"同一分组内重名"。那件事交给下面的部分唯一索引。
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id);
+
+-- 同组内账号名唯一（§4.2）。WHERE 子句把未分配账号排除在唯一性之外：
+-- 未分配是暂存区，允许两个账号都叫同一个名字，等分配进分组时再判冲突；
+-- 一旦有了分组，同名就是真实的写错，交给数据库拦下——管理端的
+-- `ensure_account_name_free` 只负责给出可读的报错，不负责兜底正确性。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_group_name
+    ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL;
 
 -- 加密的上游凭据。与账号一一对应，独立成表以便日志与查询默认不触碰密文。
 --

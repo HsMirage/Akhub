@@ -187,7 +187,8 @@ export interface GroupInput {
 }
 
 export interface AccountInput {
-  group_id: string;
+  /** 所属分组；`null` 表示未分配（§4.2.3）。新建时缺省即未分配。 */
+  group_id?: string | null;
   name: string;
   base_url: string;
   /** 账号内 Key 池（§4.2.1）。整体替换；缺省时后台不动 Key 池。 */

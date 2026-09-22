@@ -539,7 +539,7 @@ mod tests {
         .unwrap();
         let account = Account {
             id: "a1".into(),
-            group_id: "g1".into(),
+            group_id: Some("g1".into()),
             name: "测试账号".into(),
 
             base_url: "https://api.example.com".into(),

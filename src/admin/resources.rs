@@ -783,7 +783,10 @@ pub struct AccountKeyInput {
 
 #[derive(Deserialize)]
 pub struct AccountPayload {
-    pub group_id: String,
+    /// 所属分组。留空 / `null` 表示"未分配"：先把账号建好，之后再分配进
+    /// 分组（§4.2.3）。未分配账号不参与任何调度。
+    #[serde(default)]
+    pub group_id: Option<String>,
     pub name: String,
     pub base_url: String,
     /// Key 池。为空数组表示"这个账号暂时没有凭据"，是合法状态（§4.2.1）。
@@ -813,8 +816,11 @@ pub struct AccountPayload {
 
 #[derive(Deserialize)]
 pub struct AccountPatch {
-    /// 改所属分组（§4.2.2）。缺省表示"不搬家"；只有与当前分组不同才触发迁移。
-    pub group_id: Option<String>,
+    /// 改所属分组（§4.2.2）。缺省表示"不搬家"；只有与当前分组不同才触发
+    /// 迁移。显式传 `null`（或空串）表示**取消分配**（§4.2.3）：账号留在
+    /// 列表里，但名下的调度目标会全部撤下。
+    #[serde(default, deserialize_with = "double_option")]
+    pub group_id: Option<Option<String>>,
     pub name: Option<String>,
     pub base_url: Option<String>,
     /// Key 池整体替换（§4.2.1）。缺省表示"不动 Key 池"。
@@ -841,7 +847,8 @@ pub struct AccountPatch {
 #[derive(Serialize)]
 pub struct AccountDto {
     pub id: String,
-    pub group_id: String,
+    /// 所属分组；`null` 表示未分配（§4.2.3），界面把它显示成「未分配」。
+    pub group_id: Option<String>,
     pub name: String,
     pub base_url: String,
     pub preferred_protocol: Protocol,
@@ -1013,8 +1020,12 @@ fn single_key_input(api_key: &str) -> AccountKeyInput {
 
 async fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
     let config = state.config.current();
-    let limit = config
-        .group_by_id(&account.group_id)
+    // 未分配账号没有分组，也就没有分组倍率上限。这里退回 1 只影响展示：它
+    // 不参与任何调度决策，真被分配的那一刻分组上限会立刻接管（§4.2.3）。
+    let limit = account
+        .group_id
+        .as_deref()
+        .and_then(|id| config.group_by_id(id))
         .map(|group| group.group.multiplier_limit)
         .unwrap_or(Multiplier::ONE);
     let effective =
@@ -1184,6 +1195,11 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
                 .filter(|key| key.enabled && key.status == "quota_exhausted")
                 .count()
         )),
+        // 未分配与"分配了但一个模型都没勾"是两件事：前者的处置动作是"选一个
+        // 分组"，后者是"去模型管理里勾选"（§4.2.3）。
+        "active" if account.group_id.is_none() => {
+            Some("该账号还没有分配到分组，因此不参与任何调度".to_string())
+        }
         "active" if total == 0 => Some("该账号还没有任何调度目标".to_string()),
         // 只有目标级问题时把具体是哪个目标说出来。
         _ if total > 0 && status != "active" => reason,
@@ -1357,8 +1373,13 @@ pub async fn create_account(
     admin: Admin,
     Json(payload): Json<AccountPayload>,
 ) -> AdminResult<(StatusCode, Json<AccountDto>)> {
-    find_group(&state, &payload.group_id).await?;
+    // 分组是可选的：留空就是"未分配"，账号先建好、以后再分配进分组（§4.2.3）。
+    let group_id = trimmed(payload.group_id);
+    if let Some(group_id) = group_id.as_deref() {
+        find_group(&state, group_id).await?;
+    }
     let name = require_name(&payload.name, "账号名称")?;
+    ensure_account_name_free(&state, None, group_id.as_deref(), &name).await?;
     // Key 池：新格式用 `keys`，只给了旧的 `api_key` 时等价于"一把 Key 的池"
     // （§4.2.1）。Key 池为空是合法状态——管理员可以先建账号再填凭据。
     let mut inputs = payload.keys;
@@ -1398,7 +1419,7 @@ pub async fn create_account(
 
     let account = Account {
         id: ids::account(),
-        group_id: payload.group_id,
+        group_id,
         name,
         base_url,
         preferred_protocol: payload.preferred_protocol,
@@ -1431,6 +1452,9 @@ pub async fn create_account(
         .insert_account(&account, &secrets)
         .await
         .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+    // 未分配账号在配置装配里根本不会出现（§4.2.3），但配置版本仍要推进一次：
+    // 让它立刻出现在管理端的账号列表与倍率表里。
+    //
     // 建账号与写 Key 池分两步：账号行必须先存在（外键）。两步之间失败只会留下
     // 一个"没有凭据"的账号，后台如实显示，管理员补一次即可。
     state
@@ -1465,41 +1489,61 @@ pub async fn update_account(
     if let Some(name) = patch.name {
         account.name = require_name(&name, "账号名称")?;
     }
-    // 改分组（§4.2.2）。分组是调度硬边界，但迁移本身是后台的正当操作：
-    // 账号的模型目录按对外名一起搬过去，管理员不必"复制一个新账号再删旧的"。
-    // 名称检查放在后面：同一分组内名称唯一，改名与搬家同时提交时应该按**改完
-    // 的名字**判冲突。
+    // 改分组（§4.2.2、§4.2.3）。分组是调度硬边界，但迁移本身是后台的正当
+    // 操作：账号的模型目录按对外名一起搬过去，管理员不必"复制一个新账号再删
+    // 旧的"。
+    //
+    // 名称检查放在这里：同一分组内名称唯一，**改名与搬家同时提交时按改完的
+    // 名字判冲突**，所以改名的分支也要重查一次。
+    //
+    // 传 `null` / 空串表示取消分配：账号留在列表里，模型目录与凭据原封不动，
+    // 只是不再属于任何分组，名下的调度目标随之全部撤下（见下面的 `unassigned`）。
     let mut previous_group: Option<String> = None;
-    if let Some(group_id) = patch
-        .group_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|group| !group.is_empty())
-        && group_id != account.group_id
-    {
-        find_group(&state, group_id).await?;
-        let clash = state
-            .store
-            .list_accounts()
-            .await
-            .map_err(AdminError::internal)?
-            .into_iter()
-            .any(|other| {
-                other.id != account.id && other.group_id == group_id && other.name == account.name
-            });
-        // 交给数据库的唯一约束也能拦住，但报出来的是"名称已存在"，管理员看不出
-        // 是搬家撞上的。这里先判一次，把话说清楚。
-        if clash {
-            return Err(AdminError::conflict(format!(
-                "目标分组里已经有叫「{}」的账号，请先改账号名称，或换一个目标分组",
-                account.name
-            )));
+    let mut unassigned = false;
+    // 从"未分配"进入分组：没有旧分组可搬，但目标必须按目录重建出来。
+    let mut assigned = false;
+    if let Some(requested) = patch.group_id {
+        let group_id = requested
+            .as_deref()
+            .map(str::trim)
+            .filter(|group| !group.is_empty());
+        if group_id != account.group_id.as_deref() {
+            match group_id {
+                Some(group_id) => {
+                    find_group(&state, group_id).await?;
+                    // 先查一次是为了给出可读的报错；真正的兜底是数据库上的
+                    // 部分唯一索引（见 `ensure_account_name_free` 的说明）。
+                    ensure_account_name_free(
+                        &state,
+                        Some(&account.id),
+                        Some(group_id),
+                        &account.name,
+                    )
+                    .await?;
+                    // 从"未分配"进来时 previous_group 是 None，但它一样要
+                    // 走下面的调和（这一段就是"目标从哪来"的唯一入口）。
+                    assigned = account.group_id.is_none();
+                    previous_group = account.group_id.take();
+                    account.group_id = Some(group_id.to_string());
+                }
+                None => {
+                    // 撤销分配不是"搬家"：账号的目标要**撤下**而不是搬走，
+                    // 所以这里不留 from_group，交给 detach 分支处理。
+                    previous_group = None;
+                    account.group_id = None;
+                    unassigned = true;
+                }
+            }
         }
-        previous_group = Some(std::mem::replace(
-            &mut account.group_id,
-            group_id.to_string(),
-        ));
     }
+    // 只改名、不改分组时也要重查一次：同一分组内的重名同样要被拦下。
+    ensure_account_name_free(
+        &state,
+        Some(&account.id),
+        account.group_id.as_deref(),
+        &account.name,
+    )
+    .await?;
     if let Some(allow) = patch.allow_private_network {
         account.allow_private_network = allow;
     }
@@ -1616,13 +1660,30 @@ pub async fn update_account(
             state.runtime.health.clear_account_faults(&account.id);
         }
     }
-    // 搬家：账号行已经落库，接着把目标按对外名搬到新分组，再按目录整体调和
-    // 一遍（§4.2.2）。顺序不能反——先搬目标再改账号行的话，中间那一刻的快照
-    // 里目标与账号不同组，会被配置装配整批丢掉。
-    if let Some(from_group) = previous_group.as_deref() {
-        let moved = discovery::move_account_targets(&state, &account, from_group)
+    // 取消分配（§4.2.3）：账号不再属于任何分组，它名下的调度目标全部撤下。
+    // 模型目录、选择集与凭据都留着——重新分配时按目录整体调和，勾过的模型
+    // 会自动回到调度里。
+    if unassigned {
+        let removed = discovery::detach_account_targets(&state, &account)
             .await
             .map_err(AdminError::internal)?;
+        audit(&state, &admin, "move_account", &account.id).await;
+        tracing::info!(account = %account.id, removed, "账号已取消分配");
+    }
+    // 搬家 / 分配：账号行已经落库，接着把目标按对外名搬到新分组，再按目录整体
+    // 调和一遍（§4.2.2）。顺序不能反——先搬目标再改账号行的话，中间那一刻的
+    // 快照里目标与账号不同组，会被配置装配整批丢掉。
+    if assigned || previous_group.is_some() {
+        let from_group = previous_group.clone().unwrap_or_default();
+        let moved = if previous_group.is_some() && account.group_id.is_some() {
+            discovery::move_account_targets(&state, &account, &from_group)
+                .await
+                .map_err(AdminError::internal)?
+        } else {
+            // 只有"改分组"才搬家；取消分配那条路径已经在上面的 detach 分支里
+            // 把目标撤下了，这里不能重复动作（§4.2.3）。
+            0
+        };
         // 目录调和兜底：迁移只搬"已经存在的目标"，"哪些目录行该有目标"仍然
         // 由目录说了算（托管开关、上游已消失的行都在这一步收敛）。
         discovery::reconcile_account(&state, &account, account.auto_sync)
@@ -1630,13 +1691,15 @@ pub async fn update_account(
             .map_err(AdminError::internal)?;
         tracing::info!(
             account = %account.id,
-            from = from_group,
-            to = %account.group_id,
+            from = %from_group,
+            to = %account.group_id.as_deref().unwrap_or("未分配"),
             moved,
-            "账号已迁移分组"
+            "账号分组已变更"
         );
         audit(&state, &admin, "move_account", &account.id).await;
     }
+    // 先落库再调和：配置装配要求"账号行与目标行一致"（见上面的注释）。
+    // `reconcile_account` 内部会 reload_config，这里统一放在最后兜一次底。
     reload(&state).await?;
     if was_managed && !account.auto_sync {
         discovery::unhost(&state, &account)
@@ -2012,6 +2075,56 @@ fn trimmed(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// 同组内账号名唯一（§4.2）——**这里只负责给出可读的报错**。
+///
+/// 正确性由 `idx_accounts_group_name` 这个部分唯一索引兜底（见 schema.sql）：
+/// 它把"未分配之间允许重名"与"同组内必须唯一"同时表达了出来，表级
+/// `UNIQUE (group_id, name)` 做不到。
+///
+/// 之所以还要在这里先查一遍：数据库抛出来的是"UNIQUE constraint failed"，
+/// 管理员看不出是撞了哪个账号、该怎么办。由三个写入路径共用：新建、改名 /
+/// 搬家、复制。`group_id` 为 `None`（未分配）时不参与唯一性。
+async fn ensure_account_name_free(
+    state: &SharedState,
+    account_id: Option<&str>,
+    group_id: Option<&str>,
+    name: &str,
+) -> AdminResult<()> {
+    let Some(group_id) = group_id else {
+        return Ok(());
+    };
+    let clash = state
+        .store
+        .list_accounts()
+        .await
+        .map_err(AdminError::internal)?
+        .into_iter()
+        .any(|other| {
+            Some(other.id.as_str()) != account_id
+                && other.group_id.as_deref() == Some(group_id)
+                && other.name == name
+        });
+    if clash {
+        return Err(AdminError::conflict(format!(
+            "该分组里已经有叫「{name}」的账号，请先改账号名称，或换一个目标分组"
+        )));
+    }
+    Ok(())
+}
+
+/// 把 "没传" 与 "显式传 null" 分开。
+///
+/// 常规的反序列化把两者都变成 `None`，于是"取消分组分配"永远无法表达——
+/// PATCH 里字段缺省是"不改"，`null` 才是"改成没有"。这里包一层：字段缺失
+/// → `None`，`null` → `Some(None)`，值 → `Some(Some(v))`。
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 pub async fn delete_account(
     State(state): State<SharedState>,
     admin: Admin,
@@ -2360,8 +2473,11 @@ fn target_dto(
         enabled: target.enabled,
         status: view
             .map(|view| {
-                let limit = config
-                    .group_by_id(&view.account.group_id)
+                let limit = view
+                    .account
+                    .group_id
+                    .as_deref()
+                    .and_then(|id| config.group_by_id(id))
                     .map(|group| group.group.multiplier_limit)
                     .unwrap_or(crate::domain::Multiplier::ONE);
                 effective_target_status(state, limit, view)
@@ -2452,10 +2568,12 @@ fn multiplier_pause_reason(
     view: Option<&std::sync::Arc<crate::config::TargetView>>,
 ) -> Option<String> {
     let view = view?;
-    let limit = state
-        .config
-        .current()
-        .group_by_id(&view.account.group_id)
+    let config = state.config.current();
+    let limit = view
+        .account
+        .group_id
+        .as_deref()
+        .and_then(|id| config.group_by_id(id))
         .map(|group| group.group.multiplier_limit)
         .unwrap_or(crate::domain::Multiplier::ONE);
     let effective = state.runtime.multipliers.view().effective(
@@ -2775,8 +2893,14 @@ pub async fn create_target(
         .ok_or_else(|| AdminError::not_found("逻辑模型不存在"))?;
     let account = find_account(&state, &payload.account_id).await?;
 
-    // 分组是调度硬边界：跨组绑定必须在写入时就被拒绝（§4.1）。
-    if account.group_id != model.group_id {
+    // 分组是调度硬边界：跨组绑定必须在写入时就被拒绝（§4.1）。未分配账号
+    // 不属于任何分组，也就不能直接绑目标——先把账号分配进分组（§4.2.3）。
+    let Some(account_group) = account.group_id.as_deref() else {
+        return Err(AdminError::bad_request(
+            "该账号还没有分配到分组，无法绑定调度目标",
+        ));
+    };
+    if account_group != model.group_id {
         return Err(AdminError::bad_request(
             "账号与逻辑模型不在同一分组，不允许跨分组绑定",
         ));
@@ -3456,6 +3580,9 @@ pub async fn copy_account(
             .map_err(AdminError::internal)?,
     );
 
+    // 副本名带" - 副本"后缀，但同组里可能已经存在同名副本：先查一次，把
+    // 冲突说清楚（v18 起不再有数据库唯一约束兜底）。
+    ensure_account_name_free(&state, None, copy.group_id.as_deref(), &copy.name).await?;
     state
         .store
         .insert_account(&copy, &secrets)
@@ -3993,21 +4120,26 @@ pub async fn calibrate_account(
         .await
         .map_err(AdminError::internal)?;
 
-    let group_id = &account.group_id;
+    // 未分配账号没有分组，它也不可能有任何流量样本，直接按空结果报错。
+    let Some(group_id) = account.group_id.as_deref() else {
+        return Err(AdminError::bad_request(
+            "账号还没有分配到分组，分组均倍率无从计算，无法校准",
+        ));
+    };
     let model = &payload.logical_model;
     let model_samples: Vec<_> = samples
         .iter()
-        .filter(|s| &s.group_id == group_id && &s.logical_model == model)
+        .filter(|s| s.group_id == group_id && &s.logical_model == model)
         .collect();
     let model_requests: i64 = model_samples.iter().map(|s| s.requests).sum();
     let account_requests: i64 = usage
         .iter()
-        .filter(|u| &u.group_id == group_id && &u.logical_model == model && u.account_id == id)
+        .filter(|u| u.group_id == group_id && &u.logical_model == model && u.account_id == id)
         .map(|u| u.requests)
         .sum();
     let total_requests: i64 = usage
         .iter()
-        .filter(|u| &u.group_id == group_id && &u.logical_model == model)
+        .filter(|u| u.group_id == group_id && &u.logical_model == model)
         .map(|u| u.requests)
         .sum();
 
@@ -4174,12 +4306,23 @@ pub async fn import_backup(
         .filter_map(|a| Some((str_of(a, "id")?, str_of(a, "group_id")?)))
         .collect();
     let group_ids: HashSet<String> = data.groups.iter().filter_map(|g| str_of(g, "id")).collect();
+    // 同组内账号名唯一：备份里若有两个同组同名账号，直接落库会撞上部分唯一
+    // 索引，报出来是一句"内部错误 500"。这里先判一次，把是哪个分组、哪个名字
+    // 说清楚——恢复备份失败本来就够让人紧张了，不该再给一个无从下手的错误。
+    let mut claimed: HashSet<(String, String)> = HashSet::new();
     for account in &data.accounts {
+        // 未分配账号在备份里没有 group_id（或为 null / 空串），是合法状态（§4.2.3）。
         let group = str_of(account, "group_id").unwrap_or_default();
-        if !group_ids.contains(&group) {
+        let name = str_of(account, "name").unwrap_or_default();
+        if !group.is_empty() && !group_ids.contains(&group) {
             return Err(AdminError::bad_request(format!(
-                "备份里的账号 {} 引用了不存在的分组 {group}",
-                str_of(account, "name").unwrap_or_default()
+                "备份里的账号 {name} 引用了不存在的分组 {group}"
+            )));
+        }
+        // 未分配之间允许重名，与运行时口径一致。
+        if !group.is_empty() && !claimed.insert((group.clone(), name.clone())) {
+            return Err(AdminError::bad_request(format!(
+                "备份里的分组 {group} 有两个叫「{name}」的账号，同一分组内账号名必须唯一"
             )));
         }
     }

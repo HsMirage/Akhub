@@ -163,7 +163,7 @@ mod tests {
     fn model_view(name: &str, enabled: bool, target_count: usize) -> Arc<LogicalModelView> {
         let account = Arc::new(Account {
             id: "a1".into(),
-            group_id: "g1".into(),
+            group_id: Some("g1".into()),
             name: "账号A".into(),
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,

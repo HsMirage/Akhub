@@ -202,7 +202,12 @@ pub struct Group {
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: String,
-    pub group_id: String,
+    /// 所属分组；`None` 表示**未分配**（§4.2.3）。
+    ///
+    /// 未分配账号可以配凭据、模型目录与倍率，但不参与任何调度：它没有调度
+    /// 目标，配置装配时也不会进入任何分组。把它分配给某个分组时才按对外名
+    /// 把模型迁过去，与 §4.2.2 的搬家是同一条路径。
+    pub group_id: Option<String>,
     pub name: String,
     pub base_url: String,
     pub preferred_protocol: Protocol,

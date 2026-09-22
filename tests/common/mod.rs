@@ -783,7 +783,7 @@ pub async fn wire_target(akhub: &Akhub, spec: TargetSpec<'_>) -> Wired {
     let api_key = format!("key-{}", spec.name);
     let account = Account {
         id: ids::account(),
-        group_id: akhub.group_id.clone(),
+        group_id: Some(akhub.group_id.clone()),
         name: spec.name.into(),
         base_url: spec.base_url.into(),
         preferred_protocol: spec.protocol,

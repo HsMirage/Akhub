@@ -67,6 +67,9 @@ jobs:
         working-directory: web
         run: |
           npm ci
+          # 纯逻辑的行为断言（批量粘贴 Key 的切分规则）与构建同一份依赖，
+          # 顺路跑一次；发版链路不接受"规则退化了没人发现"。
+          npm test
           npm run build
 
       # 六个平台共用同一份前端产物：各平台分别 npm ci 会拖慢发版，也可能

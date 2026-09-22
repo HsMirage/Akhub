@@ -388,7 +388,7 @@ mod tests {
     fn account(id: &str, mode: MultiplierMode) -> Account {
         Account {
             id: id.into(),
-            group_id: "g1".into(),
+            group_id: Some("g1".into()),
             name: id.into(),
             base_url: "https://api.example.com".into(),
             preferred_protocol: Protocol::OpenAiChat,

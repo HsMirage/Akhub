@@ -43,7 +43,6 @@ import {
   KeyPoolEditor,
   draftsFromKeys,
   draftsToInputs,
-  emptyDraft,
   validateDrafts,
   type KeyDraft,
 } from "../components/KeyPoolEditor";
@@ -51,6 +50,9 @@ import { CalibrationDialog } from "../components/CalibrationDialog";
 import { IconPlus, IconRefresh, IconSearch, IconServer } from "../components/Icons";
 
 type AccountStatusFilter = "all" | "enabled" | "disabled";
+
+/** 分组筛选的哨兵值：未分配账号不属于任何分组（§4.2.3），不能用一个真实 id 表示。 */
+const UNASSIGNED = "__unassigned__";
 
 export function Accounts({
   data,
@@ -137,7 +139,11 @@ export function Accounts({
           const haystack = `${account.name} ${account.base_url}`.toLowerCase();
           if (!haystack.includes(needle)) return false;
         }
-        if (groupFilter !== "all" && account.group_id !== groupFilter) return false;
+        if (groupFilter === UNASSIGNED) {
+          if (account.group_id !== null) return false;
+        } else if (groupFilter !== "all" && account.group_id !== groupFilter) {
+          return false;
+        }
         if (statusFilter === "enabled" && !account.enabled) return false;
         if (statusFilter === "disabled" && account.enabled) return false;
         return true;
@@ -145,8 +151,11 @@ export function Accounts({
     [data.accounts, groupFilter, statusFilter, search],
   );
 
-  const groupName = (id: string) =>
-    data.groups.find((group) => group.id === id)?.name ?? id;
+  /** `null` 是未分配，不是"查不到的 id"——两种"没有分组"必须分开说（§4.2.3）。 */
+  const groupName = (id: string | null) =>
+    id === null
+      ? "未分配"
+      : (data.groups.find((group) => group.id === id)?.name ?? id);
 
   const remove = async (account: Account) => {
     try {
@@ -253,7 +262,7 @@ export function Accounts({
     <>
       <Card
         title="上游账号"
-        description="一个账号 = 一套独立凭据。同一把 Key 要同时用在两个分组，请复制成两个账号；只是换归属，在编辑里改「所属分组」，模型会一起迁过去。"
+        description="一个账号 = 一套独立凭据。同一把 Key 要同时用在两个分组，请复制成两个账号；只是换归属，在编辑里改「所属分组」，模型会一起迁过去。暂时不决定归属就先建「未分配」账号，之后再分配。"
         actions={
           <div className="row" style={{ gap: 8 }}>
             {/* 批量刷新：一次探测所有自动倍率账号（§11.3）。 */}
@@ -269,20 +278,13 @@ export function Accounts({
               variant="primary"
               icon={<IconPlus />}
               onClick={() => setEditing("new")}
-              disabled={data.groups.length === 0}
             >
               新建账号
             </Button>
           </div>
         }
       >
-        {data.groups.length === 0 ? (
-          <EmptyState
-            icon={<IconServer size={19} />}
-            title="请先创建分组"
-            description="账号必须归属于某个分组——分组决定了它能被哪把下游 Key 使用。"
-          />
-        ) : data.accounts.length === 0 ? (
+        {data.accounts.length === 0 ? (
           <EmptyState
             icon={<IconServer size={19} />}
             title="还没有上游账号"
@@ -320,6 +322,9 @@ export function Accounts({
                       onChange={(event) => setGroupFilter(event.target.value)}
                     >
                       <option value="all">全部分组</option>
+                      <option value={UNASSIGNED}>
+                        未分配（{data.accounts.filter((account) => account.group_id === null).length}）
+                      </option>
                       {data.groups.map((group) => (
                         <option key={group.id} value={group.id}>
                           {group.name}
@@ -421,7 +426,18 @@ export function Accounts({
                         <td>
                           <KeyCountCell account={account} />
                         </td>
-                        <td className="cell-dim">{groupName(account.group_id)}</td>
+                        <td className="cell-dim">
+                          {account.group_id === null ? (
+                            <span
+                              className="text-faint"
+                              title="未分配账号不参与调度：它没有调度目标，也不会出现在任何分组里。在「编辑」里选一个分组即可开始使用。"
+                            >
+                              未分配
+                            </span>
+                          ) : (
+                            groupName(account.group_id)
+                          )}
+                        </td>
                         <td>
                           <div
                             className="mono cell-dim cell-truncate"
@@ -444,7 +460,10 @@ export function Accounts({
                           {formatLimits(account.limits)}
                         </td>
                         <td>
-                          <AccountHealthBadge health={account.health} />
+                          <AccountHealthBadge
+                            health={account.health}
+                            unassigned={account.group_id === null}
+                          />
                         </td>
                         <td>
                           <button
@@ -676,7 +695,14 @@ function KeyCountCell({ account }: { account: Account }) {
   );
 }
 
-function AccountHealthBadge({ health }: { health: AccountHealth }) {
+function AccountHealthBadge({
+  health,
+  unassigned,
+}: {
+  health: AccountHealth;
+  /** 未分配账号的"无目标"是预期状态，措辞要指向真正该做的动作（§4.2.3）。 */
+  unassigned: boolean;
+}) {
   const labels: Record<string, string> = {
     active: "正常",
     cooldown: "冷却中",
@@ -695,8 +721,11 @@ function AccountHealthBadge({ health }: { health: AccountHealth }) {
     no_key: "danger",
     disabled: "neutral",
   };
-  const tone = tones[health.status] ?? "neutral";
-  const label = labels[health.status] ?? health.status;
+  // 未分配账号的"正常"是预期状态，但它是**不干活**的账号：绿色圆点会让人以为
+  // 它正在服务流量。这里降成中性，并让徽标本身说清"还没分配"（§4.2.3）。
+  const inactive = unassigned && health.status === "active";
+  const tone = inactive ? "neutral" : (tones[health.status] ?? "neutral");
+  const label = inactive ? "未分配" : (labels[health.status] ?? health.status);
   // 不可用目标的计数只在有问题的显示，正常时不占版面。
   const unhealthy = Object.entries(health.targets)
     .filter(([status]) => status !== "active")
@@ -712,7 +741,7 @@ function AccountHealthBadge({ health }: { health: AccountHealth }) {
           {health.target_total - unhealthy}/{health.target_total} 目标可用
         </div>
       )}
-      {health.target_total === 0 && (
+      {health.target_total === 0 && !inactive && (
         <div className="text-faint" style={{ fontSize: 11, marginTop: 2 }}>
           无目标
         </div>
@@ -843,7 +872,9 @@ function AccountDrawer({
   };
 
   const [form, setForm] = useState({
-    group_id: account?.group_id ?? data.groups[0]?.id ?? "",
+    // 新建时默认"未分配"：账号建好之后再决定进哪个分组，是一条更常见的
+    // 顺序（先连上、试通、再决定流量归属）。空串在提交时转成 null（§4.2.3）。
+    group_id: account ? (account.group_id ?? "") : "",
     name: account?.name ?? "",
     base_url: account?.base_url ?? "",
     api_key: "",
@@ -870,13 +901,15 @@ function AccountDrawer({
   const [detecting, setDetecting] = useState(false);
   /** 改分组待确认时暂存的提交内容（§4.2.2）。 */
   const [pendingMove, setPendingMove] = useState<AccountInput | null>(null);
-  const groupName = (id: string) => data.groups.find((group) => group.id === id)?.name ?? id;
+  const groupName = (id: string | null) =>
+    id === null ? "未分配" : (data.groups.find((group) => group.id === id)?.name ?? id);
   /**
    * 目标分组的上限低于账号当前有效倍率时，迁过去它不会被调度（§11.5 的红线），
    * 而这件事在账号列表上完全看不出来——提前说一句。
    */
   const moveEligibilityNotice = (() => {
-    if (!editing || !account || form.group_id === account.group_id) return null;
+    if (!editing || !account || form.group_id === (account.group_id ?? "")) return null;
+    if (form.group_id === "") return null;
     const target = data.groups.find((group) => group.id === form.group_id);
     if (!target) return null;
     const limit = Number(target.multiplier_limit);
@@ -885,8 +918,9 @@ function AccountDrawer({
     return `注意：账号当前有效倍率 ${account.effective_multiplier} 高于「${target.name}」的上限 ${target.multiplier_limit}，迁过去后它不会被调度，除非同时降低倍率或提高该分组的上限。`;
   })();
   // Key 池（§4.2.1）：编辑已有账号时从后台带回的元数据起手，明文一律为空。
+  // 新建时是**空池**：主路径是往批量粘贴框里糊一批，而不是从一行空输入开始。
   const [keyDrafts, setKeyDrafts] = useState<KeyDraft[]>(() =>
-    account ? draftsFromKeys(account.keys ?? []) : [emptyDraft()],
+    account ? draftsFromKeys(account.keys ?? []) : [],
   );
   // 逐把 Key 的测试结果，按 Key 行 ID 对齐；新增行用序号兜底。
   const [keyTestResults, setKeyTestResults] = useState<
@@ -1031,7 +1065,9 @@ function AccountDrawer({
         await api.updateAccount(account.id, payload);
         toast.success(
           moving
-            ? `账号已迁入「${groupName(form.group_id)}」，模型已按对外名一并迁移`
+            ? form.group_id === ""
+              ? "账号已取消分配，调度目标已全部撤下；模型目录与凭据保留"
+              : `账号已迁入「${groupName(form.group_id)}」，模型已按对外名一并迁移`
             : "账号已更新",
         );
         await onSaved();
@@ -1050,7 +1086,8 @@ function AccountDrawer({
   const submit = () => {
     if (invalid) return;
     const payload: AccountInput = {
-      group_id: form.group_id,
+      // 空串 = 未分配：后台把它读成"不属于任何分组"（§4.2.3）。
+      group_id: form.group_id || null,
       name: form.name.trim(),
       base_url: form.base_url.trim(),
       keys: draftsToInputs(keyDrafts),
@@ -1069,8 +1106,9 @@ function AccountDrawer({
     };
     if (form.new_api_token.trim()) payload.new_api_token = form.new_api_token.trim();
     // 改分组会把整台账号的模型搬到另一个分组（§4.2.2）：旧分组可能因此少了
-    // 这些模型，先让管理员看清后果再发。
-    if (editing && form.group_id !== account.group_id) {
+    // 这些模型，先让管理员看清后果再发。取消分配同样要确认一次——它意味着
+    // 这个账号名下的全部调度目标被撤下（§4.2.3）。
+    if (editing && form.group_id !== (account.group_id ?? "")) {
       setPendingMove(payload);
       return;
     }
@@ -1099,9 +1137,11 @@ function AccountDrawer({
         <Field
           label="所属分组"
           hint={
-            editing
-              ? "改分组会把账号的模型按对外名一起迁过去：新分组缺同名逻辑模型会自动建好，旧分组里只靠它提供的自动模型会随最后一个目标消失。"
-              : "账号必须属于某个分组；分组决定它能被哪把下游 Key 使用。"
+            form.group_id === ""
+              ? "未分配：账号可以正常配置凭据与模型，但不会参与调度，也不出现在任何分组里。之后在「编辑」里选一个分组即可开始使用。"
+              : editing
+                ? "改分组会把账号的模型按对外名一起迁过去：新分组缺同名逻辑模型会自动建好，旧分组里只靠它提供的自动模型会随最后一个目标消失。改成「未分配」会把它的调度目标全部撤下，模型目录保留。"
+                : "分组决定它能被哪把下游 Key 使用；先留「未分配」也可以，之后再分配。"
           }
         >
           {(id) => (
@@ -1111,6 +1151,7 @@ function AccountDrawer({
               value={form.group_id}
               onChange={(e) => set("group_id", e.target.value)}
             >
+              <option value="">未分配（不参与调度）</option>
               {data.groups.map((group) => (
                 <option key={group.id} value={group.id}>
                   {group.name}
@@ -1487,24 +1528,35 @@ function AccountDrawer({
 
     <ConfirmDialog
       open={pendingMove !== null}
-      title="迁移账号分组"
-      confirmLabel="迁移"
+      title={form.group_id === "" ? "取消分组分配" : "迁移账号分组"}
+      confirmLabel={form.group_id === "" ? "取消分配" : "迁移"}
+      danger={form.group_id === ""}
       message={
         editing && account ? (
-          <>
-            保存后「{account.name}」会从「{groupName(account.group_id)}」迁到「
-            {groupName(form.group_id)}」。
-            <br />
-            模型目录按对外名一起迁过去：新分组缺同名逻辑模型会自动建好；旧分组里
-            只靠这台账号提供的自动逻辑模型会随最后一个目标消失，旧分组的下游 Key
-            可能因此取不到这些模型。
-            {moveEligibilityNotice && (
-              <>
-                <br />
-                <strong>{moveEligibilityNotice}</strong>
-              </>
-            )}
-          </>
+          form.group_id === "" ? (
+            <>
+              保存后「{account.name}」会从「{groupName(account.group_id)}」变成
+              <strong>未分配</strong>：它名下的全部调度目标会被撤下，正在服务
+              这些模型的下游 Key 会立刻取不到它们。
+              <br />
+              凭据、模型目录与选择集都保留；之后重新分配进分组时会按目录恢复。
+            </>
+          ) : (
+            <>
+              保存后「{account.name}」会从「{groupName(account.group_id)}」迁到「
+              {groupName(form.group_id)}」。
+              <br />
+              模型目录按对外名一起迁过去：新分组缺同名逻辑模型会自动建好；旧分组里
+              只靠这台账号提供的自动逻辑模型会随最后一个目标消失，旧分组的下游 Key
+              可能因此取不到这些模型。
+              {moveEligibilityNotice && (
+                <>
+                  <br />
+                  <strong>{moveEligibilityNotice}</strong>
+                </>
+              )}
+            </>
+          )
         ) : null
       }
       onClose={() => setPendingMove(null)}
