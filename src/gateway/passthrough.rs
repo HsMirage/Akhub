@@ -1177,6 +1177,11 @@ impl Walk<'_> {
                             entry_protocol: self.forward.endpoint.protocol(),
                             retention_days: self.forward.state.settings.get().response_state_days,
                         });
+                    // 只有 Chat 的 usage 是「客户端可选」的：网关照例向上游索取
+                    // （见 prepare 的 ensure_upstream_usage），客户端没要就不能白给。
+                    // Responses / Messages 的用量天然带在正常事件里，不存在额外帧。
+                    let strip = self.forward.endpoint.protocol() == Protocol::OpenAiChat
+                        && !forward_body_requests_usage(&self.forward.body);
                     Attempted::Done(Flow::Done(settle::settle_stream(
                         success.response,
                         settle::StreamSettlement {
@@ -1197,6 +1202,7 @@ impl Walk<'_> {
                             responses,
                             degraded: success.degraded.unwrap_or_else(translate::degradation_sink),
                         },
+                        strip,
                     )))
                 } else {
                     self.usage_parts = success.usage_parts;
@@ -1481,6 +1487,13 @@ impl Walk<'_> {
             emitted.body.clone()
         };
         rewrite_model(&mut body, &candidate.target.target.upstream_model);
+        // 同协议快路径不经过 `emit_request`，所以"向上游索取 usage"这件事
+        // 必须在这里再补一次。网关自己需要 usage：输出速度评分（默认权重 15）
+        // 与 TPM 归还都依赖它，而下游客户端多数不会主动写 stream_options
+        // （§9.3、§17.2）。多要到的收尾块由响应侧的过滤器决定要不要给客户端。
+        if self.streaming && target_protocol == Protocol::OpenAiChat {
+            ensure_upstream_usage(&mut body);
+        }
         Ok(Prepared {
             endpoint: choice.endpoint,
             body,
@@ -1998,7 +2011,7 @@ async fn attempt(
     if streaming {
         commit_stream(forward, target, prepared, response, status, headers_wait).await
     } else {
-        commit_body(forward, target, prepared, response, status).await
+        commit_body(forward, target, prepared, response, status, sent_at).await
     }
 }
 
@@ -2261,6 +2274,7 @@ async fn commit_body(
     prepared: &Prepared,
     response: reqwest::Response,
     status: StatusCode,
+    sent_at: Instant,
 ) -> Result<Success, AttemptFailure> {
     let headers = response.headers().clone();
     let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
@@ -2348,8 +2362,13 @@ async fn commit_body(
     Ok(Success {
         status,
         response: build_response(forward, status, &headers, prepared, body),
-        first_token: None,
-        // 非流式没有"首字"，整段等待就是用户体感（§6.6）。
+        // 非流式没有"首字事件"，用户等到**完整响应体**才算拿到内容。这一项
+        // 必须进样本，否则只要某个模型的样本落在"非流式"维度上，首字维
+        // （默认权重 20）就永远取中性分——一个恒定常数，等于白给（§9.3）。
+        //
+        // 基准与流式的 first_byte 对齐：都从**发出上游请求**算起，不含网关
+        // 排队（排队另有 queued_ms 记录），两个维度才可比（§6.6）。
+        first_token: Some(sent_at.elapsed()),
         first_byte: None,
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
@@ -2567,6 +2586,36 @@ fn build_response(
         .header("x-akhub-request-id", forward.request_id)
         .body(body)
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// 下游这份请求体有没有主动索取 usage（Chat 的 `stream_options.include_usage`）。
+///
+/// 决定「上游被我们多要来的那个收尾块要不要转发给客户端」：谁要谁得。
+fn forward_body_requests_usage(body: &serde_json::Value) -> bool {
+    body.get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 向上游索取 usage：置 `stream_options.include_usage = true`。
+///
+/// 保留 `stream_options` 里已有的其他字段（供应商扩展），只动这一项。
+fn ensure_upstream_usage(body: &mut serde_json::Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let options = object
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
+    if !options.is_object() {
+        // 客户端把 stream_options 写成了非对象（畸形请求）：整个替换掉，
+        // 否则加不进去。这属于修复而不是篡改，网关自己需要这一项。
+        *options = serde_json::json!({});
+    }
+    if let Some(map) = options.as_object_mut() {
+        map.insert("include_usage".into(), serde_json::json!(true));
+    }
 }
 
 /// 首个语义事件是否真的送达过客户端（§6.6、§9.3）。

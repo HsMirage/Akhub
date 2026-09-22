@@ -430,11 +430,14 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     body.insert("model".into(), json!(request.model));
     if request.stream {
         body.insert("stream".into(), json!(true));
-        // 跨协议来的流式请求需要 usage 才能算输出速度与 TPM 归还。
-        body.insert(
-            "stream_options".into(),
-            json!({"include_usage": request.include_usage || request.origin != Protocol::OpenAiChat}),
-        );
+        // 网关自己必须拿到 usage：输出速度评分（默认权重 15）与 TPM 归还都
+        // 依赖它。若只在客户端主动写了 stream_options.include_usage 时才向
+        // 上游索取，那么绝大多数下游（SDK 默认都不写）在这两件事上永远是
+        // 瞎的——吞吐维退化成常数，TPM 只能按预留保守占用到窗口过期。
+        //
+        // 下发形状不受影响：跨协议路径由 emitter 的 include_usage 决定要不要
+        // 把这个收尾块发给客户端，同协议路径由响应侧过滤器决定（§9.3、§17.2）。
+        body.insert("stream_options".into(), json!({"include_usage": true}));
     }
 
     let mut messages: Vec<Value> = Vec::new();

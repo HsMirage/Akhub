@@ -105,7 +105,18 @@ impl Ending {
 }
 
 /// 把结算绑定到响应体的完整生命周期。
-pub fn settle_stream(response: Response, settlement: StreamSettlement) -> Response {
+///
+/// `strip_unrequested_usage` 为真时，把「客户端没有索取的 usage 收尾块」挡在
+/// 下发之前。网关为了自己算输出速度与归还 TPM 会向所有上游索取 usage，但下游
+/// 没写 `stream_options.include_usage` 时不该平白多收一帧 `choices: []`。
+///
+/// 顺序是**先喂 accounting、再过滤**：那一帧正是网关要的用量来源，先丢就
+/// 等于白问上游一句。要变的是「网关知不知道用量」，不是「客户端看到什么」。
+pub fn settle_stream(
+    response: Response,
+    settlement: StreamSettlement,
+    strip_unrequested_usage: bool,
+) -> Response {
     let (parts, body) = response.into_parts();
     let protocol = settlement.protocol;
     let guard = SettlementGuard {
@@ -115,12 +126,20 @@ pub fn settle_stream(response: Response, settlement: StreamSettlement) -> Respon
 
     let stream = async_stream::stream! {
         let mut guard = guard;
+        let mut filter = crate::gateway::translate::UnrequestedUsageFilter::new(strip_unrequested_usage);
         let mut upstream = body.into_data_stream();
         loop {
             match upstream.next().await {
                 Some(Ok(chunk)) => {
                     guard.accounting.push(&chunk);
-                    yield Ok::<_, axum::Error>(chunk);
+                    if strip_unrequested_usage {
+                        let bytes = filter.push(&chunk);
+                        if !bytes.is_empty() {
+                            yield Ok::<_, axum::Error>(bytes);
+                        }
+                    } else {
+                        yield Ok::<_, axum::Error>(chunk);
+                    }
                 }
                 Some(Err(error)) => {
                     guard.settle(Ending::Failed("upstream_exhausted"));
@@ -129,6 +148,10 @@ pub fn settle_stream(response: Response, settlement: StreamSettlement) -> Respon
                 }
                 None => break,
             }
+        }
+        // 残留的半帧也要过一遍过滤，否则它会带着 usage 漏给下游。
+        if let Some(tail) = filter.finish() {
+            yield Ok::<_, axum::Error>(tail);
         }
         guard.settle(Ending::Completed);
     };

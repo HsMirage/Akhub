@@ -355,6 +355,81 @@ pub fn passthrough_stream(
     Body::from_stream(stream)
 }
 
+/// 丢弃「下游没有索取的 usage 收尾块」，其余字节逐字透传。
+///
+/// reqwest 的 chunk 边界不等于 SSE 帧边界，所以和 `ResponseIdRewriter` 一样
+/// 必须先把帧攒齐再判断。只认**确定性**的丢弃条件：这一帧带 `usage`，且
+/// `choices` 缺失或为空数组。上游把 usage 挂在带正文的帧上（非标准写法）时
+/// 一律放行——宁可让客户端多看一眼，也不能吃掉内容。
+pub struct UnrequestedUsageFilter {
+    buffer: Vec<u8>,
+    enabled: bool,
+}
+
+impl UnrequestedUsageFilter {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            buffer: Vec::new(),
+            enabled,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Bytes {
+        if !self.enabled {
+            return Bytes::copy_from_slice(chunk);
+        }
+        let mut output = Vec::new();
+        for segment in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if self.buffer.len().saturating_add(segment.len()) > MAX_RESPONSE_FRAME_BYTES {
+                // 超限说明这不是正常的 SSE：放弃过滤，原样放行，让下游自己
+                // 看到真实字节（这里不是报错路径，报错交给调用方）。
+                output.append(&mut self.buffer);
+                output.extend_from_slice(segment);
+                continue;
+            }
+            self.buffer.extend_from_slice(segment);
+            let from = self.buffer.len().saturating_sub(4);
+            if let Some(end) = sse::find_frame_end(&self.buffer, from) {
+                let frame: Vec<u8> = self.buffer.drain(..end).collect();
+                if !is_unrequested_usage_frame(&frame) {
+                    output.extend_from_slice(&frame);
+                }
+            }
+        }
+        Bytes::from(output)
+    }
+
+    pub fn finish(&mut self) -> Option<Bytes> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let rest = std::mem::take(&mut self.buffer);
+        (!is_unrequested_usage_frame(&rest)).then(|| Bytes::from(rest))
+    }
+}
+
+/// 这一帧是不是 OpenAI Chat 的 usage 收尾块。
+fn is_unrequested_usage_frame(raw: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let frame = sse::parse_frame(text);
+    if frame.is_done_marker() || frame.data.is_empty() {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&frame.data) else {
+        return false;
+    };
+    if payload.get("usage").is_none() {
+        return false;
+    }
+    match payload.get("choices").and_then(serde_json::Value::as_array) {
+        // 带正文的帧一律放行：usage 挂在正文块上是非标准写法，绝不能吃掉。
+        Some(choices) => choices.is_empty(),
+        None => true,
+    }
+}
+
 /// 同协议 Responses 流式转发：把上游响应 ID 替换为网关 ID。
 ///
 /// 只重写 `response.created` / `response.in_progress` / `response.completed` /
@@ -511,6 +586,61 @@ fn rewrite_frame(raw: &[u8], gateway_id: &str) -> Bytes {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    /// 过滤器默认关：一个字节都不该动。
+    #[test]
+    fn the_usage_filter_is_a_no_op_when_disabled() {
+        let mut filter = UnrequestedUsageFilter::new(false);
+        let chunk = b"data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\n";
+        assert_eq!(filter.push(chunk), Bytes::copy_from_slice(chunk));
+        assert!(filter.finish().is_none());
+    }
+
+    /// 只丢 `choices` 为空（或缺失）且带 usage 的帧，其余逐字保留。
+    #[test]
+    fn only_the_unrequested_usage_frame_is_dropped() {
+        let mut filter = UnrequestedUsageFilter::new(true);
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = text_of_raw(filter.push(body.as_bytes()));
+        let tail = filter.finish().map(text_of_raw).unwrap_or_default();
+        let all = format!("{out}{tail}");
+
+        assert!(all.contains("你好"), "正文必须保留：{all}");
+        assert!(all.contains("finish_reason"), "正常事件必须保留：{all}");
+        assert!(all.contains("[DONE]"), "终止标记必须保留：{all}");
+        assert!(!all.contains("usage"), "usage 收尾块必须被丢掉：{all}");
+    }
+
+    /// 帧被拆到两个 chunk 里也必须认得出来（TCP 不保证边界）。
+    #[test]
+    fn a_usage_frame_split_across_chunks_is_still_dropped() {
+        let mut filter = UnrequestedUsageFilter::new(true);
+        let head = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usa";
+        let rest = b"ge\":{\"total_tokens\":3}}\n\n";
+        let first = text_of_raw(filter.push(head));
+        let second = text_of_raw(filter.push(rest));
+        let all = format!("{first}{second}");
+        assert!(all.contains("hi"), "{all}");
+        assert!(!all.contains("usage"), "跨块的 usage 帧也必须被丢掉：{all}");
+    }
+
+    /// 非标准写法：usage 挂在带正文的帧上时绝不能吃掉内容。
+    #[test]
+    fn a_frame_with_content_and_usage_is_always_forwarded() {
+        let mut filter = UnrequestedUsageFilter::new(true);
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}],\"usage\":{\"total_tokens\":3}}\n\n";
+        let out = text_of_raw(filter.push(frame.as_bytes()));
+        assert!(out.contains("你好") && out.contains("usage"), "{out}");
+    }
+
+    fn text_of_raw(bytes: Bytes) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     /// 起一台只吐固定 SSE 的假上游，返回它的 `reqwest::Response`。
     async fn upstream(frames: &'static str) -> reqwest::Response {
