@@ -165,7 +165,13 @@ pub async fn serve_with_shutdown(
         .with_context(|| format!("监听 {addr} 失败"))?;
 
     crate::app::tasks::spawn(&state);
-    tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin");
+    // 绑到 0.0.0.0 与绑到某个具体地址是两种暴露面，启动日志把它说清楚：
+    // 默认值就是"所有网卡"，看到这行才知道自己有没有把后台暴露出去。
+    if addr.ip().is_unspecified() {
+        tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin（监听所有网卡，未开 TLS）");
+    } else {
+        tracing::info!(%addr, "Akhub 已启动，管理后台位于 /admin");
+    }
     let grace = state.settings.get().shutdown_grace;
 
     // 宽限期必须从**收到停止信号之后**开始算。早期实现直接用

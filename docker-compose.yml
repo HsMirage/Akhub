@@ -4,9 +4,11 @@
 #   1. 开箱即用（推荐）：从 GHCR 拉预构建多架构镜像
 #        AKHUB_IMAGE=ghcr.io/hsmirage/akhub:latest docker compose up -d
 #   2. 就地构建：`docker compose up -d --build`
-#   3. 配合反代：见 deploy/Caddyfile 与 deploy/nginx.conf，再把 AKHUB_BIND 改成 0.0.0.0
+#   3. 配合反代：见 deploy/Caddyfile 与 deploy/nginx.conf（容器内已监听 0.0.0.0:8080，
+#      宿主侧是否对外由下面的 ports 决定）
 #
 # 首次启动后打开 http://127.0.0.1:8080/admin 设置管理员密码。
+# 端口默认只发布到宿主环回；要让同网段别的机器连，用 AKHUB_BIND=0.0.0.0 docker compose up -d。
 
 services:
   akhub:
@@ -23,8 +25,9 @@ services:
     stop_grace_period: 200s
 
     ports:
-      # 默认只绑定环回地址；生产环境请由 Caddy / Nginx 终止 HTTPS 后反代过来。
-      # 需要让同网段的容器直接访问时改成 "0.0.0.0:8080:8080"。
+      # 这里只是宿主侧的发布地址（容器内的 Akhub 始终监听 0.0.0.0:8080）。
+      # 默认只发布到宿主环回；要让同网段别的机器直接访问就用 AKHUB_BIND=0.0.0.0。
+      # 生产环境请由 Caddy / Nginx 终止 HTTPS 后反代过来。
       - "${AKHUB_BIND:-127.0.0.1}:${AKHUB_PORT:-8080}:8080"
 
     volumes:

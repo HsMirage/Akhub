@@ -265,6 +265,7 @@ cat <<EOF
 下一步：
   1. 前台试跑（首次会在数据目录生成主密钥）：
        AKHUB_DATA_DIR=./data ${target}
+     默认监听 0.0.0.0:8080（所有网卡）。只给本机用时加 AKHUB_LISTEN=127.0.0.1:8080。
   2. 打开 http://127.0.0.1:8080/admin 设置管理员密码。
   3. 长期运行推荐 systemd（见 deploy/README.md）或 Docker：
        docker run -d --name akhub -p 127.0.0.1:8080:8080 -v akhub-data:/data ${IMAGE}:latest

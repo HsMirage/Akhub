@@ -115,7 +115,7 @@ Copy-Item ".\akhub-$Tag-windows-x86_64\akhub.exe" 'C:\Program Files\Akhub\akhub.
 
 ```
 $env:AKHUB_DATA_DIR = 'C:\ProgramData\Akhub'
-$env:AKHUB_LISTEN   = '127.0.0.1:8080'
+$env:AKHUB_LISTEN   = '0.0.0.0:8080'   # 所有网卡；只给本机用就改回 127.0.0.1:8080
 & 'C:\Program Files\Akhub\akhub.exe'
 ```
 
@@ -123,7 +123,7 @@ $env:AKHUB_LISTEN   = '127.0.0.1:8080'
 
 ```
 INFO 数据目录已就绪 data_dir=C:\ProgramData\Akhub
-INFO Akhub 已启动，管理后台位于 /admin addr=127.0.0.1:8080
+INFO Akhub 已启动，管理后台位于 /admin（监听所有网卡，未开 TLS） addr=0.0.0.0:8080
 ```
 
 浏览器打开 `http://127.0.0.1:8080/admin` 。首次访问是**首次设置页**：需要一个用户名和至少 8 个字符的口令，接口 `POST /admin/api/setup` 只能成功一次。同时检查这些文件已经生成：
@@ -145,7 +145,7 @@ Get-ChildItem 'C:\ProgramData\Akhub' -Force | Select-Object Name, Length
 
 **账户怎么选**
 
-- **LocalSystem（默认，推荐先用它跑通）**：不需要口令、不会过期；Akhub 只需要读写自己的数据目录和监听环回端口，LocalSystem 完全够用，这也是 NSSM 与 WinSW 的默认值。
+- **LocalSystem（默认，推荐先用它跑通）**：不需要口令、不会过期；Akhub 只需要读写自己的数据目录并在本机监听端口，LocalSystem 完全够用，这也是 NSSM 与 WinSW 的默认值。
 - **专用账户（要最小权限时）**：让 Akhub 以专门的本地用户或 `NT AUTHORITY\LocalService` 运行。换账户必须同时做两件事——给数据目录授权，以及确认新账户**能读到已有的 `master.key`**：读不到时 Akhub 会在启动阶段直接报错退出（不会悄悄换一把新密钥）；但如果文件是被删掉而不是读不到，进程会生成全新的一把，此时库里已加密的上游 Key 全部无法解密。
 
 **数据目录 ACL（`icacls`）**
@@ -210,7 +210,7 @@ $Bin  = 'C:\Program Files\Akhub\akhub.exe'
 # 4) 环境变量（一条命令可给多个 KEY=VALUE，NSSM 会写成多字符串）
 & $Nssm set Akhub AppEnvironmentExtra `
     'AKHUB_DATA_DIR=C:\ProgramData\Akhub' `
-    'AKHUB_LISTEN=127.0.0.1:8080' `
+    'AKHUB_LISTEN=0.0.0.0:8080' `
     'AKHUB_SHUTDOWN_GRACE_SECS=180' `
     'RUST_LOG=akhub=info,warn'
 
@@ -293,7 +293,7 @@ WinSW 用“自己的文件名”去找同目录同名的 XML，所以必须是 
   <startmode>Automatic</startmode>
 
   <env name="AKHUB_DATA_DIR"            value="C:\ProgramData\Akhub" />
-  <env name="AKHUB_LISTEN"              value="127.0.0.1:8080" />
+  <env name="AKHUB_LISTEN"              value="0.0.0.0:8080" />
   <env name="AKHUB_SHUTDOWN_GRACE_SECS" value="180" />
   <env name="RUST_LOG"                  value="akhub=info,warn" />
 
@@ -359,9 +359,15 @@ Get-Content 'C:\ProgramData\Akhub\logs\akhub.err.log' -Tail 50 -Wait
 
 ## 5. Windows 防火墙
 
-**默认配置下什么都不用开。** Akhub 默认 `AKHUB_LISTEN`=`127.0.0.1:8080`，只绑环回地址：别的机器根本连不上（不是被防火墙拦，而是没有在可路由地址上监听），所以不存在需要放行的入站连接；环回流量也不受入站规则影响。
+**默认会开着一个可路由的监听口。** Akhub 默认 `AKHUB_LISTEN`=`0.0.0.0:8080`，所有网卡都能连，
+所以同网段的其他机器开箱即用；但 Akhub 只讲明文 HTTP，后台口令与网关 Key 都会明文过网。两个取舍：
 
-只有当你主动把 `AKHUB_LISTEN` 改成 `0.0.0.0:8080`（或某个内网 IP）时，才需要放行，并且尽量把来源收紧到可信网段：
+- **只在本机用**：把 `AKHUB_LISTEN` 设回 `127.0.0.1:8080`，什么都不用放行——别的机器根本连不上
+  （不是被防火墙拦，而是没有在可路由地址上监听），环回流量也不受入站规则影响。
+- **给别的机器用（推荐）**：让 Caddy 监听可路由地址、在 443 上终止 HTTPS，反代到 `127.0.0.1:8080`，
+  并把 Akhub 设回环回（§6）。这样防火墙只需要放行 Caddy 的端口，明文段只留在本机。
+
+确实要让 Akhub 自己对外监听时，才需要放行，并且尽量把来源收紧到可信网段：
 
 ```
 New-NetFirewallRule -DisplayName 'Akhub 网关 8080' `
@@ -375,7 +381,7 @@ New-NetFirewallRule -DisplayName 'Akhub 网关 8080' `
 Remove-NetFirewallRule -DisplayName 'Akhub 网关 8080'
 ```
 
-取舍：即使只是给内网其他机器用，也**优先让 Caddy 监听可路由地址并反代到 `127.0.0.1:8080`**，而不是把 Akhub 直接暴露到网卡上——§6 的理由同样适用（明文 HTTP、后台凭据、无 TLS）。
+取舍：即使只是给内网其他机器用，也**优先让 Caddy 监听可路由地址并反代到 `127.0.0.1:8080`**，而不是把 Akhub 直接暴露到网卡上——§6 的理由同样适用（明文 HTTP、后台凭据、无 TLS）。默认的 `0.0.0.0:8080` 是为了"装完就能被别的机器用"，不是让你把它当公网入口。
 
 ---
 
@@ -386,7 +392,9 @@ Remove-NetFirewallRule -DisplayName 'Akhub 网关 8080'
 1. **明文的**：Akhub 只监听 HTTP，自身不管证书（§25.2）。管理后台的登录口令、网关的 Bearer Key 都会以明文经过网络。
 2. **会话 Cookie 缺 `Secure`**：登录 Cookie 是否带 `Secure` 属性，取决于请求头 `X-Forwarded-Proto: https`；直连明文 HTTP 时这个头不存在，也就不会有 `Secure` 属性（这正是本地开发能直接登录的原因）。
 3. **后台就是密钥库**：`/admin` 能增删上游账号与 API Key，拿到后台等价于拿到全部上游凭据。
-4. 生产上的正确形态是：Caddy 监听 443 并自动申请证书，反代到 `127.0.0.1:8080`；Akhub 继续只绑环回。
+4. 生产上的正确形态是：Caddy 监听 443 并自动申请证书，反代到 `127.0.0.1:8080`，
+   同时把 Akhub 设回只绑环回（`AKHUB_LISTEN=127.0.0.1:8080`）——留着默认的 `0.0.0.0` 等于
+   把同一个明文后台又暴露在网卡上，反代这一层就白做了。
 
 Caddy 在 Windows 上是单个 exe，无需额外组件。
 
@@ -476,7 +484,7 @@ Copy-Item ".\akhub-$Tag-windows-x86_64\akhub.exe" $Bin -Force
 
 # 4) 启动并等待就绪
 Start-Service Akhub
-$env:AKHUB_LISTEN = '127.0.0.1:8080'      # --healthcheck 按这个地址探测 /health/ready
+$env:AKHUB_LISTEN = '127.0.0.1:8080'      # 探针固定走环回；服务监听 0.0.0.0:8080 时同样探得通
 $ok = $false
 foreach ($i in 1..60) {
     & $Bin --healthcheck
@@ -523,7 +531,7 @@ Get-NetTCPConnection -LocalPort 8080 -State Listen |
 Get-Process -Id (Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess
 ```
 
-Akhub 绑定失败时日志里是「监听 `127.0.0.1:8080` 失败: <原因>」。处理方式二选一：停掉占用者，或把 `AKHUB_LISTEN` 换成别的端口——换端口时**三处要一起改**：服务的环境变量、`--healthcheck` 探测时的 `$env:AKHUB_LISTEN`、以及 Caddy 的 reverse_proxy 上游地址。
+Akhub 绑定失败时日志里是「监听 `0.0.0.0:8080` 失败: <原因>」（把 `AKHUB_LISTEN` 设成了环回就是「监听 `127.0.0.1:8080` 失败」）。处理方式二选一：停掉占用者，或把 `AKHUB_LISTEN` 换成别的端口——换端口时**三处要一起改**：服务的环境变量、`--healthcheck` 探测时的 `$env:AKHUB_LISTEN`、以及 Caddy 的 reverse_proxy 上游地址。
 
 还有一种 Windows 特有的“假占用”：端口没有被进程监听，但落在 WSL2 / Hyper-V（`winnat`）预留的动态端口区间里，报错不是“已被占用”而是“访问权限不允许（`WSAEACCES` 10013）”。确认：
 
@@ -585,7 +593,7 @@ Get-WinEvent -LogName Application -MaxEvents 30 |
 
 | 日志关键字 | 原因 | 处理 |
 | --- | --- | --- |
-| `AKHUB_LISTEN` 不是合法的监听地址 | 环境变量的值不是合法的 `IP:端口` | 用 `127.0.0.1:8080` 或 `0.0.0.0:8080` |
+| `AKHUB_LISTEN` 不是合法的监听地址 | 环境变量的值不是合法的 `IP:端口` | 用 `0.0.0.0:8080`（所有网卡）或 `127.0.0.1:8080`（只本机） |
 | `AKHUB_MASTER_KEY` 必须是 32 字节的 hex 或 base64 值 | 环境变量长度或编码不对 | 32 字节 = 64 个 hex 字符，或 base64 形式 |
 | 监听 … 失败 | 端口被占或落在保留区间 | 见 §8.1 |
 | 创建主密钥文件失败 / 打开数据库失败 | 权限 | 见 §8.2 |
@@ -623,7 +631,7 @@ Get-WinEvent -LogName Application -MaxEvents 30 |
 
 ## 9. 与 Docker / WSL2 的关系
 
-不想装服务时，Windows 上同样可以走 **Docker Desktop**（直接 `docker compose up -d`，默认就把端口绑在 `127.0.0.1:8080`，停止宽限已在编排文件里设成 200 秒）或 **WSL2**（按 Linux 原生那一套跑）。两种方式的数据卷/目录、备份与停止超时要求完全一样。
+不想装服务时，Windows 上同样可以走 **Docker Desktop**（直接 `docker compose up -d`，容器内监听 `0.0.0.0:8080`、宿主侧默认只发布到 `127.0.0.1:8080`；要让同网段别的机器连就用 `AKHUB_BIND=0.0.0.0 docker compose up -d`，停止宽限已在编排文件里设成 200 秒）或 **WSL2**（按 Linux 原生那一套跑）。两种方式的数据卷/目录、备份与停止超时要求完全一样。
 
 Docker 与 Linux 原生的完整步骤见仓库里的 [`deploy/README.md`](README.md) 和 [`deploy/akhub.service`](akhub.service)。
 

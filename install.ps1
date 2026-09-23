@@ -151,6 +151,7 @@ try {
     Write-Host '下一步：' -ForegroundColor Green
     Write-Host '  1. 前台试跑（首次会在数据目录生成主密钥）：'
     Write-Host '       $env:AKHUB_DATA_DIR=''C:\ProgramData\Akhub''; & ''' + $target + ''''
+    Write-Host '     默认监听 0.0.0.0:8080（所有网卡）。只给本机用时加 $env:AKHUB_LISTEN=''127.0.0.1:8080''。'
     Write-Host '  2. 打开 http://127.0.0.1:8080/admin 设置管理员密码。'
     Write-Host '  3. 注册为 Windows 服务、反向代理与升级流程见文档：'
     Write-Host '       deploy\README.windows.md（随发行包一起分发）'

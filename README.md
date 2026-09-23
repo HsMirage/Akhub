@@ -112,6 +112,8 @@ React + TypeScript 写的单页后台在编译期嵌进二进制，不需要单�
 ```bash
 docker compose up -d
 # 打开 http://127.0.0.1:8080/admin 设置管理员密码
+# （compose 默认只把端口发布到环回；要让同网段别的机器连，用
+#   AKHUB_BIND=0.0.0.0 docker compose up -d）
 ```
 
 ### 一键脚本（Linux / macOS）
@@ -128,7 +130,8 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 
 ```bash
 cargo run --release
-# 默认监听 127.0.0.1:8080，数据目录 ./data
+# 默认监听 0.0.0.0:8080（所有网卡），数据目录 ./data
+# 只想本机使用：AKHUB_LISTEN=127.0.0.1:8080 cargo run --release
 ```
 
 ### 配置一条可用链路
@@ -149,7 +152,9 @@ cargo run --release
 
 ## 客户端接入
 
-下游 Key 是分组级的，三个协议共用同一把：
+下游 Key 是分组级的，三个协议共用同一把。下面写的 `127.0.0.1` 是「客户端与
+Akhub 在同一台机器上」的形态；客户端在别的机器时换成 Akhub 主机的地址（默认监听
+`0.0.0.0:8080`）。要跨公网就先把 HTTPS 反代配好，别用明文直连。
 
 ```bash
 # Claude Code / Anthropic SDK
@@ -215,7 +220,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AKHUB_LISTEN` | `127.0.0.1:8080` | 监听地址 |
+| `AKHUB_LISTEN` | `0.0.0.0:8080` | 监听地址。默认所有网卡；只给本机用时设 `127.0.0.1:8080` |
 | `AKHUB_DATA_DIR` | `./data` | SQLite、主密钥与临时文件所在目录 |
 | `AKHUB_MASTER_KEY` | 无 | 32 字节 hex 或 base64；设置后优先于数据目录中的密钥文件 |
 | `AKHUB_REQUEST_TIMEOUT_SECS` | `600` | 请求总超时 |
@@ -241,6 +246,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **主密钥丢失后，数据库里的上游 Key 无法恢复。** 备份数据目录时务必包含 `master.key`，
   或改用 `AKHUB_MASTER_KEY` 自行托管。
 - **下游 Key 只在创建与重新生成时完整显示一次**，之后只保留 HMAC 摘要与前缀。
+- **默认监听 `0.0.0.0:8080`（所有网卡）**，而 Akhub 自身只讲明文 HTTP。只在本机用时设
+  `AKHUB_LISTEN=127.0.0.1:8080`；给别的机器用时把它放在 Caddy / Nginx 后面终止 HTTPS
+  （见 [deploy/README.md](deploy/README.md) §0 与 §6），不要直接把明文后台暴露到公网。
 - **默认阻止访问环回、内网与云元数据地址。** 上游确实在内网时，需要为该账号显式开启
   「允许内网访问」。
 - **Base URL 以 `/v1` 结尾时会被识别为已含版本段**，不会拼出 `/v1/v1/messages`。

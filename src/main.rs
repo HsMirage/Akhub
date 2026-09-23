@@ -35,8 +35,11 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // 默认绑 0.0.0.0：网关本来就是给组内/容器网络里其他机器用的，只绑环回会让
+    // "装好了但别人连不上"成为默认行为。只打算本机使用时显式设回 127.0.0.1:8080，
+    // 由反向代理对外（§25.2 的整套部署文档都按这个形态写）。
     let addr: SocketAddr = std::env::var("AKHUB_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
         .context("AKHUB_LISTEN 不是合法的监听地址")?;
 
@@ -90,14 +93,14 @@ const HELP: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " —— AI 协议网关与组内负载均衡\n\n",
     "用法：\n",
-    "  akhub                 启动服务（监听 AKHUB_LISTEN，默认 127.0.0.1:8080）\n",
+    "  akhub                 启动服务（监听 AKHUB_LISTEN，默认 0.0.0.0:8080）\n",
     "  akhub --healthcheck   探测本机 /health/ready，就绪退出码 0，否则非 0\n",
     "  akhub --version       打印版本号\n",
     "  akhub --update        从 GitHub Release 下载并替换本二进制（需要写权限）\n",
     "  akhub --help          显示本帮助\n",
     "\n",
     "常用环境变量：\n",
-    "  AKHUB_LISTEN                 监听地址，默认 127.0.0.1:8080\n",
+    "  AKHUB_LISTEN                 监听地址，默认 0.0.0.0:8080（所有网卡）\n",
     "  AKHUB_DATA_DIR               数据目录，默认 ./data\n",
     "  AKHUB_MASTER_KEY             32 字节 hex 或 base64 主密钥，优先于数据目录里的密钥文件\n",
     "  AKHUB_SHUTDOWN_GRACE_SECS    关闭时给在途请求的完成时间，默认 180\n",

@@ -22,8 +22,9 @@
 
 ## 0. 先决定三件事
 
-1. **监听地址**。默认 `127.0.0.1:8080`，只对本机开放。要对外提供服务，
-   推荐让 Caddy / Nginx 终止 HTTPS 后反代过来（§5），而不是把 Akhub 直接暴露。
+1. **监听地址**。默认 `0.0.0.0:8080`，所有网卡都能连——同网段的其他机器开箱即用。
+   代价是管理后台与网关都直接暴露在明文 HTTP 上：只给本机用时设 `AKHUB_LISTEN=127.0.0.1:8080`，
+   要跨网段/公网就用 Caddy / Nginx 终止 HTTPS 后反代（§6），别把明文后台直接摆在网上。
 2. **数据目录**。容器里固定是 `/data`；原生部署默认 `./data`，systemd 用
    `/var/lib/akhub`。这是唯一需要持久化和备份的目录。
 3. **主密钥归属**。默认自动生成在数据目录里；需要脱离数据目录管理时用
@@ -67,6 +68,11 @@ docker run -d \
 compose 里对应的写法是 `stop_grace_period: 200s`，仓库文件里已经配好。
 
 然后打开 `http://127.0.0.1:8080/admin`。
+
+> 端口发布是独立于监听的一层：容器里的 Akhub 监听 `0.0.0.0:8080`，而上面两条命令把端口
+> 只发布到宿主环回（`127.0.0.1:8080`），同网段的机器因此连不上。要让它们连，把发布地址
+> 换成 `-p 0.0.0.0:8080:8080`（compose 是 `AKHUB_BIND=0.0.0.0 docker compose up -d`）；
+> 跨网段/公网仍然建议走 §6 的 HTTPS 反代。
 
 ### 1.2 就地构建
 
@@ -212,7 +218,8 @@ cat > ~/Library/LaunchAgents/com.hsmirage.akhub.plist <<'PLIST'
   <key>EnvironmentVariables</key>
   <dict>
     <key>AKHUB_DATA_DIR</key><string>/Users/you/Library/Application Support/Akhub</string>
-    <key>AKHUB_LISTEN</key><string>127.0.0.1:8080</string>
+    <!-- 默认所有网卡；只给本机用时改成 127.0.0.1:8080 -->
+    <key>AKHUB_LISTEN</key><string>0.0.0.0:8080</string>
     <key>RUST_LOG</key><string>akhub=info,warn</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -272,7 +279,8 @@ sudo systemctl enable --now akhub
   否则 systemd 会在宽限期走完前 `SIGKILL` 掉在途的长流式请求（§25.3）。
 - `StateDirectory=akhub` / `ReadWritePaths=/var/lib/akhub`：配合
   `ProtectSystem=strict`，只允许写自己的数据目录。
-- `Environment=AKHUB_LISTEN=127.0.0.1:8080`：默认只监听环回，由反代对外。
+- `Environment=AKHUB_LISTEN=0.0.0.0:8080`：与网关默认一致，所有网卡可连（按需放行 8080）。
+  只由本机反代访问时改成 `127.0.0.1:8080`，并同步改反代的 upstream 与 `--healthcheck` 的地址。
 
 ### 3.2 验证
 
@@ -420,7 +428,7 @@ Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 6
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AKHUB_LISTEN` | `127.0.0.1:8080` | 监听地址 |
+| `AKHUB_LISTEN` | `0.0.0.0:8080` | 监听地址。默认所有网卡；只给本机用时设 `127.0.0.1:8080` |
 | `AKHUB_DATA_DIR` | `./data` | SQLite、主密钥与临时文件所在目录 |
 | `AKHUB_MASTER_KEY` | 无 | 32 字节 hex 或 base64；设置后优先于数据目录中的密钥文件 |
 | `AKHUB_REQUEST_TIMEOUT_SECS` | `600` | 请求总超时 |

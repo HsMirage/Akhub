@@ -15,7 +15,7 @@ Type=simple
 User=akhub
 Group=akhub
 Environment=AKHUB_DATA_DIR=/var/lib/akhub
-Environment=AKHUB_LISTEN=127.0.0.1:8080
+Environment=AKHUB_LISTEN=0.0.0.0:8080
 Environment=RUST_LOG=akhub=info,warn
 ExecStart=/usr/local/bin/akhub
 Restart=always
@@ -24,6 +24,9 @@ RestartSec=2
 # 优雅关闭：给在途的长流式请求留出完成时间，必须大于 AKHUB_SHUTDOWN_GRACE_SECS。
 KillSignal=SIGTERM
 TimeoutStopSec=200
+
+# 监听：默认与网关一致，绑 0.0.0.0:8080。只由本机反代访问时改成 127.0.0.1:8080，
+# 并确认反代的 upstream 与 --healthcheck 用的地址跟着一起改。
 
 # 加固：只允许写入自己的数据目录。
 NoNewPrivileges=true
