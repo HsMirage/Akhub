@@ -45,6 +45,51 @@ pub fn emit_request(protocol: Protocol, request: &Request) -> Result<Emitted, Un
     }
 }
 
+/// 承载"缓存读 Token"的 details 父字段名（§11.6）。
+///
+/// OpenAI 的两种协议把同一个事实放在不同的键下：Chat 用
+/// `prompt_tokens_details.cached_tokens`，Responses 用
+/// `input_tokens_details.cached_tokens`。这里按**协议无关**的方式逐个尝试，
+/// 因为流式结算与非流式解析都需要认全两种形状。
+pub const CACHE_TOKEN_PARENTS: &[&str] = &["prompt_tokens_details", "input_tokens_details"];
+
+/// 承载"思考 Token"的 details 父字段名（§11.6）。Chat 用
+/// `completion_tokens_details`，Responses 用 `output_tokens_details`。
+pub const REASONING_TOKEN_PARENTS: &[&str] =
+    &["completion_tokens_details", "output_tokens_details"];
+
+/// 从一份 `usage` 对象里读出缓存读 Token，两种 OpenAI 形状都认（§11.6）。
+///
+/// 这是**唯一**一处定义：流式结算（`gateway::stream`）与非流式解析
+/// （`protocol::*::parse_usage`）都走它，避免两处字段名各自演化后分叉。
+///
+/// 历史上只有 Chat 的形状被认，于是整个 Responses 协议族的缓存读在请求记录里
+/// 恒为空：现场 2264 条 Responses 请求只有 50 条有缓存读（2.2%），而同期 Chat
+/// 的上报率是 61.9%。
+pub fn cache_read_tokens(usage: &Value) -> Option<u64> {
+    CACHE_TOKEN_PARENTS.iter().find_map(|parent| {
+        usage
+            .get(*parent)
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+    })
+}
+
+/// 从一份 `usage` 对象里读出思考 Token，两种 OpenAI 形状都认（§11.6）。
+pub fn reasoning_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .get("reasoning_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            REASONING_TOKEN_PARENTS.iter().find_map(|parent| {
+                usage
+                    .get(*parent)
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+        })
+}
+
 /// 解析上游的非流式响应体。
 pub fn parse_response(protocol: Protocol, body: &Value) -> Result<Response, Unsupported> {
     match protocol {

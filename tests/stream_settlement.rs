@@ -27,6 +27,8 @@ enum Script {
     ChatWithoutUsage,
     /// Responses 流：开始标记 → 输出项 → 带 output 与 usage 的 completed。
     Responses,
+    /// 非流式 Responses：完整响应体，usage 带 Responses 形状的 details。
+    ResponsesNonStream,
 }
 
 fn chat_stream(with_usage: bool) -> String {
@@ -49,7 +51,9 @@ fn responses_stream() -> String {
     [
         "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up\",\"status\":\"in_progress\"}}\n\n",
         "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}}\n\n",
-        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n",
+        // usage 按真实 Responses 形状带 details：缓存读在 `input_tokens_details`、
+        // 思考 Token 在 `output_tokens_details`——都不是 Chat 的那两个父字段。
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"total_tokens\":1050,\"input_tokens_details\":{\"cached_tokens\":768},\"output_tokens_details\":{\"reasoning_tokens\":32}}}}\n\n",
     ]
     .concat()
 }
@@ -68,11 +72,28 @@ async fn spawn_upstream(script: Script) -> String {
             let payload = match script {
                 Script::ChatWithUsage => chat_stream(true),
                 Script::ChatWithoutUsage => chat_stream(false),
-                Script::Responses => responses_stream(),
+                // 非流式那个变体走不到这条分支（请求体里没有 stream）。
+                Script::Responses | Script::ResponsesNonStream => responses_stream(),
             };
             return ([("content-type", "text/event-stream")], payload).into_response();
         }
-        axum::Json(json!({"id": "resp_up", "output": [], "usage": {}})).into_response()
+        match script {
+            Script::ResponsesNonStream => axum::Json(json!({
+                "id": "resp_up",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "你好"}]}],
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 50,
+                    "total_tokens": 1050,
+                    "input_tokens_details": {"cached_tokens": 768},
+                    "output_tokens_details": {"reasoning_tokens": 32}
+                }
+            }))
+            .into_response(),
+            _ => axum::Json(json!({"id": "resp_up", "output": [], "usage": {}})).into_response(),
+        }
     }
 
     let app = Router::new()
@@ -427,6 +448,96 @@ async fn a_disconnect_does_not_lower_the_targets_reliability() {
     let after = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
     assert_eq!(after.samples, 0, "客户端断开不该进性能样本");
     assert_eq!(after.success_rate, 1.0, "可靠性不得被断开拉低");
+}
+
+/// 端到端回归：流式 Responses 的缓存读与思考 Token 必须落进请求记录。
+///
+/// 现场故障：解析只认 Chat 的 `prompt_tokens_details`，于是整个 Responses
+/// 协议族的 `cache_read_tokens` / `reasoning_tokens` 恒为空——生产库 2299 条
+/// Responses 请求里只有 50 条有缓存读、思考 Token 是 0 条，而同期 Chat 的
+/// 缓存读上报率是 60.9%。这条用例从真实入口打进去，断言的是**落库结果**，
+/// 而不是解析函数的返回值。
+#[tokio::test]
+async fn a_responses_stream_records_cache_and_reasoning_tokens() {
+    let upstream = spawn_upstream(Script::Responses).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(
+        record.cache_read_tokens,
+        Some(768),
+        "Responses 流式的缓存读必须落进请求记录（§11.6）"
+    );
+    assert_eq!(
+        record.reasoning_tokens,
+        Some(32),
+        "Responses 流式的思考 Token 必须落进请求记录（§11.6）"
+    );
+    assert_eq!(record.input_tokens, Some(1000));
+    assert_eq!(record.output_tokens, Some(50));
+}
+
+/// 端到端回归：非流式 Responses 同样必须记下缓存读与思考 Token。
+#[tokio::test]
+async fn a_non_stream_responses_records_cache_and_reasoning_tokens() {
+    let upstream = spawn_upstream(Script::ResponsesNonStream).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(
+        record.cache_read_tokens,
+        Some(768),
+        "非流式 Responses 的缓存读必须落进请求记录（§11.6）"
+    );
+    assert_eq!(
+        record.reasoning_tokens,
+        Some(32),
+        "非流式 Responses 的思考 Token 必须落进请求记录（§11.6）"
+    );
 }
 
 /// 等请求记录真正落库（写入是攒批的，最多 1 秒刷一次）。

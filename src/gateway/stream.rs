@@ -336,22 +336,21 @@ pub fn usage_breakdown(body: &serde_json::Value) -> UsageBreakdown {
         return UsageBreakdown::default();
     };
     let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
-    // 缓存与思考的字段名：Anthropic 用 cache_*_input_tokens，OpenAI 用
-    // prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens。
-    let details = |parent: &str, name: &str| {
-        usage
-            .get(parent)
-            .and_then(|value| value.get(name))
-            .and_then(serde_json::Value::as_u64)
-    };
+    // 缓存与思考的字段名按协议各不相同：
+    // - Anthropic：cache_read_input_tokens / cache_creation_input_tokens；
+    // - Chat：prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens；
+    // - Responses：input_tokens_details.cached_tokens / output_tokens_details.reasoning_tokens。
+    //
+    // **两种 OpenAI 形状都必须认。** 只认 Chat 的形状会让整个 Responses 协议族的
+    // 缓存读写与思考 Token 在记录里恒为空——现场 2264 条 Responses 请求里只有 50 条
+    // 有缓存读、思考 Token 是 0 条，而同期 Chat 的缓存读上报率是 61.9%（§11.6）。
     UsageBreakdown {
         input: field("prompt_tokens").or_else(|| field("input_tokens")),
         output: field("completion_tokens").or_else(|| field("output_tokens")),
         cache_read: field("cache_read_input_tokens")
-            .or_else(|| details("prompt_tokens_details", "cached_tokens")),
+            .or_else(|| crate::protocol::cache_read_tokens(usage)),
         cache_write: field("cache_creation_input_tokens"),
-        reasoning: field("reasoning_tokens")
-            .or_else(|| details("completion_tokens_details", "reasoning_tokens")),
+        reasoning: crate::protocol::reasoning_tokens(usage),
     }
 }
 
@@ -507,17 +506,13 @@ impl StreamAccounting {
         {
             self.usage.output = Some(output);
         }
-        // 缓存与思考在 OpenAI 侧藏在 details 子对象里（§11.6）。
-        let details = |parent: &str, name: &str| {
-            usage
-                .get(parent)
-                .and_then(|value| value.get(name))
-                .and_then(serde_json::Value::as_u64)
-        };
-        if let Some(cached) = details("prompt_tokens_details", "cached_tokens") {
+        // 缓存与思考在 OpenAI 侧藏在 details 子对象里（§11.6）。Chat 与
+        // Responses 用的父字段名不同，两种都要认，否则流式记录里会整片丢失
+        // （见 protocol::cache_read_tokens 的说明）。
+        if let Some(cached) = crate::protocol::cache_read_tokens(usage) {
             self.usage.cache_read = Some(cached);
         }
-        if let Some(reasoning) = details("completion_tokens_details", "reasoning_tokens") {
+        if let Some(reasoning) = crate::protocol::reasoning_tokens(usage) {
             self.usage.reasoning = Some(reasoning);
         }
     }
@@ -779,6 +774,45 @@ mod tests {
         assert_eq!(output_tokens(&serde_json::json!({})), None);
     }
 
+    /// 回归：Responses 把缓存读放在 `input_tokens_details`，不是 Chat 的
+    /// `prompt_tokens_details`。只认后者会让整个 Responses 协议族的缓存读
+    /// 与思考 Token 在记录里恒为空。
+    #[test]
+    fn responses_detail_fields_are_read_not_just_chat_ones() {
+        let breakdown = usage_breakdown(&serde_json::json!({
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 50,
+                "input_tokens_details": {"cached_tokens": 768},
+                "output_tokens_details": {"reasoning_tokens": 32},
+            }
+        }));
+        assert_eq!(breakdown.input, Some(1000));
+        assert_eq!(breakdown.output, Some(50));
+        assert_eq!(
+            breakdown.cache_read,
+            Some(768),
+            "Responses 的缓存读必须被认出来"
+        );
+        assert_eq!(
+            breakdown.reasoning,
+            Some(32),
+            "Responses 的思考 Token 必须被认出来"
+        );
+
+        // Chat 的形状继续照常工作，两种协议共用一个解析器。
+        let chat = usage_breakdown(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 640},
+                "completion_tokens_details": {"reasoning_tokens": 16},
+            }
+        }));
+        assert_eq!(chat.cache_read, Some(640));
+        assert_eq!(chat.reasoning, Some(16));
+    }
+
     fn feed_all(accounting: &mut StreamAccounting, chunks: &[&str]) {
         for chunk in chunks {
             accounting.push(chunk.as_bytes());
@@ -815,6 +849,33 @@ mod tests {
         );
         assert_eq!(accounting.usage_tokens(), Some(127));
         assert_eq!(accounting.output_tokens(), Some(7));
+    }
+
+    /// 回归：流式 Responses 的收尾帧同样带 `input_tokens_details`，结算路径
+    /// 必须把缓存读与思考 Token 落到请求记录里（§11.6）。
+    #[test]
+    fn responses_stream_settles_cache_and_reasoning_details() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"total_tokens\":1050,\"input_tokens_details\":{\"cached_tokens\":768},\"output_tokens_details\":{\"reasoning_tokens\":32}}}}\n\n",
+            ],
+        );
+        let usage = accounting.usage_breakdown();
+        assert_eq!(usage.input, Some(1000));
+        assert_eq!(usage.output, Some(50));
+        assert_eq!(
+            usage.cache_read,
+            Some(768),
+            "流式 Responses 的缓存读必须被结算"
+        );
+        assert_eq!(
+            usage.reasoning,
+            Some(32),
+            "流式 Responses 的思考 Token 必须被结算"
+        );
     }
 
     #[test]

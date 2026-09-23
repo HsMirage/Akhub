@@ -405,18 +405,14 @@ fn parse_usage(usage: Option<&Value>) -> Usage {
         return Usage::default();
     };
     let field = |name: &str| usage.get(name).and_then(Value::as_u64);
+    // 缓存与思考的父字段名由 protocol 层统一判定：Chat 与 Responses 用的键
+    // 不同，共用一个解析器才不会让两边慢慢分叉（§11.6）。
     Usage {
         input: field("prompt_tokens").or_else(|| field("input_tokens")),
         output: field("completion_tokens").or_else(|| field("output_tokens")),
-        cache_read: usage
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64),
+        cache_read: super::cache_read_tokens(usage),
         cache_write: None,
-        reasoning: usage
-            .get("completion_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64),
+        reasoning: super::reasoning_tokens(usage),
     }
 }
 

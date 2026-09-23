@@ -428,18 +428,15 @@ fn parse_usage(usage: Option<&Value>) -> Usage {
         return Usage::default();
     };
     let field = |name: &str| usage.get(name).and_then(Value::as_u64);
+    // 缓存与思考的父字段名在两种 OpenAI 协议下不同，交给共享的
+    // CACHE_TOKEN_PARENTS / REASONING_TOKEN_PARENTS 判定，避免这里与
+    // 流式结算各写一套而慢慢分叉（§11.6）。
     Usage {
         input: field("input_tokens"),
         output: field("output_tokens"),
-        cache_read: usage
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64),
+        cache_read: super::cache_read_tokens(usage),
         cache_write: None,
-        reasoning: usage
-            .get("output_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64),
+        reasoning: super::reasoning_tokens(usage),
     }
 }
 
