@@ -7,7 +7,7 @@
 //! 精确推进冷却与限流窗口，而不必真的睡上几分钟。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -30,6 +30,19 @@ const RATIO_TRIP: f64 = 0.5;
 const COOLDOWN_BASE: Duration = Duration::from_secs(5);
 /// 冷却上限。再长就该由管理员处理，而不是让目标无限期消失。
 const COOLDOWN_CAP: Duration = Duration::from_secs(300);
+/// 「上游说凭据不对」要连续确认几次才真正硬停这把 Key（§12.3）。
+///
+/// 上游对 403 的用法很杂：分组被停用、权限不足、WAF 拦截与凭据无效都回 403，
+/// 只看状态码分不出来。**任何**失效判定都必须能被一次真实成功推翻，否则就会
+/// 自锁——这把 Key 已经被排除在抽签之外，那个"成功"永远不会到来。计数让偶发
+/// 的一次误判只触发本次换 Key，账号不会被永久钉死。
+const KEY_INVALID_CONFIRMATIONS: u32 = 2;
+/// 硬停的自证窗口：过了这么久允许放行一次真实请求证明自己（§12.3 的半开）。
+///
+/// §12.3 写的是"修改凭据或手动测试成功后恢复"，两条都是**人工**动作；而上游
+/// 把分组恢复、把 WAF 规则撤掉这类事没有任何人会去点一下。没有这条自动恢复
+/// 路径，面板会一直显示一个已经不存在的故障（"Key 失效，但 Key 是好的"）。
+const KEY_INVALID_PROBE_AFTER: Duration = Duration::from_secs(600);
 /// 未配置最大并发时使用的"事实上不限"额度。
 ///
 /// 用一个很大的常数而不是 `Option<Semaphore>`：上限可以被管理员随时改成有限
@@ -162,9 +175,11 @@ impl Capacity {
 /// 目标当前不可用的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unavailable {
-    /// 401/403 明确证明凭据失效，换凭据前一直硬停（§12.3）。
+    /// 上游明确证明凭据失效（401，或正文点名凭据的 403）。
     ///
     /// 范围是**那把 Key**而不是整个账号：账号里其他 Key 照常服务（§4.2.1）。
+    /// 也不是"换凭据前一直硬停"：连续两次确认才生效，且约 10 分钟后会自动
+    /// 放行一次自证——没有这条出口，被排除出抽签的 Key 永远等不到那个成功。
     KeyInvalid,
     /// 这个账号一把可用的 Key 都没有（从未配置或全部被删）。
     ///
@@ -203,7 +218,7 @@ impl Unavailable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Success,
-    /// 401/403：整个账号立即暂停。
+    /// 上游明确证明这把凭据失效（§12.3）。连续两次确认才真正硬停。
     KeyInvalid,
     /// 明确的额度不足或账号封禁，可带恢复时间。
     QuotaExhausted {
@@ -336,6 +351,16 @@ impl Registry {
         }
     }
 
+    /// 只清掉**某一把 Key** 的失效硬停与额度熔断（§12.3）。
+    ///
+    /// 与 [`Self::clear_account_faults`] 的区别是作用域：某把 Key 被上游误判、
+    /// 或上游改完配置又改回来时，管理员应当能只放行这一把，而不必把同账号其他
+    /// Key 的熔断状态一起抹掉（§4.2.1 的"逐把独立"）。
+    pub fn clear_key_faults(&self, account_id: &str, credential_digest: &str) {
+        let id = crate::credential::credential_id(account_id, credential_digest);
+        self.key(&id).reset();
+    }
+
     /// 清空全部账号、Key 与目标状态。备份恢复后调用：账号与目标可能整个换了
     /// 一批，旧的熔断与额度计数不再成立（§23.5）。
     pub fn clear_all(&self) {
@@ -449,7 +474,11 @@ impl AccountState {
 /// **401/403 与额度耗尽落在这里而不是账号上**：一把 Key 被上游封了不该让
 /// 同账号的其他九把一起停摆——那会把 Key 池的全部价值抵消掉。
 pub struct KeyState {
-    key_invalid: AtomicBool,
+    /// 「上游说凭据不对」的连续确认次数；一次真实成功即清零（§12.3）。
+    invalid_confirmations: AtomicU32,
+    /// 硬停的开始时刻。存时刻而不只存一个 bool：自证窗口要按它计算，窗口到期
+    /// 后放行一次真实请求，让它证明自己到底还行不行。
+    invalid_since: Mutex<Option<Instant>>,
     quota: Mutex<Circuit>,
     budget: Budget,
 }
@@ -457,15 +486,33 @@ pub struct KeyState {
 impl KeyState {
     fn new() -> Self {
         Self {
-            key_invalid: AtomicBool::new(false),
+            invalid_confirmations: AtomicU32::new(0),
+            invalid_since: Mutex::new(None),
             quota: Mutex::new(Circuit::default()),
             budget: Budget::new(),
         }
     }
 
-    /// 这把 Key 是否已被上游明确判定为失效（§12.3）。
+    /// 这把 Key 是否已被上游判定为失效（§12.3）。
+    ///
+    /// 自证窗口到期后**不再算失效**：放行一次真实请求去证明它。证明不了会在
+    /// 确认计数上重新硬停，证明得了就自动恢复。
     pub fn key_invalid(&self) -> bool {
-        self.key_invalid.load(Ordering::Acquire)
+        self.invalid_at().is_some()
+    }
+
+    /// 硬停开始时刻；`None` 表示当前没有硬停（或窗口已到，等待一次试运行）。
+    fn invalid_at(&self) -> Option<Instant> {
+        let since = (*crate::sync::lock(&self.invalid_since))?;
+        (Instant::now().saturating_duration_since(since) < KEY_INVALID_PROBE_AFTER).then_some(since)
+    }
+
+    /// 是否**曾经**被判定失效且还没被一次成功推翻（不受自证窗口影响）。
+    ///
+    /// 面板据此说明"这个标记是怎么来的"：窗口到期不等于问题消失，只是允许它
+    /// 再试一次。
+    pub fn auth_proves_invalid(&self) -> bool {
+        crate::sync::lock(&self.invalid_since).is_some()
     }
 
     /// 管理员给这把 Key 配的并发上限（`None` 表示不限）。
@@ -483,12 +530,29 @@ impl KeyState {
         self.budget.inflight.load(Ordering::Relaxed)
     }
 
+    /// 记一次「上游说凭据不对」（§12.3）。连续达到阈值才真正硬停。
+    fn confirm_invalid(&self, now: Instant) {
+        let confirmations = self
+            .invalid_confirmations
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if confirmations >= KEY_INVALID_CONFIRMATIONS {
+            *crate::sync::lock(&self.invalid_since) = Some(now);
+        }
+    }
+
+    /// 一次真实成功：清掉硬停与确认计数。这是 Key 从"坏"回到"好"的自动路径。
+    fn note_success(&self) {
+        self.invalid_confirmations.store(0, Ordering::Release);
+        *crate::sync::lock(&self.invalid_since) = None;
+    }
+
     /// 解除硬停并把额度熔断与半开占用一起复位。
     ///
-    /// 管理员改过凭据或手动测试成功后调用。半开标记必须一起清：留在
-    /// `HalfOpenTaken` 上会让这把 Key 在冷却结束后仍然拒绝新请求。
+    /// 管理员改过凭据、手动测试成功或显式清除标记后调用。半开标记必须一起清：
+    /// 留在 `HalfOpenTaken` 上会让这把 Key 在冷却结束后仍然拒绝新请求。
     pub fn reset(&self) {
-        self.key_invalid.store(false, Ordering::Release);
+        self.note_success();
         if let Ok(mut quota) = self.quota.lock() {
             quota.reset();
         }
@@ -496,7 +560,7 @@ impl KeyState {
 
     /// 逐 Key 的运行状态，供后台的 Key 徽标使用。
     pub fn status(&self) -> TargetStatus {
-        if self.key_invalid.load(Ordering::Acquire) {
+        if self.key_invalid() {
             return TargetStatus::KeyInvalid;
         }
         let now = Instant::now();
@@ -528,7 +592,7 @@ impl KeyState {
     /// 只看**这一把 Key** 的额度；账号总额度由 [`TargetState::check`] 在同一轮
     /// 检查里负责，调用方必须两级都过（§4.2.1）。
     pub fn check(&self, budget: Limits, now: Instant) -> Result<(), Unavailable> {
-        if self.key_invalid.load(Ordering::Acquire) {
+        if self.key_invalid() {
             return Err(Unavailable::KeyInvalid);
         }
         match crate::sync::lock(&self.quota).phase(now) {
@@ -540,7 +604,7 @@ impl KeyState {
 
     /// 真正准入时占用 Key 级半开试运行名额。
     fn try_enter(&self, now: Instant) -> Result<bool, Unavailable> {
-        if self.key_invalid.load(Ordering::Acquire) {
+        if self.key_invalid() {
             return Err(Unavailable::KeyInvalid);
         }
         crate::sync::lock(&self.quota)
@@ -598,7 +662,7 @@ impl TargetState {
     /// 目标熔断（§6.9 的既有口径，只是多了一层凭据）。
     pub fn status(&self, account: &AccountState, key: Option<&KeyState>) -> TargetStatus {
         if let Some(key) = key {
-            if key.key_invalid.load(Ordering::Acquire) {
+            if key.key_invalid() {
                 return TargetStatus::KeyInvalid;
             }
             let now = Instant::now();
@@ -891,7 +955,7 @@ impl Admission {
                 // 成功一次就清掉凭据的硬停与额度熔断：这是 Key 从"坏"回到
                 // "好"的唯一路径。
                 if let Some(key) = &self.key {
-                    key.key_invalid.store(false, Ordering::Release);
+                    key.note_success();
                     crate::sync::lock(&key.quota).on_success(now);
                 }
                 crate::sync::lock(&self.account.quota).on_success(now);
@@ -902,7 +966,7 @@ impl Admission {
                 // 试运行"而永远无法恢复。凭据层要显式 undo：它的半开名额是
                 // 这次尝试占的，跟着这次失败一起作废。
                 if let Some(key) = &self.key {
-                    key.key_invalid.store(true, Ordering::Release);
+                    key.confirm_invalid(now);
                     crate::sync::lock(&key.quota).undo_half_open(self.key_half_open);
                 }
                 self.release_account_half_open();
@@ -1668,14 +1732,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_invalid_key_only_pauses_that_key() {
         let registry = Registry::new();
-        registry
-            .try_admit(
-                caller_with_key("acc", "key-a", "tgt-a"),
-                Limits::default(),
-                0,
-            )
-            .unwrap()
-            .settle(Outcome::KeyInvalid, None);
+        // 一次判定只算一次"上游说凭据不对"：连续确认到阈值才硬停（§12.3）。
+        for _ in 0..KEY_INVALID_CONFIRMATIONS {
+            registry
+                .try_admit(
+                    caller_with_key("acc", "key-a", "tgt-a"),
+                    Limits::default(),
+                    0,
+                )
+                .unwrap()
+                .settle(Outcome::KeyInvalid, None);
+        }
         // 同一把 Key 下的另一个模型也必须一起停。
         assert_eq!(
             registry.check(caller_with_key("acc", "key-a", "tgt-b"), Limits::default()),
@@ -1696,6 +1763,99 @@ mod tests {
             registry.check(caller_with_key("acc", "key-a", "tgt-b"), Limits::default()),
             Ok(()),
             "clear_account_faults 必须把该账号下每一把 Key 的硬停都清掉"
+        );
+    }
+
+    /// 单次 403 不能把好 Key 钉死，硬停也必须能自己到期（§12.3）。
+    ///
+    /// 这条是"面板显示 Key 失效，但 Key 是好的"的根因回归：上游用 403 表达
+    /// 分组停用/权限不足时，判定必须能被一次真实成功推翻，或者到点自动放行
+    /// 一次试运行——否则这把 Key 已经被排除在抽签之外，那个"成功"永远不来。
+    #[tokio::test(start_paused = true)]
+    async fn a_single_denial_does_not_hard_stop_a_key_and_the_stop_expires() {
+        let registry = Registry::new();
+        let key = |name: &'static str| caller_with_key("acc", name, "tgt");
+
+        // 一次判定：只算一次怀疑，Key 继续服务。
+        registry
+            .try_admit(key("key-a"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::KeyInvalid, None);
+        assert!(
+            registry.check(key("key-a"), Limits::default()).is_ok(),
+            "偶发一次 403 不该把 Key 钉死"
+        );
+
+        // 再来一次：确认到位，硬停。
+        registry
+            .try_admit(key("key-a"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::KeyInvalid, None);
+        assert_eq!(
+            registry.check(key("key-a"), Limits::default()),
+            Err(Unavailable::KeyInvalid)
+        );
+
+        // 自证窗口到期：放行一次真实请求去证明自己。
+        tokio::time::advance(KEY_INVALID_PROBE_AFTER).await;
+        assert!(
+            registry.check(key("key-a"), Limits::default()).is_ok(),
+            "窗口到期后必须允许一次自证，否则故障再也没有出口"
+        );
+
+        // 证明不了：确认计数仍在，立刻重新硬停。
+        registry
+            .try_admit(key("key-a"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::KeyInvalid, None);
+        assert_eq!(
+            registry.check(key("key-a"), Limits::default()),
+            Err(Unavailable::KeyInvalid)
+        );
+
+        // 证明得了：自动恢复，且此后的偶发判定不叠加旧账。
+        tokio::time::advance(KEY_INVALID_PROBE_AFTER).await;
+        registry
+            .try_admit(key("key-a"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::Success, None);
+        assert!(
+            registry.check(key("key-a"), Limits::default()).is_ok(),
+            "一次真实成功必须清掉硬停（§12.3）"
+        );
+        registry
+            .try_admit(key("key-a"), Limits::default(), 0)
+            .unwrap()
+            .settle(Outcome::KeyInvalid, None);
+        assert!(
+            registry.check(key("key-a"), Limits::default()).is_ok(),
+            "计数必须从零开始，不能接着恢复前的旧账"
+        );
+    }
+
+    /// 管理员可以只放行一把 Key，不必动同账号其他 Key 的熔断（§4.2.1）。
+    #[tokio::test(start_paused = true)]
+    async fn clearing_one_keys_faults_leaves_its_siblings_alone() {
+        let registry = Registry::new();
+        let key = |name: &'static str| caller_with_key("acc", name, "tgt");
+        for name in ["key-a", "key-b"] {
+            for _ in 0..KEY_INVALID_CONFIRMATIONS {
+                registry
+                    .try_admit(key(name), Limits::default(), 0)
+                    .unwrap()
+                    .settle(Outcome::KeyInvalid, None);
+            }
+        }
+
+        registry.clear_key_faults("acc", "key-a");
+        assert!(
+            registry.check(key("key-a"), Limits::default()).is_ok(),
+            "被清除的那把必须立刻可用"
+        );
+        assert_eq!(
+            registry.check(key("key-b"), Limits::default()),
+            Err(Unavailable::KeyInvalid),
+            "同账号另一把 Key 的硬停不该被连带清掉"
         );
     }
 

@@ -151,18 +151,24 @@ export function KeyPoolEditor({
   drafts,
   editing,
   testing,
+  clearingKeyId,
   testResults,
   onChange,
   onTest,
+  onClearFaults,
 }: {
   drafts: KeyDraft[];
   /** 编辑已有账号时才能测试连接。 */
   editing: boolean;
   testing: boolean;
+  /** 正在清除哪一把 Key 的失效标记；null 表示没有进行中的清除。 */
+  clearingKeyId?: string | null;
   /** 测试结果，按 Key 的明文以外的标识对齐；新增行用序号兜底。 */
   testResults: Record<string, { ok: boolean; message: string }>;
   onChange: (next: KeyDraft[]) => void;
   onTest: () => void;
+  /** 清除某一把 Key 的失效标记与熔断（§12.3）。 */
+  onClearFaults?: (keyId: string) => void;
 }) {
   const [showKey, setShowKey] = useState<Record<number, boolean>>({});
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
@@ -315,6 +321,18 @@ export function KeyPoolEditor({
                         {keyStatusLabel(health.status)}
                         {health.cooldown_secs != null && ` ${health.cooldown_secs}s`}
                       </Badge>
+                    )}
+                    {/* 失效标记必须配有出口：上游用 403 说"分组被停用/权限
+                        不足"时也会落到这个状态，光看徽标分不出真假（§12.3）。 */}
+                    {draft.id && health?.auth_proves_invalid && onClearFaults && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={clearingKeyId === draft.id}
+                        onClick={() => onClearFaults(draft.id!)}
+                      >
+                        {clearingKeyId === draft.id ? "清除中…" : "清除失效标记"}
+                      </Button>
                     )}
                     {result && (
                       <Badge tone={result.ok ? "success" : "danger"}>

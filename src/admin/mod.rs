@@ -254,6 +254,11 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/admin/api/accounts/{id}/copy", post(r::copy_account))
         .route("/admin/api/accounts/{id}/test", post(r::test_account))
+        // 手动放行一把被误判的 Key（§12.3）：面板上"Key 失效"必须配有出口。
+        .route(
+            "/admin/api/accounts/{id}/keys/{key_id}/clear-faults",
+            post(r::clear_key_faults),
+        )
         .route(
             "/admin/api/accounts/{id}/calibrate",
             post(r::calibrate_account),

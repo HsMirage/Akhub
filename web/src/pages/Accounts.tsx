@@ -550,6 +550,10 @@ export function Accounts({
           if (created) setCreatedAccount(created);
           await refresh();
         }}
+        // 只刷新数据、**不关闭抽屉**：测试连接与清除失效标记都发生在编辑途中，
+        // 走 onSaved 会把抽屉关掉，连同还没保存的 Key 改动一起丢掉
+        // （Drawer 的脏数据确认只在用户点关闭按钮时才走）。
+        onRefreshed={refresh}
       />
 
       <ModelSelectionDialog
@@ -834,12 +838,15 @@ function AccountDrawer({
   open,
   onClose,
   onSaved,
+  onRefreshed,
 }: {
   data: Data;
   account: Account | null;
   open: boolean;
   onClose: () => void;
   onSaved: (created?: Account) => void | Promise<void>;
+  /** 只刷新列表数据，**不关闭抽屉**（测试连接、清除失效标记用）。 */
+  onRefreshed: () => Promise<unknown>;
 }) {
   const toast = useToast();
   const editing = account !== null;
@@ -926,6 +933,8 @@ function AccountDrawer({
   const [keyTestResults, setKeyTestResults] = useState<
     Record<string, { ok: boolean; message: string }>
   >({});
+  /** 正在清除失效标记的那把 Key（§12.3）。 */
+  const [clearingKeyId, setClearingKeyId] = useState<string | null>(null);
   const [initialSnapshot] = useState(() => JSON.stringify(form));
   const [initialKeys] = useState(() => JSON.stringify(keyDrafts));
   const dirty =
@@ -1026,6 +1035,26 @@ function AccountDrawer({
     }
   };
 
+  /**
+   * 清除一把 Key 的失效标记与熔断（§12.3）。
+   *
+   * 不重新粘贴凭据就能放行：上游用 403 表达"分组被停用/权限不足"时会把好
+   * Key 判成失效，重填一遍凭据既麻烦又没有任何作用。
+   */
+  const clearKeyFaults = async (keyId: string) => {
+    if (!account || clearingKeyId) return;
+    setClearingKeyId(keyId);
+    try {
+      const result = await api.clearKeyFaults(account.id, keyId);
+      toast.success(result.notice);
+      await onRefreshed();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "清除失败");
+    } finally {
+      setClearingKeyId(null);
+    }
+  };
+
   /** 编辑态下用已保存的凭据发一次真实请求；新建时必须先保存。 */
   const testConnection = async () => {
     if (!account || testing) return;
@@ -1050,6 +1079,11 @@ function AccountDrawer({
       } else {
         toast.error(`「${account.name}」${result.message}`);
       }
+      // 测试通过的 Key 会在后台解除硬停（§12.3："手动测试成功后恢复"）：
+      // 不刷新的话，界面上那个"Key 失效"徽标会一直挂在一把刚刚测通的 Key 上。
+      // 走 onRefreshed 而不是 onSaved：后者会关掉抽屉，把这次测试的逐行结果
+      // 与还没保存的改动一起丢掉。
+      if (result.ok || (result.healthy_keys ?? 0) > 0) await onRefreshed();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "测试失败");
     } finally {
@@ -1210,9 +1244,11 @@ function AccountDrawer({
           drafts={keyDrafts}
           editing={!!editing}
           testing={testing}
+          clearingKeyId={clearingKeyId}
           testResults={keyTestResults}
           onChange={setKeyDrafts}
           onTest={() => void testConnection()}
+          onClearFaults={(keyId) => void clearKeyFaults(keyId)}
         />
 
         <Field

@@ -88,16 +88,61 @@ enum Attempted {
     CredentialFailed(health::Admission),
 }
 
-/// 凭据被拒绝对应的健康结果。
+/// 上游的 403 响应体里有没有**明确说凭据本身不对**（§12.3）。
 ///
-/// 只有 401/403 与额度耗尽会走到这里（调用方已经筛过），所以保留
-/// `Retry-After` 供额度熔断使用。
-fn bad_key_outcome(retry_after: Option<Duration>) -> health::Outcome {
+/// 上游对 403 的用法很杂：分组被停用/删除、站点权限不足、WAF 拦截、被封 IP，
+/// 以及真正的"Key 无效"。只看状态码分不出这几种，稍不留神就把一把好 Key 判死。
+/// 只有响应体自己说出 invalid / expired / unauthorized / 无效 这类词时，才认为
+/// 它证明了凭据失效；其余 403 按**目标级权限问题**处理，只触发本次切换。
+///
+/// 判据故意保守：宁可把一次真的失效当成临时故障（下一轮换目标），也不要把
+/// "分组被停用"这种一次性事件变成这把 Key 的永久硬停。
+fn auth_proves_key_invalid(status: StatusCode, body: &[u8]) -> bool {
+    if status != StatusCode::FORBIDDEN {
+        // 401 是状态码本身就说明了问题，不看正文。
+        return status == StatusCode::UNAUTHORIZED;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if text.is_empty() {
+        // 空体的 403 什么都没证明。放行换目标，不做失效判定。
+        return false;
+    }
+    const HINTS: [&str; 12] = [
+        "invalid api key",
+        "invalid_api_key",
+        "invalid key",
+        "invalid token",
+        "api key is invalid",
+        "unauthorized",
+        "authentication_error",
+        "key 无效",
+        "无效的 key",
+        "密钥无效",
+        "凭据无效",
+        "认证失败",
+    ];
+    HINTS.iter().any(|hint| text.contains(hint))
+}
+
+/// 上游用 401/403 拒绝一次凭据级的尝试时，这次失败该记成什么（§12.3）。
+///
+/// 判据只作用于这两个状态码：402/429 有自己的判定，且它们的 `Retry-After`
+/// 正等着被消费，拿正文去改写只会把"额度耗尽"与"限流"降级成普通故障。
+fn credential_outcome(
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    body: &[u8],
+) -> health::Outcome {
     match retry_after {
+        // 上游给了恢复时间，就是"过一会儿再来"而不是"这把 Key 废了"：
+        // 按额度冷却处理，绝不做硬停。
         Some(wait) => health::Outcome::QuotaExhausted {
             retry_after: Some(wait),
         },
-        None => health::Outcome::KeyInvalid,
+        // 没给恢复时间：只有正文**明确说凭据不对**才算失效，其余 403
+        //（分组被停用、权限不足、WAF 拦截）按故障切换。
+        None if auth_proves_key_invalid(status, body) => health::Outcome::KeyInvalid,
+        None => health::Outcome::Fault,
     }
 }
 
@@ -140,6 +185,8 @@ enum AttemptFailure {
         upstream_status: Option<StatusCode>,
         /// 上游给出的恢复时间。粘性请求据此决定等待还是换号（§10.3）。
         retry_after: Option<Duration>,
+        /// 上游的错误响应体（有上限）。403 的真假凭据失效判定要看它（§12.3）。
+        upstream_body: Option<Vec<u8>>,
     },
     /// 明确属于下游请求本身的问题，切换到别的目标也是同样结果。
     /// 装箱是因为 `Response` 比其余变体大一个数量级，而这是**失败**分支：
@@ -158,6 +205,7 @@ impl AttemptFailure {
             message,
             upstream_status: None,
             retry_after: None,
+            upstream_body: None,
         }
     }
 
@@ -167,9 +215,11 @@ impl AttemptFailure {
                 code,
                 message,
                 retry_after,
+                upstream_body,
                 ..
             } => Self::Switchable {
                 code,
+                upstream_body,
                 message,
                 upstream_status: Some(status),
                 retry_after,
@@ -230,8 +280,17 @@ struct Walk<'a> {
     attempted: Vec<AttemptedKey>,
     /// 最后一次可切换失败，用来在候选耗尽时决定错误码。
     last: Option<(ErrorCode, String)>,
-    /// 最后一次失败附带的 `Retry-After`，粘性路径据此决定是否原地等待（§10.3）。
+    /// 最后一次失败附带的 `Retry-After` 原文（秒），粘性路径据此决定是否
+    /// 原地等待（§10.3）。
+    ///
+    /// 存原文而不是解析结果：换 Key 重试时要用**同一份**上游恢复时间给额度熔断
+    /// 定时，而 `Duration` 在解析失败时与"没有恢复时间"无法区分。
     last_retry_after: Option<Duration>,
+    /// 最后一次凭据级失败的**最终健康判定**，由 `run()` 结算到那把 Key 上。
+    ///
+    /// 判定只做一次：换 Key 重试时若重新推导，就会丢掉"到底是 401 还是 403"
+    /// 这个前提，把 401 也按"正文没提凭据"降级成普通故障（§12.3）。
+    last_credential_outcome: Option<health::Outcome>,
     /// 本次请求最终的 (输入, 输出) Token，成功时写入（§6.6）。
     usage_parts: (Option<u64>, Option<u64>),
     /// 非流式成功时拿到的完整 Token 细分（§11.6）。
@@ -377,6 +436,7 @@ async fn forward_inner<'a>(
         attempted: Vec::new(),
         last: None,
         last_retry_after: None,
+        last_credential_outcome: None,
         usage_parts: (None, None),
         usage_detail: None,
         attempt_log: Vec::new(),
@@ -1068,7 +1128,13 @@ impl Walk<'_> {
                 Attempted::CredentialFailed(failed) => {
                     // 先把这次失败结算到**那一把** Key 上，否则下一轮抽签会
                     // 再次选中它，换 Key 就变成了空转。
-                    failed.settle(bad_key_outcome(self.last_retry_after), None);
+                    // 用这次尝试已经定下来的判定，而不是在这里重新推导：只有
+                    // 那一刻还知道上游给的是 401 还是 403（§12.3）。
+                    failed.settle(
+                        self.last_credential_outcome
+                            .unwrap_or(health::Outcome::KeyInvalid),
+                        None,
+                    );
                     if switches >= MAX_KEY_SWITCHES_PER_TARGET {
                         // 换 Key 次数用尽：当作这个目标不可用，交给上层换目标。
                         return Flow::Continue;
@@ -1258,8 +1324,21 @@ impl Walk<'_> {
                 message,
                 upstream_status,
                 retry_after,
+                upstream_body,
             }) => {
-                let outcome = classify_outcome(code, upstream_status, retry_after);
+                let mut outcome = classify_outcome(code, upstream_status, retry_after);
+                // 401 与 403 分开看（§12.3）。判据只作用于这两个状态码：402/429
+                // 根本不是"凭据不对"的信号，拿它们去查正文会把已经判定的额度耗尽
+                // 与限流降级成普通故障，而它们的 `Retry-After` 正等着被消费。
+                if let Some(status) = upstream_status
+                    && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                {
+                    outcome = credential_outcome(
+                        status,
+                        retry_after,
+                        upstream_body.as_deref().unwrap_or(&[]),
+                    );
+                }
                 // 凭据级失败：账号内还有别的 Key 时应当换一把重试，而不是
                 // 立刻放弃这个账号（§4.2.1）。这时的 admission 原样交回调用方，
                 // 由它把失败结算到**那一把** Key 上——在这里结算会把状态记到
@@ -1268,6 +1347,7 @@ impl Walk<'_> {
                     || matches!(outcome, health::Outcome::QuotaExhausted { .. })
                 {
                     self.last_retry_after = retry_after;
+                    self.last_credential_outcome = Some(outcome);
                     self.last = Some((code, message));
                     tracing::warn!(
                         request_id = self.forward.request_id,
@@ -2453,6 +2533,14 @@ async fn classify_upstream_error(
             StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => ErrorCode::UpstreamTimeout,
             _ => ErrorCode::UpstreamExhausted,
         };
+        // 判据必须看正文：403 到底是"分组被停用"还是"Key 无效"，状态码本身
+        // 分不出来（§12.3）。体有上限，异常上游不能靠超大错误体把网关拖垮。
+        let body = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
+            .await
+            .unwrap_or_else(|reason| {
+                tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
+                axum::body::Bytes::new()
+            });
         return Err(AttemptFailure::Switchable {
             code,
             message: format!(
@@ -2465,6 +2553,7 @@ async fn classify_upstream_error(
             ),
             upstream_status: Some(status),
             retry_after: retry_after.map(Duration::from_secs),
+            upstream_body: Some(body.to_vec()),
         });
     }
 
@@ -3064,9 +3153,99 @@ mod tests {
         }
     }
 
+    /// 401 与 403 不是一个结论：403 只有正文点名凭据才算失效（§12.3）。
+    ///
+    /// 上游用 403 表达"分组被停用/权限不足"时，把它当 Key 失效会把一把好 Key
+    /// 永久钉死——失效标记只可能被一次成功清除，而那把 Key 已经被排除出抽签。
+    /// 凭据级失败的健康判定：401/403 有 Retry-After 时算"等一会儿"，否则只有
+    /// 正文点名凭据才硬停；402/429 的原判定一字不动（§12.3）。
+    ///
+    /// 这条判据此前写成"任何非 2xx 且正文没提凭据就降级成故障"，会把上游明确
+    /// 给出的额度耗尽与限流一起吞掉——开发中实测踩到过，所以整条分支都钉在这。
+    #[test]
+    fn credential_failures_map_onto_the_health_state_machine() {
+        let names_it = br#"{"error":{"message":"Invalid API key provided"}}"#;
+        let group_gone = r#"{"error":{"message":"当前分组已被停用"}}"#.as_bytes();
+
+        // 401：状态码本身就说明问题，不看正文。
+        assert!(matches!(
+            credential_outcome(StatusCode::UNAUTHORIZED, None, names_it),
+            health::Outcome::KeyInvalid
+        ));
+        // 403 + 正文点名：失效。
+        assert!(matches!(
+            credential_outcome(StatusCode::FORBIDDEN, None, names_it),
+            health::Outcome::KeyInvalid
+        ));
+        // 403 + 分组被停用：只是目标级权限问题。
+        assert!(matches!(
+            credential_outcome(StatusCode::FORBIDDEN, None, group_gone),
+            health::Outcome::Fault
+        ));
+
+        // 带 Retry-After：上游说的是"过一会儿再来"，绝不做硬停（§12.3 既有口径）。
+        assert!(matches!(
+            credential_outcome(
+                StatusCode::FORBIDDEN,
+                Some(Duration::from_secs(30)),
+                names_it
+            ),
+            health::Outcome::QuotaExhausted { .. }
+        ));
+
+        // 402 的额度耗尽与 429 的限流保持原判：它们不是"凭据不对"的信号，
+        // 网关也**不会**把它们送进上面那条判据（见 run_attempt 的状态码守卫），
+        // 所以这里从真正的入口 `classify_outcome` 断言，而不是从判据本身。
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::UpstreamExhausted,
+                Some(StatusCode::PAYMENT_REQUIRED),
+                Some(Duration::from_secs(60))
+            ),
+            health::Outcome::QuotaExhausted { .. }
+        ));
+        assert!(matches!(
+            classify_outcome(
+                ErrorCode::RateLimited,
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                None
+            ),
+            health::Outcome::RateLimited { .. }
+        ));
+    }
+
+    #[test]
+    fn only_certain_403s_prove_the_credential_is_bad() {
+        assert!(!auth_proves_key_invalid(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"当前分组已被停用"}}"#.as_bytes()
+        ));
+        // 空体什么都没证明，按临时故障处理。
+        assert!(!auth_proves_key_invalid(StatusCode::FORBIDDEN, b""));
+        // 正文点名凭据：这才是失效证据，中英文都认。
+        assert!(auth_proves_key_invalid(
+            StatusCode::FORBIDDEN,
+            br#"{"error":{"message":"Invalid API key provided"}}"#
+        ));
+        assert!(auth_proves_key_invalid(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"Key 无效"}}"#.as_bytes()
+        ));
+        // 401 不看正文：状态码本身已经说清楚了。
+        assert!(auth_proves_key_invalid(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"message":"Unauthorized"}}"#
+        ));
+        // 其他状态码不参与这条判据。
+        assert!(!auth_proves_key_invalid(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b""
+        ));
+    }
+
     #[test]
     fn upstream_statuses_map_onto_the_health_state_machine() {
-        // 401/403 是"Key 坏了"，影响整个账号；429 只影响账号 + 模型（§12.1）。
+        // 401 是"Key 坏了"；403 还要看正文，这里先钉住 401 这一支（§12.1）。
         assert!(matches!(
             classify_outcome(
                 ErrorCode::UpstreamExhausted,

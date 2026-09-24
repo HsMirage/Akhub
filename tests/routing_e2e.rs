@@ -1102,6 +1102,8 @@ async fn an_error_event_before_content_switches_but_a_delta_does_not() {
 ///
 /// 这是 Key 池带来的行为修正：单 Key 账号里账号与 Key 的作用域恰好重合，表现
 /// 与"一 Key 一账号"时代一致；多 Key 账号里一把 Key 被封不该让整号停摆。
+///
+/// 判定要连续确认两次（§12.3）：单次 401 不得把 Key 钉死，所以这里打两次。
 #[tokio::test]
 async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
     let up1 = FakeUpstream::spawn().await;
@@ -1120,15 +1122,23 @@ async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
     .await;
     wire_extra_target(&akhub, &a2.account_id, "glm-4.5", "glm-4.5").await;
 
-    // 401 证明这把 Key 失效：同一个账号下的另一个模型也立即停用。
-    up1.script([Behavior::Status(401, None)]);
+    // 401 连续两次证明这把 Key 失效。第一次只是一次怀疑：同账号的另一个模型
+    // 照常发上游；第二次确认之后，整个账号（它的每一把 Key 都已被判失效）不再
+    // 被尝试。
+    up1.script([Behavior::Status(401, None), Behavior::Status(401, None)]);
+    for model in ["glm-4.6", "glm-4.5"] {
+        assert_eq!(
+            chat(&akhub, json!({"model": model, "messages": []}))
+                .await
+                .status(),
+            200
+        );
+    }
     assert_eq!(
-        chat(&akhub, json!({"model": "glm-4.6", "messages": []}))
-            .await
-            .status(),
-        200
+        (up1.requests(), up2.requests()),
+        (2, 2),
+        "第二次确认之前，账号还在被尝试"
     );
-    assert_eq!((up1.requests(), up2.requests()), (1, 1));
     assert_eq!(
         chat(&akhub, json!({"model": "glm-4.5", "messages": []}))
             .await
@@ -1137,7 +1147,7 @@ async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
     );
     assert_eq!(
         (up1.requests(), up2.requests()),
-        (1, 2),
+        (2, 3),
         "Key 失效的账号不该再被尝试"
     );
     // 这条断言刻意**带上凭据**：401 归因到具体哪把 Key，查它就必须报失效。
@@ -1181,7 +1191,13 @@ async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
         "换过凭据之后这把 Key 必须重新可用"
     );
 
-    // 429 只影响"账号 + 模型"：另一个模型照常走原账号（§12.3）。
+    // 429 只影响"账号 + 模型"：另一个模型照常走原账号（§12.3）。先清掉 401
+    // 留下的硬停，否则这一轮测的是失效标记而不是限流。
+    akhub
+        .state
+        .runtime
+        .health
+        .clear_account_faults(&a1.account_id);
     up1.script([Behavior::Status(429, Some(30))]);
     assert_eq!(
         chat(&akhub, json!({"model": "glm-4.6", "messages": []}))
@@ -1189,14 +1205,14 @@ async fn an_invalid_key_pauses_that_key_but_a_429_only_the_model() {
             .status(),
         200
     );
-    assert_eq!((up1.requests(), up2.requests()), (2, 3));
+    assert_eq!((up1.requests(), up2.requests()), (3, 4));
     assert_eq!(
         chat(&akhub, json!({"model": "glm-4.5", "messages": []}))
             .await
             .status(),
         200
     );
-    assert_eq!((up1.requests(), up2.requests()), (3, 3));
+    assert_eq!((up1.requests(), up2.requests()), (4, 4));
 }
 
 #[tokio::test]

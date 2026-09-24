@@ -938,6 +938,12 @@ pub struct AccountKeyHealthDto {
     pub cooldown_secs: Option<u64>,
     /// 当前在途请求数。
     pub inflight: u32,
+    /// 是否曾被判定"上游说凭据不对"且还没被一次成功推翻（§12.3）。
+    ///
+    /// 与 `status` 分开：硬停有自证窗口，窗口到期后 `status` 会回到
+    /// `active`，但标记还在——面板据此说明"这个故障是什么时候出现的、还能
+    /// 手动清掉"，而不是让它凭空消失。
+    pub auth_proves_invalid: bool,
 }
 
 /// 把界面提交的 Key 列表解析成可落库的形状（§4.2.1）。
@@ -1184,7 +1190,7 @@ fn account_health(state: &SharedState, account: &Account) -> AccountHealthDto {
         "disabled" => Some("管理员已停用该账号".to_string()),
         "no_key" => Some("该账号没有启用的 API Key，任何请求都会被拒绝".to_string()),
         "key_invalid" => Some(format!(
-            "有 {} 把 Key 已被上游判定失效，需重新配置凭据",
+            "有 {} 把 Key 被上游连续两次判定失效；点那一行的「清除失效标记」或跑一次测试连接即可放行，不处理也会在约 10 分钟后自动放行一次自证",
             keys.iter()
                 .filter(|key| key.enabled && key.status == "key_invalid")
                 .count()
@@ -1249,6 +1255,7 @@ fn account_key_health_of(
         status: health.status().as_str(),
         cooldown_secs: health.cooldown_remaining(now).map(|wait| wait.as_secs()),
         inflight: health.inflight(),
+        auth_proves_invalid: health.auth_proves_invalid(),
     }
 }
 
@@ -3727,6 +3734,21 @@ pub async fn test_account(
             row.label.clone()
         };
         let attempt = test_one_key(&state, &account, &url, &model, &body, &api_key).await;
+        // §12.3："手动测试成功后恢复"。测试走的是独立路径，本来不写健康状态；
+        // 但"这一把确实通了"正是解除硬停最可信的依据——不在这里放行，面板会
+        // 一直显示一个已经不存在的故障（"Key 失效，可测试明明通过"）。
+        if attempt.0
+            && let Some(credential) = state
+                .runtime
+                .credentials
+                .current()
+                .by_id(&account.id, &row.id)
+        {
+            state
+                .runtime
+                .health
+                .clear_key_faults(&credential.account_id, &credential.credential_digest);
+        }
         results.push(json!({
             "id": row.id,
             "label": label,
@@ -3805,6 +3827,39 @@ async fn test_one_key(
         }
         Err(error) => (false, 0, latency_ms, format!("连接失败：{error}")),
     }
+}
+
+/// 清除某一把 Key 的失效标记与熔断（§12.3）。
+///
+/// 上游用 403 表达"分组被停用/权限不足"时，一次判定就会把这个 Key 记成失效；
+/// 面板上那个徽标必须有对应的解除动作，否则管理员唯一的出路是重新粘一遍凭据。
+/// 作用域是**这一把**：同账号其他 Key 的熔断状态不动（§4.2.1）。
+pub async fn clear_key_faults(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path((id, key_id)): Path<(String, String)>,
+) -> AdminResult<Json<Value>> {
+    let account = find_account(&state, &id).await?;
+    // 凭据摘要只有快照里有：动态状态表按"账号 + 摘要"归类，用错键会去清一条
+    // 根本不存在的记录（§4.2.1）。
+    let credential = state
+        .runtime
+        .credentials
+        .current()
+        .by_id(&account.id, &key_id)
+        .cloned()
+        .ok_or_else(|| AdminError::not_found("这个账号下没有这把 Key"))?;
+    state
+        .runtime
+        .health
+        .clear_key_faults(&credential.account_id, &credential.credential_digest);
+    audit(&state, &admin, "clear_key_faults", &id).await;
+    Ok(Json(json!({
+        "ok": true,
+        "key_id": key_id,
+        "label": credential.label,
+        "notice": "已清除这把 Key 的失效标记与熔断状态",
+    })))
 }
 
 // ------------------------------------------------- 成本页与校准（§6.8）

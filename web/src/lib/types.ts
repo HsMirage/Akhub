@@ -132,6 +132,11 @@ export interface AccountKeyHealth {
   cooldown_secs: number | null;
   /// 当前在途请求数。
   inflight: number;
+  /// 是否曾被判定"上游说凭据不对"且还没被一次成功推翻。
+  ///
+  /// 硬停有自证窗口：窗口到期后 status 会回到 active，标记却还在。面板据此
+  /// 提示"这个故障是什么时候出现的"，并给出「清除失效标记」的出口。
+  auth_proves_invalid: boolean;
 }
 
 /// 提交给后台的一把 Key（§4.2.1）。

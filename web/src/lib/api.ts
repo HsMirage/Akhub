@@ -300,6 +300,16 @@ export const api = {
   /** 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。 */
   testAccount: (id: string, model?: string) =>
     post<TestResult>(`/accounts/${id}/test`, { model: model || undefined }),
+  /**
+   * 清除某一把 Key 的失效标记与熔断（§12.3）。
+   *
+   * 上游用 403 表达"分组被停用/权限不足"时会把好 Key 判成失效，面板上那个
+   * 徽标必须有对应的解除动作——否则管理员唯一的出路是重新粘一遍凭据。
+   */
+  clearKeyFaults: (id: string, keyId: string) =>
+    post<{ ok: boolean; notice: string }>(
+      `/accounts/${id}/keys/${keyId}/clear-faults`,
+    ),
   /** 校准助手：按单模型对账反算校准系数（§6.8）。 */
   calibrate: (id: string, logicalModel: string, reported: string, periodStart?: number) =>
     post<CalibrationResult>(`/accounts/${id}/calibrate`, {
