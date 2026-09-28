@@ -1621,8 +1621,8 @@ fn prime_target(
                 streaming,
             },
             &akhub::routing::score::Sample {
+                kind: akhub::routing::score::SampleKind::Rated,
                 success: true,
-                counts: true,
                 first_token: Some(Duration::from_millis(first_token_ms)),
                 total: Duration::from_secs(1),
                 output_tokens: Some(output_tokens),

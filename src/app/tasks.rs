@@ -347,8 +347,9 @@ mod tests {
                 streaming: false,
             },
             &crate::routing::score::Sample {
+                // 后台自身的探针不进入目标质量判断（§9.3）。
+                kind: crate::routing::score::SampleKind::Excluded,
                 success: true,
-                counts: true,
                 first_token: None,
                 total: Duration::from_millis(1200),
                 output_tokens: Some(100),

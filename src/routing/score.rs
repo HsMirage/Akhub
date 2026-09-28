@@ -101,22 +101,44 @@ const MIN_FRAME_TARGETS: usize = 2;
 /// 混进来只会污染判断。
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
+    /// 这次观测对目标质量判断的效力。
+    pub kind: SampleKind,
+    /// 上游是否真的产出了可用的回答。
     pub success: bool,
-    /// 这次采样是否应该影响**目标质量**的判断。
-    ///
-    /// 客户端中途断开（`client_gone`）时它是 `false`：这次请求是下游自己
-    /// 放弃的，上游没有做错任何事。若把它当成失败喂进成功率 EWMA，一次
-    /// 掉线就按 `ALPHA` 扣掉两成可靠性，要连着十次成功才爬得回来——那等于
-    /// 因为调用方掉线而惩罚一个健康账号（§9.3、§12.3）。
-    ///
-    /// 与健康状态机的 `Neutral` 是同一个口径：不进统计。
-    pub counts: bool,
     /// 首字或首个语义事件延迟。非流式请求没有这一项。
     pub first_token: Option<Duration>,
     /// 端到端总耗时。
     pub total: Duration,
     /// 上游报告的输出 Token 数，用于算每秒输出速度。
     pub output_tokens: Option<u64>,
+}
+
+/// 一次采样对目标质量判断的效力（§9.3、§12.3）。
+///
+/// 把"要不要动可靠性"和"要不要算证据"分成两件事。它们此前共用一个 `counts`
+/// 布尔量，于是**下游提前断开**这个第三态只能二选一，选哪边都会出事：
+///
+/// - 当成失败喂进成功率：一次掉线按 `ALPHA` 扣掉两成可靠性，要连着十次成功
+///   才爬得回来——因为调用方掉线而惩罚一个健康账号。
+/// - 当成"不进统计"：连样本权重都不记。这条路径的后果在低流量模型上是灾难性的：
+///   现场 `deepseek-v4.1-flash` 近 7 天 1848 条请求里 1786 条是 `client_gone`，
+///   而其中 96.8% 其实拿到了完整 usage（上游跑完了，只是下游没等到收尾就关了
+///   连接）。真实计入评分的只剩 62 条，五个目标的有效样本量全在 0.1~6.6 之间，
+///   谁都跨不过 `MIN_SAMPLES`。冷目标的口粮（`EXPLORATION × MAX_STALE_FACTOR`）
+///   因此占了抽签权重 84%~97%，评分形同虚设、抽签退化成近似均匀——每轮换一次
+///   渠道，前缀缓存每轮重建一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleKind {
+    /// 真实成功或失败：可靠性、样本权重与延迟三项全部计入。
+    Rated,
+    /// 上游已经跑完，但下游提前断开（`client_gone` 且拿到了完整 usage）。
+    ///
+    /// 不动成功率（这不是上游的错），但首字与吞吐是**真实测到的**，必须计入
+    /// 权重与采样时刻——否则一个"总是被客户端提前断开"的目标永远攒不够样本，
+    /// 永远停在冷启动，评分与参照系一起失效。
+    TimingOnly,
+    /// 没有任何可用证据：后台测试按钮，以及真的中途断流（连 usage 都没等到）。
+    Excluded,
 }
 
 /// 一个目标在某个协议、某种流式模式下的 EWMA 当前值。
@@ -192,9 +214,8 @@ impl Stats {
     /// 只在 `observe` 里调用：这样 `Stats` 的其它读取路径全部是纯函数，
     /// 不需要 `&mut self`，也就不会在"评分时顺手改写状态"这种地方引入竞态。
     fn observe(&mut self, sample: &Sample, now: i64) {
-        // 客户端断开连样本都不算：它既不代表目标成功，也不代表目标失败，
-        // 混进样本数还会让 `is_warm` 提前成立（§9.3）。
-        if !sample.counts {
+        // 没有任何可用证据的观测（后台测试按钮、真正中途断流）完全不入账。
+        if sample.kind == SampleKind::Excluded {
             return;
         }
         // 先把已有权重按"距上次采样过了多久"衰减，再补上这一次观测。
@@ -206,9 +227,19 @@ impl Stats {
         self.weight = self.effective_samples(now) + 1.0;
         self.samples = self.samples.saturating_add(1);
         self.last_sample_at = now;
-        self.success_rate = ewma(self.success_rate, if sample.success { 1.0 } else { 0.0 });
+        // **可靠性只认真正的成功与失败。** 下游提前断开（`TimingOnly`）不是
+        // 上游的错，不能按 `ALPHA` 扣掉两成成功率——那要连着十次成功才爬得
+        // 回来，等于因为调用方掉线而惩罚一个健康账号（§9.3、§12.3）。
+        //
+        // 但样本权重与采样时刻照记：这条请求的**首字与吞吐是真的测出来的**，
+        // 而且它证明上游当下还活着。此前把这一整条观测丢掉，才让"总是被客户端
+        // 提前断开"的模型永远攒不够 `MIN_SAMPLES`（见 `SampleKind`）。
+        if sample.kind == SampleKind::Rated {
+            self.success_rate = ewma(self.success_rate, if sample.success { 1.0 } else { 0.0 });
+        }
 
         // 失败请求的延迟没有意义：一个 0.2 秒就 500 的目标不该因此显得"很快"。
+        // `TimingOnly` 走到这里时 `success` 为 true（上游确实产出了回答）。
         if !sample.success {
             return;
         }
@@ -558,6 +589,51 @@ fn score_one(
     }
 }
 
+/// 一个候选的基础抽签权重：`score^k` 加上与分数无关的探索口粮。
+///
+/// 单独抽出来，是因为软粘性的倍数必须按**同一把尺子**反解（见 [`affinity_boost`]），
+/// 两处各算一遍迟早会漂移。
+pub fn base_weight(score: &Score) -> f64 {
+    score.total.max(MIN_SCORE).powi(POWER) + score.exploration
+}
+
+/// 让软粘性命中的候选拿到 `retention` 留存概率所需的权重倍数（§10.1 修订）。
+///
+/// **为什么不是固定倍数。** 原实现写死 4 倍，注释说"同分候选之间约八成流量
+/// 仍留在原账号"。这在**恰好两个**候选时成立，但留存率其实是
+/// `b / (b + n - 1)`：3 个候选 67%、5 个候选只有 50%。现场国模分组正是
+/// 5 个同优先级目标，固定 4 倍的实际留存率只有一半——每两轮就把前缀缓存
+/// 重建一次，而首字延迟差着 6 倍的两个账号因此拿到几乎一样多的流量。
+///
+/// 这里直接按目标留存率反解。设绑定目标权重 `own`、其余之和 `others`：
+/// `retention = b·own / (b·own + others)`，即
+/// `b = retention/(1-retention) · others/own`。
+///
+/// `cap` 是必要的闸门：绑定目标已经明显落后时，反解出的倍数会很大，一个**差**
+/// 账号照样能被"锁"在会话上——那正是 §10.1 修订要修的病。封顶之后留存率退化为
+/// `cap·own / (cap·own + others)`：`own` 越小留存越低，差账号自然留不住，
+/// 不需要再加一条分数判据。
+pub fn affinity_boost(weights: &[f64], bound: usize, retention: f64, cap: f64) -> Vec<f64> {
+    let mut boost = vec![1.0; weights.len()];
+    let Some(&own) = weights.get(bound) else {
+        return boost;
+    };
+    if own <= 0.0 || !(0.0..1.0).contains(&retention) {
+        return boost;
+    }
+    let others: f64 = weights
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != bound)
+        .map(|(_, weight)| *weight)
+        .sum();
+    if others <= 0.0 {
+        return boost;
+    }
+    boost[bound] = ((retention / (1.0 - retention)) * (others / own)).clamp(1.0, cap);
+    boost
+}
+
 /// 按 `score^k` 加权随机排出层内的尝试顺序（§9.5）。
 ///
 /// `boost` 与 `scores` 等长，是**逐候选的权重倍数**（软粘性用，见 §10.1 修订）。
@@ -585,8 +661,7 @@ pub fn weighted_order_with(
         .iter()
         .enumerate()
         .map(|(index, score)| {
-            let base = score.total.max(MIN_SCORE).powi(POWER) + score.exploration;
-            base * boost.get(index).copied().unwrap_or(1.0).max(0.0)
+            base_weight(score) * boost.get(index).copied().unwrap_or(1.0).max(0.0)
         })
         .collect();
     let mut order = Vec::with_capacity(scores.len());
@@ -791,7 +866,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(100)),
                     total: Duration::from_millis(400),
                     output_tokens: Some(30),
@@ -824,7 +899,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(100)),
                     total: Duration::from_millis(400),
                     output_tokens: Some(30),
@@ -917,7 +992,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(900)),
                     total: Duration::from_millis(4_000),
                     output_tokens: Some(30),
@@ -946,7 +1021,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1_000),
                     output_tokens: Some(80),
@@ -982,7 +1057,7 @@ mod tests {
         stats.observe(
             &Sample {
                 success: true,
-                counts: true,
+                kind: SampleKind::Rated,
                 first_token: Some(Duration::from_millis(200)),
                 total: Duration::from_millis(1_000),
                 output_tokens: Some(80),
@@ -1006,7 +1081,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1_000),
                     output_tokens: Some(80),
@@ -1290,6 +1365,58 @@ mod tests {
         );
     }
 
+    /// **现场回归**：留存率必须与候选个数无关（§10.1 修订）。
+    ///
+    /// 原实现把"约八成流量留在原账号"写死成固定 4 倍权重。8 成只在**恰好两个**
+    /// 候选时成立：同分时留存率是 `b / (b + n - 1)`，3 个候选 67%、5 个候选只剩
+    /// 50%。现场国模分组正是 5 个同优先级目标，固定倍数因此每两轮就换一次渠道。
+    /// 这里断言反解出来的倍数能把留存率稳定钉在目标值上。
+    #[test]
+    fn affinity_retention_holds_regardless_of_candidate_count() {
+        let retention = 0.8;
+        let cap = AFFINITY_RETENTION_TEST_CAP;
+        for n in 2..=6 {
+            // 同分候选：不含口粮，纯粹比较倍数是否按 n 反解。
+            let weights = vec![1.0_f64; n];
+            let boost = affinity_boost(&weights, 0, retention, cap);
+            // 同分时候所需倍数 = retention/(1-retention) · (n-1) = 4·(n-1)。
+            // 关键就是它**随 n 增长**：固定 4 倍在 n=5 时只留下 50% 流量。
+            let expected = (4.0 * (n - 1) as f64).min(cap);
+            assert!(
+                (boost[0] - expected).abs() < 1e-9,
+                "n={n} 个同分候选时应得 {expected} 倍，实际 {}",
+                boost[0]
+            );
+            // 用抽签实测留存率。
+            let scores: Vec<Score> = (0..n).map(|_| score(0.8)).collect();
+            let share = simulate_with_boost(&scores, &boost, 40_000);
+            assert!(
+                (share[0] - retention).abs() < 0.05,
+                "n={n} 候选时留存率应当稳定在 {retention}，实际 {share:?}"
+            );
+        }
+    }
+
+    /// 反解出的倍数必须封顶：绑定目标明显落后时不能被"锁死"。
+    #[test]
+    fn the_affinity_boost_is_capped_so_a_bad_target_still_yields() {
+        let cap = 4.0;
+        // 绑定目标权重极小（远差于对手）：反解会要求极大的倍数。
+        let weights = vec![0.0001, 1.0];
+        let boost = affinity_boost(&weights, 0, 0.8, cap);
+        assert_eq!(boost[0], cap, "倍数必须被 cap 截断");
+        // 封顶之后差目标依然留不住：留存率退化为 cap·own/(cap·own+others)。
+        let scores = vec![score(0.30), score(0.95)];
+        let share = simulate_with_boost(&scores, &boost, 40_000);
+        assert!(
+            share[1] > share[0],
+            "封顶之后健康目标必须仍然占优，差目标不得被锁死：{share:?}"
+        );
+    }
+
+    /// 测试里沿用的倍数上限，与生产常量保持一致的可比语义。
+    const AFFINITY_RETENTION_TEST_CAP: f64 = 64.0;
+
     #[test]
     fn every_candidate_appears_exactly_once_in_the_attempt_order() {
         let scores = vec![score(0.9), score(0.5), score(0.1)];
@@ -1377,7 +1504,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(1000)),
                     total: Duration::from_millis(4000),
                     output_tokens: Some(400),
@@ -1393,7 +1520,7 @@ mod tests {
             stats.observe(
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1000),
                     output_tokens: Some(400),
@@ -1410,7 +1537,7 @@ mod tests {
         stats.observe(
             &Sample {
                 success: true,
-                counts: true,
+                kind: SampleKind::Rated,
                 first_token: Some(Duration::from_millis(1000)),
                 total: Duration::from_millis(4000),
                 output_tokens: Some(400),
@@ -1423,7 +1550,7 @@ mod tests {
         stats.observe(
             &Sample {
                 success: false,
-                counts: true,
+                kind: SampleKind::Rated,
                 first_token: Some(Duration::from_millis(1)),
                 total: Duration::from_millis(200),
                 output_tokens: None,
@@ -1432,6 +1559,124 @@ mod tests {
         );
         assert_eq!(stats.first_token_ms, fast_first_token);
         assert!(stats.success_rate < 1.0);
+    }
+
+    /// **现场回归**：上游写完了、下游才断开的请求，必须计入证据。
+    ///
+    /// 这条钉的是本修复的核心。此前 `client_gone` 走的是"连样本都不进"，
+    /// 于是 `deepseek-v4.1-flash` 近 7 天近 2000 条请求里，真实生效的只有 60
+    /// 出头，五个目标的有效样本量全在 0.1~6.6 之间，没有任何目标能成为"热"目标。
+    #[test]
+    fn a_disconnect_after_the_answer_finished_keeps_evidence_but_not_reliability() {
+        let mut stats = Stats::default();
+        // 先来 3 条真正的成功，把成功率钉在 1.0。
+        for _ in 0..3 {
+            stats.observe(
+                &Sample {
+                    kind: SampleKind::Rated,
+                    success: true,
+                    first_token: Some(Duration::from_millis(500)),
+                    total: Duration::from_millis(2_000),
+                    output_tokens: Some(200),
+                },
+                NOW,
+            );
+        }
+        let before = stats.success_rate;
+        let weight_before = stats.weight;
+
+        // 再来一条"上游写了终止信号、下游才提前断开"的观测。
+        stats.observe(
+            &Sample {
+                kind: SampleKind::TimingOnly,
+                // 上游确实产出了回答：按成功记账，但不参与成功率 EWMA。
+                success: true,
+                first_token: Some(Duration::from_millis(5_000)),
+                total: Duration::from_millis(20_000),
+                output_tokens: Some(900),
+            },
+            NOW,
+        );
+
+        // 证据照记：这正是让低流量目标能跨过 MIN_SAMPLES 的那一部分。
+        assert!(
+            stats.weight > weight_before,
+            "断开但跑完的请求必须增加样本权重：{weight_before} -> {}",
+            stats.weight
+        );
+        assert_eq!(stats.samples, 4);
+        assert_eq!(stats.last_sample_at, NOW);
+        // 延迟也是真测到的，必须反映进去。
+        assert!(
+            stats.first_token_ms > 500.0,
+            "5 秒的首字必须拉动 EWMA，实际 {}",
+            stats.first_token_ms
+        );
+        // 但可靠性一根汗毛都不能动：这不是上游的错。
+        assert_eq!(
+            stats.success_rate, before,
+            "客户端断开不得影响成功率 EWMA（§9.3）"
+        );
+    }
+
+    /// 回答**还没写完**就断掉，仍然完全没有证据价值。
+    ///
+    /// 注意判据是"有没有收到终止信号"，不是"有没有出现过 usage"——真实
+    /// Anthropic 的开头帧就带 usage（见 `answer_completed`）。
+    #[test]
+    fn a_disconnect_before_the_answer_finished_is_ignored() {
+        let mut stats = Stats::default();
+        stats.observe(
+            &Sample {
+                kind: SampleKind::Excluded,
+                success: false,
+                first_token: None,
+                total: Duration::from_millis(30_000),
+                output_tokens: None,
+            },
+            NOW,
+        );
+        assert_eq!(stats.weight, 0.0, "没写完的断开不得产生任何证据");
+        assert_eq!(stats.samples, 0);
+        assert_eq!(stats.last_sample_at, 0);
+        assert!(!stats.is_warm(NOW));
+    }
+
+    /// **现场量化回归**：只有"断开但跑完"的流量也必须能把目标喂热。
+    ///
+    /// 现场速率是每目标约 0.074 条/小时（几乎全是 client_gone）。按修复前的
+    /// 口径，稳态有效样本量只有 2.6，永远跨不过 10；按修复后的口径，
+    /// 每目标 2.2 条/小时 → 稳态约 76，稳稳跨过门槛。
+    #[test]
+    fn aborted_traffic_alone_still_warms_a_low_traffic_target() {
+        // 每目标 2.2 条/小时 —— 现场 1848 条/7 天 ÷ 5 个目标。
+        let interval = (3600.0 / 2.2) as i64;
+        let mut stats = Stats::default();
+        let mut at = NOW;
+        let mut fed = 0;
+        // 跑 48 小时，远超一个半衰期，进入稳态。
+        while at < NOW + 48 * 3600 {
+            stats.observe(
+                &Sample {
+                    kind: SampleKind::TimingOnly,
+                    success: true,
+                    first_token: Some(Duration::from_millis(7_000)),
+                    total: Duration::from_millis(28_000),
+                    output_tokens: Some(800),
+                },
+                at,
+            );
+            fed += 1;
+            at += interval;
+        }
+        assert!(fed > 50, "48 小时应当采到 50 条以上，实际 {fed}");
+        assert!(
+            stats.is_warm(at),
+            "只有断开流量的目标也必须能被喂热，否则评分永远退化：有效样本 {}",
+            stats.effective_samples(at)
+        );
+        // 可靠性没有被这批流量污染：它一次都没有被写过。
+        assert_eq!(stats.success_rate, 1.0, "断开流量不得压低成功率");
     }
 
     #[test]
@@ -1451,7 +1696,7 @@ mod tests {
                 dimension,
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: Some(Duration::from_millis(700)),
                     total: Duration::from_millis(3000),
                     output_tokens: Some(300),
@@ -1512,7 +1757,7 @@ mod tests {
                 dimension,
                 &Sample {
                     success: true,
-                    counts: true,
+                    kind: SampleKind::Rated,
                     first_token: None,
                     total: Duration::from_millis(10),
                     output_tokens: None,

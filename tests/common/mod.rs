@@ -41,6 +41,15 @@ pub enum Behavior {
     StreamThenAbort,
     /// 流式：先发送语义增量，等待 release 后再发剩余内容。
     StreamThenHang,
+    /// 流式：只发协议的开头帧（Anthropic 的这个帧自带 usage），然后挂住。
+    ///
+    /// 用来模拟"回答还没写就断了"：那一帧里的 usage 绝不能被当成"上游跑完了"。
+    StreamUsageStartThenHang,
+    /// 流式：把**带 usage 的收尾事件**也发出去，然后挂住不回结束标记。
+    ///
+    /// 对应线上最常见的 `client_gone` 形态：上游其实已经跑完并上报了用量，
+    /// 只是下游没等到最后就关了连接（§9.3 修订）。
+    StreamUsageThenHang,
     /// 流式：只送协议开始标记与一个错误事件，然后结束。
     StreamErrorEvent,
     /// 按协议返回一次工具调用，用于验证跨协议的工具往返。
@@ -302,6 +311,48 @@ async fn inference(
             )
                 .into_response()
         }
+        Behavior::StreamUsageStartThenHang => {
+            let sent = axum::body::Bytes::from(start_frames(&path).concat());
+            let mut released = upstream.release.subscribe();
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(sent);
+                while !*released.borrow() {
+                    if released.changed().await.is_err() {
+                        return;
+                    }
+                }
+            };
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Behavior::StreamUsageThenHang => {
+            // 送出"带输出用量、但还没终止流"的那一段，然后挂住。上游其实已经
+            // 把回答写完了，只是流没关；下游此刻断开就是线上那种"跑完但没等到
+            // 收尾"。
+            //
+            // 必须按协议取到**输出用量**才停下：Anthropic 的输入用量在开头的
+            // `message_start` 就出现，用开头当断点会变成"回答还没写就断开"，
+            // 那是另一条路径（`Excluded`），测不到这里要测的东西。
+            let frames = usage_frames(&path);
+            let sent = axum::body::Bytes::from(frames.concat());
+            let mut released = upstream.release.subscribe();
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(sent);
+                while !*released.borrow() {
+                    if released.changed().await.is_err() {
+                        return;
+                    }
+                }
+            };
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
         Behavior::StreamThenAbort => {
             let frames = ok_frames(&path);
             let first = axum::body::Bytes::from(frames[..2].concat());
@@ -420,6 +471,56 @@ fn ok_frames(path: &str) -> Vec<String> {
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n".into(),
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n".into(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into(),
+        ]
+    }
+}
+
+/// 一段"回答已经写完、但流还没终止"的帧序列，供 `StreamUsageThenHang` 使用。
+///
+/// 与 [`ok_frames`] 的区别有两点：
+/// * Chat 补上了真实的 usage 收尾帧（`choices: []` + `usage`）——线上上游正是
+///   这么发的，而 `ok_frames` 为了简洁没有它；
+/// * 一律**去掉终止标记**（`[DONE]` / `message_stop`），因为调用方要模拟的正是
+///   "上游写完就不说话、连接迟迟不关"。
+fn usage_frames(path: &str) -> Vec<String> {
+    if path.starts_with("/v1/chat/completions") {
+        let mut frames = ok_frames(path);
+        // 把 [DONE] 换成 usage 收尾帧：上游报完用量，流却没有结束。
+        frames.pop();
+        frames.push(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\n".into(),
+        );
+        frames
+    } else if path.starts_with("/v1/responses") {
+        // Responses 本来就以 `response.completed`（带 usage）收尾，没有额外终止帧。
+        ok_frames(path)
+    } else {
+        // Anthropic：输出用量在 `message_delta`，`message_stop` 是终止标记。
+        let mut frames = ok_frames(path);
+        frames.pop();
+        frames
+    }
+}
+
+/// "回答已经开头、但远没结束"的帧序列，供 `StreamUsageStartThenHang` 使用。
+///
+/// 必须包含一个**语义增量**，否则网关会一直缓冲、连响应头都不发。
+///
+/// 关键是**忠实还原真实上游**：Anthropic 的 `message_start` 就带 `usage`，
+/// 而且 `output_tokens` 是个占位值 `1`——那时回答才刚开头。用它来模拟"没写完
+/// 就断掉"，正好压住"看用量判断有没有跑完"这个错误判据（§9.3 修订）。
+fn start_frames(path: &str) -> Vec<String> {
+    if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/responses") {
+        // 这两个协议开头帧都不带 usage，直接取前两帧（开始标记 + 一个语义增量）。
+        let frames = ok_frames(path);
+        frames[..frames.len().min(2)].to_vec()
+    } else {
+        let frames = ok_frames(path);
+        vec![
+            // 真实形状：开头就报用量，且 output_tokens 是占位值 1。
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":20}}}\n\n".into(),
+            // 一个语义增量：让网关把头发出、进入可结算状态，但**没有** stop_reason。
+            frames[1].clone(),
         ]
     }
 }

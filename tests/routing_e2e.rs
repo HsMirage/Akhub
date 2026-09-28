@@ -635,8 +635,8 @@ fn prime_target(akhub: &common::Akhub, target_id: &str, first_token_ms: u64, tok
                 streaming: false,
             },
             &akhub::routing::score::Sample {
+                kind: akhub::routing::score::SampleKind::Rated,
                 success: true,
-                counts: true,
                 first_token: Some(Duration::from_millis(first_token_ms)),
                 total: Duration::from_millis(1000),
                 output_tokens: Some(tokens),

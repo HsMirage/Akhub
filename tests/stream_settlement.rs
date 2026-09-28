@@ -450,6 +450,142 @@ async fn a_disconnect_does_not_lower_the_targets_reliability() {
     assert_eq!(after.success_rate, 1.0, "可靠性不得被断开拉低");
 }
 
+/// **现场回归**：上游把回答写完了、下游才断开，必须计入证据。
+///
+/// 这是 `deepseek-v4.1-flash` 的真实形态：绝大部分 `client_gone` 其实收到了
+/// 终止信号（上游写完了），只是下游没等到收尾就关了连接。修复前这些观测被整条
+/// 丢弃，五个目标的有效样本量全在 0.1~6.6 之间，没有任何目标能跨过
+/// `MIN_SAMPLES`，评分永久退化成"近似均匀抽签"，于是每轮换一次渠道、前缀缓存
+/// 每轮重建一次。
+///
+/// 断言两件事：证据必须进（样本数与首字），可靠性必须不动。
+#[tokio::test]
+async fn a_disconnect_after_the_answer_finished_still_feeds_the_evidence() {
+    // `StreamUsageThenHang`：连 usage 收尾事件都发了，然后挂住不回结束标记。
+    // 此时丢弃响应体 = 下游断开，而上游其实已经跑完。
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamUsageThenHang);
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiResponses,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let dimension = akhub::routing::score::Dimension {
+        protocol: Protocol::OpenAiResponses,
+        streaming: true,
+    };
+    let before = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
+    assert_eq!(before.samples, 0, "还没有任何样本");
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-5", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(response);
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(record.error_code.as_deref(), Some("client_gone"));
+    // 夹具确实走了"上游写完、下游才断开"那条路：用量被记录下来了。
+    // 注意判据本身是终止信号，不是这里的 output_tokens（见 stream.rs 的
+    // `answer_completed`：Anthropic 开头就有 output_tokens 占位值）。
+    assert!(
+        record.output_tokens.is_some(),
+        "夹具应当送出带 output_tokens 的收尾事件：{record:?}"
+    );
+
+    let after = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
+    assert_eq!(
+        after.samples, 1,
+        "跑完但下游断开的请求必须留下证据，否则低流量目标永远热不起来"
+    );
+    assert!(after.last_sample_at > 0, "采样时刻必须被记录");
+    assert!(
+        after.weight > 0.0,
+        "样本权重必须被记下，它是跨过 MIN_SAMPLES 的唯一途径"
+    );
+    // 但可靠性一根汗毛都不能动。
+    assert_eq!(after.success_rate, 1.0, "断开不得压低成功率（§9.3）");
+}
+
+/// **协议回归**：Anthropic 开头就报输入用量，不能在那一刻就认定"跑完了"。
+///
+/// `message_start` 带 `input_tokens`（还有缓存字段），但那时回答一个字都没写。
+/// 若拿输入侧的用量当"上游跑完了"的判据，一次刚开始就被截断的请求会被当成
+/// 完整证据喂进评分，把目标的质量判断污染掉（§9.3 修订）。
+///
+/// 这里用 `StreamThenHang` 让上游在**开头帧之后**就挂住：客户端断开时只有
+/// 输入侧用量，因此必须走"没有证据"那条路，样本数保持为 0。
+#[tokio::test]
+async fn an_anthropic_truncation_before_output_is_not_evidence() {
+    // 只发开头帧就挂住：真实 Anthropic 的 `message_start` 自带 `usage`
+    // （`output_tokens` 还是占位值 1），回答一个字都没写。
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamUsageStartThenHang);
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            "claude-x",
+            "claude-x",
+            50,
+        ),
+    )
+    .await;
+
+    let dimension = akhub::routing::score::Dimension {
+        protocol: Protocol::AnthropicMessages,
+        streaming: true,
+    };
+
+    let response = client()
+        .post(format!("{}/v1/messages", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "claude-x",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "你好"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(response);
+
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(record.error_code.as_deref(), Some("client_gone"));
+    // 关键证据：这一帧真的报了 `output_tokens: 1`（上游的占位值），但回答
+    // 根本没写完。所以"有没有 output_tokens"完全不能当判据——这行断言把这个
+    // 陷阱钉在测试里，免得将来有人又拿用量去猜"跑完了没有"。
+    assert_eq!(
+        record.output_tokens,
+        Some(1),
+        "夹具必须还原真实 Anthropic 的占位 output_tokens，否则测不到这个陷阱：{record:?}"
+    );
+    let after = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
+    assert_eq!(
+        after.samples, 0,
+        "回答还没写就断掉的请求不得成为证据，否则质量判断被污染"
+    );
+    assert_eq!(after.success_rate, 1.0, "可靠性同样不得被动");
+}
+
 /// 端到端回归：流式 Responses 的缓存读与思考 Token 必须落进请求记录。
 ///
 /// 现场故障：解析只认 Chat 的 `prompt_tokens_details`，于是整个 Responses

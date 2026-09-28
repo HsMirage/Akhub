@@ -624,20 +624,28 @@ fn into_layers(
     layers
 }
 
-/// 软粘性（弱身份）在层内抽签里的**权重**倍数。
+/// 软粘性命中时，绑定目标在层内抽签里应有的**留存率**（§10.1 修订）。
 ///
-/// 4 倍而不是"必中"：绑定目标拿到约 4 倍权重，意味着同分候选之间约八成流量
-/// 仍留在原账号——前缀缓存的价值基本保住——但每五次里总有一次会重新分配。
-/// 这个比例直接决定"某个账号变慢或变差之后，多久能被评分发现并真正让出流量"。
+/// 八成而不是"必中"：前缀缓存的价值基本保住，但每五次里总有一次重新分配，
+/// 免得某个账号一旦被抽中就把整条会话锁死——那正是 §10.1 修订要修的病。
 ///
-/// 注意它是**权重**倍数而不是分数倍数：分数被夹在 1.0，乘在分数上会撞上限，
-/// 让倍数失真（`weighted_order_with` 的注释里有完整说明）。
-const AFFINITY_BOOST: f64 = 4.0;
+/// 注意它是**留存率**，不是权重倍数。两者只有在**恰好两个**候选时才等价：
+/// 固定 4 倍在 5 个候选下只剩 50% 留存，而现场国模分组正是 5 个同优先级目标。
+/// 倍数由 [`score::affinity_boost`] 按当前候选集合反解。
+const AFFINITY_RETENTION: f64 = 0.8;
+
+/// 反解出的倍数上限（§10.1 修订）。
+///
+/// 留存率反解在"绑定目标权重很小"时会炸成很大的倍数，把会话锁在一个**差**
+/// 账号上。封顶之后留存率退化为 `cap·own / (cap·own + others)`——绑定目标越差
+/// 留存越低，不需要额外的分数判据。取 64：即便对手权重只有绑定目标的 1/10，
+/// 也仍然拿得到相当份额的流量，避免"封顶本身"把留存重新压回固定倍数的水平。
+const AFFINITY_BOOST_CAP: f64 = 64.0;
 
 /// 按综合评分加权随机排出一组候选的尝试顺序。
 ///
-/// `affinity` 命中时把那个候选的**权重**乘以 [`AFFINITY_BOOST`]（§10.1 修订的
-/// 软粘性）。它只影响**层内**顺序，不跨层。
+/// `affinity` 命中时把那个候选的**权重**按 [`AFFINITY_RETENTION`] 反解出的倍数
+/// 放大（§10.1 修订的软粘性）。它只影响**层内**顺序，不跨层。
 fn shuffle(
     candidates: Vec<Candidate>,
     affinity: Option<&str>,
@@ -645,16 +653,18 @@ fn shuffle(
 ) -> Vec<Candidate> {
     let scores: Vec<score::Score> = candidates.iter().map(|c| c.score).collect();
     let boost: Vec<f64> = match affinity {
-        Some(id) => candidates
-            .iter()
-            .map(|candidate| {
-                if candidate.target.target.id == id {
-                    AFFINITY_BOOST
-                } else {
-                    1.0
+        Some(id) => {
+            let weights: Vec<f64> = scores.iter().map(score::base_weight).collect();
+            match candidates
+                .iter()
+                .position(|candidate| candidate.target.target.id == id)
+            {
+                Some(bound) => {
+                    score::affinity_boost(&weights, bound, AFFINITY_RETENTION, AFFINITY_BOOST_CAP)
                 }
-            })
-            .collect(),
+                None => Vec::new(),
+            }
+        }
         None => Vec::new(),
     };
     let order = score::weighted_order_with(&scores, &boost, random);

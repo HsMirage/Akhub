@@ -1279,9 +1279,8 @@ impl Walk<'_> {
                         &candidate.target.target.id,
                         dimension,
                         &score::Sample {
+                            kind: score::SampleKind::Rated,
                             success: true,
-                            // 走到这里的都是真正成功的非流式响应，必须进统计。
-                            counts: true,
                             // 用客户端体感的首字节时间，而不是"响应头之后到首个
                             // 语义事件"那一段：上游先憋响应头时后者接近 0（§9.3）。
                             // 非流式没有首字，退回 None，由总耗时代言。
@@ -1374,10 +1373,10 @@ impl Walk<'_> {
                         &candidate.target.target.id,
                         dimension,
                         &score::Sample {
+                            kind: score::SampleKind::Rated,
                             success: false,
                             // 走到这里已经排除了"与目标健康无关"的中性失败，
                             // 所以这一次必须反映在可靠性上（§12.1）。
-                            counts: true,
                             first_token: None,
                             total: started.elapsed(),
                             output_tokens: None,

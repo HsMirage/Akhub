@@ -302,6 +302,41 @@ pub fn first_response_id(chunk: &[u8]) -> Option<String> {
     None
 }
 
+/// 这一帧是不是该协议的"回答写完了"终止信号（§9.3 修订）。
+///
+/// 三个协议的终止形状不同，但都只在真正收尾时出现：
+/// * **OpenAI Chat** —— 某个 choice 的 `finish_reason` 非空。
+/// * **Anthropic** —— `message_delta.stop_reason`，或 `message_stop` 事件。
+/// * **OpenAI Responses** —— `response.completed` / `incomplete` / `failed`。
+///
+/// 不能用"帧里有没有 usage"代替：Anthropic 开头就报用量（见
+/// [`StreamAccounting::answer_completed`]）。
+fn answers_stop_signal(protocol: Protocol, kind: Option<&str>, value: &serde_json::Value) -> bool {
+    match protocol {
+        Protocol::OpenAiChat => value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+                })
+            }),
+        Protocol::AnthropicMessages => {
+            kind == Some("message_stop")
+                || value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .is_some_and(|reason| !reason.is_null())
+        }
+        Protocol::OpenAiResponses => matches!(
+            kind,
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        ),
+    }
+}
+
 /// 流式响应的完成态与用量收集器（§26.3）。
 ///
 /// 同协议透传不重编码字节，但结算仍然需要知道"这条流最终成功了没有、实际
@@ -315,6 +350,11 @@ pub struct StreamAccounting {
     usage: UsageBreakdown,
     total_tokens: Option<u64>,
     finished: Option<serde_json::Value>,
+    /// 上游有没有发出"这一轮回答写完了"的终止信号（§9.3 修订）。
+    ///
+    /// 三个协议的终止信号形状不同，但语义一致：Chat 的 `finish_reason`、
+    /// Anthropic 的 `stop_reason`、Responses 的 `response.completed`。
+    stop_signalled: bool,
 }
 
 /// 一次请求的 Token 细分（§11.6）。
@@ -363,6 +403,7 @@ impl StreamAccounting {
             usage: UsageBreakdown::default(),
             total_tokens: None,
             finished: None,
+            stop_signalled: false,
         }
     }
 
@@ -418,6 +459,23 @@ impl StreamAccounting {
         self.usage.input
     }
 
+    /// 上游有没有把这次回答**写完**（§9.3 修订）。
+    ///
+    /// 判据是协议自己的**终止信号**，不是"有没有出现过 usage"。这一点必须说清楚，
+    /// 因为"看用量"两个方向都会骗人：
+    ///
+    /// - **输入侧用量出现得很早。** Anthropic 的 `message_start.message.usage` 就带
+    ///   `input_tokens` 与缓存字段，那时回答一个字都没写。
+    /// - **输出侧用量也不可靠。** 真实 Anthropic 的 `message_start` 里
+    ///   `output_tokens` 是 `1`（占位值），此时同样什么都没写完。
+    ///
+    /// 所以只认终止信号：Chat 的 `finish_reason`、Anthropic 的 `stop_reason`、
+    /// Responses 的 `response.completed` / `incomplete` / `failed`。三者都只在
+    /// 上游真的收尾时才出现，跨协议语义一致。
+    pub fn answer_completed(&self) -> bool {
+        self.stop_signalled
+    }
+
     /// Responses：`response.completed` / `incomplete` / `failed` 里的最终对象。
     pub fn finished_response(&self) -> Option<&serde_json::Value> {
         self.finished.as_ref()
@@ -429,10 +487,15 @@ impl StreamAccounting {
         }
         let raw = frame.data.as_bytes();
         let event = frame.event.as_deref();
-        let interesting = event
-            .is_some_and(|name| name.starts_with("response.") || name == "error")
-            || has(raw, b"usage")
+        // 终止信号也必须算"有意思"：Chat 的 finish_reason 帧、Anthropic 的
+        // message_stop 帧都不带 usage，漏掉它们就判定不了"上游写完了没有"
+        // （§9.3 修订）。这里只做廉价的字节探测，解析失败仍然直接忽略。
+        let interesting = event.is_some_and(|name| {
+            name.starts_with("response.") || name == "error" || name == "message_stop"
+        }) || has(raw, b"usage")
             || has(raw, b"\"error\"")
+            || has(raw, b"finish_reason")
+            || has(raw, b"stop_reason")
             || has(raw, b"response.completed")
             || has(raw, b"response.incomplete")
             || has(raw, b"response.failed");
@@ -451,6 +514,10 @@ impl StreamAccounting {
                 .unwrap_or("上游返回了错误事件");
             self.error = Some(message.chars().take(200).collect());
             return;
+        }
+        // 先认终止信号，再吸收用量：收尾事件往往同时带上用量。
+        if answers_stop_signal(self.protocol, kind, &value) {
+            self.stop_signalled = true;
         }
         match self.protocol {
             Protocol::OpenAiChat => self.absorb_usage(&value),
@@ -834,6 +901,75 @@ mod tests {
         assert_eq!(accounting.usage_tokens(), Some(910));
         assert_eq!(accounting.output_tokens(), Some(10));
         assert_eq!(accounting.error(), None);
+    }
+
+    /// `answer_completed` 只认协议的**终止信号**（§9.3 修订）。
+    ///
+    /// 这条钉的是"看用量"这个想当然的判据有多危险：真实 Anthropic 的
+    /// `message_start` 里 `output_tokens` 是 `1`（占位值），输入用量也在那一刻
+    /// 就出现。无论看输入侧还是输出侧，都会把"回答还没写"误判成"上游跑完了"。
+    #[test]
+    fn answer_completed_requires_a_stop_signal_not_just_usage() {
+        // 真实的 Anthropic 开头帧：输入用量 + output_tokens 占位值 1。
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":20}}}\n\n";
+        let mut early = StreamAccounting::new(Protocol::AnthropicMessages);
+        feed_all(&mut early, &[start]);
+        assert!(
+            !early.answer_completed(),
+            "开头帧带 output_tokens 占位值也不算写完：上游还没吐正文"
+        );
+
+        // 收到 stop_reason 才算写完。
+        feed_all(
+            &mut early,
+            &[
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            ],
+        );
+        assert!(early.answer_completed(), "收到 stop_reason 才算写完");
+
+        // message_stop 同样算。
+        let mut stopped = StreamAccounting::new(Protocol::AnthropicMessages);
+        feed_all(
+            &mut stopped,
+            &["event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"],
+        );
+        assert!(stopped.answer_completed(), "message_stop 是终止信号");
+
+        // Chat：finish_reason 才算，单纯收到 usage 不算。
+        let mut chat = StreamAccounting::new(Protocol::OpenAiChat);
+        feed_all(
+            &mut chat,
+            &[
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":10}}\n\n",
+            ],
+        );
+        assert!(
+            !chat.answer_completed(),
+            "只有 usage 没有 finish_reason 不算写完"
+        );
+        feed_all(
+            &mut chat,
+            &["data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"],
+        );
+        assert!(chat.answer_completed(), "finish_reason 是终止信号");
+
+        // Responses：response.completed 才算。
+        let mut resp = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut resp,
+            &[
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            ],
+        );
+        assert!(!resp.answer_completed(), "创建事件不算写完");
+        feed_all(
+            &mut resp,
+            &[
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"output_tokens\":2}}}\n\n",
+            ],
+        );
+        assert!(resp.answer_completed(), "response.completed 是终止信号");
     }
 
     #[test]
