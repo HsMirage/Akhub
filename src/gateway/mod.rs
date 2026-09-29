@@ -32,6 +32,7 @@ pub fn router() -> Router<SharedState> {
         .route("/v1/responses", post(responses_create))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
+        .route("/v1/images/variations", post(images_variations))
         // Responses 的查询、删除与取消（§15.1、§15.2）。全部走网关 ID。
         .route(
             "/v1/responses/{id}",
@@ -74,6 +75,11 @@ async fn images_generations(state: State<SharedState>, headers: HeaderMap, body:
 /// `POST /v1/images/edits`：JSON 以外也允许原样携带 multipart 正文。
 async fn images_edits(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
     handle(state, headers, body, Endpoint::ImagesEdits).await
+}
+
+/// `POST /v1/images/variations`：与 edits 一样是 multipart 原生透传。
+async fn images_variations(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::ImagesVariations).await
 }
 
 /// `POST /v1/responses/compact`：只能原生转发，没有等价适配器（§15.4）。
@@ -125,8 +131,8 @@ async fn handle(
         }
     };
 
-    // 图片 edits 使用 multipart 时必须保留完整原始正文与 boundary；其它请求
-    // 继续走既有 JSON 读取与解析路径。
+    // 图片 edits / variations 使用 multipart 时必须保留完整原始正文与
+    // boundary；其它请求继续走既有 JSON 读取与解析路径。
     let is_multipart = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -138,12 +144,12 @@ async fn handle(
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"multipart/form-data"))
         });
     let (body, request_bytes, raw) = if is_multipart {
-        // 原始正文只有图片编辑需要；其它入口收到 multipart 说明客户端
+        // 原始正文只有图片端点需要；其它入口收到 multipart 说明客户端
         // 用错了接口，明确 400，而不是把它转发成一条形状错误的请求。
-        if endpoint != Endpoint::ImagesEdits {
+        if !matches!(endpoint, Endpoint::ImagesEdits | Endpoint::ImagesVariations) {
             return GatewayError::new(
                 crate::gateway::error::ErrorCode::UnsupportedParameter,
-                "multipart 请求体只支持 /v1/images/edits",
+                "multipart 请求体只支持 /v1/images/edits 与 /v1/images/variations",
             )
             .with_protocol(protocol)
             .with_request_id(request_id)
@@ -175,8 +181,15 @@ async fn handle(
                 .into_response();
             }
         };
+        // 流式由 multipart 表单字段决定（`stream=true` 的图生图返回 SSE）。
+        // 不认这个字段就会把 SSE 当 JSON 解析：上游图片已经生成、钱已经花了，
+        // 网关才报一条"响应体无法解析"。
+        let mut parsed = serde_json::json!({"model": model});
+        if passthrough::multipart_requests_stream(&bytes) {
+            parsed["stream"] = serde_json::Value::Bool(true);
+        }
         (
-            serde_json::json!({"model": model}),
+            parsed,
             request_bytes,
             Some(passthrough::RawBody {
                 bytes,

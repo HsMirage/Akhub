@@ -134,6 +134,25 @@ pub enum Endpoint {
     ImagesGenerations,
     /// `POST /v1/images/edits`：只能原生转发，没有跨协议等价物。
     ImagesEdits,
+    /// `POST /v1/images/variations`：只能原生转发，没有跨协议等价物。
+    ImagesVariations,
+}
+
+impl Endpoint {
+    /// 三个图片端点：都是 multipart / JSON 原样透传的原生端点。
+    ///
+    /// 抽成一个常量，是为了让"图片入口共用同一套资格与 token 口径"这件事
+    /// 只有一处定义：新增图片端点时不会漏掉其中一条分支。
+    pub const IMAGES: [Endpoint; 3] = [
+        Self::ImagesGenerations,
+        Self::ImagesEdits,
+        Self::ImagesVariations,
+    ];
+
+    /// 这个端点是不是图片入口。
+    pub fn is_image(self) -> bool {
+        Self::IMAGES.contains(&self)
+    }
 }
 
 impl Endpoint {
@@ -159,6 +178,7 @@ impl Endpoint {
                 | Self::ResponsesInputTokens
                 | Self::ImagesGenerations
                 | Self::ImagesEdits
+                | Self::ImagesVariations
         )
     }
 
@@ -170,7 +190,9 @@ impl Endpoint {
                 Protocol::OpenAiResponses
             }
             Self::Messages | Self::CountTokens => Protocol::AnthropicMessages,
-            Self::ImagesGenerations | Self::ImagesEdits => Protocol::OpenAiChat,
+            Self::ImagesGenerations | Self::ImagesEdits | Self::ImagesVariations => {
+                Protocol::OpenAiChat
+            }
         }
     }
 
@@ -185,6 +207,7 @@ impl Endpoint {
             Self::ResponsesInputTokens => "v1/responses/input_tokens",
             Self::ImagesGenerations => "v1/images/generations",
             Self::ImagesEdits => "v1/images/edits",
+            Self::ImagesVariations => "v1/images/variations",
         }
     }
 
@@ -199,6 +222,7 @@ impl Endpoint {
             Self::ResponsesInputTokens => "responses_input_tokens",
             Self::ImagesGenerations => "images_generations",
             Self::ImagesEdits => "images_edits",
+            Self::ImagesVariations => "images_variations",
         }
     }
 }
@@ -295,6 +319,9 @@ fn parse_model_list(bytes: &[u8]) -> std::result::Result<Vec<String>, UpstreamEr
 /// 管理员填写的 Base URL 既可能是 `https://host`，也可能是 `https://host/v1`
 /// 或 `https://host/api/v1`。以 `/v1` 结尾时视为已经包含版本段，避免拼出
 /// `https://host/v1/v1/messages` 这种必然 404 的地址。
+///
+/// Base URL 自带的查询串与 fragment 一律丢掉（§23.3）：它们是管理员配置里
+/// 的残留，可能带着不该出现在每条上游请求里的凭据，端点路由只由路径决定。
 pub fn build_url(base_url: &str, endpoint: Endpoint) -> Result<Url, UpstreamError> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let mut url = Url::parse(trimmed).map_err(|e| UpstreamError::InvalidBaseUrl(e.to_string()))?;

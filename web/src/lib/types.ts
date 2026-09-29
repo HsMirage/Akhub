@@ -663,6 +663,11 @@ export const ENDPOINT_LABELS: Record<string, string> = {
   responses: "Responses",
   messages: "Messages",
   count_tokens: "CountTokens",
+  responses_compact: "Compact",
+  responses_input_tokens: "InputTokens",
+  images_generations: "生图",
+  images_edits: "改图",
+  images_variations: "变体图",
 };
 
 /** 部署形态：决定「立即更新」是否可用、该给哪条升级命令。 */

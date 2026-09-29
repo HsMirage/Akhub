@@ -409,6 +409,10 @@ impl UnrequestedUsageFilter {
 }
 
 /// 这一帧是不是 OpenAI Chat 的 usage 收尾块。
+///
+/// 只有 **Chat 分块**才谈得上"网关照例多要来的收尾块"。图片生成的事件流
+/// （image_generation.completed）同样带 usage，但那一帧就是**生成结果本身**：
+/// 按 usage 丢掉它等于把用户要的图扔了。带 type（事件型载荷）或 data 的一律放行。
 fn is_unrequested_usage_frame(raw: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(raw) else {
         return false;
@@ -421,6 +425,9 @@ fn is_unrequested_usage_frame(raw: &[u8]) -> bool {
         return false;
     };
     if payload.get("usage").is_none() {
+        return false;
+    }
+    if payload.get("type").is_some() || payload.get("data").is_some() {
         return false;
     }
     match payload.get("choices").and_then(serde_json::Value::as_array) {
@@ -627,6 +634,35 @@ mod tests {
         let all = format!("{first}{second}");
         assert!(all.contains("hi"), "{all}");
         assert!(!all.contains("usage"), "跨块的 usage 帧也必须被丢掉：{all}");
+    }
+
+    /// 图片生成的事件流也带 usage，但它是内容本身，不能按收尾块丢掉。
+    #[test]
+    fn image_generation_frames_survive_the_usage_filter() {
+        let mut filter = UnrequestedUsageFilter::new(true);
+        let body = concat!(
+            "event: image_generation.partial_image\n",
+            "data: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"QUJD\"}\n\n",
+            "event: image_generation.completed\n",
+            "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJDRA==\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1056,\"total_tokens\":1068}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = text_of_raw(filter.push(body.as_bytes()));
+        let tail = filter.finish().map(text_of_raw).unwrap_or_default();
+        let all = format!("{out}{tail}");
+
+        assert!(
+            all.contains("image_generation.completed"),
+            "最终图片事件必须保留：{all}"
+        );
+        assert!(all.contains("QUJDRA=="), "图片数据必须保留：{all}");
+        assert!(all.contains("[DONE]"), "终止标记必须保留：{all}");
+
+        // 真正的 Chat 收尾块仍然照丢：两件事不能互相带偏。
+        let mut chat = UnrequestedUsageFilter::new(true);
+        let dropped =
+            text_of_raw(chat.push(b"data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\n"));
+        assert!(dropped.is_empty(), "Chat 的 usage 收尾块必须继续被丢掉");
     }
 
     /// 非标准写法：usage 挂在带正文的帧上时绝不能吃掉内容。

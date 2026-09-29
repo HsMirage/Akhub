@@ -192,7 +192,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `POST /v1/responses` | Responses，含状态链、`previous_response_id` 续链 |
 | `POST /v1/responses/compact` · `/input_tokens` | 原生转发，上游没有该路由时明确返回不支持 |
 | `GET /v1/responses/{id}` · `DELETE` · `/cancel` · `/input_items` | 有原生映射就转发，没有则回放或明确拒绝 |
-| `POST /v1/images/generations` · `/v1/images/edits` | 仅原生转发到 OpenAI 兼容上游，不做跨协议转换 |
+| `POST /v1/images/generations` · `/v1/images/edits` · `/v1/images/variations` | 仅原生转发到 OpenAI 兼容上游，不做跨协议转换；multipart 原样透传，`stream: true` 的 SSE 逐字节转发 |
 | `GET /v1/models` · `GET /v1/models/{model}` | 双形状模型目录 |
 | `GET /health/live` · `/health/ready` · `/health/version` | 运维探针，无需凭据 |
 

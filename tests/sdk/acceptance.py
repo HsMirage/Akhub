@@ -3,7 +3,7 @@
 
 用官方 OpenAI / Anthropic SDK 作为客户端，对一个 Akhub 入口（或上游站点做
 基线自检）跑一遍协议矩阵：非流式、流式、工具调用、Responses 状态链、模型
-列表、Token 计数、图片生成与错误对象/状态码。
+列表、Token 计数、图片生成与编辑、错误对象/状态码。
 
 用法（不把密钥写进文件）：
 
@@ -384,7 +384,29 @@ def main() -> int:
                 raise AssertionError("既没有 b64_json 也没有 url")
             return "b64_json" if getattr(item, "b64_json", None) else "url"
 
+        def image_edit():
+            # 图生图同样是 multipart 原样透传；现场实测 1–3 分钟，放宽到 300 秒。
+            import base64
+            import io
+
+            # 1×1 透明 PNG：验收只关心链路，不关心提示词效果。
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            )
+            result = openai_client.images.edit(
+                model=model,
+                image=("probe.png", io.BytesIO(png), "image/png"),
+                prompt="make the whole image a solid red square",
+                timeout=300,
+            )
+            assert result.data, "没有图片数据"
+            item = result.data[0]
+            if not (getattr(item, "b64_json", None) or getattr(item, "url", None)):
+                raise AssertionError("既没有 b64_json 也没有 url")
+            return "edit"
+
         case(f"OpenAI Images 生成（{model}）", image_generate, strict)
+        case(f"OpenAI Images 编辑（{model}）", image_edit, strict)
 
     print()
     passed = sum(1 for status, _, _ in RESULTS if status == "PASS")

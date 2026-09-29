@@ -77,7 +77,7 @@ pub fn choices(
                     || account.preferred_protocol == Protocol::OpenAiResponses,
                 "该账号没有 /v1/responses/input_tokens 端点，Token 计数无法跨协议表达",
             ),
-            Endpoint::ImagesGenerations | Endpoint::ImagesEdits => {
+            Endpoint::ImagesGenerations | Endpoint::ImagesEdits | Endpoint::ImagesVariations => {
                 let plausible = matches!(
                     account.preferred_protocol,
                     Protocol::OpenAiChat | Protocol::OpenAiResponses
@@ -420,7 +420,7 @@ mod tests {
         let translation = Translation::new(Protocol::OpenAiChat, &body);
         let now = Instant::now();
 
-        for endpoint in [Endpoint::ImagesGenerations, Endpoint::ImagesEdits] {
+        for endpoint in Endpoint::IMAGES {
             let refused = choices(
                 &account(Protocol::AnthropicMessages, false),
                 endpoint,

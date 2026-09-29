@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use akhub::domain::Protocol;
+use akhub::domain::{Limits, Protocol};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -26,6 +26,7 @@ struct SeenImageRequest {
 struct ImageUpstream {
     seen: Arc<Mutex<Vec<SeenImageRequest>>>,
     response_body: Vec<u8>,
+    content_type: &'static str,
 }
 
 async fn image_upstream_handler(
@@ -41,20 +42,33 @@ async fn image_upstream_handler(
     });
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
+        [(header::CONTENT_TYPE, upstream.content_type)],
         upstream.response_body.clone(),
     )
         .into_response()
 }
 
 async fn spawn_image_upstream_at(response_body: &[u8]) -> (String, ImageUpstream) {
+    spawn_image_upstream_typed("application/json", response_body).await
+}
+
+/// 指定响应类型的假图片上游：流式生图返回的是 SSE。
+async fn spawn_image_upstream_typed(
+    content_type: &'static str,
+    response_body: &[u8],
+) -> (String, ImageUpstream) {
     let upstream = ImageUpstream {
         seen: Arc::new(Mutex::new(Vec::new())),
         response_body: response_body.to_vec(),
+        content_type,
     };
     let app = Router::new()
         .route("/v1/images/generations", post(image_upstream_handler))
         .route("/v1/images/edits", post(image_upstream_handler))
+        .route("/v1/images/variations", post(image_upstream_handler))
+        // 图片编辑动辄几 MB：假上游也必须能收下真实尺寸的正文，否则测的是
+        // axum 的 2 MB 默认上限，而不是网关的行为。
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(upstream.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -97,6 +111,38 @@ fn multipart_body(boundary: &str, model: Option<&str>, image: &[u8]) -> Vec<u8> 
     body.extend_from_slice(image);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     body
+}
+
+/// 追加一个普通表单字段。
+fn push_multipart_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
+/// 追加一个文件 part（图片本体，带 filename）。
+fn push_multipart_file(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    filename: &str,
+    bytes: &[u8],
+) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn finish_multipart(body: &mut Vec<u8>, boundary: &str) {
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 }
 
 fn parse_multipart_parts(body: &[u8], content_type: &str) -> Vec<(String, Vec<u8>)> {
@@ -373,6 +419,297 @@ async fn images_require_authentication() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 图生图的流式：stream 是 multipart 表单字段，响应是 SSE。网关必须原样转发
+/// 事件流——把 SSE 当 JSON 解析会在上游已经生成图片之后才报错。
+#[tokio::test]
+async fn multipart_edits_with_stream_keep_the_sse_response() {
+    let frames = concat!(
+        "event: image_generation.partial_image\n",
+        "data: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"QUJD\"}\n\n",
+        "event: image_generation.completed\n",
+        "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJDRA==\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1056,\"total_tokens\":1068}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (upstream_url, upstream) =
+        spawn_image_upstream_typed("text/event-stream", frames.as_bytes()).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "edit-model",
+            "edit-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let boundary = "stream-boundary";
+    let mut body = Vec::new();
+    // 字段顺序打乱：stream 与 partial_images 都在图片之后。
+    push_multipart_file(&mut body, boundary, "image", "in.png", &[1_u8, 2, 3, 4]);
+    push_multipart_field(&mut body, boundary, "stream", "true");
+    push_multipart_field(&mut body, boundary, "partial_images", "3");
+    push_multipart_field(&mut body, boundary, "model", "edit-model");
+    finish_multipart(&mut body, boundary);
+
+    let response = client()
+        .post(format!("{}/v1/images/edits", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(
+        response.text().await.unwrap(),
+        frames,
+        "SSE 事件流必须逐字节透传，usage 收尾帧也不能被当成 Chat 收尾块丢掉"
+    );
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let content_type = seen[0]
+        .headers
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let parts = parse_multipart_parts(&seen[0].body, &content_type);
+    assert_eq!(parts[0].0, "image");
+    assert_eq!(parts[0].1, vec![1_u8, 2, 3, 4], "图片字节不能被改写");
+    assert_eq!(parts[1], ("stream".to_string(), b"true".to_vec()));
+    assert_eq!(parts[2], ("partial_images".to_string(), b"3".to_vec()));
+    assert_eq!(
+        parts[3],
+        ("model".to_string(), b"edit-model-upstream".to_vec())
+    );
+}
+
+/// OpenAI 的第三个图片端点：变体图同样是 multipart 原生透传。
+#[tokio::test]
+async fn variations_are_forwarded_natively() {
+    let response_body = br#"{"created":2,"data":[{"b64_json":"dmFy"}]}"#;
+    let (upstream_url, upstream) = spawn_image_upstream_at(response_body).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "variation-model",
+            "variation-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let boundary = "variation-boundary";
+    let mut body = Vec::new();
+    push_multipart_field(&mut body, boundary, "model", "variation-model");
+    push_multipart_field(&mut body, boundary, "n", "2");
+    push_multipart_file(&mut body, boundary, "image", "src.png", &[9_u8, 8, 7]);
+    finish_multipart(&mut body, boundary);
+
+    let response = client()
+        .post(format!("{}/v1/images/variations", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), response_body);
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/images/variations");
+    let content_type = seen[0]
+        .headers
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let parts = parse_multipart_parts(&seen[0].body, &content_type);
+    assert_eq!(
+        parts[0],
+        ("model".to_string(), b"variation-model-upstream".to_vec())
+    );
+    assert_eq!(parts[1], ("n".to_string(), b"2".to_vec()));
+    assert_eq!(parts[2].0, "image");
+    assert_eq!(parts[2].1, vec![9_u8, 8, 7]);
+}
+
+/// JSON 入口的流式生图：最终事件同时带图片数据与 usage，两个都必须到达客户端。
+#[tokio::test]
+async fn generations_with_stream_keep_every_image_event() {
+    let frames = concat!(
+        "event: image_generation.partial_image\n",
+        "data: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"QUJD\"}\n\n",
+        "event: image_generation.completed\n",
+        "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJDRA==\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1056,\"total_tokens\":1068}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (upstream_url, upstream) =
+        spawn_image_upstream_typed("text/event-stream", frames.as_bytes()).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/images/generations", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "image-model",
+            "prompt": "一只猫",
+            "stream": true,
+            "partial_images": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.unwrap(),
+        frames,
+        "最终事件带 usage，但它是图片本体，不能被当成 Chat 的 usage 收尾块丢掉"
+    );
+
+    let seen = upstream.seen.lock().unwrap();
+    let request: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(request["model"], "image-model-upstream");
+    assert_eq!(request["stream"], true);
+}
+
+/// edits 也接受 JSON 正文（内联 base64 图片），与 multipart 一样原样转发。
+#[tokio::test]
+async fn edits_accept_json_bodies_with_inline_images() {
+    let (upstream_url, upstream) = spawn_image_upstream_at(br#"{"ok":true}"#).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "edit-model",
+            "edit-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let inline = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+    let response = client()
+        .post(format!("{}/v1/images/edits", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "edit-model",
+            "prompt": "把背景换成白色",
+            "image": inline
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen[0].path, "/v1/images/edits");
+    let request: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(request["model"], "edit-model-upstream");
+    assert_eq!(request["image"], inline, "内联图片必须逐字节透传");
+}
+
+/// 图片字节不是 Token：一次 4 MB 的图生图不能被算成上百万 token，
+/// 否则任何配了 TPM 的分组都会把它判成超限，而且永远等不到窗口释放。
+#[tokio::test]
+async fn image_bytes_do_not_consume_the_tpm_budget() {
+    let (upstream_url, upstream) = spawn_image_upstream_at(br#"{"ok":true}"#).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "edit-model",
+            "edit-model-upstream",
+            50,
+        )
+        .limits(Limits {
+            rpm: None,
+            tpm: Some(2_000),
+            max_concurrency: None,
+        }),
+    )
+    .await;
+
+    let boundary = "big-image";
+    let mut body = Vec::new();
+    push_multipart_field(&mut body, boundary, "model", "edit-model");
+    push_multipart_field(&mut body, boundary, "prompt", "把背景换成白色");
+    push_multipart_file(
+        &mut body,
+        boundary,
+        "image",
+        "big.png",
+        &vec![9_u8; 4 * 1024 * 1024],
+    );
+    finish_multipart(&mut body, boundary);
+
+    let response = client()
+        .post(format!("{}/v1/images/edits", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "提示词只有几十字节的图生图不该被 TPM 拦下：{body}"
+    );
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1);
 }
 
 /// multipart 只允许用于图片编辑入口；其它入口必须明确 400。

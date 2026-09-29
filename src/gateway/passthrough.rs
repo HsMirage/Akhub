@@ -429,7 +429,12 @@ async fn forward_inner<'a>(
         translation: &translation,
         telemetry: Telemetry::default(),
         streaming,
-        estimated_tokens: estimate_tokens(forward.request_bytes, &forward.body),
+        estimated_tokens: estimate_tokens(
+            forward.endpoint,
+            forward.request_bytes,
+            &forward.body,
+            forward.raw.as_ref(),
+        ),
         deadline,
         queue_deadline,
         now_unix,
@@ -1510,8 +1515,8 @@ impl Walk<'_> {
                 rewrite_multipart_model(&raw.bytes, &candidate.target.target.upstream_model)
                     .map_err(|error| {
                         let message = match error {
-                            MultipartModelError::Missing => "multipart 请求体缺少 model 字段",
-                            MultipartModelError::UnsafeReplacement => {
+                            MultipartFieldError::Missing => "multipart 请求体缺少 model 字段",
+                            MultipartFieldError::UnsafeReplacement => {
                                 "上游模型名包含 multipart 不安全字符"
                             }
                         };
@@ -2745,14 +2750,50 @@ fn rewrite_model(body: &mut serde_json::Value, upstream_model: &str) {
 }
 
 /// 没有 tokenizer 时的保守 Token 估算（§17.2）。
-fn estimate_tokens(request_bytes: usize, body: &serde_json::Value) -> u64 {
-    let input = (request_bytes / BYTES_PER_TOKEN) as u64;
+///
+/// 图片端点是例外：它们的工作量在图片本体里，而图片字节不是 Token。按请求体
+/// 字节折算会把一张 4 MB 的图记成 130 万 Token——凡是配了 TPM 的分组，一次
+/// 图生图就会被判成"超出 TPM 限额"，而且永远等不到窗口释放（单条请求就超过
+/// 整个窗口）。图片请求只按**文本字段**估算：JSON 入口数 prompt 一类的短字符串，
+/// multipart 入口只数非文件 part。
+fn estimate_tokens(
+    endpoint: Endpoint,
+    request_bytes: usize,
+    body: &serde_json::Value,
+    raw: Option<&RawBody>,
+) -> u64 {
+    let input = if endpoint.is_image() {
+        image_text_bytes(body, raw).div_ceil(BYTES_PER_TOKEN) as u64
+    } else {
+        (request_bytes / BYTES_PER_TOKEN) as u64
+    };
     let output = body
         .get("max_tokens")
         .or_else(|| body.get("max_output_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     input.saturating_add(output)
+}
+
+/// 超过这个长度的字符串按内联图片（base64/data URL）处理，不计入 Token 估算。
+///
+/// 提示词不会写到 4 KiB 以上；宁可少算一次提示词，也不能把图片本体当成 token。
+const MAX_TOKEN_TEXT_BYTES: usize = 4 * 1024;
+
+/// 图片请求里的文本字节数：内联 data URL 与超长字符串都按图片本体处理。
+fn image_text_bytes(body: &serde_json::Value, raw: Option<&RawBody>) -> usize {
+    if let Some(raw) = raw {
+        return multipart_text_bytes(&raw.bytes);
+    }
+    let Some(object) = body.as_object() else {
+        return 0;
+    };
+    object
+        .values()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|text| !text.starts_with("data:") && text.len() <= MAX_TOKEN_TEXT_BYTES)
+        .map(str::len)
+        .sum()
 }
 
 /// 兜底凭据来源：数据库里账号凭据信封的第一把 Key。
@@ -2798,10 +2839,10 @@ pub fn extract_model(body: &serde_json::Value, protocol: Protocol) -> Result<Str
         })
 }
 
-/// multipart `model` part 的解析错误。图片编辑只需要识别这个字段，
+/// multipart 字段的解析错误。图片端点只需要识别少数几个字段，
 /// 不试图实现完整 multipart 语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MultipartModelError {
+pub enum MultipartFieldError {
     Missing,
     UnsafeReplacement,
 }
@@ -2810,15 +2851,104 @@ pub enum MultipartModelError {
 ///
 /// 解析按 boundary 行与 CRLF/LF 分隔进行，调用方已经把请求体完整读入内存，
 /// 因而不会受网络分块边界影响。返回值会去掉字段值两端的空白。
-pub fn extract_multipart_model(body: &[u8]) -> Result<String, MultipartModelError> {
-    let range = multipart_model_range(body)?;
+pub fn extract_multipart_model(body: &[u8]) -> Result<String, MultipartFieldError> {
+    extract_multipart_field(body, "model")
+}
+
+/// 提取 multipart 正文里任意一个普通字段（按 `Content-Disposition` 的 name 匹配）。
+///
+/// 字段顺序无关紧要：图片端点允许 `model` 出现在图片之后，`stream` 之类的
+/// 控制字段同样如此。匹配只看 `name`，所以图片 part（`name="image"`）不会
+/// 被当成 `model`；只有客户端把文件 part 也命名为同一个字段时才需要额外区分。
+pub fn extract_multipart_field(body: &[u8], field: &str) -> Result<String, MultipartFieldError> {
+    let range = multipart_field_range(body, field)?;
     let value = std::str::from_utf8(&body[range])
-        .map_err(|_| MultipartModelError::Missing)?
+        .map_err(|_| MultipartFieldError::Missing)?
         .trim();
     if value.is_empty() {
-        return Err(MultipartModelError::Missing);
+        return Err(MultipartFieldError::Missing);
     }
     Ok(value.to_string())
+}
+
+/// multipart 里有没有要求流式返回（`stream: true` 这类表单字段）。
+///
+/// 图片端点必须认这个字段：`gpt-image-1` 的流式改图把 `stream` 放在
+/// multipart 正文里，响应是 SSE。不认它就会把 SSE 当 JSON 解析，整条请求
+/// 在上游已经生成图片之后才失败（还要白花一次生成的钱）。
+pub fn multipart_requests_stream(body: &[u8]) -> bool {
+    extract_multipart_field(body, "stream").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
+}
+
+/// multipart 正文里**非文件**字段的字节数。
+///
+/// 用于图片端点的工作量估算：提示词、尺寸这些文本字段算数，图片本体不算。
+/// 把几 MB 的图片按 3 字节一个 token 折算，一次图生图会被记成上百万 token，
+/// 直接把带 TPM 限额的分组挡在门外。
+pub fn multipart_text_bytes(body: &[u8]) -> usize {
+    let Ok((boundary, mut cursor)) = multipart_first_boundary(body) else {
+        return 0;
+    };
+    let mut total = 0usize;
+    loop {
+        if cursor >= body.len() || !body[cursor..].starts_with(&boundary) {
+            return total;
+        }
+        let after_boundary = cursor + boundary.len();
+        if body[after_boundary..].starts_with(b"--") {
+            return total;
+        }
+        let Some((_, headers_start)) = multipart_line(body, cursor) else {
+            return total;
+        };
+        let mut line_start = headers_start;
+        let mut is_file = false;
+        let value_start = loop {
+            let Some((line_end, next)) = multipart_line(body, line_start) else {
+                return total;
+            };
+            if line_end == line_start {
+                break next;
+            }
+            if multipart_disposition_has_filename(&body[line_start..line_end]) {
+                is_file = true;
+            }
+            line_start = next;
+        };
+        let Some(next_boundary) = multipart_find_boundary(body, value_start, &boundary) else {
+            return total;
+        };
+        if !is_file {
+            let value_end = multipart_trim_delimiter_newline(body, value_start, next_boundary);
+            total = total.saturating_add(value_end.saturating_sub(value_start));
+        }
+        cursor = next_boundary;
+    }
+}
+
+/// 这个 header 行是不是带 `filename` 的 `Content-Disposition`（文件 part）。
+fn multipart_disposition_has_filename(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    if !trim_ascii(&line[..colon]).eq_ignore_ascii_case(b"content-disposition") {
+        return false;
+    }
+    line[colon + 1..]
+        .split(|byte| *byte == b';')
+        .any(|segment| {
+            segment
+                .iter()
+                .position(|byte| *byte == b'=')
+                .is_some_and(|equal| {
+                    trim_ascii(&segment[..equal]).eq_ignore_ascii_case(b"filename")
+                })
+        })
 }
 
 /// 只替换 multipart `model` part 的内容，保留其它字节与 boundary 原样。
@@ -2828,11 +2958,11 @@ pub fn extract_multipart_model(body: &[u8]) -> Result<String, MultipartModelErro
 pub fn rewrite_multipart_model(
     body: &[u8],
     upstream_model: &str,
-) -> Result<Vec<u8>, MultipartModelError> {
+) -> Result<Vec<u8>, MultipartFieldError> {
     if upstream_model.is_empty() || upstream_model.chars().any(char::is_control) {
-        return Err(MultipartModelError::UnsafeReplacement);
+        return Err(MultipartFieldError::UnsafeReplacement);
     }
-    let range = multipart_model_range(body)?;
+    let range = multipart_field_range(body, "model")?;
     let mut rewritten = Vec::with_capacity(
         body.len()
             .saturating_sub(range.end.saturating_sub(range.start))
@@ -2844,40 +2974,40 @@ pub fn rewrite_multipart_model(
     Ok(rewritten)
 }
 
-/// 找到 `model` part 的值范围（不包含值前后的 multipart 分隔换行）。
-fn multipart_model_range(body: &[u8]) -> Result<Range<usize>, MultipartModelError> {
+/// 找到某个字段 part 的值范围（不包含值前后的 multipart 分隔换行）。
+fn multipart_field_range(body: &[u8], field: &str) -> Result<Range<usize>, MultipartFieldError> {
     let (boundary, mut cursor) = multipart_first_boundary(body)?;
 
     loop {
         if cursor >= body.len() || !body[cursor..].starts_with(&boundary) {
-            return Err(MultipartModelError::Missing);
+            return Err(MultipartFieldError::Missing);
         }
         let after_boundary = cursor + boundary.len();
         if body[after_boundary..].starts_with(b"--") {
-            return Err(MultipartModelError::Missing);
+            return Err(MultipartFieldError::Missing);
         }
 
         // 当前 boundary 行后面必须紧跟换行，之后才是 part headers。
         let (_, headers_start) =
-            multipart_line(body, cursor).ok_or(MultipartModelError::Missing)?;
+            multipart_line(body, cursor).ok_or(MultipartFieldError::Missing)?;
         let mut line_start = headers_start;
-        let mut is_model = false;
+        let mut is_field = false;
         let value_start = loop {
             let (line_end, next) =
-                multipart_line(body, line_start).ok_or(MultipartModelError::Missing)?;
+                multipart_line(body, line_start).ok_or(MultipartFieldError::Missing)?;
             if line_end == line_start {
                 break next;
             }
-            if multipart_is_model_disposition(&body[line_start..line_end]) {
-                is_model = true;
+            if multipart_field_disposition(&body[line_start..line_end], field) {
+                is_field = true;
             }
             line_start = next;
         };
 
         let next_boundary = multipart_find_boundary(body, value_start, &boundary)
-            .ok_or(MultipartModelError::Missing)?;
+            .ok_or(MultipartFieldError::Missing)?;
         let value_end = multipart_trim_delimiter_newline(body, value_start, next_boundary);
-        if is_model {
+        if is_field {
             return Ok(value_start..value_end);
         }
         cursor = next_boundary;
@@ -2899,13 +3029,13 @@ fn multipart_line(body: &[u8], start: usize) -> Option<(usize, usize)> {
 }
 
 /// 取出正文首行 boundary 与首个 part 的起点。
-fn multipart_first_boundary(body: &[u8]) -> Result<(Vec<u8>, usize), MultipartModelError> {
+fn multipart_first_boundary(body: &[u8]) -> Result<(Vec<u8>, usize), MultipartFieldError> {
     if !body.starts_with(b"--") {
-        return Err(MultipartModelError::Missing);
+        return Err(MultipartFieldError::Missing);
     }
-    let (line_end, _) = multipart_line(body, 0).ok_or(MultipartModelError::Missing)?;
+    let (line_end, _) = multipart_line(body, 0).ok_or(MultipartFieldError::Missing)?;
     if line_end <= 2 {
-        return Err(MultipartModelError::Missing);
+        return Err(MultipartFieldError::Missing);
     }
     // 从首个 delimiter 行开始处理；循环会从该行读取 headers 起点。
     Ok((body[..line_end].to_vec(), 0))
@@ -2942,8 +3072,8 @@ fn multipart_trim_delimiter_newline(body: &[u8], start: usize, boundary: usize) 
     end
 }
 
-/// 判断一个 header 行是否声明了 `name="model"` part。
-fn multipart_is_model_disposition(line: &[u8]) -> bool {
+/// 判断一个 header 行是否声明了 `name="<field>"` 的 form-data part。
+fn multipart_field_disposition(line: &[u8], field: &str) -> bool {
     let Some(colon) = line.iter().position(|byte| *byte == b':') else {
         return false;
     };
@@ -2961,7 +3091,7 @@ fn multipart_is_model_disposition(line: &[u8]) -> bool {
         if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
             value = &value[1..value.len() - 1];
         }
-        return value == b"model";
+        return value == field.as_bytes();
     }
     false
 }
@@ -3293,10 +3423,102 @@ mod tests {
     fn token_estimates_stay_on_the_conservative_side() {
         // 宁可高估把自己挡在限流外，也不要低估越过上游的 TPM。
         let body = json!({"max_tokens": 4096});
-        let estimate = estimate_tokens(30_000, &body);
+        let estimate = estimate_tokens(Endpoint::ChatCompletions, 30_000, &body, None);
         assert_eq!(estimate, 10_000 + 4096);
         // 没声明最大输出时只算输入。
-        assert_eq!(estimate_tokens(3_000, &json!({})), 1_000);
+        assert_eq!(
+            estimate_tokens(Endpoint::ChatCompletions, 3_000, &json!({}), None),
+            1_000
+        );
+    }
+
+    /// 图片请求的 token 口径：只数文本字段，绝不把图片字节按 3 字节一个 token
+    /// 折算——那会把一次图生图记成上百万 token，带 TPM 的分组直接全灭。
+    #[test]
+    fn image_token_estimates_ignore_image_bytes() {
+        let boundary = "b";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n一只猫\r\n"
+            )
+            .as_bytes(),
+        );
+        raw.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        raw.extend_from_slice(&vec![7_u8; 4 * 1024 * 1024]);
+        raw.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        assert!(
+            multipart_text_bytes(&raw) < 1024,
+            "图片字节被算成了文本字段"
+        );
+        let raw_body = RawBody {
+            bytes: raw.clone(),
+            content_type: HeaderValue::from_static("multipart/form-data; boundary=b"),
+        };
+        let image = estimate_tokens(
+            Endpoint::ImagesEdits,
+            raw.len(),
+            &json!({"model": "edit-model"}),
+            Some(&raw_body),
+        );
+        assert!(image < 100, "一次图生图被估成了 {image} 个 token");
+
+        // 同一个正文走文本端点仍是老口径：图片端点那次豁免不能顺手放宽别处。
+        let text = estimate_tokens(Endpoint::ChatCompletions, raw.len(), &json!({}), None);
+        assert!(text > 1_000_000, "文本端点必须继续按体积保守估算");
+    }
+
+    /// JSON 入口的内联图片（data URL / 超长 base64）同样不算 token。
+    #[test]
+    fn image_token_estimates_skip_inline_data_urls() {
+        let body = json!({
+            "model": "gpt-image-1",
+            "prompt": "一只猫",
+            "image": format!("data:image/png;base64,{}", "A".repeat(200_000)),
+        });
+        let estimate = estimate_tokens(Endpoint::ImagesGenerations, 200_000, &body, None);
+        assert!(estimate < 64, "内联图片被算成了 token：{estimate}");
+    }
+
+    /// multipart 里 `stream` 字段决定走不走流式；字段顺序无关，非真值不算。
+    #[test]
+    fn multipart_stream_field_is_read_from_form_data() {
+        let with_stream = |value: &str, stream_first: bool| {
+            let mut body = Vec::new();
+            let model = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n";
+            let stream = format!(
+                "--b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\n{value}\r\n"
+            );
+            if stream_first {
+                body.extend_from_slice(stream.as_bytes());
+                body.extend_from_slice(model.as_bytes());
+            } else {
+                body.extend_from_slice(model.as_bytes());
+                body.extend_from_slice(stream.as_bytes());
+            }
+            body.extend_from_slice(b"--b--\r\n");
+            body
+        };
+
+        assert!(multipart_requests_stream(&with_stream("true", false)));
+        assert!(multipart_requests_stream(&with_stream("TRUE", true)));
+        assert!(multipart_requests_stream(&with_stream("1", true)));
+        assert!(!multipart_requests_stream(&with_stream("false", false)));
+        assert!(!multipart_requests_stream(b"not multipart"));
+        assert_eq!(
+            extract_multipart_field(&with_stream("true", true), "stream").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            extract_multipart_field(&with_stream("true", false), "model").unwrap(),
+            "m"
+        );
     }
 
     #[test]
@@ -3455,7 +3677,7 @@ Content-Type: application/octet-stream\r\n\
         let body = b"--b\nContent-Disposition: form-data; name=\"image\"\n\nbytes\n--b--\n";
         assert_eq!(
             extract_multipart_model(body),
-            Err(MultipartModelError::Missing)
+            Err(MultipartFieldError::Missing)
         );
         let body = b"--b\nContent-Disposition: form-data; name=\"model\"\n\n m \n--b--\n";
         assert_eq!(extract_multipart_model(body).unwrap(), "m");
@@ -3466,7 +3688,7 @@ Content-Type: application/octet-stream\r\n\
         let body = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--b--\r\n";
         assert_eq!(
             rewrite_multipart_model(body, "bad\r\nvalue"),
-            Err(MultipartModelError::UnsafeReplacement)
+            Err(MultipartFieldError::UnsafeReplacement)
         );
     }
 }
