@@ -776,7 +776,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "18");
+    assert_eq!(version, "19");
 }
 
 /// v18 重建 `upstream_accounts` 时按列名逐列拷贝。历史上有几列是**直接
@@ -840,7 +840,7 @@ async fn a_very_old_database_migrates_all_the_way_to_the_current_version() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "18");
+    assert_eq!(version, "19");
 
     // 老账号还在，归属没变。
     let account = reopened
@@ -961,7 +961,7 @@ async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "18");
+    assert_eq!(version, "19");
 }
 /// v18 把 upstream_accounts.group_id 改成可空（§4.2.3）。
 ///
@@ -1122,6 +1122,75 @@ async fn the_v18_migration_rebuilds_the_account_table_without_breaking_foreign_k
         .find(|account| account.id == "a18-free")
         .expect("未分配账号必须能加载");
     assert_eq!(unassigned.group_id, None);
+}
+
+/// v19 只给已经存在的 image_tasks 补一列（§14.9 的异步生图任务定位）。
+///
+/// 这条迁移有两种历史形态要同时兼容：表压根不存在（从没跑过带这个功能的版本）
+/// 与表在但没有 key_digest 列（跑过上一版）。前者必须原样跳过——迁移里对不
+/// 存在的表做 ALTER 会让服务起不来，那是对现有部署最糟的失败模式。
+#[tokio::test]
+async fn the_v19_migration_adds_the_key_digest_column_without_losing_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+    drop(state);
+
+    let now = akhub::storage::now_unix();
+    // 退回 v18 形态：image_tasks 没有 key_digest，但已经有一行任务。
+    sqlx::query("DROP TABLE image_tasks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE image_tasks (
+            task_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, account_id TEXT NOT NULL,
+            target_id TEXT, upstream_model TEXT, created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO image_tasks (task_id, group_id, account_id, created_at, expires_at)
+         VALUES ('task_v18', 'g18', 'a18', ?, ?)",
+    )
+    .bind(now)
+    .bind(now + 600)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '18' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // 再打开一次：列必须补上，已有任务一个都不能丢。
+    let reopened = akhub::storage::open(dir.path()).await.unwrap();
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(version, "19");
+
+    let row = sqlx::query("SELECT key_digest FROM image_tasks WHERE task_id = 'task_v18'")
+        .fetch_optional(&reopened)
+        .await
+        .unwrap()
+        .expect("迁移不能丢已有任务");
+    let digest: Option<String> = sqlx::Row::try_get(&row, "key_digest").unwrap();
+    assert!(digest.is_none(), "老任务的摘要只能是空，不能编造");
+
+    // 补出来的列要真的能用。
+    sqlx::query("UPDATE image_tasks SET key_digest = 'd19' WHERE task_id = 'task_v18'")
+        .execute(&reopened)
+        .await
+        .unwrap();
+    reopened.close().await;
 }
 
 /// 第三方声明里的版本必须与 Cargo.lock 一致。

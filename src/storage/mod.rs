@@ -44,7 +44,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v18：账号分组可以为空，空表示"未分配"（§4.2.3）。`upstream_accounts`
 /// 的 `group_id` 与分组的外键约束一起重建为可空版本——SQLite 改不了列约束；
 /// 未分配账号不生成调度目标，所以 `dispatch_targets` 不受影响。
-const SCHEMA_VERSION: i64 = 18;
+/// v19：异步生图任务的定位记录补"下单那把 Key"的凭据摘要（§14.9、§4.2.1）。
+/// 表本身由 schema.sql 建；这里只给已经建过表的老库补列。列缺失时轮询会退回
+/// 账号第一把 Key——多 Key 账号上那可能问出"没这个任务"。
+const SCHEMA_VERSION: i64 = 19;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -677,6 +680,18 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         // bootstrap 里：内存库、测试与任何直接 open 的路径都走同一条路，
         // 不会有"某些调用方建出来的库里 Key 池是空的"这种状态。
         backfill_account_keys(pool).await?;
+    }
+    if from < 19 {
+        // v19：异步生图任务的定位记录补"下单那把 Key"的凭据摘要（§14.9）。
+        // 表可能压根不存在（从没跑过带这个功能的版本）：PRAGMA 对不存在的表返回
+        // 空列集，这时什么都不用做——schema.sql 已经把它整张建全了。
+        let columns = table_columns(pool, "image_tasks").await?;
+        if !columns.is_empty() && !columns.contains("key_digest") {
+            sqlx::query("ALTER TABLE image_tasks ADD COLUMN key_digest TEXT")
+                .execute(pool)
+                .await
+                .context("迁移 image_tasks.key_digest 失败")?;
+        }
     }
     if from < 15 {
         // v15：请求记录补"粘性键来源"，让守门放行的比例可以按级统计（§24.1）。

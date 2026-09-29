@@ -972,14 +972,16 @@ impl Store {
     pub async fn upsert_image_task(&self, task: &ImageTaskRow) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO image_tasks
-                (task_id, group_id, account_id, target_id, upstream_model, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, group_id, account_id, target_id, upstream_model, key_digest,
+                 created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.task_id)
         .bind(&task.group_id)
         .bind(&task.account_id)
         .bind(&task.target_id)
         .bind(&task.upstream_model)
+        .bind(&task.key_digest)
         .bind(task.created_at)
         .bind(task.expires_at)
         .execute(&self.pool)
@@ -1004,6 +1006,7 @@ impl Store {
             account_id: row.try_get("account_id")?,
             target_id: row.try_get("target_id")?,
             upstream_model: row.try_get("upstream_model")?,
+            key_digest: row.try_get("key_digest")?,
             created_at: row.try_get("created_at")?,
             expires_at: row.try_get("expires_at")?,
         })
@@ -3107,8 +3110,8 @@ pub struct ResponseStateRow {
 
 /// 一条异步生图任务的定位记录（§14.9）。
 ///
-/// 只回答"这个任务该问哪个账号"，不保存任务结果与正文：结果留在上游，
-/// 这里过期就按"任务不存在"处理。
+/// 只回答"这个任务该问哪个账号、用哪把 Key"，不保存任务结果与正文：结果留在
+/// 上游，这里过期就按"任务不存在"处理。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageTaskRow {
     /// 上游签发的任务 ID（客户端轮询时用的就是它）。
@@ -3118,6 +3121,9 @@ pub struct ImageTaskRow {
     pub account_id: String,
     pub target_id: Option<String>,
     pub upstream_model: Option<String>,
+    /// 下单那把 Key 的凭据摘要（§4.2.1）。为空只可能出现在老记录上：轮询会
+    /// 退回账号的第一把 Key——那可能被上游当成"没这个任务"。
+    pub key_digest: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
 }

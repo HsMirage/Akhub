@@ -355,6 +355,9 @@ CREATE TABLE IF NOT EXISTS image_tasks (
     account_id     TEXT NOT NULL,
     target_id      TEXT,
     upstream_model TEXT,
+    -- 下单那一刻用的那把 Key 的凭据摘要（§4.2.1 的不变量 A）。上游的任务按
+    -- 凭据隔离：换一把 Key 去问同一个任务 ID，它只会当作不存在。
+    key_digest     TEXT,
     created_at     INTEGER NOT NULL,
     expires_at     INTEGER NOT NULL
 );

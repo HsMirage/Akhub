@@ -88,6 +88,11 @@ const CODES: Record<string, ErrorCodeInfo> = {
     hint: "续链所需的响应状态超过保留期已被清理。到「设置」页调大 Responses 状态保留天数。",
     retryable: false,
   },
+  image_task_not_found: {
+    label: "生图任务不存在",
+    hint: "任务 ID 查不到、已过期，或不属于当前分组。任务定位记录保留 24 小时；确认轮询用的是下单返回的 id，而不是上游的 task_id。",
+    retryable: false,
+  },
   rate_limited: {
     label: "触发限流",
     hint: "命中账号或目标的 RPM / TPM / 并发限制。可重试，或调整限制配置。",

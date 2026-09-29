@@ -64,7 +64,9 @@ pub async fn task_status(
 
     let row = match state.store.image_task(&task_id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return missing_task(&request_id),
+        Ok(None) => {
+            return missing_task(&state, &group.group.id, &request_id, started_unix, started);
+        }
         Err(error) => {
             tracing::warn!(%error, request_id, "读取异步生图任务定位失败");
             return GatewayError::new(ErrorCode::InternalError, "读取任务定位失败")
@@ -75,18 +77,34 @@ pub async fn task_status(
     };
     // 分组不匹配与"查不到"返回同一个答案：任务 ID 不该成为跨组探测工具（§26.8）。
     if row.group_id != group.group.id {
-        return missing_task(&request_id);
+        return missing_task(&state, &group.group.id, &request_id, started_unix, started);
     }
     let Some(target) = config.target_by_account(&row.account_id).cloned() else {
         // 账号被删、或已经不再被任何分组引用：这个任务无处可问。
-        return missing_task(&request_id);
+        return missing_task(&state, &group.group.id, &request_id, started_unix, started);
     };
 
     // 轮询必须用**当初那把 Key**：上游的任务是按凭据隔离的资源，换一把 Key 去
     // 问同一个任务 ID，上游只会当作不存在（§4.2.1 的不变量 A）。
+    //
+    // 摘要对不上（老记录没存、或那把 Key 已被删）时退回账号的第一把 Key：
+    // 多 Key 账号上这可能问出"没这个任务"，但直接拒绝会让"上游根本不按 Key
+    // 隔离任务"的站点整条不可用。两者相权，先试一次更划算。
     let credentials = state.runtime.credentials.current();
-    let credential = credentials.keys_of(&row.account_id).first().cloned();
+    let credential = row
+        .key_digest
+        .as_deref()
+        .and_then(|digest| credentials.by_digest(&row.account_id, digest))
+        .or_else(|| credentials.keys_of(&row.account_id).first())
+        .cloned();
     drop(credentials);
+    if credential.is_none() {
+        tracing::warn!(
+            request_id,
+            account = target.account.name,
+            "账号没有可用凭据，异步生图任务无法轮询"
+        );
+    }
     let Some(credential) = credential else {
         return GatewayError::new(
             ErrorCode::UpstreamExhausted,
@@ -179,7 +197,7 @@ pub async fn task_status(
             record_poll(
                 &state,
                 &group.group.id,
-                &target,
+                Some(&target),
                 &request_id,
                 started_unix,
                 started,
@@ -208,7 +226,7 @@ pub async fn task_status(
                 record_poll(
                     &state,
                     &group.group.id,
-                    &target,
+                    Some(&target),
                     &request_id,
                     started_unix,
                     started,
@@ -239,7 +257,7 @@ pub async fn task_status(
     record_poll(
         &state,
         &group.group.id,
-        &target,
+        Some(&target),
         &request_id,
         started_unix,
         started,
@@ -250,12 +268,20 @@ pub async fn task_status(
 
     // 原样回传：状态码、正文与 Retry-After 都是上游对"这个任务现在怎么样"的
     // 权威回答，网关不加工（§14.9 与图片端点同一口径）。
+    //
+    // 但**必须显式 no-store**：同一个 URL 的答案随任务进度变化，任何中间层
+    // 缓存住它，客户端就会永远看到"处理中"。上游自己带 cache-control 时以它为
+    // 准；没带也不能让缓存替我们决定。
     let mut builder = Response::builder().status(upstream_status);
     if let Some(value) = upstream_headers.get(header::CONTENT_TYPE) {
         builder = builder.header(header::CONTENT_TYPE, value.as_bytes());
     }
     if let Some(value) = upstream_headers.get(header::RETRY_AFTER) {
         builder = builder.header(header::RETRY_AFTER, value.as_bytes());
+    }
+    match upstream_headers.get(header::CACHE_CONTROL) {
+        Some(value) => builder = builder.header(header::CACHE_CONTROL, value.as_bytes()),
+        None => builder = builder.header(header::CACHE_CONTROL, "no-store"),
     }
     builder
         .header("x-akhub-request-id", request_id)
@@ -264,7 +290,27 @@ pub async fn task_status(
 }
 
 /// 查不到任务时的统一答案。
-fn missing_task(request_id: &str) -> Response {
+///
+/// 一样落一条请求记录：客户端"一直 404"是运维真会遇到的现场，记录里没有它
+/// 就只能靠猜（§24.1）。这时还没有目标，账号/目标留空——不编造。
+fn missing_task(
+    state: &SharedState,
+    group_id: &str,
+    request_id: &str,
+    started_unix: i64,
+    started: Instant,
+) -> Response {
+    record_poll(
+        state,
+        group_id,
+        None,
+        request_id,
+        started_unix,
+        started,
+        None,
+        ErrorCode::ImageTaskNotFound.status(),
+        Some(ErrorCode::ImageTaskNotFound),
+    );
     GatewayError::new(
         ErrorCode::ImageTaskNotFound,
         "任务不存在、已过期，或不属于当前分组",
@@ -281,7 +327,7 @@ fn missing_task(request_id: &str) -> Response {
 fn record_poll(
     state: &SharedState,
     group_id: &str,
-    target: &TargetView,
+    target: Option<&TargetView>,
     request_id: &str,
     started_unix: i64,
     started: Instant,
@@ -297,9 +343,9 @@ fn record_poll(
         streaming: false,
         group_id: Some(group_id.to_string()),
         logical_model: None,
-        target_id: Some(target.target.id.clone()),
-        account_id: Some(target.account.id.clone()),
-        upstream_model: Some(target.target.upstream_model.clone()),
+        target_id: target.map(|target| target.target.id.clone()),
+        account_id: target.map(|target| target.account.id.clone()),
+        upstream_model: target.map(|target| target.target.upstream_model.clone()),
         request_bytes: 0,
         upstream_status: upstream_status.map(i64::from),
         http_status: http_status.as_u16() as i64,

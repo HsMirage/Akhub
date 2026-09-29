@@ -2126,10 +2126,16 @@ async fn attempt(
     } else {
         streaming
     };
+    // 异步生图任务要记住"是哪把 Key 接的单"：上游的任务按凭据隔离，
+    // 轮询换一把 Key 去问，它只会当作没这个任务（§4.2.1 的不变量 A）。
+    let key_digest = credential.map(|credential| credential.credential_digest.as_str());
     if streamed {
         commit_stream(forward, target, prepared, response, status, headers_wait).await
     } else {
-        commit_body(forward, target, prepared, response, status, sent_at).await
+        commit_body(
+            forward, target, prepared, response, status, sent_at, key_digest,
+        )
+        .await
     }
 }
 
@@ -2410,6 +2416,7 @@ async fn commit_body(
     response: reqwest::Response,
     status: StatusCode,
     sent_at: Instant,
+    key_digest: Option<&str>,
 ) -> Result<Success, AttemptFailure> {
     let headers = response.headers().clone();
     let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
@@ -2430,9 +2437,10 @@ async fn commit_body(
         .with_status(status)
     })?;
 
-    // 异步生图下单成功：把上游任务 ID 记到接单账号上，客户端轮询才找得到人（§14.9）。
+    // 异步生图下单成功：把上游任务 ID 记到接单账号与**那一把 Key** 上，
+    // 客户端轮询才找得到人（§14.9、§4.2.1 的不变量 A）。
     if forward.endpoint.submits_image_task() {
-        remember_image_task(forward, target, &parsed).await;
+        remember_image_task(forward, target, key_digest, &parsed).await;
     }
 
     let downstream = forward.endpoint.protocol();
@@ -2587,6 +2595,7 @@ const IMAGE_TASK_TTL_SECS: i64 = 24 * 60 * 60;
 async fn remember_image_task(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
+    key_digest: Option<&str>,
     body: &serde_json::Value,
 ) {
     let Some(task_id) = body
@@ -2609,6 +2618,7 @@ async fn remember_image_task(
         account_id: target.account.id.clone(),
         target_id: Some(target.target.id.clone()),
         upstream_model: Some(target.target.upstream_model.clone()),
+        key_digest: key_digest.map(str::to_string),
         created_at: now,
         expires_at: now.saturating_add(IMAGE_TASK_TTL_SECS),
     };

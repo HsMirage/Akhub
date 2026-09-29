@@ -468,6 +468,22 @@ mod tests {
         assert_eq!(url.as_str(), "https://host/proxy/v1/messages");
     }
 
+    /// 带 ID 的路径（异步生图任务轮询）与固定端点走同一套拼接规则。
+    #[test]
+    fn suffix_urls_follow_the_same_version_rules() {
+        let url = build_url_with_suffix("https://host/v1", "v1/images/tasks/abc-123").unwrap();
+        assert_eq!(url.as_str(), "https://host/v1/images/tasks/abc-123");
+
+        let url = build_url_with_suffix("https://host/api", "v1/images/tasks/abc-123").unwrap();
+        assert_eq!(url.as_str(), "https://host/api/v1/images/tasks/abc-123");
+
+        // 任务 ID 里的特殊字符必须是**一个路径段**，不能变成查询串或 fragment，
+        // 否则轮询会打到另一个路由上。
+        let url = build_url_with_suffix("https://host/v1", "v1/images/tasks/a?b#c").unwrap();
+        assert_eq!(url.path(), "/v1/images/tasks/a%3Fb%23c");
+        assert!(url.query().is_none() && url.fragment().is_none());
+    }
+
     #[test]
     fn drops_query_and_fragment_from_the_base_url() {
         let url = build_url("https://host/?token=leak#frag", Endpoint::Responses).unwrap();

@@ -138,6 +138,16 @@ function sameProtocol(protocol: string, endpoint: string): boolean {
     responses: "openai_responses",
     messages: "anthropic_messages",
     count_tokens: "anthropic_messages",
+    responses_compact: "openai_responses",
+    responses_input_tokens: "openai_responses",
+    // 图片端点全部走 OpenAI 兼容协议：不登记的话后台会在每条生图记录上多显示
+    // 一个"Chat → 生图"的箭头，看起来像发生了跨协议转换。
+    images_generations: "openai_chat",
+    images_edits: "openai_chat",
+    images_variations: "openai_chat",
+    images_generations_async: "openai_chat",
+    images_edits_async: "openai_chat",
+    images_tasks: "openai_chat",
   };
   return of[endpoint] === protocol;
 }

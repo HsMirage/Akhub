@@ -148,6 +148,21 @@ async fn spawn_missing_image_upstream() -> (String, Arc<Mutex<usize>>) {
     (format!("http://{addr}"), calls)
 }
 
+/// 等一条"生图任务轮询"的请求记录落库（写入是攒批的，最多 1 秒刷一次）。
+async fn wait_for_task_record(akhub: &common::Akhub) -> akhub::storage::store::RequestRecord {
+    for _ in 0..100 {
+        let records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if let Some(record) = records
+            .into_iter()
+            .find(|record| record.endpoint.as_deref() == Some("images_tasks"))
+        {
+            return record;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    panic!("生图任务轮询的记录没有在预期时间内落库");
+}
+
 fn multipart_body(boundary: &str, model: Option<&str>, image: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     if let Some(model) = model {
@@ -914,8 +929,28 @@ async fn async_image_tasks_are_polled_back_to_the_accepting_account() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "3");
+    // 同一个 URL 的答案随时间变化，缓存住就会让客户端永远看到"处理中"。
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
     let task: Value = response.json().await.unwrap();
     assert_eq!(task["id"], "task_up_1");
+
+    // 轮询同样留一条请求记录，并带上接单账号（否则现场只剩客户端说"我一直 404"）。
+    // 这段要 await，所以放在取上游锁之前：锁不跨 await 是硬规矩。
+    let record = wait_for_task_record(&akhub).await;
+    assert_eq!(record.http_status, 200);
+    assert_eq!(
+        record.account_id.as_deref(),
+        Some(wired.account_id.as_str())
+    );
+    assert_eq!(record.error_code, None);
 
     let seen = upstream.seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
@@ -925,11 +960,85 @@ async fn async_image_tasks_are_polled_back_to_the_accepting_account() {
     assert_eq!(request["model"], "image-model-upstream");
     assert_eq!(seen[1].method, "GET");
     assert_eq!(seen[1].path, "/v1/images/tasks/task_up_1");
+    // 判据是"与下单那一把相同"，而不是"等于某把固定 Key"：多 Key 账号上池子
+    // 选哪把都行，但轮询必须跟着走（§4.2.1 的不变量 A）。
+    let submitted_with = api_key_of(&seen[0].headers);
+    let polled_with = api_key_of(&seen[1].headers);
+    assert_eq!(submitted_with.as_deref(), Some(wired.api_key.as_str()));
+    assert_eq!(polled_with, submitted_with, "轮询必须用接单时那把 Key");
+}
+
+/// 异步改图的 multipart 形状：与同步 edits 一样逐字节透传，并按同一套规则
+/// 登记任务归属（否则下单能过、轮询永远 404）。
+#[tokio::test]
+async fn async_edits_accept_multipart_and_stay_pollable() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "edit-model",
+            "edit-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let boundary = "async-edit-boundary";
+    let mut body = Vec::new();
+    push_multipart_field(&mut body, boundary, "model", "edit-model");
+    push_multipart_field(&mut body, boundary, "prompt", "换成白底");
+    push_multipart_file(&mut body, boundary, "image", "in.png", &[1_u8, 2, 3]);
+    finish_multipart(&mut body, boundary);
+
+    let response = client()
+        .post(format!("{}/v1/images/edits/async", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let submitted: Value = response.json().await.unwrap();
+    assert_eq!(submitted["id"], "task_up_1");
+
+    // 能轮询到，说明 multipart 下单同样登记了归属。
+    let response = client()
+        .get(format!("{}/v1/images/tasks/task_up_1", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].path, "/v1/images/edits/async");
+    let content_type = seen[0]
+        .headers
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let parts = parse_multipart_parts(&seen[0].body, &content_type);
     assert_eq!(
-        api_key_of(&seen[1].headers).as_deref(),
-        Some(wired.api_key.as_str()),
-        "轮询必须用接单时那把 Key"
+        parts[0],
+        ("model".to_string(), b"edit-model-upstream".to_vec())
     );
+    assert_eq!(
+        parts[1],
+        ("prompt".to_string(), "换成白底".as_bytes().to_vec())
+    );
+    assert_eq!(parts[2].0, "image");
+    assert_eq!(parts[2].1, vec![1_u8, 2, 3]);
 }
 
 /// 查不到的任务：明确 404，且一个字节都不打上游。
@@ -960,6 +1069,65 @@ async fn unknown_image_task_is_404_without_touching_upstream() {
     let error: Value = response.json().await.unwrap();
     assert_eq!(error["error"]["code"], "image_task_not_found");
     assert!(upstream.seen.lock().unwrap().is_empty());
+
+    // 查不到也要留下记录：这时还没有目标，账号与目标必须留空，而不是编造。
+    let record = wait_for_task_record(&akhub).await;
+    assert_eq!(record.http_status, 404);
+    assert_eq!(record.error_code.as_deref(), Some("image_task_not_found"));
+    assert!(record.account_id.is_none());
+    assert!(record.target_id.is_none());
+}
+
+/// 定位记录里那把 Key 已经不在了（老记录没存摘要、或那把 Key 刚被删）：
+/// 退回账号第一把 Key 试一次，而不是把整个任务判死。
+#[tokio::test]
+async fn poll_falls_back_when_the_recorded_key_is_gone() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let now = akhub::storage::now_unix();
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "task_up_1".into(),
+            group_id: akhub.group_id.clone(),
+            account_id: wired.account_id.clone(),
+            target_id: None,
+            upstream_model: None,
+            key_digest: Some("digest-that-no-longer-exists".into()),
+            created_at: now,
+            expires_at: now + 600,
+        })
+        .await
+        .unwrap();
+
+    let response = client()
+        .get(format!("{}/v1/images/tasks/task_up_1", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        api_key_of(&seen[0].headers).as_deref(),
+        Some(wired.api_key.as_str()),
+        "摘要对不上时退回账号第一把 Key"
+    );
 }
 
 /// 任务 ID 不是跨组探测工具：别的分组的任务一律当作不存在（§26.8）。
@@ -990,6 +1158,7 @@ async fn image_tasks_do_not_cross_groups() {
             account_id: "acc_someone_else".into(),
             target_id: None,
             upstream_model: None,
+            key_digest: None,
             created_at: now,
             expires_at: now + 600,
         })
