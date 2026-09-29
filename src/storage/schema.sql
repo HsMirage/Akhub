@@ -346,6 +346,21 @@ CREATE TABLE IF NOT EXISTS response_states (
 
 CREATE INDEX IF NOT EXISTS idx_states_expiry ON response_states(expires_at);
 
+-- 异步生图任务的定位记录（§14.9）。客户端轮询时手里拿的是**上游**的任务 ID，
+-- 必须回到当初接单的那个账号去问——别的账号根本不知道这个任务。这里只存定位
+-- 信息，不存任务结果：结果留在上游，过期后按"任务不存在"处理。
+CREATE TABLE IF NOT EXISTS image_tasks (
+    task_id        TEXT PRIMARY KEY,
+    group_id       TEXT NOT NULL,
+    account_id     TEXT NOT NULL,
+    target_id      TEXT,
+    upstream_model TEXT,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_image_tasks_expiry ON image_tasks(expires_at);
+
 -- 账号级模型选择集（§16.2）。主键是上游真名：两个不同的上游名可以经别名
 -- 归并到同一个对外名，它们各自占一行，选择后成为同一逻辑模型的两个目标。
 CREATE TABLE IF NOT EXISTS account_models (

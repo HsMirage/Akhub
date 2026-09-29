@@ -1202,6 +1202,12 @@ impl Walk<'_> {
         let started = Instant::now();
         let result = self.walk_endpoints(candidate, credential.as_ref()).await;
 
+        // 图片端点可能按上游响应形状改了投递方式（见 `attempt`）：成功路径的
+        // 结算、评分维度与请求记录都必须用**实际**那一种，否则记录会写"流式"
+        // 却按非流式投递，记录页的"首字"也跟着解释不通（§9.3）。
+        if let Ok(success) = &result {
+            self.streaming = success.streamed;
+        }
         let dimension = score::Dimension {
             protocol: self.forward.endpoint.protocol(),
             streaming: self.streaming,
@@ -1252,6 +1258,7 @@ impl Walk<'_> {
                     // （见 prepare 的 ensure_upstream_usage），客户端没要就不能白给。
                     // Responses / Messages 的用量天然带在正常事件里，不存在额外帧。
                     let strip = self.forward.endpoint.protocol() == Protocol::OpenAiChat
+                        && !self.forward.endpoint.is_image()
                         && !forward_body_requests_usage(&self.forward.body);
                     Attempted::Done(Flow::Done(settle::settle_stream(
                         success.response,
@@ -1575,7 +1582,12 @@ impl Walk<'_> {
         // 必须在这里再补一次。网关自己需要 usage：输出速度评分（默认权重 15）
         // 与 TPM 归还都依赖它，而下游客户端多数不会主动写 stream_options
         // （§9.3、§17.2）。多要到的收尾块由响应侧的过滤器决定要不要给客户端。
-        if self.streaming && target_protocol == Protocol::OpenAiChat {
+        // 图片端点不参与：OpenAI 的图片接口没有 `stream_options`，硬塞进去
+        // 只会让严格的上游 400；它也没有 Chat 那种"收尾 usage 块"。
+        if self.streaming
+            && target_protocol == Protocol::OpenAiChat
+            && !self.forward.endpoint.is_image()
+        {
             ensure_upstream_usage(&mut body);
         }
         Ok(Prepared {
@@ -1897,6 +1909,12 @@ impl Walk<'_> {
 /// 一次成功尝试的产物。
 struct Success {
     status: StatusCode,
+    /// 这次**实际**是按流式投递的还是整体缓冲的。
+    ///
+    /// 图片端点可能按上游响应形状改变投递方式（客户端要流式、上游却回 JSON，
+    /// 或反过来），所以它由提交阶段决定，不能再用请求级标志冒充（§9.3 的口径
+    /// 一致性：结算、评分维度与请求记录都要说同一种话）。
+    streamed: bool,
     response: Response,
     /// 首个**语义**事件的距离，用于评分（§9.3）。
     first_token: Option<Duration>,
@@ -1950,7 +1968,7 @@ fn classify_outcome(
     }
 }
 
-fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
+pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
     match reason {
         health::Unavailable::RateLimited | health::Unavailable::ConcurrencyFull => {
             ErrorCode::RateLimited
@@ -2092,11 +2110,41 @@ async fn attempt(
     }
     // 响应头之前已经等掉的时间，之后所有"首字延迟"都必须从这一刻起算。
     let headers_wait = sent_at.elapsed();
-    if streaming {
+    // 图片端点以**上游实际返回的形状**为准（§14.9）：这类端点没有跨协议转换，
+    // 上游给什么就该转发什么。
+    //
+    // 两个方向都会真实发生，而且都不是"损坏响应"：
+    // - 客户端要流式、上游却按普通 JSON 回（New API 这类中转的图片接口就不认
+    //   stream）：整段缓冲后按 JSON 解析必然失败，而上游其实已经生成过图片了，
+    //   可切换的失败还会换号再生成一次，白花一次钱。
+    // - 请求没声明流式、上游回了 SSE：按 JSON 解析同样失败。
+    //
+    // 判据只看上游的内容类型；推理端点保持原样——它们有跨协议转换与严格的流式
+    // 语义，请求要流式却拿到普通 JSON 属于真正的协议违约（§13.2）。
+    let streamed = if prepared.endpoint.is_image() {
+        upstream_streams(&response)
+    } else {
+        streaming
+    };
+    if streamed {
         commit_stream(forward, target, prepared, response, status, headers_wait).await
     } else {
         commit_body(forward, target, prepared, response, status, sent_at).await
     }
+}
+
+/// 上游这次回的是不是 SSE。
+fn upstream_streams(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .get(.."text/event-stream".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/event-stream"))
+        })
 }
 
 /// 流式响应：在第一个**有语义**的事件之前仍可切换（§13.4）。
@@ -2162,6 +2210,7 @@ async fn commit_stream(
         {
             Ok(committed) => Ok(Success {
                 status,
+                streamed: true,
                 response: build_response(forward, status, &headers, prepared, committed.body),
                 first_token: Some(committed.first_token),
                 first_byte: Some(headers_wait + committed.first_token),
@@ -2225,6 +2274,7 @@ async fn commit_stream(
                             );
                             return Ok(Success {
                                 status,
+                                streamed: true,
                                 response: build_response(forward, status, &headers, prepared, body),
                                 first_token: first_token_of(started.elapsed()),
                                 first_byte: Some(headers_wait + started.elapsed()),
@@ -2297,6 +2347,7 @@ async fn commit_stream(
                     );
                     return Ok(Success {
                         status,
+                        streamed: true,
                         response: build_response(forward, status, &headers, prepared, body),
                         first_token: first_token_of(started.elapsed()),
                         first_byte: Some(headers_wait + started.elapsed()),
@@ -2379,6 +2430,11 @@ async fn commit_body(
         .with_status(status)
     })?;
 
+    // 异步生图下单成功：把上游任务 ID 记到接单账号上，客户端轮询才找得到人（§14.9）。
+    if forward.endpoint.submits_image_task() {
+        remember_image_task(forward, target, &parsed).await;
+    }
+
     let downstream = forward.endpoint.protocol();
     let upstream_protocol = prepared.endpoint.protocol();
     let body = if upstream_protocol == downstream {
@@ -2445,6 +2501,7 @@ async fn commit_body(
 
     Ok(Success {
         status,
+        streamed: false,
         response: build_response(forward, status, &headers, prepared, body),
         // 非流式没有"首字事件"，用户等到**完整响应体**才算拿到内容。这一项
         // 必须进样本，否则只要某个模型的样本落在"非流式"维度上，首字维
@@ -2515,6 +2572,53 @@ async fn record_response_state(
         state.settings.get().response_state_days,
     )
     .await;
+}
+
+/// 异步生图任务定位记录的有效期（秒）。
+///
+/// 上游自己的任务也有过期时间；这里取一天，够客户端把一次 4K 出图轮询完，
+/// 又不至于让定位表无限增长。
+const IMAGE_TASK_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// 记下"这个上游任务 ID 是哪个账号接的单"（§14.9）。
+///
+/// 只在成功下单时调用：失败响应里没有可轮询的任务 ID。写失败只记日志——
+/// 轮询是增强能力，不能反过来把已经成功的下单变成失败。
+async fn remember_image_task(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    body: &serde_json::Value,
+) {
+    let Some(task_id) = body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            "异步生图下单响应里没有任务 ID，后续轮询将无法定位"
+        );
+        return;
+    };
+    let now = crate::storage::now_unix();
+    let row = crate::storage::store::ImageTaskRow {
+        task_id: task_id.to_string(),
+        group_id: forward.group.group.id.clone(),
+        account_id: target.account.id.clone(),
+        target_id: Some(target.target.id.clone()),
+        upstream_model: Some(target.target.upstream_model.clone()),
+        created_at: now,
+        expires_at: now.saturating_add(IMAGE_TASK_TTL_SECS),
+    };
+    if let Err(error) = forward.state.store.upsert_image_task(&row).await {
+        tracing::warn!(
+            %error,
+            request_id = forward.request_id,
+            "写入异步生图任务定位失败"
+        );
+    }
 }
 
 /// 把上游的非 2xx 响应分成"可切换"与"必须直接返回下游"两类。

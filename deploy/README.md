@@ -475,6 +475,17 @@ Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 6
 多半是反向代理先拒了。把 `client_max_body_size`（Nginx）或
 `request_body max_size`（Caddy）调到 ≥ `AKHUB_MAX_REQUEST_BYTES`。
 
+**生图超过一分钟就被反代掐断（524 / 504）**
+真实生图与图生图常见 1–3 分钟，而网关要等上游把整张图吐完才会有响应头——这段时间
+连接上一个字节都不流动，任何按"空闲"计时的中间层都会动手：
+
+- 仓库自带的 `deploy/nginx.conf` 与 `deploy/Caddyfile` 已经把读超时设成 600 秒，
+  照抄就行；自建的反代要确认 `proxy_read_timeout` / `read_timeout` ≥ 600 秒。
+- **Cloudflare 的 100 秒是空闲超时且不可调**（免费版），前置了 CF 就只剩两条路：
+  让客户端改用异步接口 `POST /v1/images/generations/async` +
+  `GET /v1/images/tasks/{id}`（下单立刻返回 202，轮询是短请求，不会撞上 100 秒），
+  或者把生图流量绕开 CF。
+
 **登录后台后立刻掉线**
 HTTPS 部署下没转发 `X-Forwarded-Proto`，会话 Cookie 的 `Secure` 判定与实际协议
 对不上。见 §5.1。

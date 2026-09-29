@@ -303,6 +303,15 @@ async fn cleanup(state: Weak<AppState>) {
             Err(error) => tracing::warn!(%error, "清理 Responses 状态失败"),
             _ => {}
         }
+        // 生图任务的定位记录按自己的到期时间清理（§14.9）：它不是保留期
+        // 概念，而是"这个任务 ID 还能不能问"。
+        match state.store.prune_image_tasks(now).await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "已清理过期异步生图任务定位");
+            }
+            Err(error) => tracing::warn!(%error, "清理异步生图任务定位失败"),
+            _ => {}
+        }
         // 托管后台任务与响应状态共用保留期（计划 §29.1）。
         match state.store.prune_background_tasks(now, 500).await {
             Ok(removed) if removed > 0 => {

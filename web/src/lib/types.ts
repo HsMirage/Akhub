@@ -668,6 +668,9 @@ export const ENDPOINT_LABELS: Record<string, string> = {
   images_generations: "生图",
   images_edits: "改图",
   images_variations: "变体图",
+  images_generations_async: "生图下单",
+  images_edits_async: "改图下单",
+  images_tasks: "生图任务",
 };
 
 /** 部署形态：决定「立即更新」是否可用、该给哪条升级命令。 */

@@ -14,6 +14,8 @@ use crate::domain::Protocol;
 pub enum ErrorCode {
     AuthInvalid,
     ModelNotFound,
+    /// 异步生图任务不存在、已过期，或不属于当前分组（§14.9）。
+    ImageTaskNotFound,
     NoEligibleTarget,
     MultiplierUnknown,
     MultiplierExceeded,
@@ -43,6 +45,7 @@ impl ErrorCode {
     pub const ALL: &'static [Self] = &[
         Self::AuthInvalid,
         Self::ModelNotFound,
+        Self::ImageTaskNotFound,
         Self::NoEligibleTarget,
         Self::MultiplierUnknown,
         Self::MultiplierExceeded,
@@ -80,6 +83,7 @@ impl ErrorCode {
         match self {
             Self::AuthInvalid => "auth_invalid",
             Self::ModelNotFound => "model_not_found",
+            Self::ImageTaskNotFound => "image_task_not_found",
             Self::NoEligibleTarget => "no_eligible_target",
             Self::MultiplierUnknown => "multiplier_unknown",
             Self::MultiplierExceeded => "multiplier_exceeded",
@@ -108,7 +112,9 @@ impl ErrorCode {
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MultiplierUnknown | Self::MultiplierExceeded => StatusCode::FORBIDDEN,
             Self::AuthInvalid => StatusCode::UNAUTHORIZED,
-            Self::ModelNotFound | Self::ResponseStateExpired => StatusCode::NOT_FOUND,
+            Self::ModelNotFound | Self::ResponseStateExpired | Self::ImageTaskNotFound => {
+                StatusCode::NOT_FOUND
+            }
             Self::UnsupportedParameter => StatusCode::BAD_REQUEST,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
@@ -285,6 +291,7 @@ mod tests {
             let registered: &[ErrorCode] = match *code {
                 ErrorCode::AuthInvalid
                 | ErrorCode::ModelNotFound
+                | ErrorCode::ImageTaskNotFound
                 | ErrorCode::NoEligibleTarget
                 | ErrorCode::MultiplierUnknown
                 | ErrorCode::MultiplierExceeded

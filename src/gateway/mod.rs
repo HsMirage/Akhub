@@ -2,6 +2,7 @@
 
 pub mod background;
 pub mod error;
+pub mod images;
 pub mod models;
 pub mod passthrough;
 pub mod responses;
@@ -33,6 +34,14 @@ pub fn router() -> Router<SharedState> {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/images/variations", post(images_variations))
+        // 异步下单与任务轮询（§14.9）：形状来自 sub2api，客户端拿到的任务 ID
+        // 是上游签发的，轮询按定位表回到接单账号（见 images 模块）。
+        .route(
+            "/v1/images/generations/async",
+            post(images_generations_async),
+        )
+        .route("/v1/images/edits/async", post(images_edits_async))
+        .route("/v1/images/tasks/{task_id}", get(images::task_status))
         // Responses 的查询、删除与取消（§15.1、§15.2）。全部走网关 ID。
         .route(
             "/v1/responses/{id}",
@@ -80,6 +89,20 @@ async fn images_edits(state: State<SharedState>, headers: HeaderMap, body: Body)
 /// `POST /v1/images/variations`：与 edits 一样是 multipart 原生透传。
 async fn images_variations(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
     handle(state, headers, body, Endpoint::ImagesVariations).await
+}
+
+/// `POST /v1/images/generations/async`：异步下单，走的还是同一条调度链路。
+async fn images_generations_async(
+    state: State<SharedState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    handle(state, headers, body, Endpoint::ImagesGenerationsAsync).await
+}
+
+/// `POST /v1/images/edits/async`：异步改图下单，multipart 同样原样透传。
+async fn images_edits_async(state: State<SharedState>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::ImagesEditsAsync).await
 }
 
 /// `POST /v1/responses/compact`：只能原生转发，没有等价适配器（§15.4）。
@@ -146,10 +169,13 @@ async fn handle(
     let (body, request_bytes, raw) = if is_multipart {
         // 原始正文只有图片端点需要；其它入口收到 multipart 说明客户端
         // 用错了接口，明确 400，而不是把它转发成一条形状错误的请求。
-        if !matches!(endpoint, Endpoint::ImagesEdits | Endpoint::ImagesVariations) {
+        if !matches!(
+            endpoint,
+            Endpoint::ImagesEdits | Endpoint::ImagesVariations | Endpoint::ImagesEditsAsync
+        ) {
             return GatewayError::new(
                 crate::gateway::error::ErrorCode::UnsupportedParameter,
-                "multipart 请求体只支持 /v1/images/edits 与 /v1/images/variations",
+                "multipart 请求体只支持 /v1/images/edits、/v1/images/variations 与 /v1/images/edits/async",
             )
             .with_protocol(protocol)
             .with_request_id(request_id)

@@ -77,7 +77,11 @@ pub fn choices(
                     || account.preferred_protocol == Protocol::OpenAiResponses,
                 "该账号没有 /v1/responses/input_tokens 端点，Token 计数无法跨协议表达",
             ),
-            Endpoint::ImagesGenerations | Endpoint::ImagesEdits | Endpoint::ImagesVariations => {
+            Endpoint::ImagesGenerations
+            | Endpoint::ImagesEdits
+            | Endpoint::ImagesVariations
+            | Endpoint::ImagesGenerationsAsync
+            | Endpoint::ImagesEditsAsync => {
                 let plausible = matches!(
                     account.preferred_protocol,
                     Protocol::OpenAiChat | Protocol::OpenAiResponses

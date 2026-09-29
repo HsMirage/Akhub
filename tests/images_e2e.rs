@@ -12,11 +12,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use common::{TargetSpec, client, spawn_akhub, wire_target};
+use common::{TargetSpec, api_key_of, client, spawn_akhub, wire_target};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 struct SeenImageRequest {
+    method: String,
     path: String,
     headers: HeaderMap,
     body: Vec<u8>,
@@ -31,11 +32,13 @@ struct ImageUpstream {
 
 async fn image_upstream_handler(
     State(upstream): State<ImageUpstream>,
+    method: axum::http::Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     upstream.seen.lock().unwrap().push(SeenImageRequest {
+        method: method.to_string(),
         path: uri.path().to_string(),
         headers,
         body: body.to_vec(),
@@ -69,6 +72,59 @@ async fn spawn_image_upstream_typed(
         // 图片编辑动辄几 MB：假上游也必须能收下真实尺寸的正文，否则测的是
         // axum 的 2 MB 默认上限，而不是网关的行为。
         .layer(axum::extract::DefaultBodyLimit::disable())
+        .with_state(upstream.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), upstream)
+}
+
+/// 异步生图的假上游：下单回 202 任务对象，轮询回任务状态（形状照 sub2api）。
+async fn spawn_async_image_upstream() -> (String, ImageUpstream) {
+    const SUBMIT_BODY: &[u8] = br#"{"id":"task_up_1","task_id":"up_1","object":"image.task","status":"processing","created_at":1,"expires_at":2}"#;
+    const POLL_BODY: &[u8] = br#"{"id":"task_up_1","object":"image.task","status":"processing"}"#;
+
+    async fn handler(
+        State(upstream): State<ImageUpstream>,
+        method: axum::http::Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        upstream.seen.lock().unwrap().push(SeenImageRequest {
+            method: method.to_string(),
+            path: uri.path().to_string(),
+            headers,
+            body: body.to_vec(),
+        });
+        if uri.path().ends_with("/async") {
+            return (
+                StatusCode::ACCEPTED,
+                [(header::CONTENT_TYPE, "application/json")],
+                SUBMIT_BODY.to_vec(),
+            )
+                .into_response();
+        }
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::RETRY_AFTER, "3"),
+            ],
+            POLL_BODY.to_vec(),
+        )
+            .into_response()
+    }
+
+    let upstream = ImageUpstream {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        response_body: Vec::new(),
+        content_type: "application/json",
+    };
+    let app = Router::new()
+        .route("/v1/images/generations/async", axum::routing::post(handler))
+        .route("/v1/images/edits/async", axum::routing::post(handler))
+        .route("/v1/images/tasks/{task_id}", axum::routing::get(handler))
         .with_state(upstream.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -615,6 +671,91 @@ async fn generations_with_stream_keep_every_image_event() {
     assert_eq!(request["stream"], true);
 }
 
+/// 客户端要流式、上游按普通 JSON 回：上游给什么就转发什么。报协议错不仅
+/// 用户拿不到已经生成好的图，多目标下还会换号重试——那是第二次真金白银的生图。
+#[tokio::test]
+async fn stream_request_falls_back_to_json_when_upstream_ignores_it() {
+    let body = br#"{"created":1,"data":[{"url":"https://upstream.example/x.png"}]}"#;
+    let (upstream_url, upstream) = spawn_image_upstream_typed("application/json", body).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/images/generations", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "image-model", "prompt": "猫", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), body);
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "形状不符不是上游故障，不许换号重试");
+    let request: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(request["model"], "image-model-upstream");
+    assert!(
+        request.get("stream_options").is_none(),
+        "图片接口没有 stream_options，网关不能为了自己的 usage 硬塞进去"
+    );
+}
+
+/// 请求没声明流式、上游却回了 SSE：按 SSE 原样转发，不去按 JSON 解析。
+#[tokio::test]
+async fn upstream_sse_wins_when_the_client_did_not_ask_for_streaming() {
+    let frames = "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\ndata: [DONE]\n\n";
+    let (upstream_url, upstream) =
+        spawn_image_upstream_typed("text/event-stream", frames.as_bytes()).await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/images/generations", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "image-model", "prompt": "猫"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(response.text().await.unwrap(), frames);
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let request: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert!(request.get("stream_options").is_none());
+}
+
 /// edits 也接受 JSON 正文（内联 base64 图片），与 multipart 一样原样转发。
 #[tokio::test]
 async fn edits_accept_json_bodies_with_inline_images() {
@@ -728,4 +869,144 @@ async fn multipart_on_other_endpoints_is_rejected() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: Value = response.json().await.unwrap();
     assert_eq!(error["error"]["code"], "unsupported_parameter");
+}
+
+/// 异步下单 + 轮询：任务 ID 是上游签发的，轮询必须回到接单的那个账号，
+/// 并用当初那把 Key（§14.9、§4.2.1 的不变量 A）。
+#[tokio::test]
+async fn async_image_tasks_are_polled_back_to_the_accepting_account() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    // 账号名用 ASCII：假上游按 "key-<账号名>" 造凭据，中文名会让 Bearer 值
+    // 落到 HeaderValue 的非可见 ASCII 之外，测的就不是网关了。
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    // 下单：202 与任务对象原样透传。
+    let response = client()
+        .post(format!("{}/v1/images/generations/async", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "image-model", "prompt": "一只猫"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let submitted: Value = response.json().await.unwrap();
+    assert_eq!(submitted["id"], "task_up_1");
+    assert_eq!(submitted["status"], "processing");
+
+    // 轮询：同一个上游账号、同一个任务路径，Retry-After 也照传。
+    let response = client()
+        .get(format!("{}/v1/images/tasks/task_up_1", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "3");
+    let task: Value = response.json().await.unwrap();
+    assert_eq!(task["id"], "task_up_1");
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].path, "/v1/images/generations/async");
+    let request: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(request["model"], "image-model-upstream");
+    assert_eq!(seen[1].method, "GET");
+    assert_eq!(seen[1].path, "/v1/images/tasks/task_up_1");
+    assert_eq!(
+        api_key_of(&seen[1].headers).as_deref(),
+        Some(wired.api_key.as_str()),
+        "轮询必须用接单时那把 Key"
+    );
+}
+
+/// 查不到的任务：明确 404，且一个字节都不打上游。
+#[tokio::test]
+async fn unknown_image_task_is_404_without_touching_upstream() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .get(format!("{}/v1/images/tasks/never-existed", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "image_task_not_found");
+    assert!(upstream.seen.lock().unwrap().is_empty());
+}
+
+/// 任务 ID 不是跨组探测工具：别的分组的任务一律当作不存在（§26.8）。
+#[tokio::test]
+async fn image_tasks_do_not_cross_groups() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let now = akhub::storage::now_unix();
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "other-group-task".into(),
+            group_id: "grp_someone_else".into(),
+            account_id: "acc_someone_else".into(),
+            target_id: None,
+            upstream_model: None,
+            created_at: now,
+            expires_at: now + 600,
+        })
+        .await
+        .unwrap();
+
+    let response = client()
+        .get(format!(
+            "{}/v1/images/tasks/other-group-task",
+            akhub.base_url
+        ))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "image_task_not_found");
+    assert!(upstream.seen.lock().unwrap().is_empty());
 }

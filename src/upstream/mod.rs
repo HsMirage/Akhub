@@ -136,22 +136,41 @@ pub enum Endpoint {
     ImagesEdits,
     /// `POST /v1/images/variations`：只能原生转发，没有跨协议等价物。
     ImagesVariations,
+    /// `POST /v1/images/generations/async`：异步生图下单（§14.9）。
+    ImagesGenerationsAsync,
+    /// `POST /v1/images/edits/async`：异步改图下单（§14.9）。
+    ImagesEditsAsync,
+    /// `GET /v1/images/tasks/{task_id}`：异步任务轮询（§14.9）。
+    ///
+    /// 它与其他图片端点不同：没有请求体、没有模型，也不走调度链路——轮询必须
+    /// 回到当初接单的那个账号（见 `images` 模块）。
+    ImagesTasks,
 }
 
 impl Endpoint {
-    /// 三个图片端点：都是 multipart / JSON 原样透传的原生端点。
+    /// 图片端点：都是 multipart / JSON 原样透传的原生端点。
     ///
     /// 抽成一个常量，是为了让"图片入口共用同一套资格与 token 口径"这件事
-    /// 只有一处定义：新增图片端点时不会漏掉其中一条分支。
-    pub const IMAGES: [Endpoint; 3] = [
+    /// 只有一处定义：新增图片端点时不会漏掉其中一条分支。轮询端点不在其中：
+    /// 它不接受生图请求，也不参与"按提示词估 Token"这套口径。
+    pub const IMAGES: [Endpoint; 5] = [
         Self::ImagesGenerations,
         Self::ImagesEdits,
         Self::ImagesVariations,
+        Self::ImagesGenerationsAsync,
+        Self::ImagesEditsAsync,
     ];
 
     /// 这个端点是不是图片入口。
     pub fn is_image(self) -> bool {
         Self::IMAGES.contains(&self)
+    }
+
+    /// 这个端点是不是"异步生图下单"。
+    ///
+    /// 下单成功后要把上游任务 ID 记到接单账号上，轮询才知道该问谁（§14.9）。
+    pub fn submits_image_task(self) -> bool {
+        matches!(self, Self::ImagesGenerationsAsync | Self::ImagesEditsAsync)
     }
 }
 
@@ -179,6 +198,8 @@ impl Endpoint {
                 | Self::ImagesGenerations
                 | Self::ImagesEdits
                 | Self::ImagesVariations
+                | Self::ImagesGenerationsAsync
+                | Self::ImagesEditsAsync
         )
     }
 
@@ -190,9 +211,12 @@ impl Endpoint {
                 Protocol::OpenAiResponses
             }
             Self::Messages | Self::CountTokens => Protocol::AnthropicMessages,
-            Self::ImagesGenerations | Self::ImagesEdits | Self::ImagesVariations => {
-                Protocol::OpenAiChat
-            }
+            Self::ImagesGenerations
+            | Self::ImagesEdits
+            | Self::ImagesVariations
+            | Self::ImagesGenerationsAsync
+            | Self::ImagesEditsAsync
+            | Self::ImagesTasks => Protocol::OpenAiChat,
         }
     }
 
@@ -208,6 +232,9 @@ impl Endpoint {
             Self::ImagesGenerations => "v1/images/generations",
             Self::ImagesEdits => "v1/images/edits",
             Self::ImagesVariations => "v1/images/variations",
+            Self::ImagesGenerationsAsync => "v1/images/generations/async",
+            Self::ImagesEditsAsync => "v1/images/edits/async",
+            Self::ImagesTasks => "v1/images/tasks",
         }
     }
 
@@ -223,6 +250,9 @@ impl Endpoint {
             Self::ImagesGenerations => "images_generations",
             Self::ImagesEdits => "images_edits",
             Self::ImagesVariations => "images_variations",
+            Self::ImagesGenerationsAsync => "images_generations_async",
+            Self::ImagesEditsAsync => "images_edits_async",
+            Self::ImagesTasks => "images_tasks",
         }
     }
 }
@@ -323,11 +353,20 @@ fn parse_model_list(bytes: &[u8]) -> std::result::Result<Vec<String>, UpstreamEr
 /// Base URL 自带的查询串与 fragment 一律丢掉（§23.3）：它们是管理员配置里
 /// 的残留，可能带着不该出现在每条上游请求里的凭据，端点路由只由路径决定。
 pub fn build_url(base_url: &str, endpoint: Endpoint) -> Result<Url, UpstreamError> {
+    build_url_with_suffix(base_url, endpoint.path())
+}
+
+/// 用任意路径后缀拼 URL。
+///
+/// 带 ID 的路径（异步生图任务的 v1/images/tasks/{id}）写不进 Endpoint::path，
+/// 但版本段处理必须与 build_url 完全一致——两处规则漂移过一次就会拼出
+/// /v1/v1/... 这种必然 404 的地址。
+pub fn build_url_with_suffix(base_url: &str, suffix: &str) -> Result<Url, UpstreamError> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let mut url = Url::parse(trimmed).map_err(|e| UpstreamError::InvalidBaseUrl(e.to_string()))?;
 
     let base_path = url.path().trim_end_matches('/').to_string();
-    let mut suffix = endpoint.path();
+    let mut suffix = suffix;
     if base_path.ends_with("/v1") || base_path == "/v1" {
         suffix = suffix.strip_prefix("v1/").unwrap_or(suffix);
     }

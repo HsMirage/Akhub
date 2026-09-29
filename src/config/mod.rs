@@ -120,6 +120,19 @@ impl RuntimeConfig {
         self.groups.iter().find(|g| g.group.id == id)
     }
 
+    /// 按账号 ID 找它在这份配置里的一个目标（§14.9 的生图任务轮询用）。
+    ///
+    /// 轮询手里只有"当初接单的账号"，没有模型，因此走不了调度链路——按 ID
+    /// 反查是唯一能把请求送回原账号的办法。账号被删或不再被任何分组引用时
+    /// 返回 None，调用方按"任务不存在"处理。
+    pub fn target_by_account(&self, account_id: &str) -> Option<&Arc<TargetView>> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.models.values())
+            .flat_map(|model| model.targets.iter())
+            .find(|target| target.account.id == account_id)
+    }
+
     /// 当前配置中全部账号与目标的 ID，供动态状态表清理已消失的条目。
     pub fn live_ids(&self) -> (Vec<String>, Vec<String>) {
         let mut accounts = Vec::new();

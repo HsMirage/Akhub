@@ -966,6 +966,59 @@ impl Store {
         )
     }
 
+    // ---------------------------------------------------------- 异步生图任务
+
+    /// 记下"这个上游任务 ID 是哪个账号接的单"（§14.9）。
+    pub async fn upsert_image_task(&self, task: &ImageTaskRow) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO image_tasks
+                (task_id, group_id, account_id, target_id, upstream_model, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task.task_id)
+        .bind(&task.group_id)
+        .bind(&task.account_id)
+        .bind(&task.target_id)
+        .bind(&task.upstream_model)
+        .bind(task.created_at)
+        .bind(task.expires_at)
+        .execute(&self.pool)
+        .await
+        .context("写入异步生图任务定位失败")?;
+        Ok(())
+    }
+
+    /// 按任务 ID 读回接单账号。分组是否匹配由调用方判定（§26.8）。
+    pub async fn image_task(&self, task_id: &str) -> Result<Option<ImageTaskRow>> {
+        let row = sqlx::query("SELECT * FROM image_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(Self::image_task_row).transpose()
+    }
+
+    fn image_task_row(row: sqlx::sqlite::SqliteRow) -> Result<ImageTaskRow> {
+        Ok(ImageTaskRow {
+            task_id: row.try_get("task_id")?,
+            group_id: row.try_get("group_id")?,
+            account_id: row.try_get("account_id")?,
+            target_id: row.try_get("target_id")?,
+            upstream_model: row.try_get("upstream_model")?,
+            created_at: row.try_get("created_at")?,
+            expires_at: row.try_get("expires_at")?,
+        })
+    }
+
+    /// 清理已过期的任务定位记录。
+    pub async fn prune_image_tasks(&self, older_than: i64) -> Result<u64> {
+        let affected = sqlx::query("DELETE FROM image_tasks WHERE expires_at < ?")
+            .bind(older_than)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected)
+    }
+
     /// 读取 New API 倍率探针的访问令牌信封。
     pub async fn account_sealed_new_api_token(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
         Ok(
@@ -3048,6 +3101,23 @@ pub struct ResponseStateRow {
     pub sealed_body: Option<Vec<u8>>,
     /// 生成该响应的入口协议。
     pub protocol: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// 一条异步生图任务的定位记录（§14.9）。
+///
+/// 只回答"这个任务该问哪个账号"，不保存任务结果与正文：结果留在上游，
+/// 这里过期就按"任务不存在"处理。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageTaskRow {
+    /// 上游签发的任务 ID（客户端轮询时用的就是它）。
+    pub task_id: String,
+    /// 下单所属分组：轮询必须来自同一个分组（§26.8）。
+    pub group_id: String,
+    pub account_id: String,
+    pub target_id: Option<String>,
+    pub upstream_model: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
 }
