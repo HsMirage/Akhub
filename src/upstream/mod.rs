@@ -200,6 +200,10 @@ impl Endpoint {
                 | Self::ImagesVariations
                 | Self::ImagesGenerationsAsync
                 | Self::ImagesEditsAsync
+                // 轮询端点（§14.9）。它当前只被 images 模块直连使用、不经过
+                // choices，但漏在这里就是一颗定时炸弹：endpoints::choices 的
+                // 兜底分支是 unreachable!，哪天有人从调度路径碰它就会 panic。
+                | Self::ImagesTasks
         )
     }
 
@@ -362,6 +366,24 @@ pub fn build_url(base_url: &str, endpoint: Endpoint) -> Result<Url, UpstreamErro
 /// 但版本段处理必须与 build_url 完全一致——两处规则漂移过一次就会拼出
 /// /v1/v1/... 这种必然 404 的地址。
 pub fn build_url_with_suffix(base_url: &str, suffix: &str) -> Result<Url, UpstreamError> {
+    build_url_with_segments(base_url, suffix, std::iter::empty())
+}
+
+/// 用「固定路径后缀 + 若干不可信路径段」拼 URL（§14.9、§23.4）。
+///
+/// 路径段来自上游或被下游可控的数据（例如上游签发的任务 ID）时**必须**走这里，
+/// 而不是把字符串插进 `build_url_with_suffix`：
+///
+/// - `Url::set_path` 会按 WHATWG 规则折叠 `..` 段。上游返回
+///   `..%2F..%2Fchat%2Fcompletions` 时，axum 先 percent-decode，拼进去再
+///   被折叠，网关就会带着该账号的 Bearer 凭据去请求**另一个上游路由**。
+/// - 这里改用 `path_segments_mut().extend()`：`/`、`%`、`?`、`#` 都会被
+///   编码成单个段的内容，且 `.` / `..` 段被拒绝，注入无从发生。
+pub fn build_url_with_segments<'a>(
+    base_url: &str,
+    suffix: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<Url, UpstreamError> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let mut url = Url::parse(trimmed).map_err(|e| UpstreamError::InvalidBaseUrl(e.to_string()))?;
 
@@ -370,7 +392,29 @@ pub fn build_url_with_suffix(base_url: &str, suffix: &str) -> Result<Url, Upstre
     if base_path.ends_with("/v1") || base_path == "/v1" {
         suffix = suffix.strip_prefix("v1/").unwrap_or(suffix);
     }
-    url.set_path(&format!("{base_path}/{suffix}"));
+    let path = format!("{base_path}/{suffix}");
+    // 先 set_path 处理固定后缀里的版本段规则（后缀是我们自己写的常量），
+    // 再把不可信段逐段 push 上去——两件事分开，注入面就只剩后者。
+    url.set_path(&path);
+    {
+        let mut parts = url.path_segments_mut().map_err(|_| {
+            UpstreamError::InvalidBaseUrl("Base URL 不能是 cannot-be-a-base".into())
+        })?;
+        for segment in segments {
+            // 三种必须显式挡住的形状：
+            // - 空串：会拼出尾随斜杠，打到另一个路由；
+            // - "." 与 ".."：url crate 的 push 会把它们当**点段**处理（实测 ".."
+            //   会把上一个段弹掉，URL 悄悄变成另一个路径），编码也拦不住，
+            //   只能在进来之前拒绝。
+            // 其余字符（/ ? # %）由 push 负责百分号编码成单个段的内容。
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return Err(UpstreamError::InvalidBaseUrl(format!(
+                    "路径段不安全：{segment:?}"
+                )));
+            }
+            parts.push(segment);
+        }
+    }
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -482,6 +526,62 @@ mod tests {
         let url = build_url_with_suffix("https://host/v1", "v1/images/tasks/a?b#c").unwrap();
         assert_eq!(url.path(), "/v1/images/tasks/a%3Fb%23c");
         assert!(url.query().is_none() && url.fragment().is_none());
+    }
+
+    /// 不可信路径段（上游签发的任务 ID）必须整段编码，且不能折叠成别的路由。
+    ///
+    /// 这条用例锁死的是一个真实的安全洞：axum 会先 percent-decode，再把任务 ID
+    /// 拼进路径时，`Url::set_path` 会按 WHATWG 规则折叠 `..` 段——上游返回
+    /// `..%2F..%2Fchat%2Fcompletions` 就能让网关带着该账号的 Bearer 凭据去请求
+    /// 另一个上游路由。
+    #[test]
+    fn untrusted_path_segments_cannot_traverse_upstream_paths() {
+        // 这些不是点段本身，但含 / % ? #：必须被编码进**一个**段里。
+        for hostile in [
+            "..%2F..%2Fchat%2Fcompletions",
+            "%2E%2E%2F%2E%2E%2Fmodels",
+            "../secrets",
+            "a/b",
+            "a?b#c",
+        ] {
+            let url = build_url_with_segments("https://host/v1", "v1/images/tasks", [hostile])
+                .unwrap_or_else(|error| panic!("{hostile} 不该构造失败：{error}"));
+            // 前缀是 /v1/images/tasks，不可信段必须跟在它后面、且只占一个段：
+            // 段内的 / % ? # 全被编码（%2F 会变成 %252F，不会被上游再解一次），
+            // ".." 也折叠不动它。
+            let path = url.path();
+            assert!(
+                path.starts_with("/v1/images/tasks/"),
+                "{hostile} 离开了 images/tasks 前缀：{url}"
+            );
+            assert_eq!(
+                path.trim_start_matches("/v1/images/tasks/")
+                    .split("/")
+                    .count(),
+                1,
+                "{hostile} 必须仍然是 images/tasks 下的单个路径段：{url}"
+            );
+            // 关键不变量：整段被编码之后，路径里不再有**活的**分隔符，
+            // 也不会被 WHATWG 折叠——".." 折叠需要有 "/" 分隔的段才成立。
+            let tail = path.trim_start_matches("/v1/images/tasks/");
+            assert!(
+                !tail.contains("/") && !tail.contains("?") && !tail.contains("#"),
+                "{hostile} 在路径里引入了活的分隔符：{url}"
+            );
+            assert!(url.query().is_none() && url.fragment().is_none());
+        }
+
+        // 空段会拼出尾随斜杠那种会打到另一个路由的形状，明确拒绝。
+        assert!(build_url_with_segments("https://host/v1", "v1/images/tasks", [""]).is_err());
+        // 点段必须直接拒绝：url crate 的 push 会把 ".." 当点段、把上一个段弹掉
+        // （实测 URL 会变成 https://host/v1/images/tasks），编码拦不住它。
+        assert!(build_url_with_segments("https://host/v1", "v1/images/tasks", [".."]).is_err());
+        assert!(build_url_with_segments("https://host/v1", "v1/images/tasks", ["."]).is_err());
+
+        // 正常 ID 不受影响。
+        let url = build_url_with_segments("https://host/v1", "v1/images/tasks", ["task_abc-123"])
+            .unwrap();
+        assert_eq!(url.as_str(), "https://host/v1/images/tasks/task_abc-123");
     }
 
     #[test]

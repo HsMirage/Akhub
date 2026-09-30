@@ -47,7 +47,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v19：异步生图任务的定位记录补"下单那把 Key"的凭据摘要（§14.9、§4.2.1）。
 /// 表本身由 schema.sql 建；这里只给已经建过表的老库补列。列缺失时轮询会退回
 /// 账号第一把 Key——多 Key 账号上那可能问出"没这个任务"。
-const SCHEMA_VERSION: i64 = 19;
+/// v20：image_tasks 的主键从单列 task_id 改成 (group_id, account_id, task_id)。
+/// 上游任务 ID 只在**上游站点**内唯一，而多个分组可以指向同一个站点；按单列
+/// 做主键时后下单的分组会覆盖先方的定位行，先方轮询变成永久 404（§14.9、§23.4）。
+/// SQLite 改不了主键，只能重建表；v18 已经示范过这件事的全部坑（见那里的注释）。
+const SCHEMA_VERSION: i64 = 20;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -691,6 +695,63 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .execute(pool)
                 .await
                 .context("迁移 image_tasks.key_digest 失败")?;
+        }
+    }
+    if from < 20 {
+        // v20：image_tasks 的主键改成 (group_id, account_id, task_id)（§14.9）。
+        //
+        // 表可能压根不存在（从没跑过带这个功能的版本）：PRAGMA 对不存在的表返回
+        // 空列集，这时什么都不用做——schema.sql 已经把它整张建全了。
+        //
+        // 存在时只能重建表：SQLite 改不了主键。image_tasks 既不引用别的表，也没有
+        // 别的表引用它，所以不需要 v18 那套关外键的仪式；但"先建新表、按列名拷贝、
+        // 再删旧表换名"的次序必须照旧，否则中途失败就会丢掉定位记录。
+        let columns = table_columns(pool, "image_tasks").await?;
+        if !columns.is_empty() {
+            // v19 可能刚补过这一列，也可能由 schema.sql 建全；更老的形态里它不存在。
+            let has_digest = columns.contains("key_digest");
+            let digest_expr = if has_digest { "key_digest" } else { "NULL" };
+            let mut tx = pool.begin().await.context("开始 v20 迁移事务失败")?;
+            sqlx::query(
+                "CREATE TABLE image_tasks_v20 (
+                    task_id        TEXT NOT NULL,
+                    group_id       TEXT NOT NULL,
+                    account_id     TEXT NOT NULL,
+                    target_id      TEXT,
+                    upstream_model TEXT,
+                    key_digest     TEXT,
+                    created_at     INTEGER NOT NULL,
+                    expires_at     INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, account_id, task_id)
+                )",
+            )
+            .execute(&mut *tx)
+            .await
+            .context("v20 迁移建新表失败")?;
+            let copied = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO image_tasks_v20
+                    (task_id, group_id, account_id, target_id, upstream_model,
+                     key_digest, created_at, expires_at)
+                 SELECT task_id, group_id, account_id, target_id, upstream_model,
+                        {digest_expr}, created_at, expires_at
+                 FROM image_tasks"
+            )))
+            .execute(&mut *tx)
+            .await
+            .context("v20 迁移拷贝既有任务失败")?
+            .rows_affected();
+            sqlx::query("DROP TABLE image_tasks")
+                .execute(&mut *tx)
+                .await
+                .context("v20 迁移删除旧表失败")?;
+            sqlx::query("ALTER TABLE image_tasks_v20 RENAME TO image_tasks")
+                .execute(&mut *tx)
+                .await
+                .context("v20 迁移重命名新表失败")?;
+            // 失败时事务整体回滚（旧表与数据原样保留）并中止启动，版本号不会推进，
+            // 下次启动会重试。带着半迁移的结构继续跑比起不来更危险。
+            tx.commit().await.context("提交 v20 迁移失败")?;
+            tracing::info!(copied, "已迁移异步生图任务定位表的主键");
         }
     }
     if from < 15 {

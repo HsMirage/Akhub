@@ -969,6 +969,9 @@ impl Store {
     // ---------------------------------------------------------- 异步生图任务
 
     /// 记下"这个上游任务 ID 是哪个账号接的单"（§14.9）。
+    ///
+    /// 冲突目标就是主键 (group_id, account_id, task_id)：同一个分组、同一个账号
+    /// 重复下单同一 ID 才谈得上覆盖，别的分组 / 账号的行动不到。
     pub async fn upsert_image_task(&self, task: &ImageTaskRow) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO image_tasks
@@ -990,12 +993,31 @@ impl Store {
         Ok(())
     }
 
-    /// 按任务 ID 读回接单账号。分组是否匹配由调用方判定（§26.8）。
-    pub async fn image_task(&self, task_id: &str) -> Result<Option<ImageTaskRow>> {
-        let row = sqlx::query("SELECT * FROM image_tasks WHERE task_id = ?")
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await?;
+    /// 按分组 + 任务 ID 读回接单账号（§26.8、§14.9）。
+    ///
+    /// 分组条件写在 SQL 里而不是读回来再比：主键含 group_id 之后，同一个上游
+    /// 任务 ID 在**多个分组**下可以各有一行，只按 task_id 查会拿到不确定的
+    /// 那一条——别的分组的轮询就可能撞见本组的行。带上 group_id 之后，
+    /// "不属于当前分组"与"查不到"天然就是同一个结果，不需要再区分。
+    ///
+    /// **过期即查不到**：清理是每 600 秒一轮的后台任务，只靠它会让一条记录在
+    /// 到期后多存活最多 10 分钟，而文档承诺的是"过期就按任务不存在处理"。
+    /// 这里在读取时按 now 判一次，惰性过期与后台清理互为兜底。
+    pub async fn image_task(
+        &self,
+        group_id: &str,
+        task_id: &str,
+        now: i64,
+    ) -> Result<Option<ImageTaskRow>> {
+        let row = sqlx::query(
+            "SELECT * FROM image_tasks
+             WHERE group_id = ? AND task_id = ? AND expires_at > ?",
+        )
+        .bind(group_id)
+        .bind(task_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(Self::image_task_row).transpose()
     }
 

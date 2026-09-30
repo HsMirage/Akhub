@@ -157,6 +157,26 @@ impl CredentialPool {
             .find(|key| key.credential_digest == credential_digest)
     }
 
+    /// 按摘要找一把**启用中**的 Key。
+    ///
+    /// 与 [`Self::by_digest`] 的区别只在 enabled：调度路径由 select_key
+    /// 过滤禁用项，而异步生图轮询这类**直连**路径绕过了调度，必须自己把
+    /// 「管理员已经停用这把 Key」挡在外面（§4.2.1 的不变量 A）。
+    pub fn enabled_by_digest(
+        &self,
+        account_id: &str,
+        credential_digest: &str,
+    ) -> Option<&Arc<Credential>> {
+        self.keys_of(account_id)
+            .iter()
+            .find(|key| key.enabled && key.credential_digest == credential_digest)
+    }
+
+    /// 账号下第一把**启用中**的 Key（直连路径的兜底，见上）。
+    pub fn first_enabled(&self, account_id: &str) -> Option<&Arc<Credential>> {
+        self.keys_of(account_id).iter().find(|key| key.enabled)
+    }
+
     /// 账号是否一把 Key 都没有（从未配置或全部被删）。
     pub fn is_empty(&self, account_id: &str) -> bool {
         self.keys_of(account_id).is_empty()

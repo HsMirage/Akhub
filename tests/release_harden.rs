@@ -776,7 +776,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "19");
+    assert_eq!(version, "20");
 }
 
 /// v18 重建 `upstream_accounts` 时按列名逐列拷贝。历史上有几列是**直接
@@ -840,7 +840,7 @@ async fn a_very_old_database_migrates_all_the_way_to_the_current_version() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "19");
+    assert_eq!(version, "20");
 
     // 老账号还在，归属没变。
     let account = reopened
@@ -961,7 +961,7 @@ async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "19");
+    assert_eq!(version, "20");
 }
 /// v18 把 upstream_accounts.group_id 改成可空（§4.2.3）。
 ///
@@ -1175,7 +1175,7 @@ async fn the_v19_migration_adds_the_key_digest_column_without_losing_tasks() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(version, "19");
+    assert_eq!(version, "20");
 
     let row = sqlx::query("SELECT key_digest FROM image_tasks WHERE task_id = 'task_v18'")
         .fetch_optional(&reopened)
@@ -1631,4 +1631,88 @@ fn deployment_docs_only_reference_files_that_exist() {
     }
 
     assert!(checked >= 8, "应当核对到若干仓库内文件引用，实际 {checked}");
+}
+/// v20 把 image_tasks 的主键从单列 task_id 换成 (group_id, account_id, task_id)
+/// （§14.9、§23.4）。
+///
+/// 上游任务 ID 只在**上游站点**内唯一，多个分组可以指向同一个站点。旧结构下
+/// 后下单的分组会 REPLACE 掉先方的定位行，先方轮询永久 404，而任务还在上游跑。
+/// SQLite 改不了主键，必须重建表——这条用例验证重建之后老数据一条不丢，并且
+/// 同一个 task_id 真的能在两个分组下各存一行。
+#[tokio::test]
+async fn the_v20_migration_rebuilds_image_tasks_with_a_scoped_primary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+    drop(state);
+
+    let now = akhub::storage::now_unix();
+    // 退回旧形态：task_id 单列主键，且没有 key_digest（v19 之前的老库）。
+    sqlx::query("DROP TABLE image_tasks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE image_tasks (
+            task_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, account_id TEXT NOT NULL,
+            target_id TEXT, upstream_model TEXT, created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO image_tasks (task_id, group_id, account_id, created_at, expires_at)
+         VALUES ('task_keep', 'g20', 'a20', ?, ?)",
+    )
+    .bind(now)
+    .bind(now + 600)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '19' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let reopened = akhub::storage::open(dir.path()).await.unwrap();
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(version, "20");
+
+    // 老行必须原样还在（重建是"建新表 → 拷贝 → 换名"，不是重建数据）。
+    let row =
+        sqlx::query("SELECT group_id, key_digest FROM image_tasks WHERE task_id = 'task_keep'")
+            .fetch_optional(&reopened)
+            .await
+            .unwrap()
+            .expect("v20 迁移不能丢已有任务");
+    let group: String = sqlx::Row::try_get(&row, "group_id").unwrap();
+    let digest: Option<String> = sqlx::Row::try_get(&row, "key_digest").unwrap();
+    assert_eq!(group, "g20");
+    assert!(digest.is_none(), "老任务的摘要只能是空，不能编造");
+
+    // 新主键的形状：同一个 task_id 在另一个分组下可以另存一行，而不是被顶掉。
+    sqlx::query(
+        "INSERT INTO image_tasks (task_id, group_id, account_id, created_at, expires_at)
+         VALUES ('task_keep', 'g_other', 'a_other', ?, ?)",
+    )
+    .bind(now)
+    .bind(now + 600)
+    .execute(&reopened)
+    .await
+    .expect("复合主键必须允许同一个 task_id 分属不同分组");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM image_tasks WHERE task_id = 'task_keep'")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
+    reopened.close().await;
 }

@@ -235,7 +235,15 @@ export function ModelSelectionDialog({
           const payload = cause.payload as
             | { warnings?: SelectionWarning[]; needs_confirm?: SelectionWarning[] }
             | null;
-          setConfirmWarnings(payload?.warnings ?? payload?.needs_confirm ?? []);
+          const warnings = payload?.warnings ?? payload?.needs_confirm ?? [];
+          // 409 不只有"有流量要确认"一种：托管账号（auto_sync）也返回 409，
+          // 但**没有 warnings**。把它也当成二次确认，用户就会看到一个一条警告
+          // 都没有的确认框，点"仍然停用"再撞一次同样的 409，永远出不去。
+          if (warnings.length > 0) {
+            setConfirmWarnings(warnings);
+          } else {
+            toast.error(cause.message);
+          }
           return false;
         }
         toast.error(cause instanceof Error ? cause.message : "保存失败");
@@ -281,7 +289,10 @@ export function ModelSelectionDialog({
     setQuery("");
     setOnlyEnabled(false);
     setEditing(null);
+    setEditAlias("");
     setAdding(false);
+    setNewUpstream("");
+    setNewAlias("");
     setNotice(null);
     setConfirmWarnings(null);
     conflictRetried.current = false;
@@ -289,6 +300,33 @@ export function ModelSelectionDialog({
     void load();
     void loadGroupNames();
   }, [open, accountId, forgetDraft, load, loadGroupNames]);
+
+  /**
+   * 弹窗还在、但组件被整个卸载时（浏览器后退 / ⌘K 跳转 / 切页）的兜底补交。
+   *
+   * `Modal` 的 dirty 守卫只覆盖它自己的关闭动作（X / Esc / 点遮罩）。hash 路由
+   * 一变化，`Accounts` 连同这个弹窗一起被卸载，`pending` ref 随之销毁——既没有
+   * 弹窗也没有补交，用户的勾选与改名就无声消失了。v1.1.14 在这里是"尽力补交"，
+   * 不能反而退化成"保证不保存"。
+   *
+   * 只在**卸载**时补交，正常关闭仍走「保存」/脏数据确认：那时组件还活着，
+   * 走这里会把用户明确放弃的改动又写回去。
+   */
+  useEffect(() => {
+    return () => {
+      const changes: ModelChange[] = [...pending.current.entries()].map(
+        ([upstream_model, change]) => ({ upstream_model, ...change }),
+      );
+      if (changes.length === 0) return;
+      pending.current.clear();
+      // 卸载后没有人能看 toast，失败只能记日志：这条路已经是"无路可退"的兜底。
+      void api
+        .applyAccountModels(accountIdRef.current, changes, false)
+        .catch((cause) => {
+          console.warn("卸载时补交模型改动失败", cause);
+        });
+    };
+  }, []);
 
   const existingNames = useMemo(() => {
     const names = new Set<string>();
@@ -509,7 +547,13 @@ export function ModelSelectionDialog({
         // 关闭前不补交草稿：写只发生在「保存」。带着未保存的改动关窗时，
         // Modal 的 dirty 守卫会先问一次"放弃未保存的修改？"。
         onClose={onClose}
-        dirty={draftCount > 0}
+        // 草稿之外，"正在输入但还没点「加入待保存」"的内容同样算脏：
+        // 行内改名框与添加模型表单填了一半就关窗，输入会无声消失。
+        dirty={
+          draftCount > 0 ||
+          (editing !== null && editAlias.trim() !== "") ||
+          (adding && (newUpstream.trim() !== "" || newAlias.trim() !== ""))
+        }
         title={account ? `模型管理 · ${account.name}` : "模型管理"}
         className="model-selection-modal"
         footer={
@@ -525,7 +569,10 @@ export function ModelSelectionDialog({
             <Button
               variant="primary"
               onClick={() => void commitDraft()}
-              disabled={draftCount === 0 || rowBusy}
+              // managed 时服务端一律拒绝（自动同步接管了目录），按钮可以点
+              // 只是让用户白撞一次 409——账号可能在弹窗开着的这段时间里被
+              // 另一处打开自动同步，所以这个判断必须放在渲染里而不是打开时。
+              disabled={draftCount === 0 || rowBusy || managed}
               title={draftCount === 0 ? "没有未保存的改动" : "保存本次改动"}
             >
               {saving ? "保存中…" : "保存"}
@@ -601,7 +648,7 @@ export function ModelSelectionDialog({
             <Button
               size="sm"
               onClick={() => setAllVisible(true)}
-              disabled={managed || rowBusy || allSelected}
+              disabled={managed || rowBusy || allSelected || selectable.length === 0}
               title={`把当前列表里的 ${selectable.length} 个模型全部启用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
             >
               全选
@@ -609,7 +656,7 @@ export function ModelSelectionDialog({
             <Button
               size="sm"
               onClick={() => setAllVisible(false)}
-              disabled={managed || rowBusy || allCleared}
+              disabled={managed || rowBusy || allCleared || selectable.length === 0}
               title={`把当前列表里的 ${selectable.length} 个模型全部停用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
             >
               全不选

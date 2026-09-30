@@ -1179,3 +1179,206 @@ async fn image_tasks_do_not_cross_groups() {
     assert_eq!(error["error"]["code"], "image_task_not_found");
     assert!(upstream.seen.lock().unwrap().is_empty());
 }
+
+/// 过期的定位记录在**读取时**就当作不存在（§14.9）。
+///
+/// 后台清理是 600 秒一轮，只靠它会让记录在到期后多存活最多 10 分钟；文档承诺
+/// 的是"过期就按任务不存在处理"。这条用例把 expires_at 放到过去，验证惰性判定。
+#[tokio::test]
+async fn an_expired_image_task_is_404_without_touching_upstream() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let now = akhub::storage::now_unix();
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "expired-task".into(),
+            group_id: akhub.group_id.clone(),
+            account_id: wired.account_id.clone(),
+            target_id: None,
+            upstream_model: None,
+            key_digest: None,
+            created_at: now - 7200,
+            expires_at: now - 60,
+        })
+        .await
+        .unwrap();
+
+    let response = client()
+        .get(format!("{}/v1/images/tasks/expired-task", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "image_task_not_found");
+    assert!(upstream.seen.lock().unwrap().is_empty(), "过期任务不打上游");
+}
+
+/// 管理员停用一把 Key 之后，此前由它接单的任务不能继续拿它发请求（§4.2.1）。
+///
+/// 轮询是**直连**路径，绕过了调度器的 select_key——那把 Key 的 enabled 过滤
+/// 必须在这里自己做，否则停用一把泄露的 Key 起不到任何作用。
+#[tokio::test]
+async fn polling_refuses_a_disabled_key_and_falls_back_to_an_enabled_one() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    // 定位记录指向这把 Key，然后把它停用。
+    let now = akhub::storage::now_unix();
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "task_up_1".into(),
+            group_id: akhub.group_id.clone(),
+            account_id: wired.account_id.clone(),
+            target_id: None,
+            upstream_model: None,
+            key_digest: Some(wired.credential_digest.clone()),
+            created_at: now,
+            expires_at: now + 600,
+        })
+        .await
+        .unwrap();
+    let keys = akhub
+        .state
+        .store
+        .list_account_key_rows(&wired.account_id)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    // 原样重写同一把 Key，只把 enabled 关掉（摘要不变，定位记录仍指向它）。
+    let stored = keys[0].clone();
+    akhub
+        .state
+        .store
+        .replace_account_keys(
+            &wired.account_id,
+            &[akhub::storage::store::AccountKeyWrite {
+                id: stored.id.clone(),
+                label: stored.label.clone(),
+                sealed_key: stored.sealed_key.clone(),
+                credential_digest: wired.credential_digest.clone(),
+                limits: stored.limits,
+                enabled: false,
+            }],
+        )
+        .await
+        .unwrap();
+    akhub.state.reload_credentials().await.unwrap();
+
+    // 账号只剩一把停用的 Key：轮询必须明确失败，绝不能拿它发出去。
+    let response = client()
+        .get(format!("{}/v1/images/tasks/task_up_1", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+    assert!(
+        upstream.seen.lock().unwrap().is_empty(),
+        "停用的 Key 绝不能被用来发轮询请求"
+    );
+}
+
+/// 同一个上游任务 ID 在两个分组下必须各存各的：后下单的分组不能覆盖先方
+/// 的定位行（§14.9、§23.4）。
+///
+/// 上游任务 ID 只在**上游站点**内唯一，而多个分组完全可能指向同一个站点。
+/// 按单列 task_id 做主键时，后写会 REPLACE 掉先方那一行，先方轮询永久 404，
+/// 而任务还在上游跑——客户端多半会重新下单，真金白银重复扣费。
+#[tokio::test]
+async fn the_same_task_id_can_belong_to_two_groups_without_overwriting() {
+    let (upstream_url, upstream) = spawn_async_image_upstream().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "account-a",
+            &upstream_url,
+            Protocol::OpenAiChat,
+            "image-model",
+            "image-model-upstream",
+            50,
+        ),
+    )
+    .await;
+
+    let now = akhub::storage::now_unix();
+    // 本组的定位行。
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "shared-task".into(),
+            group_id: akhub.group_id.clone(),
+            account_id: wired.account_id.clone(),
+            target_id: None,
+            upstream_model: None,
+            key_digest: None,
+            created_at: now,
+            expires_at: now + 600,
+        })
+        .await
+        .unwrap();
+    // 另一个分组在同一个上游站点上拿到了同一个任务 ID：这一行不该顶掉上面那行。
+    akhub
+        .state
+        .store
+        .upsert_image_task(&akhub::storage::store::ImageTaskRow {
+            task_id: "shared-task".into(),
+            group_id: "grp_someone_else".into(),
+            account_id: "acc_someone_else".into(),
+            target_id: None,
+            upstream_model: None,
+            key_digest: None,
+            created_at: now,
+            expires_at: now + 600,
+        })
+        .await
+        .unwrap();
+
+    // 本组的轮询必须仍然命中本组那一行、正常打到上游。
+    let response = client()
+        .get(format!("{}/v1/images/tasks/shared-task", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        api_key_of(&seen[0].headers).as_deref(),
+        Some(wired.api_key.as_str()),
+        "轮询必须回到本组接单的那个账号"
+    );
+}

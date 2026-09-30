@@ -62,7 +62,14 @@ pub async fn task_status(
         }
     };
 
-    let row = match state.store.image_task(&task_id).await {
+    // 分组是查询条件的一部分："查不到"、"已过期"与"不是本组的任务"在这里
+    // 就是同一件事，任务 ID 不会成为跨组探测工具（§26.8）。过期也在这里判，
+    // 不依赖 600 秒一轮的后台清理（§14.9）。
+    let row = match state
+        .store
+        .image_task(&group.group.id, &task_id, started_unix)
+        .await
+    {
         Ok(Some(row)) => row,
         Ok(None) => {
             return missing_task(&state, &group.group.id, &request_id, started_unix, started);
@@ -75,10 +82,6 @@ pub async fn task_status(
                 .into_response();
         }
     };
-    // 分组不匹配与"查不到"返回同一个答案：任务 ID 不该成为跨组探测工具（§26.8）。
-    if row.group_id != group.group.id {
-        return missing_task(&state, &group.group.id, &request_id, started_unix, started);
-    }
     let Some(target) = config.target_by_account(&row.account_id).cloned() else {
         // 账号被删、或已经不再被任何分组引用：这个任务无处可问。
         return missing_task(&state, &group.group.id, &request_id, started_unix, started);
@@ -91,11 +94,14 @@ pub async fn task_status(
     // 多 Key 账号上这可能问出"没这个任务"，但直接拒绝会让"上游根本不按 Key
     // 隔离任务"的站点整条不可用。两者相权，先试一次更划算。
     let credentials = state.runtime.credentials.current();
+    // 两处都必须只要**启用中**的 Key：管理员停用一把泄露的 Key 之后，此前由它
+    // 接单的任务不能继续拿它发请求（§4.2.1 的不变量 A）。这条直连路径绕过了
+    // 调度器的 select_key，所以过滤要在这里自己做。
     let credential = row
         .key_digest
         .as_deref()
-        .and_then(|digest| credentials.by_digest(&row.account_id, digest))
-        .or_else(|| credentials.keys_of(&row.account_id).first())
+        .and_then(|digest| credentials.enabled_by_digest(&row.account_id, digest))
+        .or_else(|| credentials.first_enabled(&row.account_id))
         .cloned();
     drop(credentials);
     if credential.is_none() {
@@ -140,9 +146,13 @@ pub async fn task_status(
         }
     };
 
-    let url = match upstream::build_url_with_suffix(
+    // 任务 ID 是**上游签发、下游可控**的字符串，必须整段编码后再拼 URL：
+    // 直接插进路径会让 `..%2F..%2F...` 这类值被 WHATWG 折叠成另一个上游路由，
+    // 网关会带着本账号的凭据去请求它（§23.4）。
+    let url = match upstream::build_url_with_segments(
         &target.account.base_url,
-        &format!("v1/images/tasks/{task_id}"),
+        "v1/images/tasks",
+        [task_id.as_str()],
     ) {
         Ok(url) => url,
         Err(error) => {

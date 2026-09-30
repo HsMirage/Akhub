@@ -349,8 +349,13 @@ CREATE INDEX IF NOT EXISTS idx_states_expiry ON response_states(expires_at);
 -- 异步生图任务的定位记录（§14.9）。客户端轮询时手里拿的是**上游**的任务 ID，
 -- 必须回到当初接单的那个账号去问——别的账号根本不知道这个任务。这里只存定位
 -- 信息，不存任务结果：结果留在上游，过期后按"任务不存在"处理。
+--
+-- 主键是 (group_id, account_id, task_id)，不是单独的 task_id：上游签发的任务 ID
+-- 只在**上游站点**内唯一，而多个分组完全可以指向同一个上游站点。按 task_id 单列
+-- 做主键时，后下单的分组会覆盖先下单分组的定位行，先方轮询就变成永久 404——
+-- 任务还在上游跑，客户端多半会重新下单，真金白银重复扣费（§14.9、§23.4）。
 CREATE TABLE IF NOT EXISTS image_tasks (
-    task_id        TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
     group_id       TEXT NOT NULL,
     account_id     TEXT NOT NULL,
     target_id      TEXT,
@@ -359,7 +364,8 @@ CREATE TABLE IF NOT EXISTS image_tasks (
     -- 凭据隔离：换一把 Key 去问同一个任务 ID，它只会当作不存在。
     key_digest     TEXT,
     created_at     INTEGER NOT NULL,
-    expires_at     INTEGER NOT NULL
+    expires_at     INTEGER NOT NULL,
+    PRIMARY KEY (group_id, account_id, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_image_tasks_expiry ON image_tasks(expires_at);
