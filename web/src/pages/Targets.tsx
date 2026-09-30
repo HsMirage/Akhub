@@ -145,6 +145,11 @@ export function Targets({
           });
 
         // 同优先级构成一层；层内权重取 score^8，与调度器的加权随机一致。
+        //
+        // 停用的账号 / 目标权重是 0，不占分母：调度器在资格判定里直接把
+        // Disabled 挡在候选之外（`check_eligibility`），它们的真实占比就是 0%，
+        // 留着它们会让"预计分配"变成一个根本拿不到流量的百分比，同层其它
+        // 账号加起来也到不了 100%（§6.5）。
         const layerPriorities = [...new Set(raw.map((item) => item.target.priority))].sort(
           (a, b) => b - a,
         );
@@ -152,13 +157,16 @@ export function Targets({
         for (const priority of layerPriorities) {
           const layer = raw.filter((item) => item.target.priority === priority);
           const weights = layer.map((item) =>
-            Math.max(item.target.score?.total ?? 1, 0.01) ** 8,
+            isSchedulable(item.target, item.account)
+              ? Math.max(item.target.score?.total ?? 1, 0.01) ** 8
+              : 0,
           );
-          const total = weights.reduce((sum, value) => sum + value, 0) || 1;
+          // 整层都停用时没有分母可言：每一行都是 0%，不是 NaN。
+          const total = weights.reduce((sum, value) => sum + value, 0);
           layer.forEach((item, index) => {
             shares.set(
               raw.indexOf(item),
-              (weights[index] ?? 0) / total,
+              total > 0 ? (weights[index] ?? 0) / total : 0,
             );
           });
         }
@@ -360,10 +368,26 @@ export function Targets({
   );
 }
 
+/**
+ * 这个目标此刻会不会真的被调度器选中。
+ *
+ * 与调度器资格判定里的 Disabled 分支一致（`src/routing/mod.rs`）：账号停用或
+ * 目标停用都不进候选。界面上的"预计分配"必须用同一把尺子。
+ */
+function isSchedulable(target: DispatchTarget, account: Account | undefined): boolean {
+  return target.enabled && account?.enabled !== false;
+}
+
+/**
+ * 这一行是不是"异常"。
+ *
+ * **主动关闭不算异常**：停用的账号 / 目标是管理员按自己的意愿让它退出调度，
+ * 不是需要处理的问题。把它算进卡片头部的"xx 个异常"，会让一张卡片永远挂着
+ * 警示徽标，真正该看的冷却、倍率未知反而被淹掉（§6.5）。
+ */
 function targetHasIssue(target: DispatchTarget, account: Account | undefined): boolean {
+  if (!isSchedulable(target, account)) return false;
   return (
-    !target.enabled ||
-    account?.enabled === false ||
     target.status !== "active" ||
     account?.multiplier_status !== "known" ||
     target.pause_reason !== null
