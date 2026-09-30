@@ -147,7 +147,7 @@ function Console({
     () => onSignedOut("登录状态已过期，请重新登录。"),
     [onSignedOut],
   );
-  const { data, loading, error, truncated, lastUpdated, refresh } = useData(
+  const { data, loading, error, truncated, lastUpdated, refresh, patch, refreshSoon } = useData(
     true,
     handleUnauthorized,
   );
@@ -450,9 +450,11 @@ function Console({
                 {route === "overview" && (
                   <Overview data={data} navigate={navigate} />
                 )}
-                {route === "groups" && <Groups data={data} refresh={refresh} />}
+                {route === "groups" && (
+              <Groups data={data} refresh={refresh} refreshSoon={refreshSoon} />
+            )}
                 {route === "accounts" && (
-                  <Accounts data={data} refresh={refresh} />
+                  <Accounts data={data} refresh={refresh} patch={patch} refreshSoon={refreshSoon} />
                 )}
                 {route === "targets" && (
                   <Targets data={data} navigate={navigate} />
@@ -462,7 +464,7 @@ function Console({
                 )}
                 {route === "cost" && <Cost data={data} navigate={navigate} />}
                 {route === "settings" && (
-                  <SettingsPage data={data} refresh={refresh} />
+                  <SettingsPage data={data} patch={patch} refreshSoon={refreshSoon} />
                 )}
               </>
             )}

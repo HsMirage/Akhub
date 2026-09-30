@@ -1,7 +1,7 @@
 /** 设置页：可编辑系统设置、管理员账号、版本信息与配置备份恢复。 */
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api } from "../lib/api";
-import type { Data } from "../lib/store";
+import type { Data, DataPatch } from "../lib/store";
 import type { NewApiSite, Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
 import { formatBytes, humanizeSeconds } from "../lib/format";
 import { MIN_PASSWORD_LENGTH, USERNAME_STORAGE_KEY } from "../lib/policy";
@@ -109,10 +109,12 @@ function buildSettingsPatch(form: SettingsForm, settings: Settings): SettingsPat
 
 export function Settings({
   data,
-  refresh,
+  patch,
+  refreshSoon,
 }: {
   data: Data;
-  refresh: () => Promise<unknown>;
+  patch: DataPatch;
+  refreshSoon: () => void;
 }) {
   const toast = useToast();
   const settings = data.settings;
@@ -184,7 +186,10 @@ export function Settings({
       } else {
         toast.success("系统设置已保存并立即生效");
       }
-      await refresh();
+      // 写接口返回的就是保存后的设置：本地直接采纳，"未保存"提示不会
+      // 因为等待全量刷新而虚留一下。其余视图交给后台刷新。
+      patch((current) => ({ ...current, settings: updated }));
+      refreshSoon();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "保存设置失败");
     } finally {
@@ -355,7 +360,7 @@ export function Settings({
       setImportPassword("");
       setImportFile(null);
       if (fileInput.current) fileInput.current.value = "";
-      await refresh();
+      refreshSoon();
       setConfirmImport(false);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "恢复失败");

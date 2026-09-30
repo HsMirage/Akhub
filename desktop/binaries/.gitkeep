@@ -1,0 +1,5 @@
+# 这个目录在构建时存放 Tauri externalBin 需要的 sidecar：
+#   binaries/akhub-<target-triple>       （Windows 还要加 .exe）
+#
+# 它们由 desktop/prepare-sidecar.sh 从已编译好的 akhub 二进制复制而来，
+# 因为体积大（每个平台约 20 MB）而不进版本库。

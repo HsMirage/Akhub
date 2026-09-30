@@ -1,0 +1,6 @@
+# 桌面端是独立 crate，构建产物必须留在 desktop/target，绝不能污染仓库根的
+# target/（服务端构建正在用同一个目录，抢文件锁会让两边都卡住）。
+
+# target-dir 是相对本文件所在目录解析的，因此等价于 desktop/target。
+[build]
+target-dir = "target"

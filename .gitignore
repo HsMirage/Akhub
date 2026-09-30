@@ -18,6 +18,18 @@ web/tsconfig.tsbuildinfo
 /诊断报告-*.md
 /review
 
+# ------------------------------------------------------------ 桌面端（desktop/）
+# 独立 crate：构建产物必须留在 desktop/target，不碰仓库根的 /target（服务端在用）。
+/desktop/target
+# Tauri CLI 的 npm 依赖。
+/desktop/node_modules
+# sidecar 二进制由 desktop/prepare-sidecar.sh 从服务端构建产物复制而来：约 20 MB，
+# 且每个平台一份，不进版本库（CI 与本地都在构建前生成）。
+/desktop/binaries/*
+!/desktop/binaries/.gitkeep
+# Tauri 每次构建都会重新生成的 ACL 清单与 JSON schema。
+/desktop/gen/schemas
+
 # ---------------------------------------------------------------- 本地文件
 # 浏览器自动化快照与本地编辑器/代理配置。
 /.playwright-mcp

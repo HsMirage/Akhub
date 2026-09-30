@@ -152,8 +152,12 @@ cargo run --release
 3. **配置模型**：打开账号的「模型管理」，点「获取上游模型」并启用要用的模型。
    每行的**对外名**就是下游看到的模型名，留空则跟随上游真名；把不同上游站的同一个模型
    设成相同对外名即可自动归并。模型启用后会自动生成调度目标，不需要手工绑定。
-   勾选、改名与删除都只改本地草稿，底部会显示还有几项未保存——点右下角「保存」才
-   一次性提交（服务端只调和一遍目标）。带着未保存的改动关窗会先确认一次。
+
+   最左列是**选择列**：勾上几行（表头可全选）之后，表格上方会出现「批量启用 /
+   批量停用 / 批量删除」；单个模型的启用与停用点「状态」列里的状态徽标。勾选、改名
+   与删除都只改本地草稿，底部会显示还有几项未保存——点右下角「保存」才一次性提交
+   （服务端只调和一遍目标）。带着未保存的改动关窗会先确认一次；**删除不再弹二次
+   确认**，误删点底部的「撤销移除」即可还原。
 
 ---
 
@@ -317,6 +321,27 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 
 容器侧记得给足停止宽限（compose 的 `stop_grace_period` 或 `docker run --stop-timeout` ≥ 200 秒），
 否则 Docker 默认的 10 秒会强杀在途的长流式请求。
+
+---
+
+## 桌面端（Windows / macOS）
+
+不想开终端、也不想操心端口的话，可以直接装桌面应用：双击打开就是同一个管理后台。
+
+- 应用在 `127.0.0.1` 上自动挑一个空闲端口拉起内置的 akhub（sidecar），数据目录固定在
+  系统应用数据目录下（macOS 是 `~/Library/Application Support/com.hsmirage.akhub/data`，
+  Windows 是 `%APPDATA%\com.hsmirage.akhub\data`），窗口打开的就是
+  `http://127.0.0.1:<port>/admin`，与管理后台的功能完全一致。
+- 关掉窗口时 sidecar 一起退出，不会留下后台进程；端口每次启动都可能不同，不需要手工配置，
+  也不会和本机已有的 akhub / 其它服务抢端口。
+- 安装包与裸二进制挂在同一个 Release 页面：`akhub-desktop-<tag>-macos-aarch64.dmg`、
+  `akhub-desktop-<tag>-macos-x86_64.dmg`、`akhub-desktop-<tag>-windows-x86_64.msi`、
+  `akhub-desktop-<tag>-windows-x86_64-setup.exe`（NSIS 安装器）。
+
+安装包没有做代码签名：macOS 首次打开要右键点图标选「打开」
+（或 `xattr -dr com.apple.quarantine /Applications/Akhub.app`），Windows 首次运行要在
+SmartScreen 弹窗里点「更多信息 → 仍要运行」。构建、调试与打包的完整说明见
+[desktop/README.md](desktop/README.md)。
 
 ---
 

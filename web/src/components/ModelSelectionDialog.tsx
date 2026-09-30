@@ -7,11 +7,19 @@
  * - 多个账号填成同一个名称，会自动合并为一个模型；
  * - 账号级「隐藏原始模型名」打开后，只暴露填写了下游模型名的模型。
  *
- * 性能上只有两条规矩，但都是必需的：
+ * 交互上只有三条规矩，但都是必需的：
  * 1. 勾选 / 改名 / 删除只改**本地草稿**，点右下角「保存」才合并成**一次**
  *    `/models/apply`。逐行 POST 会让服务端每次勾选都重调和一遍目标、重建一遍
  *    配置快照，几百个模型时界面就会卡住（`/models/apply` 一次请求只调和一遍）。
  * 2. 行组件用 `memo` 包起来，勾一个复选框只重渲染那一行，而不是整张表。
+ * 3. **最左列是选择列，不是启用列**：勾上它只进入“已选 N 项”，供批量启用 /
+ *    批量停用 / 批量删除使用；单个模型的启用与停用由「状态」列里那个可点击的
+ *    状态徽标承担。选择是纯界面状态、不进草稿——所以“全选”之后一定跟着一排
+ *    批量操作，不会出现“勾完不知道能干什么”。
+ *
+ * 删除**不再弹二次确认**：它和勾选一样只是草稿，点「保存」之前那一行都还在
+ * 服务端的目录里，反悔可以点「撤销移除」。真正会被拦下的是“最近 24 小时有
+ * 流量的模型被停用 / 删除”，那是服务端 409 的安全阀，不是本地确认框。
  *
  * 为什么不做"防抖自动提交"（§16.8 的 2026-09-29 修订）：连点复选框时每隔
  * 350ms 就会发一次写请求，而每次写都会推进配置版本、重建配置快照。列表越长
@@ -111,9 +119,12 @@ export function ModelSelectionDialog({
   const [adding, setAdding] = useState(false);
   const [newUpstream, setNewUpstream] = useState("");
   const [newAlias, setNewAlias] = useState("");
-  const [pendingDelete, setPendingDelete] = useState<AccountModel | null>(null);
-  /** 有流量模型被停用/删除时的二次确认（§16.3）。 */
+  /** 有流量模型被停用/删除时的二次确认（§16.3，服务端 409 驱动，不是本地确认框）。 */
   const [confirmWarnings, setConfirmWarnings] = useState<SelectionWarning[] | null>(null);
+  /** 左列选择集：纯界面状态，只服务批量操作，**不进草稿**。 */
+  const [selection, setSelection] = useState<ReadonlySet<string>>(() => new Set());
+  /** 本次草稿里被移除的行，供「撤销移除」用（删除不再弹二次确认）。 */
+  const [removedRows, setRemovedRows] = useState<AccountModel[]>([]);
 
   /** 本地草稿：上游模型名 → 待保存的改动。只有点「保存」时才提交。 */
   const pending = useRef<Map<string, PendingChange>>(new Map());
@@ -192,10 +203,15 @@ export function ModelSelectionDialog({
         const list = await api.applyAccountModels(requestedFor, changes, force);
         if (accountIdRef.current === requestedFor) setRows(list);
         if (confirmWarningsRef.current !== null) setConfirmWarnings(null);
+        setRemovedRows([]);
         toast.success(`已保存 ${changes.length} 项模型改动`);
         // 写已经成功了：刷新数据失败不能算作这次保存失败，否则下面的 catch 会把
         // 存好的改动又塞回草稿，用户再点一次「保存」就是重复提交。
-        await onChangedRef.current().catch(() => undefined);
+        //
+        // 而且这里**不等**它：全局数据（调度目标 / 概览）在后台追上即可，
+        // 让「保存中…」一直挂到 6 个列表请求回来，正是"保存模型卡一下"的
+        // 来源。对话框自己的目录已经用写接口返回的真值更新过了。
+        void onChangedRef.current().catch(() => undefined);
         return true;
       } catch (cause) {
         // 失败一律把改动放回草稿：用户刚点的是「保存」，界面不能在这个时候
@@ -281,6 +297,8 @@ export function ModelSelectionDialog({
   const forgetDraft = useCallback(() => {
     pending.current.clear();
     setDraftCount(0);
+    setSelection(new Set());
+    setRemovedRows([]);
   }, []);
 
   useEffect(() => {
@@ -349,10 +367,23 @@ export function ModelSelectionDialog({
       });
   }, [rows, onlyEnabled, query]);
 
-  /** 当前列表里可勾选的行：上游已消失的行不能勾，全选 / 全不选也只作用于它们。 */
+  /** 当前列表里可操作的行：上游已消失的行不能选、也不能批量改。 */
   const selectable = useMemo(() => visible.filter((row) => !row.missing), [visible]);
-  const allSelected = selectable.length > 0 && selectable.every((row) => row.selected);
-  const allCleared = selectable.length > 0 && selectable.every((row) => !row.selected);
+  /**
+   * 选择列的实际内容。
+   *
+   * 选择集按上游模型名存，但渲染与批量操作都只认“现在还在列表里”的行——
+   * 被删掉的行即使名字还留在选择集里也不该再算数。
+   */
+  const selectedRows = useMemo(
+    () => selectable.filter((row) => selection.has(row.upstream_model)),
+    [selectable, selection],
+  );
+  const selectedNames = useMemo(
+    () => new Set(selectedRows.map((row) => row.upstream_model)),
+    [selectedRows],
+  );
+  const allVisibleSelected = selectable.length > 0 && selectedRows.length === selectable.length;
   /**
    * 有服务端动作在途：行内的勾选 / 改名 / 删除一律锁住。
    *
@@ -374,13 +405,16 @@ export function ModelSelectionDialog({
   const enabledCount = rows.filter((row) => row.selected).length;
   const renamedCount = rows.filter(hasDownstreamName).length;
   const blockedCount = hideOriginal ? rows.filter((row) => !hasDownstreamName(row)).length : 0;
-  const deleteTargets = pendingDelete
-    ? data.targets.filter(
-        (target) =>
-          target.account_id === account?.id &&
-          target.upstream_model === pendingDelete.upstream_model,
-      ).length
-    : 0;
+  /** 被移除的行数：底部状态行与「撤销移除」都看它。 */
+  const removedCount = removedRows.length;
+  /** 这些移除会连带撤下多少个调度目标：状态行用它把影响说清楚。 */
+  const removedTargets = useMemo(() => {
+    if (removedRows.length === 0) return 0;
+    const names = new Set(removedRows.map((row) => row.upstream_model));
+    return data.targets.filter(
+      (target) => target.account_id === accountId && names.has(target.upstream_model),
+    ).length;
+  }, [removedRows, data.targets, accountId]);
 
   const beginEdit = useCallback((upstreamModel: string) => {
     setEditing(upstreamModel);
@@ -451,35 +485,111 @@ export function ModelSelectionDialog({
   );
 
   /**
-   * 全选 / 全不选：作用于**当前列表里的行**（受搜索与「只看已启用」筛选），
-   * 上游已消失的行跳过。和单个勾选一样只改本地草稿，点「保存」才提交。
+   * 批量把若干行设成同一个启用状态。
+   *
+   * 走的是和单个状态切换完全相同的草稿路径（同一个 pending 映射），点「保存」
+   * 才提交；一次批量动作只推进一次草稿计数，不额外发任何请求。
    */
-  const setAllVisible = useCallback(
-    (selected: boolean) => {
-      const changed = selectable.filter((row) => row.selected !== selected);
-      if (changed.length === 0) return;
-      const names = new Set(changed.map((row) => row.upstream_model));
+  const setRowsEnabled = useCallback(
+    (names: ReadonlySet<string>, selected: boolean) => {
+      if (names.size === 0) return;
       setRows((current) =>
         current.map((row) => (names.has(row.upstream_model) ? { ...row, selected } : row)),
       );
-      for (const row of changed) {
+      let touched = false;
+      for (const row of rows) {
+        if (!names.has(row.upstream_model) || row.selected === selected) continue;
         pending.current.set(row.upstream_model, {
           ...(pending.current.get(row.upstream_model) ?? {}),
           selected,
         });
+        touched = true;
       }
+      if (!touched) return;
       setDraftCount(pending.current.size);
       conflictRetried.current = false;
+    },
+    [rows],
+  );
+
+  /** 单独勾选左列的选择框。纯界面状态，不进草稿、不推进配置版本。 */
+  const toggleSelected = useCallback((upstreamModel: string, on: boolean) => {
+    setSelection((current) => {
+      const next = new Set(current);
+      if (on) next.add(upstreamModel);
+      else next.delete(upstreamModel);
+      return next;
+    });
+  }, []);
+
+  /** 表头复选框：全选 / 取消全选**当前列表里的行**（受搜索与筛选影响）。 */
+  const selectAllVisible = useCallback(
+    (on: boolean) => {
+      setSelection((current) => {
+        const next = new Set(current);
+        for (const row of selectable) {
+          if (on) next.add(row.upstream_model);
+          else next.delete(row.upstream_model);
+        }
+        return next;
+      });
     },
     [selectable],
   );
 
-  /** 删除也只记草稿：点「保存」之前这一行都还在服务端的目录里。 */
-  const requestDelete = useCallback((upstreamModel: string) => {
-    setRows((current) => current.filter((row) => row.upstream_model !== upstreamModel));
-    queueDraft(upstreamModel, { delete: true });
-    setPendingDelete(null);
-  }, [queueDraft]);
+  const clearSelection = useCallback(() => setSelection(new Set()), []);
+
+  /**
+   * 移除若干行。**只记草稿、不弹二次确认**：点「保存」之前这些行都还在服务端
+   * 的目录里，反悔可以点「撤销移除」，或者直接关掉弹窗放弃整批改动。
+   */
+  const removeRows = useCallback((rowsToRemove: AccountModel[]) => {
+    if (rowsToRemove.length === 0) return;
+    const names = new Set(rowsToRemove.map((row) => row.upstream_model));
+    setRows((current) => current.filter((row) => !names.has(row.upstream_model)));
+    setRemovedRows((current) => [
+      ...current.filter((row) => !names.has(row.upstream_model)),
+      ...rowsToRemove,
+    ]);
+    setSelection((current) => {
+      const next = new Set(current);
+      for (const name of names) next.delete(name);
+      return next;
+    });
+    for (const name of names) {
+      pending.current.set(name, {
+        ...(pending.current.get(name) ?? {}),
+        delete: true,
+      });
+    }
+    setDraftCount(pending.current.size);
+    conflictRetried.current = false;
+    setNotice(
+      rowsToRemove.length === 1
+        ? `已从目录移除「${rowsToRemove[0]!.upstream_model}」，点「保存」后生效；反悔可以点「撤销移除」。`
+        : `已从目录移除 ${rowsToRemove.length} 个模型，点「保存」后生效；反悔可以点「撤销移除」。`,
+    );
+  }, []);
+
+  /** 撤销本次草稿里的全部移除：行回到列表，草稿里的 delete 标记一并清掉。 */
+  const undoRemove = useCallback(() => {
+    if (removedRows.length === 0) return;
+    const restored = removedRows;
+    setRows((current) => [...current, ...restored]);
+    for (const row of restored) {
+      const change = pending.current.get(row.upstream_model);
+      if (!change) continue;
+      if (change.alias === undefined && change.selected === undefined) {
+        pending.current.delete(row.upstream_model);
+      } else {
+        delete change.delete;
+        pending.current.set(row.upstream_model, change);
+      }
+    }
+    setRemovedRows([]);
+    setDraftCount(pending.current.size);
+    setNotice(`已恢复 ${restored.length} 个模型。`);
+  }, [removedRows]);
 
   const refreshUpstream = async () => {
     if (!account) return;
@@ -563,7 +673,14 @@ export function ModelSelectionDialog({
                 ? "加载中…"
                 : `${rows.length} 个模型 · ${enabledCount} 个启用 · ${renamedCount} 个已设下游名`}
               {blockedCount > 0 && ` · ${blockedCount} 个未设下游名且被隐藏`}
+              {removedCount > 0 &&
+                ` · 已移除 ${removedCount} 个模型（连带撤下 ${removedTargets} 个调度目标）`}
             </span>
+            {removedCount > 0 && (
+              <Button size="sm" variant="ghost" onClick={undoRemove} disabled={rowBusy}>
+                撤销移除
+              </Button>
+            )}
             {draftCount > 0 && <span className="dirty-badge">{draftCount} 项未保存</span>}
             <div className="spacer" />
             <Button
@@ -642,25 +759,6 @@ export function ModelSelectionDialog({
               />
               只看已启用
             </label>
-            {/* 全选 / 全不选只作用于当前筛选出来的行：搜索框里打了字还"全选"，
-                用户期待的是眼前这一批。所以标题里把范围说清楚，别让人以为
-                改到了看不见的那些模型。 */}
-            <Button
-              size="sm"
-              onClick={() => setAllVisible(true)}
-              disabled={managed || rowBusy || allSelected || selectable.length === 0}
-              title={`把当前列表里的 ${selectable.length} 个模型全部启用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
-            >
-              全选
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => setAllVisible(false)}
-              disabled={managed || rowBusy || allCleared || selectable.length === 0}
-              title={`把当前列表里的 ${selectable.length} 个模型全部停用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
-            >
-              全不选
-            </Button>
             <span className="spacer" />
             {!managed && (
               <Button
@@ -702,6 +800,44 @@ export function ModelSelectionDialog({
               </Button>
             )}
           </div>
+
+          {/* 选择列的落点：勾了行之后**一定**有动作可做，这正是「全选」的意义。
+              批量动作和单个动作一样只改草稿，点「保存」才提交。 */}
+          {selectedRows.length > 0 && (
+            <div className="model-batch-bar" role="toolbar" aria-label="批量操作">
+              <span className="tabular model-batch-count">已选 {selectedRows.length} 个模型</span>
+              <Button
+                size="sm"
+                onClick={() => setRowsEnabled(selectedNames, true)}
+                disabled={managed || rowBusy}
+                title="把这批模型设为启用；点「保存」后生效"
+              >
+                批量启用
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => setRowsEnabled(selectedNames, false)}
+                disabled={managed || rowBusy}
+                title="把这批模型设为停用；点「保存」后生效"
+              >
+                批量停用
+              </Button>
+              <Button
+                size="sm"
+                variant="danger"
+                icon={<IconTrash size={13} />}
+                onClick={() => removeRows(selectedRows)}
+                disabled={managed || rowBusy}
+                title="把这批模型从目录移除会连带撤下它们的调度目标；点「保存」后生效，可撤销"
+              >
+                批量删除
+              </Button>
+              <span className="spacer" />
+              <button type="button" className="link-button" onClick={clearSelection}>
+                清除选择
+              </button>
+            </div>
+          )}
 
           {adding && !managed && (
             <div className="model-add-row model-add-row-plain">
@@ -763,11 +899,20 @@ export function ModelSelectionDialog({
               <table className="data model-manager-table model-manager-table-wide">
                 <thead>
                   <tr>
-                    <th aria-label="启用" />
+                    <th className="model-checkbox-cell">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        disabled={managed || rowBusy || selectable.length === 0}
+                        aria-label="全选当前列表"
+                        title={`全选 / 取消全选当前列表里的 ${selectable.length} 个模型（受搜索与「只看已启用」筛选影响）`}
+                        onChange={(event) => selectAllVisible(event.target.checked)}
+                      />
+                    </th>
                     <th>上游模型名</th>
                     <th>下游模型名</th>
                     <th>下游可用名称</th>
-                    <th>状态</th>
+                    <th>状态（点击切换）</th>
                     <th />
                   </tr>
                 </thead>
@@ -800,7 +945,9 @@ export function ModelSelectionDialog({
                           onAliasChange={setEditAlias}
                           onSave={saveEdit}
                           onToggle={toggleRow}
-                          onDelete={setPendingDelete}
+                          selected={selectedNames.has(row.upstream_model)}
+                          onSelect={toggleSelected}
+                          onRemove={removeRows}
                         />
                       );
                     })
@@ -811,25 +958,6 @@ export function ModelSelectionDialog({
           )}
         </div>
       </Modal>
-
-      <ConfirmDialog
-        open={pendingDelete !== null}
-        title="删除模型"
-        danger
-        confirmLabel="删除"
-        message={
-          pendingDelete ? (
-            <>
-              删除「{pendingDelete.upstream_model}」会移除它对应的 {deleteTargets} 个调度目标，
-              下游将无法再用这个模型请求，在途请求会正常完成。
-              <br />
-              删除会在点「保存」时生效。
-            </>
-          ) : null
-        }
-        onClose={() => setPendingDelete(null)}
-        onConfirm={() => pendingDelete && requestDelete(pendingDelete.upstream_model)}
-      />
 
       <ConfirmDialog
         open={confirmWarnings !== null}
@@ -861,7 +989,7 @@ export function ModelSelectionDialog({
 /**
  * 表格里的一行（含展开的改名表单）。
  *
- * `memo` 是必需的：一个账号几百个模型时，勾一个复选框不该让整张表重渲染。
+ * `memo` 是必需的：一个账号几百个模型时，勾一个选择框不该让整张表重渲染。
  * 因此回调都做成“接收上游模型名”的稳定函数，未处于编辑态的行拿到的是
  * 全等的空数组。
  */
@@ -874,6 +1002,7 @@ const ModelRow = memo(function ModelRow({
   isEditing,
   managed,
   locked,
+  selected,
   editAlias,
   mergeSuggestions,
   existingNames,
@@ -882,7 +1011,8 @@ const ModelRow = memo(function ModelRow({
   onAliasChange,
   onSave,
   onToggle,
-  onDelete,
+  onSelect,
+  onRemove,
 }: {
   row: AccountModel;
   renamed: boolean;
@@ -893,6 +1023,8 @@ const ModelRow = memo(function ModelRow({
   managed: boolean;
   /** 有服务端动作在途（保存 / 拉取 / 添加）：行内操作暂时锁住。 */
   locked: boolean;
+  /** 是否被左列的选择框选中。选择只服务批量操作，与「启用 / 停用」是两回事。 */
+  selected: boolean;
   editAlias: string;
   mergeSuggestions: string[];
   existingNames: string[];
@@ -901,7 +1033,8 @@ const ModelRow = memo(function ModelRow({
   onAliasChange: (value: string) => void;
   onSave: () => void;
   onToggle: (upstreamModel: string, selected: boolean) => void;
-  onDelete: (row: AccountModel) => void;
+  onSelect: (upstreamModel: string, on: boolean) => void;
+  onRemove: (rows: AccountModel[]) => void;
 }) {
   return (
     <>
@@ -909,17 +1042,15 @@ const ModelRow = memo(function ModelRow({
         <td className="model-checkbox-cell">
           <input
             type="checkbox"
-            checked={row.selected}
+            checked={selected}
             disabled={managed || row.missing || locked}
-            aria-label={`启用 ${row.upstream_model}`}
+            aria-label={`选择 ${row.upstream_model}`}
             title={
               row.missing
                 ? "上游已消失，重新出现后会自动恢复"
-                : locked
-                  ? "正在与后台交互，稍后再改"
-                  : "启用 / 停用该模型（改完点右下角「保存」）"
+                : "选中它，再用上方的「批量启用 / 批量停用 / 批量删除」"
             }
-            onChange={(event) => onToggle(row.upstream_model, event.target.checked)}
+            onChange={(event) => onSelect(row.upstream_model, event.target.checked)}
           />
         </td>
         <td>
@@ -967,14 +1098,22 @@ const ModelRow = memo(function ModelRow({
               <Badge tone="danger" dot>
                 上游已消失
               </Badge>
-            ) : row.selected ? (
-              <Badge tone="success" dot>
-                已启用
-              </Badge>
             ) : (
-              <Badge tone="neutral" dot>
-                已停用
-              </Badge>
+              <button
+                type="button"
+                className={`model-state-toggle ${row.selected ? "is-on" : "is-off"}`}
+                aria-pressed={row.selected}
+                disabled={managed || locked}
+                title={
+                  locked
+                    ? "正在与后台交互，稍后再改"
+                    : "点击切换启用 / 停用（改完点右下角「保存」）"
+                }
+                onClick={() => onToggle(row.upstream_model, !row.selected)}
+              >
+                <span className="model-state-dot" aria-hidden="true" />
+                {row.selected ? "已启用" : "已停用"}
+              </button>
             )}
             {row.excluded && !row.missing && <Badge tone="warn">你停用过</Badge>}
           </div>
@@ -995,7 +1134,7 @@ const ModelRow = memo(function ModelRow({
               icon={<IconTrash size={13} />}
               title="从目录删除并移除目标"
               aria-label={`删除模型 ${row.upstream_model}`}
-              onClick={() => onDelete(row)}
+              onClick={() => onRemove([row])}
               disabled={managed || locked}
             />
           </div>

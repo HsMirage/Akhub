@@ -1,11 +1,14 @@
-# 公开发版：推 v* tag 时产出 5 个平台的单文件二进制 + 多架构 Docker 镜像。
+# 公开发版：推 v* tag 时产出 5 个平台的单文件二进制 + 桌面安装包 + 多架构 Docker 镜像。
 #
 # 平台矩阵（全原生构建，不用 QEMU，也不用 actions-rust-cross）：
 #   linux-x86_64 / linux-aarch64
 #   macos-aarch64 / macos-x86_64
 #   windows-x86_64（只发裸 exe，不再打 zip）
 #
-# 二进制直接挂在 GitHub Release 下，并附带 checksums.txt；
+# 桌面端（Tauri v2 外壳，见 desktop/）另外产出 macOS 的 .dmg（aarch64 / x86_64
+# 各一份）与 Windows 的 .msi + NSIS .exe，和裸二进制挂在同一个 Release 下。
+#
+# 二进制直接挂在 GitHub Release 下，并附带 checksums.txt（桌面产物同样纳入）；
 # 镜像推送到 GHCR（ghcr.io/<owner>/<repo>），配置了 Docker Hub 变量时再镜像一份过去。
 #
 # 管理后台必须在 cargo 之前构建：rust-embed 在编译期把它嵌进二进制。
@@ -47,6 +50,20 @@ jobs:
           echo "tag=$tag crate=$crate"
           if [[ "$tag" != "$crate" ]]; then
             echo "::error::tag v$tag 与 Cargo.toml 的 $crate 不一致；二进制里的 /admin 版本号和 --version 都会对不上"
+            exit 1
+          fi
+
+      # 桌面端是独立 crate（desktop/），版本号手写在它自己的 Cargo.toml 里：
+      # 一旦掉队，安装包版本与 .app 的 CFBundleShortVersionString 就会和服务端
+      # 对不上。这里提前卡住，别等用户装完才发现。
+      - name: desktop 版本必须与根 crate 一致
+        run: |
+          set -euo pipefail
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          desktop="$(grep -m1 '^version' desktop/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "crate=$crate desktop=$desktop"
+          if [[ "$desktop" != "$crate" ]]; then
+            echo "::error::desktop/Cargo.toml 的 $desktop 与根 Cargo.toml 的 $crate 不一致"
             exit 1
           fi
 
@@ -150,10 +167,123 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # ---------------------------------------------------------------- 桌面端
+  # Tauri v2 外壳：sidecar 用的 akhub 二进制直接复用 binaries job 的发行工件
+  # （macOS 的 .tar.gz / Windows 的裸 exe），不在这里重编译一遍——这样「桌面端里
+  # 跑的 akhub」与用户手工下载的那个一定是同一份产物。
+  #
+  # 不签名（仓库没有 Apple Developer ID / Windows 代码签名证书）：macOS 首次打开
+  # 需要右键「打开」或 xattr 放行，Windows 需要过 SmartScreen 的「仍要运行」。
+  # 具体步骤写在 desktop/README.md。
+  desktop:
+    name: desktop-${{ matrix.name }}
+    needs: [binaries]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary-asset: akhub-macos-aarch64
+            bundles: app,dmg
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary-asset: akhub-macos-x86_64
+            bundles: app,dmg
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary-asset: akhub-windows-x86_64
+            bundles: msi,nsis
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary-asset }}
+          path: sidecar-dist
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 桌面 crate 是独立 workspace，缓存也走它自己的 target/。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+          key: desktop-${{ matrix.target }}
+
+      - name: 安装 Tauri CLI
+        working-directory: desktop
+        run: npm ci
+
+      # utilities-rust 的三元组命名只在这一个脚本里定义：CI 与本地共用同一份实现。
+      - name: 准备 sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sidecar-raw
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            src="$(ls sidecar-dist/*.exe | head -n1)"
+          else
+            tar -xzf "$(ls sidecar-dist/*.tar.gz | head -n1)" -C sidecar-raw --strip-components=1
+            src="sidecar-raw/akhub"
+          fi
+          echo "sidecar 来源：$src"
+          ./desktop/prepare-sidecar.sh "${{ matrix.target }}" "$src"
+          ls -l desktop/binaries
+
+      - name: 构建桌面端
+        working-directory: desktop
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/desktop/target
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # 产物统一改名成 akhub-desktop-<tag>-<platform>.<ext>：用户从 Release 页面
+      # 一眼就能看出是哪个平台、什么版本，也与裸二进制的命名风格一致。
+      - name: 归集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          TAG="${GITHUB_REF_NAME:-v$VERSION}"
+          BUNDLE="desktop/target/${{ matrix.target }}/release/bundle"
+          # Tauri 在有 --target 时把产物放在 <target-dir>/<triple>/release/bundle；
+          # 万一将来布局变了，退回到不带三元组的那层，避免整条发版卡在一个路径上。
+          if [[ ! -d "$BUNDLE" ]]; then BUNDLE="desktop/target/release/bundle"; fi
+          mkdir -p dist-desktop
+          case "${{ matrix.target }}" in
+            *windows*)
+              cp "$BUNDLE"/msi/*.msi "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}.msi"
+              cp "$BUNDLE"/nsis/*-setup.exe "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}-setup.exe"
+              ;;
+            *)
+              cp "$BUNDLE"/dmg/*.dmg "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}.dmg"
+              ;;
+          esac
+          ls -l dist-desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: akhub-desktop-${{ matrix.name }}
+          path: dist-desktop/*
+          retention-days: 7
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- 发布
   release:
     name: 生成 Release
-    needs: [binaries]
+    # 桌面产物也要进同一个 Release：checksums.txt 得把它们一起算上。
+    needs: [binaries, desktop]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -169,10 +299,10 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          # 校验和文件本身不能被算进去。Windows 只有裸 exe，同样要算，
-          # 否则用户没法校验那个直接下载的文件。
+          # 校验和文件本身不能被算进去。Windows 只有裸 exe、桌面端是 .dmg/.msi，
+          # 同样要算，否则用户没法校验那些直接下载的文件。
           rm -f checksums.txt
-          sha256sum ./*.tar.gz ./*.exe > checksums.txt
+          sha256sum ./*.tar.gz ./*.exe ./*.dmg ./*.msi > checksums.txt
           cat checksums.txt
 
       - uses: softprops/action-gh-release@v2
@@ -180,6 +310,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.exe
+            dist/*.dmg
+            dist/*.msi
             dist/checksums.txt
           generate_release_notes: true
   # ---------------------------------------------------------------- 容器镜像

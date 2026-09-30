@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Akhub</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: #0f1115;
+        color: #e6e8ee;
+        font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        text-align: center;
+        padding: 32px;
+      }
+      h1 { margin: 0; font-size: 20px; }
+      #msg { white-space: pre-wrap; max-width: 46em; }
+    </style>
+  </head>
+  <body>
+    <h1>Akhub 桌面端</h1>
+    <!--
+      占位页面：正常情况下这个页面不会出现——外壳会在 sidecar 就绪后直接把窗口
+      导航到 http://127.0.0.1:<port>/admin。只有在 sidecar 启动失败时，窗口才会
+      停留在这一页并显示失败原因（见 desktop/src/main.rs 的 show_startup_failure）。
+    -->
+    <p id="msg">akhub 服务未能启动。</p>
+    <script>
+      window.__akhubFail = function (message) {
+        document.getElementById("msg").textContent = message;
+      };
+    </script>
+  </body>
+</html>

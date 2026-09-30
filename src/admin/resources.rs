@@ -104,58 +104,77 @@ pub async fn overview(State(state): State<SharedState>, _: Admin) -> AdminResult
     // 对外形状完全一致，前端不需要知道数据是从哪来的。
     let retention_off = state.settings.get().retention_days == 0;
     let live = state.runtime.live.snapshot(now);
-    let stats = state
-        .store
-        .request_stats(now - window_secs, 2000)
-        .await
-        .map_err(AdminError::internal)?;
-    let trend = if retention_off {
-        // 内存里只有小时桶，直接补零成 24 根柱子。
-        let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
-            std::collections::BTreeMap::new();
-        for (start, requests, success) in &live.buckets {
-            by_bucket.insert(*start, (*requests, *success));
-        }
-        let mut points = Vec::with_capacity(24);
-        let mut cursor = ((now - window_secs) / trend_bucket_secs) * trend_bucket_secs;
-        let last = (now / trend_bucket_secs) * trend_bucket_secs;
-        while cursor <= last {
-            let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
-            points.push(crate::storage::store::TrendPoint {
-                bucket_start: cursor,
-                requests,
-                success,
-            });
-            cursor += trend_bucket_secs;
-        }
-        points
+    // 下面三条聚合查询是这个接口的全部成本，而且管理端**每次写操作之后**都会
+    // 重拉一遍概览。先看短命缓存：命中时一条 SQL 都不发（见 OverviewCache）。
+    // 保留期为 0 时读的是内存汇总，本来就不贵，也就不进缓存。
+    let cached = if retention_off {
+        None
     } else {
-        state
-            .store
-            .request_trend(now - window_secs, trend_bucket_secs, now)
-            .await
-            .map_err(AdminError::internal)?
+        state.overview.get()
     };
-    let recent_errors = if retention_off {
-        live.recent_errors
-            .iter()
-            .rev()
-            .take(5)
-            .map(|error| crate::storage::store::RecentError {
-                request_id: error.request_id.clone(),
-                started_at: error.started_at,
-                logical_model: error.logical_model.clone(),
-                target_id: error.target_id.clone(),
-                http_status: error.http_status,
-                error_code: error.error_code.clone(),
-            })
-            .collect()
-    } else {
-        state
-            .store
-            .recent_errors(now - window_secs, 5)
-            .await
-            .map_err(AdminError::internal)?
+    let (stats, trend, recent_errors) = match cached {
+        Some(hit) => hit,
+        None => {
+            let stats = state
+                .store
+                .request_stats(now - window_secs, 2000)
+                .await
+                .map_err(AdminError::internal)?;
+            let trend = if retention_off {
+                // 内存里只有小时桶，直接补零成 24 根柱子。
+                let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
+                    std::collections::BTreeMap::new();
+                for (start, requests, success) in &live.buckets {
+                    by_bucket.insert(*start, (*requests, *success));
+                }
+                let mut points = Vec::with_capacity(24);
+                let mut cursor = ((now - window_secs) / trend_bucket_secs) * trend_bucket_secs;
+                let last = (now / trend_bucket_secs) * trend_bucket_secs;
+                while cursor <= last {
+                    let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
+                    points.push(crate::storage::store::TrendPoint {
+                        bucket_start: cursor,
+                        requests,
+                        success,
+                    });
+                    cursor += trend_bucket_secs;
+                }
+                points
+            } else {
+                state
+                    .store
+                    .request_trend(now - window_secs, trend_bucket_secs, now)
+                    .await
+                    .map_err(AdminError::internal)?
+            };
+            let recent_errors = if retention_off {
+                live.recent_errors
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|error| crate::storage::store::RecentError {
+                        request_id: error.request_id.clone(),
+                        started_at: error.started_at,
+                        logical_model: error.logical_model.clone(),
+                        target_id: error.target_id.clone(),
+                        http_status: error.http_status,
+                        error_code: error.error_code.clone(),
+                    })
+                    .collect()
+            } else {
+                state
+                    .store
+                    .recent_errors(now - window_secs, 5)
+                    .await
+                    .map_err(AdminError::internal)?
+            };
+            if !retention_off {
+                state
+                    .overview
+                    .put((stats.clone(), trend.clone(), recent_errors.clone()));
+            }
+            (stats, trend, recent_errors)
+        }
     };
     let recent_changes = state
         .store

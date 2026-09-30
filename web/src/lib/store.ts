@@ -50,7 +50,26 @@ export interface DataStore {
   lastUpdated: number | null;
   /** 返回是否成功，便于调用方决定提示成功还是失败。 */
   refresh: () => Promise<boolean>;
+  /**
+   * 写操作成功之后的**本地先行更新**。
+   *
+   * 写接口返回的就是落库后的真值，界面没有任何理由等整轮全量刷新回来才反映它。
+   * mutator 只做一件事：把 data 换成已经包含这次改动的副本。
+   */
+  patch: DataPatch;
+  /**
+   * 后台刷新：**不 await、不阻塞交互**。
+   *
+   * 写操作的卡顿感有一半来自这里——写请求成功之后还要再等一轮全量刷新（6 个
+   * 请求）才解锁按钮、才弹提示。现在写成功即解锁，其余视图在后台追上；与
+   * refresh() 共用同一个 in-flight 请求，并且如果写完成时已经有一轮刷新
+   * 在途（它读到的可能是写之前的旧数据），会在它结束后**再补一次**。
+   */
+  refreshSoon: () => void;
 }
+
+/** 本地先行更新：接收一个"把当前数据换成新数据"的纯函数。 */
+export type DataPatch = (mutator: (data: Data) => Data) => void;
 
 /**
  * 资源之间互相引用（目标要显示模型名与账号名），分页与增量同步在这个规模下
@@ -146,7 +165,27 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
     void refresh();
   }, [active, refresh]);
 
-  return { data, loading, error, truncated, lastUpdated, refresh };
+  /**
+   * 本地先行更新。写接口已经把真值返回来了，界面不必等全量刷新。
+   */
+  const patch = useCallback((mutator: (current: Data) => Data) => {
+    setData((current) => (current ? mutator(current) : current));
+  }, []);
+
+  /** 后台刷新；已有刷新在途时排在它后面再补一次（见接口上的说明）。 */
+  const refreshSoon = useCallback(() => {
+    const kick = () => {
+      void refresh().catch(() => undefined);
+    };
+    const running = inFlight.current;
+    if (running) {
+      void running.then(kick, kick);
+      return;
+    }
+    kick();
+  }, [refresh]);
+
+  return { data, loading, error, truncated, lastUpdated, refresh, patch, refreshSoon };
 }
 
 /** 定时重渲染用的当前时间；用于"更新于 X 分钟前"这类相对时间展示。 */

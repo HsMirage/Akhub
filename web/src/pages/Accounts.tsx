@@ -22,7 +22,7 @@ import {
   validateMultiplier,
 } from "../lib/format";
 import { useRouteParams } from "../lib/store";
-import type { Data } from "../lib/store";
+import type { Data, DataPatch } from "../lib/store";
 import {
   Badge,
   Button,
@@ -57,9 +57,13 @@ const UNASSIGNED = "__unassigned__";
 export function Accounts({
   data,
   refresh,
+  patch,
+  refreshSoon,
 }: {
   data: Data;
   refresh: () => Promise<unknown>;
+  patch: DataPatch;
+  refreshSoon: () => void;
 }) {
   const toast = useToast();
   const [editing, setEditing] = useState<Account | "new" | null>(null);
@@ -160,7 +164,12 @@ export function Accounts({
   const remove = async (account: Account) => {
     try {
       await api.deleteAccount(account.id);
-      await refresh();
+      // 本地先摘掉这一行：写已经成功，界面没有理由再等一轮全量刷新。
+      patch((current) => ({
+        ...current,
+        accounts: current.accounts.filter((item) => item.id !== account.id),
+      }));
+      refreshSoon();
       toast.success(`账号「${account.name}」已删除`);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "删除失败");
@@ -169,8 +178,14 @@ export function Accounts({
 
   const toggle = async (account: Account) => {
     try {
-      await api.updateAccount(account.id, { enabled: !account.enabled });
-      await refresh();
+      const updated = await api.updateAccount(account.id, { enabled: !account.enabled });
+      // 启停是用户最常点的操作：直接用写接口返回的真值更新这一行，
+      // 全量刷新退到后台，徽标与提示都不再等它。
+      patch((current) => ({
+        ...current,
+        accounts: current.accounts.map((item) => (item.id === account.id ? updated : item)),
+      }));
+      refreshSoon();
       toast.success(account.enabled ? "账号已停用" : "账号已启用");
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "操作失败");
@@ -182,7 +197,7 @@ export function Accounts({
     setRefreshingMultiplierId(account.id);
     try {
       const result = await api.refreshMultiplier(account.id);
-      await refresh();
+      refreshSoon();
       toast.success(result.notice);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "操作失败");
@@ -196,7 +211,7 @@ export function Accounts({
     setRefreshingAll(true);
     try {
       const result = await api.refreshAllMultipliers();
-      await refresh();
+      refreshSoon();
       setRefreshReport(result);
       if (result.failed > 0) {
         // 部分失败要如实说清楚是哪几个，不能只报"完成"（§11.3）。
@@ -219,7 +234,7 @@ export function Accounts({
       const count = account.auto_sync
         ? (await api.syncAccountModels(account.id)).managed_models
         : (await api.refreshAccountModels(account.id)).length;
-      await refresh();
+      refreshSoon();
       toast.success(`已同步 ${count} 个模型`);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "同步模型失败");
@@ -232,7 +247,7 @@ export function Accounts({
     setBusyId(account.id);
     try {
       const created = await api.copyAccount(account.id);
-      await refresh();
+      refreshSoon();
       setEditing(created);
       toast.success(`已创建停用状态的「${created.name}」，请修改后启用`);
     } catch (cause) {
@@ -548,7 +563,7 @@ export function Accounts({
         onSaved={async (created) => {
           setEditing(null);
           if (created) setCreatedAccount(created);
-          await refresh();
+          refreshSoon();
         }}
         // 只刷新数据、**不关闭抽屉**：测试连接与清除失效标记都发生在编辑途中，
         // 走 onSaved 会把抽屉关掉，连同还没保存的 Key 改动一起丢掉

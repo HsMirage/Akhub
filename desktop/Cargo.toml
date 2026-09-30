@@ -1,0 +1,26 @@
+[package]
+name = "akhub-desktop"
+version = "1.1.17"
+edition = "2021"
+description = "Akhub 桌面外壳：以 sidecar 方式拉起 akhub 并打开本机管理后台"
+license-file = "../LICENSE"
+publish = false
+
+# 独立 crate：不加入仓库根 crate 的 workspace，依赖与锁文件都与服务端解耦。
+# 构建时请用独立 target 目录，避免与根 crate 的 target/ 抢文件锁：
+#   CARGO_TARGET_DIR=desktop/target cargo build
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

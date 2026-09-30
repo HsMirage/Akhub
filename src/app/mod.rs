@@ -337,6 +337,54 @@ impl Runtime {
     }
 }
 
+/// 概览页那几条 24 小时窗口聚合的短命缓存。
+///
+/// 管理端**每一次写操作之后**都会把六个接口重新拉一遍，其中 /overview 是唯一
+/// 随记录量增长的：三十万条请求记录时，统计 / 小时趋势 / 最近错误三条查询合计
+/// 200ms 以上，而它服务的是一个 24 小时窗口的看板——几秒钟的陈旧在这个尺度上
+/// 肉眼不可见。把这份贵但不敏感的结果缓存几秒，命中时概览接口一条 SQL 都不发，
+/// 单连接池也不必反复为同一个看板查询让路。
+///
+/// 只在保留期大于 0（走数据库）时使用：保留期为 0 时概览读内存汇总，本来就不贵。
+pub struct OverviewCache {
+    slot: std::sync::Mutex<Option<(std::time::Instant, OverviewAggregates)>>,
+}
+
+/// 概览页缓存的内容：请求统计、小时趋势、最近错误。
+pub type OverviewAggregates = (
+    crate::storage::store::RequestStats,
+    Vec<crate::storage::store::TrendPoint>,
+    Vec<crate::storage::store::RecentError>,
+);
+
+/// 缓存有效期。3 秒：比手动点一次刷新短得多，又短到不会让看板"看着不对"。
+const OVERVIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl Default for OverviewCache {
+    fn default() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl OverviewCache {
+    /// 命中就返回一份克隆。看板数据本身很小（最多 2000 个耗时样本），
+    /// 复制远比重新扫一遍记录表便宜。
+    pub fn get(&self) -> Option<OverviewAggregates> {
+        let slot = crate::sync::lock(&self.slot);
+        match slot.as_ref() {
+            Some((at, value)) if at.elapsed() < OVERVIEW_CACHE_TTL => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// 缓存一份刚算出来的结果。
+    pub fn put(&self, value: OverviewAggregates) {
+        *crate::sync::lock(&self.slot) = Some((std::time::Instant::now(), value));
+    }
+}
+
 /// 全进程共享状态。所有字段要么不可变，要么内部可变且线程安全。
 pub struct AppState {
     pub config: ConfigService,
@@ -355,6 +403,8 @@ pub struct AppState {
     pub master_key_from_env: bool,
     /// 数据目录：大请求体的临时文件落在这里（§17.3、§19.4）。
     pub data_dir: std::path::PathBuf,
+    /// 概览页聚合查询的短命缓存（见 OverviewCache）。
+    pub overview: OverviewCache,
 }
 
 /// 大请求体的临时目录名（§1291、§1292）。
@@ -432,6 +482,7 @@ impl AppState {
             runtime,
             refresh: tasks::RefreshHandle::default(),
             data_dir: data_dir.to_path_buf(),
+            overview: OverviewCache::default(),
         });
         // 启动时把账号模型目录与调度目标对齐一次：旧版本可能留下"已启用但无目标"
         // 或"已停用但目标仍在"的不一致；新版以目录行的启用/别名/隐藏设置为唯一真相。

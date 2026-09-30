@@ -71,9 +71,11 @@ function GroupAlerts({ alerts }: { alerts: GroupAlert[] }) {
 export function Groups({
   data,
   refresh,
+  refreshSoon,
 }: {
   data: Data;
   refresh: () => Promise<unknown>;
+  refreshSoon: () => void;
 }) {
   const toast = useToast();
   const [editing, setEditing] = useState<Group | "new" | null>(null);
@@ -99,7 +101,8 @@ export function Groups({
   const run = async (action: () => Promise<void>, success: string) => {
     try {
       await action();
-      await refresh();
+      // 写已经成功：提示立刻出现，列表在后台补齐（不再等一轮全量刷新）。
+      refreshSoon();
       toast.success(success);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "操作失败");

@@ -3840,3 +3840,54 @@ table.data tbody tr.is-clickable:hover {
   flex-wrap: wrap;
   margin-top: var(--space-2);
 }
+
+/* 模型管理的批量操作栏：让「已选 N 项」后面一定跟着可执行的动作。
+   只有存在选择时才渲染，出现在表格上方。 */
+.model-batch-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.model-batch-count {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* 状态列里的启用 / 停用开关：整块可点，比 16px 的复选框好点得多，
+   也让最左列可以专心当选择列。 */
+.model-state-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.model-state-toggle:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.model-state-toggle .model-state-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.model-state-toggle.is-on {
+  border-color: var(--success);
+  color: var(--success);
+}
