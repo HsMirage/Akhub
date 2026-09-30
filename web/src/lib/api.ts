@@ -96,13 +96,26 @@ function enqueueWrite<T>(run: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/** 单次请求的可选行为。 */
+interface RequestOptions {
+  /**
+   * 冲突由调用方自己处理，不要触发全局的"配置已被其他会话修改"弹窗。
+   *
+   * 模型管理对话框就是这种调用方：它自己会重新读一次目录拿到新版本、再自动
+   * 重试一次。这时弹一个"请重新加载，会放弃本页尚未保存的修改"的全屏确认，
+   * 只会让用户以为刚做的改动要丢了——而它其实已经自动存下来了。
+   */
+  quietConflict?: boolean;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit & { method?: string } = {},
+  options: RequestOptions = {},
 ): Promise<T> {
   const method = init.method ?? "GET";
   // 写操作排队，读操作直发。
-  const send = () => sendOnce<T>(path, init, method);
+  const send = () => sendOnce<T>(path, init, method, options);
   return method === "GET" ? send() : enqueueWrite(send);
 }
 
@@ -110,6 +123,7 @@ async function sendOnce<T>(
   path: string,
   init: RequestInit & { method?: string },
   method: string,
+  options: RequestOptions = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set("content-type", "application/json");
@@ -153,8 +167,12 @@ async function sendOnce<T>(
         ? String((body as { error: unknown }).error)
         : null) ?? `请求失败（HTTP ${response.status}）`;
     // 并发编辑冲突交给全局处理：用户需要的是"重新加载"的明确路径，
-    // 而不是 toast 里一行 config_conflict（§7.4）。
-    if (response.status === 409 && message.includes("config_conflict")) {
+    // 而不是 toast 里一行 config_conflict（§7.4）。自带重试的调用方除外。
+    if (
+      response.status === 409 &&
+      message.includes("config_conflict") &&
+      !options.quietConflict
+    ) {
       window.dispatchEvent(new CustomEvent("akhub-config-conflict"));
     }
     throw new ApiError(message, response.status, body);
@@ -170,8 +188,8 @@ function safeParse(text: string): unknown {
   }
 }
 
-const post = <T>(path: string, body?: unknown) =>
-  request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+const post = <T>(path: string, body?: unknown, options?: RequestOptions) =>
+  request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }, options);
 const patch = <T>(path: string, body: unknown) =>
   request<T>(path, { method: "PATCH", body: JSON.stringify(body) });
 const del = (path: string) => request<void>(path, { method: "DELETE" });
@@ -376,9 +394,12 @@ export const api = {
   /**
    * 批量应用模型目录改动（§16.3）。
    *
-   * 界面的勾选是本地草稿 + 防抖：一次请求提交整批改动，服务端只调和一遍目标、
-   * 只重载一遍配置。逐行 `updateAccountModel` 在几百个模型时会明显卡住。
-   * 停用有流量的模型时返回 409，由调用方确认后带 `force` 重发。
+   * 界面的勾选只改本地草稿，点「保存」才走这里：一次请求提交整批改动，服务端
+   * 只调和一遍目标、只重载一遍配置。逐行 `updateAccountModel` 在几百个模型时
+   * 会明显卡住。停用有流量的模型时返回 409，由调用方确认后带 `force` 重发。
+   *
+   * 配置版本冲突也由调用方（模型管理对话框）自己重试，所以这里静默处理：
+   * 不再触发全局的"配置已被其他会话修改"弹窗（§7.4）。
    */
   applyAccountModels: (
     id: string,
@@ -389,7 +410,12 @@ export const api = {
       delete?: boolean;
     }[],
     force = false,
-  ) => post<AccountModel[]>(`/accounts/${id}/models/apply`, { changes, force }),
+  ) =>
+    post<AccountModel[]>(
+      `/accounts/${id}/models/apply`,
+      { changes, force },
+      { quietConflict: true },
+    ),
   /** 从账号目录永久删除一行并移除其目标（§16.5）。 */
   deleteAccountModel: (id: string, upstreamModel: string) =>
     post<void>(`/accounts/${id}/models/delete`, { upstream_model: upstreamModel }),

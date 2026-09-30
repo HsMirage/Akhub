@@ -8,10 +8,16 @@
  * - 账号级「隐藏原始模型名」打开后，只暴露填写了下游模型名的模型。
  *
  * 性能上只有两条规矩，但都是必需的：
- * 1. 勾选 / 改名先在本地草稿上生效，再用防抖合并成**一次** `/models/apply`。
- *    逐行 POST 会让服务端每次勾选都重调和一遍目标、重建一遍配置快照，
- *    几百个模型时界面就会卡住（`/models/apply` 一次请求只调和一遍）。
+ * 1. 勾选 / 改名 / 删除只改**本地草稿**，点右下角「保存」才合并成**一次**
+ *    `/models/apply`。逐行 POST 会让服务端每次勾选都重调和一遍目标、重建一遍
+ *    配置快照，几百个模型时界面就会卡住（`/models/apply` 一次请求只调和一遍）。
  * 2. 行组件用 `memo` 包起来，勾一个复选框只重渲染那一行，而不是整张表。
+ *
+ * 为什么不做"防抖自动提交"（§16.8 的 2026-09-29 修订）：连点复选框时每隔
+ * 350ms 就会发一次写请求，而每次写都会推进配置版本、重建配置快照。列表越长
+ * 越卡之外，还会莫名弹出"配置已被其他会话修改"——那多半不是真有第二个人在改，
+ * 而是自己上一次写还在途、或者后台任务（倍率刷新、托管同步）刚推进了版本。
+ * 现在写只发生在用户明确点「保存」的那一刻，底部状态行也会明说"有几项未保存"。
  */
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../lib/api";
@@ -40,9 +46,6 @@ interface PendingChange {
 
 /** 提交给 `/models/apply` 的一行。 */
 type ModelChange = PendingChange & { upstream_model: string };
-
-/** 勾选合并的等待窗口（毫秒）。连点复选框时只发一次请求。 */
-const FLUSH_DELAY_MS = 350;
 
 /** 空数组常量：让未处于编辑态的行拿到稳定引用，`memo` 才不会被破功。 */
 const NO_NAMES: string[] = [];
@@ -95,8 +98,10 @@ export function ModelSelectionDialog({
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  /** 防抖提交进行中：底部用它显示“保存中…”。 */
+  /** 保存进行中：底部用它显示“保存中…”，同时锁住行内操作。 */
   const [saving, setSaving] = useState(false);
+  /** 草稿行数：0 表示没有未保存的改动（「保存」按钮与关闭确认都看它）。 */
+  const [draftCount, setDraftCount] = useState(0);
   const [query, setQuery] = useState("");
   const [onlyEnabled, setOnlyEnabled] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -110,15 +115,16 @@ export function ModelSelectionDialog({
   /** 有流量模型被停用/删除时的二次确认（§16.3）。 */
   const [confirmWarnings, setConfirmWarnings] = useState<SelectionWarning[] | null>(null);
 
-  // 待提交的改动与最近一次被拒的改动：前者是草稿，后者用于“仍然停用”。
+  /** 本地草稿：上游模型名 → 待保存的改动。只有点「保存」时才提交。 */
   const pending = useRef<Map<string, PendingChange>>(new Map());
-  const rejected = useRef<ModelChange[] | null>(null);
-  const flushTimer = useRef<number | null>(null);
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
   /** 当前账号 ID 的即时副本：慢响应回来时用它判断是否还有效。 */
   const accountIdRef = useRef(accountId);
   accountIdRef.current = accountId;
+  /** 当前账号的即时副本：打开 / 换账号的副作用只认 ID，不认对象引用。 */
+  const accountRef = useRef(account);
+  accountRef.current = account;
   /** 二次确认列表的即时副本，供异步回调判断确认框是否还开着。 */
   const confirmWarningsRef = useRef<SelectionWarning[] | null>(null);
   confirmWarningsRef.current = confirmWarnings;
@@ -139,51 +145,46 @@ export function ModelSelectionDialog({
   }, [accountId, toast]);
 
   const loadGroupNames = useCallback(async () => {
-    if (!account) return;
+    const current = accountRef.current;
+    if (!current) return;
     // 未分配账号没有分组，也就没有"同组已有模型"可以挑（§4.2.3）。
-    if (account.group_id === null) {
+    if (current.group_id === null) {
       setGroupModels([]);
       return;
     }
     try {
-      const result = await api.availableGroupModels(account.group_id);
+      const result = await api.availableGroupModels(current.group_id);
       setGroupModels(result.models);
     } catch {
       setGroupModels([]);
     }
-  }, [account]);
+    // 依赖留空：它只该在"打开弹窗 / 换账号"时跑一次。跟着 account 对象引用
+    // 重跑会让数据刷新连带清掉用户正在改的草稿。
+  }, []);
 
-  /** 安排一次防抖提交；`delay` 为 0 时立即提交（版本冲突重试用）。 */
-  const scheduleFlushRef = useRef<(delay: number) => void>(() => {});
+  /** 提交函数的即时副本：版本冲突的自动重试要重新走一遍 `commitDraft`。 */
+  const commitDraftRef = useRef<(force?: boolean) => Promise<boolean>>(async () => true);
 
   /**
-   * 把草稿合并成一次请求提交。
+   * 把草稿合并成**一次** `/models/apply` 提交。返回是否成功（没有草稿也算成功）。
    *
-   * `force` 用于二次确认之后的再次提交（最近 24 小时有流量的模型）。
+   * 调用点只有三处：
+   * 1. 用户点「保存」（`force = false`；停用有流量的模型由服务端 409 拦下再确认）；
+   * 2. 二次确认之后带 `force = true` 重发；
+   * 3. 「获取上游模型 / 添加模型 / 切换隐藏原始模型名」之前——这些动作会重写
+   *    服务端目录，草稿不先落库就会被回来的新目录整体覆盖。它们拿到 `false`
+   *    就中止，绝不带着"已经保存好了"的错觉继续。
    */
-  const flush = useCallback(
+  const commitDraft = useCallback(
     async (force = false) => {
-      if (flushTimer.current !== null) {
-        window.clearTimeout(flushTimer.current);
-        flushTimer.current = null;
-      }
-      // 上次被 409 拦下的改动与这次新攒的改动按行合并，新意图覆盖旧意图：
-      // 二次确认还开着时用户继续勾选，确认后一次全部生效。
-      const merged = new Map<string, ModelChange>();
-      for (const change of rejected.current ?? []) {
-        merged.set(change.upstream_model, { ...change });
-      }
-      for (const [upstream_model, change] of pending.current) {
-        merged.set(upstream_model, {
-          ...(merged.get(upstream_model) ?? { upstream_model }),
-          ...change,
-          upstream_model,
-        });
-      }
-      const changes = [...merged.values()];
-      if (changes.length === 0) return;
+      const changes: ModelChange[] = [...pending.current.entries()].map(
+        ([upstream_model, change]) => ({ upstream_model, ...change }),
+      );
+      if (changes.length === 0) return true;
+      // 提交期间行内操作是锁住的（见 `rowBusy`），所以这里可以先清空草稿：
+      // 失败时再整体放回去，不会出现"提交到一半又攒进新改动"的交错。
       pending.current.clear();
-      rejected.current = null;
+      setDraftCount(0);
       // 请求发出后账号可能已经被切走：回来的目录只属于发出它的那个账号。
       const requestedFor = accountId;
       setSaving(true);
@@ -191,112 +192,103 @@ export function ModelSelectionDialog({
         const list = await api.applyAccountModels(requestedFor, changes, force);
         if (accountIdRef.current === requestedFor) setRows(list);
         if (confirmWarningsRef.current !== null) setConfirmWarnings(null);
-        await onChangedRef.current();
+        toast.success(`已保存 ${changes.length} 项模型改动`);
+        // 写已经成功了：刷新数据失败不能算作这次保存失败，否则下面的 catch 会把
+        // 存好的改动又塞回草稿，用户再点一次「保存」就是重复提交。
+        await onChangedRef.current().catch(() => undefined);
+        return true;
       } catch (cause) {
-        // 409 有两种完全不同的含义，必须分开：
-        //
-        // - `config_conflict`：乐观锁拦下的并发写（多半是上一次自己的写在途，
-        //   或者另一个标签页刚改过配置）。它不是"有流量的模型要确认"，
-        //   把它当成后者会弹出一个**一条警告都没有**的确认框——用户只能反复
-        //   点"仍然停用"，而每次都会再撞一次。正确做法是把改动放回草稿，
-        //   刷新一次配置版本，然后自动重试一次。
-        // - 其余 409 才是"以下模型最近 24 小时有流量"的二次确认。
-        if (cause instanceof ApiError && cause.status === 409 && cause.configConflict) {
+        // 失败一律把改动放回草稿：用户刚点的是「保存」，界面不能在这个时候
+        // 把他做的选择悄悄抹掉——那正是旧版本最糟的一种表现。
+        if (accountIdRef.current === requestedFor) {
           for (const change of changes) {
             pending.current.set(change.upstream_model, {
               ...(pending.current.get(change.upstream_model) ?? {}),
               ...change,
             });
           }
+          setDraftCount(pending.current.size);
+        }
+        // 409 有两种完全不同的含义，必须分开：
+        //
+        // - `config_conflict`：乐观锁拦下的并发写（多半是后台任务刚推进过配置
+        //   版本，或者上一次自己的写在途）。它不是"有流量的模型要确认"，
+        //   把它当成后者会弹出一个**一条警告都没有**的确认框——用户只能反复
+        //   点"仍然停用"，而每次都会再撞一次。正确做法是重新拉一次目录拿到
+        //   新版本，然后自动重试一次；这条路径自带重试，所以它不触发全局的
+        //   "配置已被其他会话修改"弹窗（见 `api.applyAccountModels`）。
+        // - 其余 409 才是"以下模型最近 24 小时有流量"的二次确认。
+        if (cause instanceof ApiError && cause.status === 409 && cause.configConflict) {
           await load();
           if (!conflictRetried.current) {
             conflictRetried.current = true;
-            // 等这次 flush 的 `setSaving(false)` 落定再重试，避免紧挨着的又一次
+            // 等这次提交的 `setSaving(false)` 落定再重试，避免紧挨着的又一次
             // 请求仍带着同一个过期版本号。
-            window.setTimeout(() => scheduleFlushRef.current(0), 0);
+            window.setTimeout(() => void commitDraftRef.current(force), 0);
           } else {
-            toast.error("配置刚被其他会话改过，已保留你的改动；请确认目录后重试");
+            toast.error("配置刚被其他会话改过，你的改动还留在这个弹窗里；请确认目录后再点「保存」");
           }
-          return;
+          return false;
         }
         if (cause instanceof ApiError && cause.status === 409) {
-          // 停用有流量的模型：先让用户确认，改动原样留在 rejected 里。
+          // 停用有流量的模型：先让用户确认。改动已经在草稿里，确认后原样重发。
           const payload = cause.payload as
             | { warnings?: SelectionWarning[]; needs_confirm?: SelectionWarning[] }
             | null;
-          rejected.current = changes;
           setConfirmWarnings(payload?.warnings ?? payload?.needs_confirm ?? []);
-        } else {
-          toast.error(cause instanceof Error ? cause.message : "保存失败");
-          // 本地草稿可能与服务端不一致：重新读一次目录，别让界面说谎。
-          await load();
+          return false;
         }
+        toast.error(cause instanceof Error ? cause.message : "保存失败");
+        return false;
       } finally {
         setSaving(false);
       }
     },
     [accountId, load, toast],
   );
+  commitDraftRef.current = commitDraft;
 
-  const scheduleFlush = useCallback(
-    (delay: number) => {
-      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
-      flushTimer.current = window.setTimeout(() => {
-        flushTimer.current = null;
-        // 二次确认开着时先只攒着：用户点“仍然停用”会连新改动一起提交。
-        if (rejected.current === null) void flush();
-      }, delay);
-    },
-    [flush],
-  );
-  scheduleFlushRef.current = scheduleFlush;
+  /**
+   * 记下一行本地草稿。**不发任何请求**：写只发生在点「保存」的那一刻（§16.8）。
+   */
+  const queueDraft = useCallback((upstreamModel: string, change: PendingChange) => {
+    pending.current.set(upstreamModel, {
+      ...(pending.current.get(upstreamModel) ?? {}),
+      ...change,
+    });
+    setDraftCount(pending.current.size);
+    // 用户又动手了：这一批改动值得再获得一次自动重试。
+    conflictRetried.current = false;
+  }, []);
 
-  /** 记下一行改动并安排防抖提交。 */
-  const queueChange = useCallback(
-    (upstreamModel: string, change: PendingChange) => {
-      pending.current.set(upstreamModel, {
-        ...(pending.current.get(upstreamModel) ?? {}),
-        ...change,
-      });
-      // 用户又动手了：这一批改动值得再获得一次自动重试。
-      conflictRetried.current = false;
-      scheduleFlush(FLUSH_DELAY_MS);
-    },
-    [scheduleFlush],
-  );
+  /**
+   * 打开 / 换账号：清空草稿并从服务端读一份新目录。
+   *
+   * 草稿是按上游模型名索引的，串到别的账号就是一次错误的写入，所以这里必须
+   * 先丢掉它。**依赖里只有账号 ID，没有 account 对象**：数据刷新会给父级一个
+   * 新的对象引用，跟着它重跑会把用户正在改的草稿清掉。
+   *
+   * 关闭时同样清空：Modal 的 `dirty` 守卫已经在放弃之前问过用户了。
+   */
+  const forgetDraft = useCallback(() => {
+    pending.current.clear();
+    setDraftCount(0);
+  }, []);
 
   useEffect(() => {
+    forgetDraft();
     if (!open) return;
-    // 切换账号前先把上一个账号的草稿落库，避免改动被静默丢弃。
-    void flush();
     setQuery("");
     setOnlyEnabled(false);
     setEditing(null);
     setAdding(false);
     setNotice(null);
     setConfirmWarnings(null);
-    rejected.current = null;
     conflictRetried.current = false;
-    setHideOriginal(account?.hide_original ?? false);
+    setHideOriginal(accountRef.current?.hide_original ?? false);
     void load();
     void loadGroupNames();
-  }, [open, account, flush, load, loadGroupNames]);
-
-  // 组件消失时把草稿补交一次；已提交的请求不受影响。
-  useEffect(
-    () => () => {
-      if (flushTimer.current !== null) {
-        window.clearTimeout(flushTimer.current);
-        flushTimer.current = null;
-      }
-      const changes = [...pending.current.entries()].map(([upstream_model, change]) => ({
-        upstream_model,
-        ...change,
-      }));
-      if (changes.length > 0) void api.applyAccountModels(accountId, changes, false);
-    },
-    [accountId],
-  );
+  }, [open, accountId, forgetDraft, load, loadGroupNames]);
 
   const existingNames = useMemo(() => {
     const names = new Set<string>();
@@ -318,6 +310,18 @@ export function ModelSelectionDialog({
         );
       });
   }, [rows, onlyEnabled, query]);
+
+  /** 当前列表里可勾选的行：上游已消失的行不能勾，全选 / 全不选也只作用于它们。 */
+  const selectable = useMemo(() => visible.filter((row) => !row.missing), [visible]);
+  const allSelected = selectable.length > 0 && selectable.every((row) => row.selected);
+  const allCleared = selectable.length > 0 && selectable.every((row) => !row.selected);
+  /**
+   * 有服务端动作在途：行内的勾选 / 改名 / 删除一律锁住。
+   *
+   * 一次「保存」必须是原子的——提交的内容和草稿不能交错，否则回来的是服务端的
+   * 新目录，用户在这中间点的几下就会被悄悄吞掉。
+   */
+  const rowBusy = saving || fetching || busy !== null;
 
   const mergeSuggestions = useMemo(() => {
     if (!editing) return [];
@@ -367,20 +371,22 @@ export function ModelSelectionDialog({
         return { ...updated, exposed_names: exposedNames(updated, hideOriginal) };
       }),
     );
-    queueChange(editing, { alias });
+    queueDraft(editing, { alias });
     cancelEdit();
     setNotice(
       alias
-        ? `已保存：下游用「${alias}」调用这个模型。`
-        : "已清空下游模型名，这个模型会使用上游原名。",
+        ? `已把「${editing}」的下游模型名设为「${alias}」，点「保存」后生效。`
+        : `已清空「${editing}」的下游模型名，这个模型会使用上游原名；点「保存」后生效。`,
     );
-  }, [account, editing, editAlias, hideOriginal, queueChange, cancelEdit]);
+  }, [account, editing, editAlias, hideOriginal, queueDraft, cancelEdit]);
 
   const saveHideOriginal = async (next: boolean) => {
     if (!account) return;
     setBusy("hide");
     try {
-      await flush();
+      // 这个开关是账号级设置，单独立即生效；但账号目录必须先落库——下面会用
+      // 服务端返回的目录整体替换本地列表，草稿不落库就等于被丢掉。
+      if (!(await commitDraft())) return;
       await api.updateAccount(account.id, { hide_original: next });
       setHideOriginal(next);
       await load();
@@ -401,23 +407,49 @@ export function ModelSelectionDialog({
           row.upstream_model === upstreamModel ? { ...row, selected } : row,
         ),
       );
-      queueChange(upstreamModel, { selected });
+      queueDraft(upstreamModel, { selected });
     },
-    [account, queueChange],
+    [account, queueDraft],
   );
 
+  /**
+   * 全选 / 全不选：作用于**当前列表里的行**（受搜索与「只看已启用」筛选），
+   * 上游已消失的行跳过。和单个勾选一样只改本地草稿，点「保存」才提交。
+   */
+  const setAllVisible = useCallback(
+    (selected: boolean) => {
+      const changed = selectable.filter((row) => row.selected !== selected);
+      if (changed.length === 0) return;
+      const names = new Set(changed.map((row) => row.upstream_model));
+      setRows((current) =>
+        current.map((row) => (names.has(row.upstream_model) ? { ...row, selected } : row)),
+      );
+      for (const row of changed) {
+        pending.current.set(row.upstream_model, {
+          ...(pending.current.get(row.upstream_model) ?? {}),
+          selected,
+        });
+      }
+      setDraftCount(pending.current.size);
+      conflictRetried.current = false;
+    },
+    [selectable],
+  );
+
+  /** 删除也只记草稿：点「保存」之前这一行都还在服务端的目录里。 */
   const requestDelete = useCallback((upstreamModel: string) => {
     setRows((current) => current.filter((row) => row.upstream_model !== upstreamModel));
-    queueChange(upstreamModel, { delete: true });
+    queueDraft(upstreamModel, { delete: true });
     setPendingDelete(null);
-  }, [queueChange]);
+  }, [queueDraft]);
 
   const refreshUpstream = async () => {
     if (!account) return;
     setFetching(true);
     setNotice(null);
     try {
-      await flush();
+      // 拉取会用上游目录 + 服务端的选择集重新合并出一份目录，草稿必须先落库。
+      if (!(await commitDraft())) return;
       const list = await api.refreshAccountModels(account.id);
       setRows(list);
       const created = list.filter((row) => row.is_new).length;
@@ -440,6 +472,7 @@ export function ModelSelectionDialog({
     if (!account || !newUpstream.trim()) return;
     setBusy("add");
     try {
+      if (!(await commitDraft())) return;
       await api.addManualModel(account.id, newUpstream.trim(), newAlias.trim());
       setNewUpstream("");
       setNewAlias("");
@@ -469,17 +502,14 @@ export function ModelSelectionDialog({
     }
   };
 
-  const close = () => {
-    // 未到防抖窗口的改动在这里补交，关闭弹窗不会丢操作。
-    void flush();
-    onClose();
-  };
-
   return (
     <>
       <Modal
         open={open}
-        onClose={close}
+        // 关闭前不补交草稿：写只发生在「保存」。带着未保存的改动关窗时，
+        // Modal 的 dirty 守卫会先问一次"放弃未保存的修改？"。
+        onClose={onClose}
+        dirty={draftCount > 0}
         title={account ? `模型管理 · ${account.name}` : "模型管理"}
         className="model-selection-modal"
         footer={
@@ -489,10 +519,17 @@ export function ModelSelectionDialog({
                 ? "加载中…"
                 : `${rows.length} 个模型 · ${enabledCount} 个启用 · ${renamedCount} 个已设下游名`}
               {blockedCount > 0 && ` · ${blockedCount} 个未设下游名且被隐藏`}
-              {saving && " · 保存中…"}
             </span>
+            {draftCount > 0 && <span className="dirty-badge">{draftCount} 项未保存</span>}
             <div className="spacer" />
-            <Button onClick={close}>关闭</Button>
+            <Button
+              variant="primary"
+              onClick={() => void commitDraft()}
+              disabled={draftCount === 0 || rowBusy}
+              title={draftCount === 0 ? "没有未保存的改动" : "保存本次改动"}
+            >
+              {saving ? "保存中…" : "保存"}
+            </Button>
           </>
         }
       >
@@ -558,6 +595,25 @@ export function ModelSelectionDialog({
               />
               只看已启用
             </label>
+            {/* 全选 / 全不选只作用于当前筛选出来的行：搜索框里打了字还"全选"，
+                用户期待的是眼前这一批。所以标题里把范围说清楚，别让人以为
+                改到了看不见的那些模型。 */}
+            <Button
+              size="sm"
+              onClick={() => setAllVisible(true)}
+              disabled={managed || rowBusy || allSelected}
+              title={`把当前列表里的 ${selectable.length} 个模型全部启用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
+            >
+              全选
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => setAllVisible(false)}
+              disabled={managed || rowBusy || allCleared}
+              title={`把当前列表里的 ${selectable.length} 个模型全部停用（受搜索与「只看已启用」筛选影响）；点「保存」后生效`}
+            >
+              全不选
+            </Button>
             <span className="spacer" />
             {!managed && (
               <Button
@@ -688,6 +744,7 @@ export function ModelSelectionDialog({
                           hideOriginal={hideOriginal}
                           isEditing={isEditing}
                           managed={managed}
+                          locked={rowBusy}
                           editAlias={isEditing ? editAlias : ""}
                           mergeSuggestions={isEditing ? mergeSuggestions : NO_NAMES}
                           existingNames={isEditing ? existingNames : NO_NAMES}
@@ -718,6 +775,8 @@ export function ModelSelectionDialog({
             <>
               删除「{pendingDelete.upstream_model}」会移除它对应的 {deleteTargets} 个调度目标，
               下游将无法再用这个模型请求，在途请求会正常完成。
+              <br />
+              删除会在点「保存」时生效。
             </>
           ) : null
         }
@@ -741,11 +800,12 @@ export function ModelSelectionDialog({
           </>
         }
         onClose={() => {
+          // 用户不愿意停用这些有流量的模型：丢掉这批草稿，回到服务端的目录真相。
           setConfirmWarnings(null);
-          rejected.current = null;
+          forgetDraft();
           void load();
         }}
-        onConfirm={() => void flush(true)}
+        onConfirm={() => void commitDraft(true)}
       />
     </>
   );
@@ -766,6 +826,7 @@ const ModelRow = memo(function ModelRow({
   hideOriginal,
   isEditing,
   managed,
+  locked,
   editAlias,
   mergeSuggestions,
   existingNames,
@@ -783,6 +844,8 @@ const ModelRow = memo(function ModelRow({
   hideOriginal: boolean;
   isEditing: boolean;
   managed: boolean;
+  /** 有服务端动作在途（保存 / 拉取 / 添加）：行内操作暂时锁住。 */
+  locked: boolean;
   editAlias: string;
   mergeSuggestions: string[];
   existingNames: string[];
@@ -800,9 +863,15 @@ const ModelRow = memo(function ModelRow({
           <input
             type="checkbox"
             checked={row.selected}
-            disabled={managed || row.missing}
+            disabled={managed || row.missing || locked}
             aria-label={`启用 ${row.upstream_model}`}
-            title={row.missing ? "上游已消失，重新出现后会自动恢复" : "启用 / 停用该模型"}
+            title={
+              row.missing
+                ? "上游已消失，重新出现后会自动恢复"
+                : locked
+                  ? "正在与后台交互，稍后再改"
+                  : "启用 / 停用该模型（改完点右下角「保存」）"
+            }
             onChange={(event) => onToggle(row.upstream_model, event.target.checked)}
           />
         </td>
@@ -869,7 +938,7 @@ const ModelRow = memo(function ModelRow({
               size="sm"
               icon={<IconEdit size={13} />}
               onClick={() => onEdit(row.upstream_model)}
-              disabled={managed}
+              disabled={managed || locked}
             >
               改名
             </Button>
@@ -880,7 +949,7 @@ const ModelRow = memo(function ModelRow({
               title="从目录删除并移除目标"
               aria-label={`删除模型 ${row.upstream_model}`}
               onClick={() => onDelete(row)}
-              disabled={managed}
+              disabled={managed || locked}
             />
           </div>
         </td>
@@ -932,10 +1001,11 @@ const ModelRow = memo(function ModelRow({
                   size="sm"
                   icon={<IconCheck size={13} />}
                   onClick={onSave}
+                  disabled={locked}
                 >
-                  保存
+                  加入待保存
                 </Button>
-                <Button size="sm" icon={<IconX size={13} />} onClick={onCancelEdit}>
+                <Button size="sm" icon={<IconX size={13} />} onClick={onCancelEdit} disabled={locked}>
                   取消
                 </Button>
               </div>
