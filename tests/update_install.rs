@@ -28,6 +28,10 @@ fn leftovers(dir: &std::path::Path) -> Vec<String> {
 
 #[tokio::test]
 async fn a_verified_release_replaces_the_binary_and_keeps_a_backup() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
     let archive = make_release_archive("9.9.9", NEW_BINARY);
     let github = FakeGithub::spawn("v9.9.9", archive).await;
     let dir = tempfile::tempdir().unwrap();
@@ -69,6 +73,10 @@ async fn a_verified_release_replaces_the_binary_and_keeps_a_backup() {
 /// 跨国链路上资产下载偶发中断是常态：一次失败不能直接判定"更新失败"。
 #[tokio::test]
 async fn a_transient_download_failure_is_retried() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
     let archive = make_release_archive("9.9.9", NEW_BINARY);
     let github = FakeGithub::spawn_with_transient_failures("v9.9.9", archive, 1).await;
     let dir = tempfile::tempdir().unwrap();
@@ -86,6 +94,10 @@ async fn a_transient_download_failure_is_retried() {
 
 #[tokio::test]
 async fn a_bad_checksum_stops_the_update_before_anything_is_written() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
     let archive = make_release_archive("9.9.9", NEW_BINARY);
     // 形状合法但内容必然对不上的哈希：验证的是"校验不过就停"，而不是"清单里没有这一行"。
     let github = FakeGithub::spawn_with_checksum("v9.9.9", archive, &"0".repeat(64), 0).await;
@@ -116,6 +128,10 @@ async fn a_bad_checksum_stops_the_update_before_anything_is_written() {
 
 #[tokio::test]
 async fn an_explicit_version_can_be_installed_even_without_asking_the_latest() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
     let archive = make_release_archive("9.9.9", NEW_BINARY);
     let github = FakeGithub::spawn("v9.9.9", archive).await;
     let dir = tempfile::tempdir().unwrap();

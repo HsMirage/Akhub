@@ -5,9 +5,9 @@
 | 方式 | 适合 | 升级方式 | 文档 |
 |---|---|---|---|
 | **Docker / Compose** | 绝大多数 Linux 服务器 | `docker compose pull` 或换 tag 重启 | 本文 §1 |
-| **一键脚本（Linux / macOS）** | 不想装 Docker、想直接用系统服务 | 重跑同一行命令 | 本文 §2 |
+| **一键脚本（Linux）** | 不想装 Docker、想直接用系统服务 | 重跑同一行命令 | 本文 §2 |
 | **systemd 原生** | 需要精细控制权限与环境变量 | 换二进制 + `systemctl restart` | 本文 §3 |
-| **Windows** | Windows Server / 桌面 | `install.ps1` 重跑 | [README.windows.md](README.windows.md) |
+| **Windows** | Windows Server / 桌面 | 重装桌面端安装包 | [README.windows.md](README.windows.md) |
 | **源码构建** | 开发者、需要打补丁 | 自己重新编译 | 仓库根目录 README「开发」一节 |
 
 四种方式共用同一份二进制与同一个数据目录约定，数据可以在它们之间搬来搬去：
@@ -189,13 +189,20 @@ sh install.sh --version v1.1.17 --service
 
 ### 2.2 macOS
 
-同一个脚本，macOS 上会去拿 `macos-aarch64` 或 `macos-x86_64` 资产：
+**macOS 从 v1.1.17 起只发桌面应用**：到
+[Releases](https://github.com/HsMirage/Akhub/releases/latest) 下载
+`akhub-desktop-<tag>-macos-arm64.dmg`（Apple Silicon）或
+`akhub-desktop-<tag>-macos-x86_64.dmg`（Intel），双击安装；数据目录在
+`~/Library/Application Support/com.hsmirage.akhub/data`。
+
+想在 macOS 上跑命令行版（例如挂 launchd 当服务），从源码构建：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
+cargo build --release   # 产物在 target/release/akhub
 ```
 
-macOS 没有 systemd，脚本装完只打印后续步骤，`--service` 在 macOS 上会被跳过并提示。
+`install.sh` 只服务 Linux。想装 v1.1.16 及更早的 macOS 资产仍然可以
+（`--version v1.1.16`），新版本它会直接告诉你去下桌面端。
 
 直接跑（前台）：
 

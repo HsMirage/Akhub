@@ -1,14 +1,17 @@
-# 公开发版：推 v* tag 时产出 5 个平台的单文件二进制 + 桌面安装包 + 多架构 Docker 镜像。
+# 公开发版：推 v* tag 时产出桌面安装包 + Linux 单文件二进制 + 多架构 Docker 镜像。
 #
-# 平台矩阵（全原生构建，不用 QEMU，也不用 actions-rust-cross）：
-#   linux-x86_64 / linux-aarch64
-#   macos-aarch64 / macos-x86_64
-#   windows-x86_64（只发裸 exe，不再打 zip）
+# 挂到 Release 上的只有这几个（2026-10-01 起的口径）：
+#   akhub-desktop-<tag>-macos-arm64.dmg            Apple Silicon 桌面端
+#   akhub-desktop-<tag>-macos-x86_64.dmg           Intel Mac 桌面端
+#   akhub-desktop-<tag>-windows-x86_64-setup.exe   Windows 桌面端（NSIS 安装器）
+#   akhub-v<tag>-linux-x86_64.tar.gz               Linux 服务端
+#   akhub-v<tag>-linux-aarch64.tar.gz              Linux 服务端（arm64）
+#   checksums.txt                                  上面这些文件的 sha256
 #
-# 桌面端（Tauri v2 外壳，见 desktop/）另外产出 macOS 的 .dmg（aarch64 / x86_64
-# 各一份）与 Windows 的 .msi + NSIS .exe，和裸二进制挂在同一个 Release 下。
+# macOS / Windows 不再发裸二进制：这两个平台的产品形态是桌面端应用。它们的二进制
+# 仍然在各自的 runner 上编出来，但只作为桌面端的 sidecar 使用，不挂到 Release。
+# Windows 的 .msi 也不再打——只留一个双击即装的 setup.exe，安装入口只有一个。
 #
-# 二进制直接挂在 GitHub Release 下，并附带 checksums.txt（桌面产物同样纳入）；
 # 镜像推送到 GHCR（ghcr.io/<owner>/<repo>），配置了 Docker Hub 变量时再镜像一份过去。
 #
 # 管理后台必须在 cargo 之前构建：rust-embed 在编译期把它嵌进二进制。
@@ -99,6 +102,8 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- 二进制
+  # 五个平台都要编：Linux 的两份是发布资产，macOS / Windows 的三份是桌面端 sidecar
+  # 的来源（见下面的 desktop job），编完只留在 workflow artifact 里，不上 Release。
   binaries:
     name: ${{ matrix.name }}
     needs: [web, verify]
@@ -197,7 +202,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             binary-asset: akhub-windows-x86_64
-            bundles: msi,nsis
+            # 只打 NSIS：安装入口留一个就够，.msi 不再产出。
+            bundles: nsis
     steps:
       - uses: actions/checkout@v4
 
@@ -249,7 +255,8 @@ jobs:
         run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       # 产物统一改名成 akhub-desktop-<tag>-<platform>.<ext>：用户从 Release 页面
-      # 一眼就能看出是哪个平台、什么版本，也与裸二进制的命名风格一致。
+      # 一眼就能看出是哪个平台、什么版本。macOS 的 arm64 用 arm64 而不是目标三元组
+      # 里的 aarch64：这是给下载者看的名字，跟构建目标名无关。
       - name: 归集产物
         shell: bash
         run: |
@@ -263,8 +270,10 @@ jobs:
           mkdir -p dist-desktop
           case "${{ matrix.target }}" in
             *windows*)
-              cp "$BUNDLE"/msi/*.msi "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}.msi"
               cp "$BUNDLE"/nsis/*-setup.exe "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}-setup.exe"
+              ;;
+            aarch64-apple-darwin)
+              cp "$BUNDLE"/dmg/*.dmg "dist-desktop/akhub-desktop-$TAG-macos-arm64.dmg"
               ;;
             *)
               cp "$BUNDLE"/dmg/*.dmg "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}.dmg"
@@ -282,7 +291,7 @@ jobs:
   # ---------------------------------------------------------------- 发布
   release:
     name: 生成 Release
-    # 桌面产物也要进同一个 Release：checksums.txt 得把它们一起算上。
+    # 桌面产物与 Linux 二进制进同一个 Release：checksums.txt 得把它们一起算上。
     needs: [binaries, desktop]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -295,23 +304,38 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 只对真正要发布的那几个文件算：下载下来的中间产物（macOS / Windows 的裸
+      # 二进制）不挂 Release，也就不该出现在校验和里。
       - name: 生成校验和
         run: |
           set -euo pipefail
           cd dist
-          # 校验和文件本身不能被算进去。Windows 只有裸 exe、桌面端是 .dmg/.msi，
-          # 同样要算，否则用户没法校验那些直接下载的文件。
           rm -f checksums.txt
-          sha256sum ./*.tar.gz ./*.exe ./*.dmg ./*.msi > checksums.txt
+          shopt -s nullglob
+          targets=(
+            ./akhub-v*-linux-x86_64.tar.gz
+            ./akhub-v*-linux-aarch64.tar.gz
+            ./akhub-desktop-*-macos-arm64.dmg
+            ./akhub-desktop-*-macos-x86_64.dmg
+            ./akhub-desktop-*-windows-x86_64-setup.exe
+          )
+          shopt -u nullglob
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "::error::没有匹配到任何发布产物，拒绝生成空的 checksums.txt"
+            exit 1
+          fi
+          # 校验和文件本身不能被算进去。
+          sha256sum "${targets[@]}" > checksums.txt
           cat checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.exe
-            dist/*.dmg
-            dist/*.msi
+            dist/akhub-v*-linux-x86_64.tar.gz
+            dist/akhub-v*-linux-aarch64.tar.gz
+            dist/akhub-desktop-*-macos-arm64.dmg
+            dist/akhub-desktop-*-macos-x86_64.dmg
+            dist/akhub-desktop-*-windows-x86_64-setup.exe
             dist/checksums.txt
           generate_release_notes: true
   # ---------------------------------------------------------------- 容器镜像

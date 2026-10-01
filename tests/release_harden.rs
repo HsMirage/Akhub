@@ -1443,22 +1443,20 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
     );
 }
 
-/// Windows 只发裸 exe，不再打 zip。
+/// Release 上只挂五个包：两个 Linux 服务端二进制 + 三个桌面安装包。
 ///
-/// Unix 那边必须打包：可执行权限靠文件模式的 +x 位，浏览器下载会丢掉它，
-/// 裸传 ELF 用户拿到的是「权限不足」。Windows 没有这个问题——能不能跑只看
-/// 扩展名——所以「必须打包」的理由在这里不成立，剩下的只是压缩收益
-/// （17 MB -> 6 MB）和顺带捎上文档，却要用户多走「解压 -> 进一层目录 -> 运行」
-/// 三步。只给一个文件，安装脚本、自更新与手工下载都少一层解包。
+/// 2026-10-01 起的口径：macOS / Windows 只以桌面应用发布（裸二进制仍会编出来，
+/// 但那是桌面端的 sidecar，不上 Release），Windows 的 .msi 也不再打。这条用例把
+/// 发布清单钉死——少一个用户装不上，多一个说明又回到了"每个平台发一堆东西"。
 #[test]
-fn windows_ships_only_a_bare_exe() {
+fn the_release_publishes_exactly_the_five_assets() {
     let package = std::fs::read_to_string("scripts/package.sh").expect("package.sh");
     let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
 
-    // 打包侧要产出裸 exe，且不再产出 zip。
+    // 打包侧照样产裸 exe：桌面端的 sidecar 要用它，只是不再挂 Release。
     assert!(
         package.contains(r#"cp "$STAGE/akhub.exe" "dist/$ASSET.exe""#),
-        "package.sh 必须为 Windows 产出一个裸 exe"
+        "package.sh 必须为 Windows 产出一个裸 exe（桌面端 sidecar 要用）"
     );
     assert!(
         package.contains(r#"ARTIFACT="$ASSET.exe""#),
@@ -1469,23 +1467,54 @@ fn windows_ships_only_a_bare_exe() {
         "package.sh 不该再出现 zip：Windows 只发裸 exe"
     );
 
-    // 流水线要把 exe 上传并发布，且**算进校验和**——否则用户没法校验那个
-    // 他直接下载的文件，而校验和的意义就在于覆盖每一个可下载的产物。
+    // 只看发布 job：binaries job 仍要上传中间产物（含 macOS / Windows 的裸二进制），
+    // 那是给桌面端做 sidecar 用的，不是发布清单的一部分。
+    let release_job = workflow
+        .split("---------------------------------------------------------------- 发布")
+        .nth(1)
+        .expect("release.yml 里应有发布 job");
+    let release_job = release_job
+        .split("---------------------------------------------------------------- 容器镜像")
+        .next()
+        .expect("发布 job 之后应有容器镜像 job");
+
+    for pattern in [
+        "dist/akhub-v*-linux-x86_64.tar.gz",
+        "dist/akhub-v*-linux-aarch64.tar.gz",
+        "dist/akhub-desktop-*-macos-arm64.dmg",
+        "dist/akhub-desktop-*-macos-x86_64.dmg",
+        "dist/akhub-desktop-*-windows-x86_64-setup.exe",
+        "dist/checksums.txt",
+    ] {
+        assert!(release_job.contains(pattern), "发布清单里少了 {pattern}");
+    }
+    for forbidden in ["dist/*.exe", "dist/*.msi", "dist/*.tar.gz", "dist/*.dmg"] {
+        assert!(
+            !release_job.contains(forbidden),
+            "发布清单里不该再出现通配 {forbidden}：要逐个列出发布的那五个包"
+        );
+    }
+
+    // 三个桌面安装包必须进校验和，否则用户没法校验直接下载的安装器。
+    for installer in [
+        "macos-arm64.dmg",
+        "macos-x86_64.dmg",
+        "windows-x86_64-setup.exe",
+    ] {
+        assert!(
+            release_job.contains(installer),
+            "校验和必须覆盖 {installer}"
+        );
+    }
+
+    // arm64 是给下载者看的名字；Windows 只打 NSIS，安装入口留一个。
     assert!(
-        workflow.matches("dist/*.exe").count() >= 2,
-        "release.yml 必须在上传与发布两处都包含 dist/*.exe"
+        workflow.contains("akhub-desktop-$TAG-macos-arm64.dmg"),
+        "归集产物时要把 macOS arm64 的 dmg 命名成 macos-arm64"
     );
     assert!(
-        !workflow.contains("dist/*.zip"),
-        "release.yml 不该再引用 dist/*.zip：没有这个产物了"
-    );
-    let checksum_line = workflow
-        .lines()
-        .find(|line| line.contains("sha256sum ./*.tar.gz"))
-        .expect("release.yml 里应有校验和生成命令");
-    assert!(
-        checksum_line.contains("./*.exe") && !checksum_line.contains("./*.zip"),
-        "校验和必须覆盖裸 exe、且不再包含 zip，实际命令：{checksum_line}"
+        workflow.contains("bundles: nsis") && !workflow.contains("bundles: msi,nsis"),
+        "Windows 桌面端只应打 NSIS 安装器"
     );
 }
 

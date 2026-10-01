@@ -59,6 +59,10 @@ async fn status_of(base: &str, client: &reqwest::Client, query: &str) -> Value {
 
 #[tokio::test]
 async fn a_newer_release_is_reported_and_the_answer_is_cached() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
     let github = FakeGithub::spawn("v9.9.9", b"not-a-real-binary".to_vec()).await;
     let (base, client, _dir, state) = spawn().await;
     state.runtime.update.set_api_base(github.base_url.clone());

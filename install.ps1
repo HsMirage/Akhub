@@ -86,7 +86,12 @@ try {
     try {
         Invoke-WebRequest -Uri "$base/$asset" -OutFile (Join-Path $tmp $asset) -UseBasicParsing
     } catch {
-        Fail "下载失败：$base/$asset`n$($_.Exception.Message)" 3
+        # 固定到旧版本（-Version v1.1.16）时这里仍然下得到，所以只在失败时提示。
+        $hint = "下载失败：$base/$asset" + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine
+        $hint += "Windows 从 v1.1.17 起只发桌面应用，请到 https://github.com/$Repo/releases/latest 下载" + [Environment]::NewLine
+        $hint += "  akhub-desktop-<版本>-windows-x86_64-setup.exe" + [Environment]::NewLine
+        $hint += "双击安装即可；要在 Windows 上跑命令行版，请从源码构建（cargo build --release）。"
+        Fail $hint 3
     }
 
     if (-not $NoVerify) {

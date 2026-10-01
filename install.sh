@@ -150,7 +150,18 @@ fetch() {
 }
 
 info "下载 ${asset}"
-fetch "${base}/${asset}" "${tmp}/${asset}" || die "下载失败：${base}/${asset}" 3
+if ! fetch "${base}/${asset}" "${tmp}/${asset}"; then
+    # macOS 从 v1.1.17 起只发桌面应用（.dmg），命令行版只发 Linux。
+    # 固定到旧版本（--version v1.1.16）时这里仍然下得到，所以只在失败时提示。
+    if [ "$os_family" = "macos" ]; then
+        die "下载失败：${base}/${asset}
+  macOS 从 v1.1.17 起只发桌面应用，请到 https://github.com/${REPO}/releases/latest 下载
+    akhub-desktop-<版本>-macos-arm64.dmg    （Apple Silicon）
+    akhub-desktop-<版本>-macos-x86_64.dmg   （Intel）
+  双击安装即可；要在 macOS 上跑命令行版，请从源码构建（cargo build --release）。" 3
+    fi
+    die "下载失败：${base}/${asset}" 3
+fi
 
 if [ "$VERIFY" = "1" ]; then
     info "校验 sha256"

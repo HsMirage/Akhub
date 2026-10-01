@@ -64,9 +64,12 @@ CARGO_TARGET_DIR="$PWD/target" npx tauri build --bundles msi,nsis  # Windows
 
 | 平台 | 产物 |
 | --- | --- |
-| macOS aarch64 | `akhub-desktop-<tag>-macos-aarch64.dmg` |
+| macOS arm64 | `akhub-desktop-<tag>-macos-arm64.dmg` |
 | macOS x86_64 | `akhub-desktop-<tag>-macos-x86_64.dmg` |
-| Windows x86_64 | `akhub-desktop-<tag>-windows-x86_64.msi` + `akhub-desktop-<tag>-windows-x86_64-setup.exe` |
+| Windows x86_64 | `akhub-desktop-<tag>-windows-x86_64-setup.exe` |
+
+Release 上同时还有 Linux 的两个服务端包（`akhub-v<tag>-linux-{x86_64,aarch64}.tar.gz`）；
+**macOS / Windows 的裸二进制从这里起不再发布**，只有桌面安装包。
 
 sidecar 直接复用 `binaries` job 已发布的 akhub 工件（macOS 取 `.tar.gz` 里的二进制，
 Windows 取裸 `.exe`），因此「桌面端里跑的 akhub」与用户手工下载的是同一份产物；

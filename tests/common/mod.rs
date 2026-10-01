@@ -1171,7 +1171,9 @@ impl FakeGithub {
         let addr: SocketAddr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
         let version = tag.trim_start_matches('v');
-        let suffix = akhub::update::asset_suffix().expect("测试平台必须在发行矩阵内");
+        // 只在还有命令行发行资产的平台上构造（调用方先检查 cli_updates_supported）；
+        // 占位名只是让夹具在任何平台上都建得出来。
+        let suffix = akhub::update::asset_suffix().unwrap_or("linux-x86_64");
         let checksums = {
             let hash = checksum.unwrap_or_else(|| {
                 use sha2::Digest as _;
@@ -1211,6 +1213,14 @@ impl FakeGithub {
     }
 }
 
+/// 更新链路的 e2e 只在还有命令行发行资产的平台上跑。
+///
+/// macOS / Windows 从 v1.1.17 起只发桌面应用（见 `akhub::update::asset_suffix`），
+/// 这两个平台上根本挑不到资产。本地开发机跳过这些用例，CI 的 Linux runner 覆盖。
+pub fn cli_updates_supported() -> bool {
+    akhub::update::asset_suffix().is_some()
+}
+
 /// 一台 Release 的 JSON：资产覆盖全部发行平台，下载地址都指向假服务器。
 fn release_json(tag: &str, base: &str) -> Value {
     let version = tag.trim_start_matches('v');
@@ -1245,7 +1255,7 @@ fn release_json(tag: &str, base: &str) -> Value {
 
 /// 造一个与真实发行包同构的归档：内层目录 == 资产名去掉扩展名，里面是 `akhub`。
 pub fn make_release_archive(version: &str, binary: &[u8]) -> Vec<u8> {
-    let suffix = akhub::update::asset_suffix().expect("测试平台必须在发行矩阵内");
+    let suffix = akhub::update::asset_suffix().unwrap_or("linux-x86_64");
     let stem = format!("akhub-v{version}-{suffix}");
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);

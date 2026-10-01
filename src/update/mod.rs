@@ -558,12 +558,7 @@ impl Registry {
         };
 
         let latest = normalize_tag(&release.tag_name);
-        let asset = pick_asset(&release.assets, &latest).ok_or_else(|| {
-            format!(
-                "Release v{latest} 里没有适配当前平台（{}）的资产，请手工下载安装。",
-                platform_label()
-            )
-        })?;
+        let asset = pick_asset(&release.assets, &latest).ok_or_else(|| no_asset_hint(&latest))?;
         let checksums = release
             .assets
             .iter()
@@ -711,14 +706,40 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// 当前平台在发行资产名里的后缀，与 `scripts/package.sh` 的命名一一对应。
 ///
+/// **只有 Linux 还有命令行版的发行资产**：macOS 与 Windows 从 v1.1.17 起改以桌面
+/// 应用发布（见 `desktop/`），Release 里没有它们的裸二进制，也就没有可自动更新的
+/// 包。这两个平台返回 None，由 no_asset_hint 给出"去下桌面安装包"的提示。
+///
 /// 公开出去是为了让测试能拼出与真实发行包同构的资产名；生产代码只用它挑文件。
 pub fn asset_suffix() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux-x86_64"),
         ("linux", "aarch64") => Some("linux-aarch64"),
-        ("macos", "aarch64") => Some("macos-aarch64"),
-        ("macos", "x86_64") => Some("macos-x86_64"),
         _ => None,
+    }
+}
+
+/// 挑不到发行包时给用户一句能照着做的话。
+///
+/// macOS / Windows 从 v1.1.17 起只发桌面应用，自动更新只覆盖 Linux 的单体二进制。
+/// 这两个平台上还留着旧命令行版的机器，需要被告知去哪儿拿新的东西，而不是看到一句
+/// "没有适配当前平台的资产"。
+fn no_asset_hint(version: &str) -> String {
+    no_asset_hint_for(std::env::consts::OS, version)
+}
+
+fn no_asset_hint_for(os: &str, version: &str) -> String {
+    match os {
+        "macos" => format!(
+            "macOS 从 v1.1.17 起只以桌面应用发布：请在 Releases 页面下载 akhub-desktop-{version}-macos-arm64.dmg（Apple Silicon）或 akhub-desktop-{version}-macos-x86_64.dmg（Intel）。自动更新只支持 Linux 服务端。"
+        ),
+        "windows" => format!(
+            "Windows 从 v1.1.17 起只以桌面应用发布：请在 Releases 页面下载 akhub-desktop-{version}-windows-x86_64-setup.exe。自动更新只支持 Linux 服务端。"
+        ),
+        _ => format!(
+            "Release v{version} 里没有适配当前平台（{}）的资产，请手工下载安装。",
+            platform_label()
+        ),
     }
 }
 
@@ -1073,6 +1094,27 @@ mod tests {
             "/home/me/akhub/target/release/akhub"
         )));
         assert!(!looks_like_source_build(Path::new("/usr/local/bin/akhub")));
+    }
+
+    /// 没有命令行资产的平台要给出去哪儿下载的提示，而不是一句无从下手的"没有资产"。
+    #[test]
+    fn missing_assets_get_an_actionable_hint() {
+        let mac = no_asset_hint_for("macos", "1.1.17");
+        assert!(
+            mac.contains("akhub-desktop-1.1.17-macos-arm64.dmg"),
+            "{mac}"
+        );
+        assert!(
+            mac.contains("akhub-desktop-1.1.17-macos-x86_64.dmg"),
+            "{mac}"
+        );
+        let win = no_asset_hint_for("windows", "1.1.17");
+        assert!(
+            win.contains("akhub-desktop-1.1.17-windows-x86_64-setup.exe"),
+            "{win}"
+        );
+        let other = no_asset_hint_for("freebsd", "1.1.17");
+        assert!(other.contains("没有适配当前平台"), "{other}");
     }
 
     #[test]

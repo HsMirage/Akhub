@@ -1,5 +1,14 @@
 # Windows 部署
 
+> **Windows 从 v1.1.17 起只发桌面应用**：Release 里能直接下载的是
+> `akhub-desktop-<tag>-windows-x86_64-setup.exe`（双击安装，装完就是同一个管理后台，
+> 见 [desktop/README.md](../desktop/README.md)）。命令行版 `akhub.exe` 与 `install.ps1`
+> 依赖的裸 exe 资产**不再发布**，本文保留给**从源码构建**在 Windows 上跑服务端的场景：
+> `cargo build --release` 出来的 `target\release\akhub.exe` 用法与下文完全一致。
+>
+> 本机已验证过的桌面端安装包在 Release 页面；想把它当服务常驻，请用桌面端 + 下面的
+> 服务托管思路自行封装，或改用 Linux 服务器。
+
 Akhub 的 Windows 原生部署（§25.2）：**一个 `akhub.exe` 加一个数据目录**。发布矩阵里 Windows 只有 `windows-x86_64` 一个目标，Windows 10 / 11 与 Windows Server 2016 及以上均可直接运行，不需要 .NET、Node、Java 或任何容器运行时。
 
 官方没有把 Windows 做成服务安装包，所以本机跑起来只有两步：把 exe 放到 `C:\Program Files\Akhub` 目录下，把数据目录固定在 `C:\ProgramData\Akhub`，然后选一个服务托管方式（§4）。**最容易踩坑的一处是停止超时**：Akhub 收到停止信号后最多要给在途的长流式请求 180 秒（§25.3），Windows 侧不把停止超时调到 180 秒以上，就会把正在进行中的流式响应强杀掉。

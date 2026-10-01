@@ -127,9 +127,10 @@ docker compose up -d
 curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
 ```
 
-脚本会自动识别平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
-`/usr/local/bin`；`--service` 会顺带装好 systemd 单元。Windows 用
-[`install.ps1`](install.ps1)，细节见 [deploy/README.windows.md](deploy/README.windows.md)。
+脚本只服务 Linux：识别平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
+`/usr/local/bin`；`--service` 会顺带装好 systemd 单元。**macOS 与 Windows 请装桌面端**
+（见下面的「桌面端」一节）——这两个平台从 v1.1.17 起不再发命令行二进制；要在这两个平台上
+跑命令行版，从源码构建即可。
 
 ### 本地运行
 
@@ -221,7 +222,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   权限，这时面板会给出 `sudo akhub --update`——同一个二进制自带更新能力，不需要 curl 管道。
 - **容器部署**：升级的是镜像，面板会给出带目标版本的重建命令，形如
   `AKHUB_IMAGE=ghcr.io/hsmirage/akhub:<tag> docker compose up -d`。
-- **Windows / 源码构建**：分别给出 `install.ps1` 与 `git pull && cargo build --release`。
+- **Windows / 源码构建**：给出去哪儿装桌面端（Windows 与 macOS 只发桌面应用，没有可自动
+  更新的命令行资产），源码构建则给出 `git pull && cargo build --release`。
 
 更新检查在服务端缓存 30 分钟，不会频繁打扰 GitHub；需要完全关闭时设
 `AKHUB_UPDATE_DISABLED=1`。
@@ -313,11 +315,11 @@ docker compose up -d                       # 或
 curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
 ```
 
-每个 `v*` 标签会触发 [release.yml](.github/workflows/release.yml)，在各自平台的原生 runner 上
-构建 5 个平台的单文件二进制（`linux-x86_64`、`linux-aarch64`、
-`macos-aarch64`、`macos-x86_64`、`windows-x86_64`；Windows 只发免解压的裸 `.exe`），
-并合成多架构镜像推送到 GHCR，附 `checksums.txt`。本地发版用 `scripts/release.sh`，打包规则由
-[scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
+每个 `v*` 标签会触发 [release.yml](.github/workflows/release.yml)：Linux 的 runner 上构建
+`linux-x86_64` / `linux-aarch64` 两个单文件二进制，macOS 与 Windows 的 runner 上构建桌面
+安装包（见「桌面端」），再合成多架构镜像推送到 GHCR，附 `checksums.txt`。Release 上只有这
+几个文件——**macOS 与 Windows 的裸二进制不再单独发布**，它们的形态是桌面应用。本地发版用
+`scripts/release.sh`，打包规则由 [scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
 
 容器侧记得给足停止宽限（compose 的 `stop_grace_period` 或 `docker run --stop-timeout` ≥ 200 秒），
 否则 Docker 默认的 10 秒会强杀在途的长流式请求。
@@ -334,9 +336,10 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
   `http://127.0.0.1:<port>/admin`，与管理后台的功能完全一致。
 - 关掉窗口时 sidecar 一起退出，不会留下后台进程；端口每次启动都可能不同，不需要手工配置，
   也不会和本机已有的 akhub / 其它服务抢端口。
-- 安装包与裸二进制挂在同一个 Release 页面：`akhub-desktop-<tag>-macos-aarch64.dmg`、
-  `akhub-desktop-<tag>-macos-x86_64.dmg`、`akhub-desktop-<tag>-windows-x86_64.msi`、
-  `akhub-desktop-<tag>-windows-x86_64-setup.exe`（NSIS 安装器）。
+- Release 页面上一共五个文件：macOS 的 `akhub-desktop-<tag>-macos-arm64.dmg`（Apple
+  Silicon）与 `akhub-desktop-<tag>-macos-x86_64.dmg`（Intel）、Windows 的
+  `akhub-desktop-<tag>-windows-x86_64-setup.exe`（NSIS 安装器），加上 Linux 服务端的
+  `akhub-v<tag>-linux-x86_64.tar.gz` 与 `akhub-v<tag>-linux-aarch64.tar.gz`。
 
 安装包没有做代码签名：macOS 首次打开要右键点图标选「打开」
 （或 `xattr -dr com.apple.quarantine /Applications/Akhub.app`），Windows 首次运行要在
