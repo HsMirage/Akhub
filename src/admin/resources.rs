@@ -2732,6 +2732,9 @@ fn target_display_stats(
 /// 用与调度完全相同的算法算出来：后台看到的分数必须和调度器用的是同一个数字，
 /// 否则诊断毫无意义。按模型算一次，行级 DTO 只取下标——否则每个目标都要重算
 /// 整个模型的候选集，500 个目标就是 500 倍的计算量。
+///
+/// 不参与调度的行照样给分（管理员想知道"重新启用它大概是什么水平"），但它们的
+/// 样本不进参照系：**参照系只由能参与调度的目标定义**，与调度器一致。
 fn model_scores(
     state: &SharedState,
     group: &GroupView,
@@ -2745,36 +2748,58 @@ fn model_scores(
         round4(value * f64::from(weight) / f64::from(SchedulingWeights::TOTAL))
     };
 
-    let mut values = Vec::with_capacity(model.targets.len());
+    let mut values: Vec<(String, Multiplier, bool, bool)> = Vec::with_capacity(model.targets.len());
     for target in &model.targets {
         let effective = multipliers.effective(&target.account, group.group.multiplier_limit, now);
+        // 这个目标此刻能不能真的参与调度（`check_eligibility` 里与配置、倍率有关
+        // 的那几道门）。运行时状态（熔断、并发）**刻意不进这个判据**：参照系不该
+        // 随冷却在"有这个目标 / 没有"之间抖动。
+        let schedulable = target.account.enabled
+            && target.target.enabled
+            && effective.status.is_usable()
+            && effective.value <= group.group.multiplier_limit;
         values.push((
             target.target.id.clone(),
             effective.value,
             effective.status == crate::multiplier::Status::Stale,
+            schedulable,
         ));
     }
+    // 参照系只能由**还能参与调度**的账号定义：这里必须与 `routing::plan` 的
+    // `cheapest_in_group` 用同一把尺子（同样过滤停用账号与停用目标）。少了这道
+    // 过滤，分组里一个停用的低价账号会把整个参照系拉到它那一档——现场 gpt-boom
+    // 的 `sub2api-gpt账号`（停用、倍率 0.01）就是这样把全部在用目标的倍率分压到
+    // 0.2 以下，后台评分因此比调度器实际用的低一截（§9.4）。
     let cheapest = group
         .models
         .values()
         .flat_map(|model| model.targets.iter())
+        .filter(|target| target.account.enabled && target.target.enabled)
         .map(|target| {
             multipliers
                 .effective(&target.account, group.group.multiplier_limit, now)
                 .value
         })
         .min();
-    let candidates: Vec<_> = values
+    let candidate = |value: &(String, Multiplier, bool, bool)| crate::routing::score::Candidate {
+        target_id: value.0.clone(),
+        multiplier: value.1,
+        multiplier_stale: value.2,
+        stats: state.runtime.perf.stats(&value.0, dimension),
+    };
+    let candidates: Vec<_> = values.iter().map(candidate).collect();
+    // 参照系只由**能参与调度**的目标定义，与调度器一致（它交给 `score_all` 的
+    // 就是 `eligible` 那一批）。这一条和上面的 `cheapest` 同样要紧：倍率分被停用
+    // 账号的低价拉低只是"分偏低"，而性能三维是按"帧内最优"归一化的——一个已经
+    // 下线、历史样本很快的账号会把在用目标的首字与吞吐压到 0.05 量级（§9.4）。
+    let frame: Vec<_> = values
         .iter()
-        .map(|(id, multiplier, stale)| crate::routing::score::Candidate {
-            target_id: id.clone(),
-            multiplier: *multiplier,
-            multiplier_stale: *stale,
-            stats: state.runtime.perf.stats(id, dimension),
-        })
+        .filter(|value| value.3)
+        .map(candidate)
         .collect();
-    let scores = crate::routing::score::score_all(
+    let scores = crate::routing::score::score_all_with_frame(
         &candidates,
+        &frame,
         weights,
         cheapest,
         crate::storage::now_unix(),
@@ -2796,7 +2821,9 @@ fn model_scores(
                     first_token: crate::routing::score::NEUTRAL,
                     throughput: crate::routing::score::NEUTRAL,
                     total: crate::routing::score::NEUTRAL,
-                    exploration: crate::routing::score::NEUTRAL,
+                    // 口粮不是"中性分"：它是 0.03~0.24 的底权，没有就是 0。
+                    // 前端 `exploration ?? 0` 与这里必须是同一个口径。
+                    exploration: 0.0,
                 });
             let stats = state.runtime.perf.stats(&target.target.id, dimension);
             ScoreDto {

@@ -997,6 +997,257 @@ async fn list_target_scores_are_per_row_not_shared() {
     }
 }
 
+/// 分组参照系必须与调度器同一把尺子：只统计**启用**的账号与目标（§9.4）。
+///
+/// 停用账号留在分组里是常态（换号、比价、临时下线）。它的低价如果进了参照系，
+/// 后台每一行评分都会比调度器实际用的低一截，管理员看到的就是一套无从解释的数字
+/// ——现场 gpt-boom 的 `sub2api-gpt账号`（停用、倍率 0.01）正是这样把五个在用
+/// 目标的倍率分压到 0.2 以下的。
+#[tokio::test]
+async fn the_group_reference_ignores_disabled_accounts() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    // 两个账号接同一个模型：在用的 0.5 与停用的 0.1。参照系只能由前者定义。
+    let mut account_ids = Vec::new();
+    for (index, multiplier) in ["0.5", "0.1"].iter().enumerate() {
+        let account: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/accounts"),
+        )
+        .json(&json!({
+            "group_id": group_id,
+            "name": format!("账号{index}"),
+            "base_url": "https://api.example.com",
+            "api_key": "sk-x",
+            "preferred_protocol": "openai_chat",
+            "manual_multiplier": multiplier,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let response = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/targets"),
+        )
+        .json(&json!({
+            "logical_model_id": model["id"],
+            "account_id": account["id"],
+            "upstream_model": "glm-4.6",
+        }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        account_ids.push(account["id"].as_str().unwrap().to_string());
+    }
+
+    // 停用那个便宜账号：它已经拿不到流量，也就不该再决定全组的参照系。
+    let disabled = write(
+        &client,
+        reqwest::Method::PATCH,
+        format!("{base}/admin/api/accounts/{}", account_ids[1]),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(disabled.status(), 200, "{}", disabled.text().await.unwrap());
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = listed["data"].as_array().unwrap();
+
+    let live = rows
+        .iter()
+        .find(|row| row["account_id"] == account_ids[0].as_str())
+        .expect("在用账号的目标行必须在列表里");
+    let dead = rows
+        .iter()
+        .find(|row| row["account_id"] == account_ids[1].as_str())
+        .expect("停用账号的目标行照常显示");
+
+    // 在用的 0.5 就是参照系里最便宜的 → 倍率分满分。若停用账号的 0.1 混进参照系，
+    // 这里会变成 0.1/0.5 = 0.2，后台评分与调度器当场对不上。
+    assert_eq!(live["score"]["multiplier"], 1.0, "{live}");
+    // 停用行按同一个参照系算（大于最便宜会被夹到 1.0），但它在界面上占 0% 权重。
+    assert_eq!(dead["score"]["multiplier"], 1.0, "{dead}");
+}
+/// 参照系只由**能参与调度**的目标定义，性能三维也不例外（§9.4）。
+///
+/// 现场形状：一个已经停用、但历史样本很快的账号，会把全部在用目标的首字与
+/// 吞吐按"帧内最优"压到 0.05 量级——而调度器根本没把它算进候选。倍率分被拉低
+/// 只是"分偏低"，性能分被拉低是直接乘在归一化比值上的，量级差一二十倍。
+#[tokio::test]
+async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
+    let (base, client, _dir, state) = spawn_with_state().await;
+    setup_admin(&base, &client).await;
+    let group: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = group["group"]["id"].as_str().unwrap().to_string();
+
+    let model: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/logical-models"),
+    )
+    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+    // 三个账号接同一个模型、同层同倍率：倍率与可靠性对三方完全一样，差别只在
+    // 速度。最快那个一会儿会被停用——它不能当参照系。
+    let mut targets = Vec::new();
+    let mut accounts = Vec::new();
+    for (name, first_token_ms, output_tokens) in [
+        ("快但停用", 100u64, 100u64),
+        ("在用A", 2000, 10),
+        ("在用B", 4000, 5),
+    ] {
+        let account: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/accounts"),
+        )
+        .json(&json!({
+            "group_id": group_id,
+            "name": format!("账号{name}"),
+            "base_url": "https://api.example.com",
+            "api_key": "sk-x",
+            "preferred_protocol": "openai_chat",
+            "manual_multiplier": "1",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let target: Value = write(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/admin/api/targets"),
+        )
+        .json(&json!({
+            "logical_model_id": model["id"],
+            "account_id": account["id"],
+            "upstream_model": "glm-4.6",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let target_id = target["id"].as_str().unwrap().to_string();
+        prime_target(
+            &state,
+            &target_id,
+            Protocol::OpenAiChat,
+            true,
+            30,
+            first_token_ms,
+            output_tokens,
+            akhub::storage::now_unix(),
+        );
+        targets.push(target_id);
+        accounts.push(account["id"].as_str().unwrap().to_string());
+    }
+
+    // 停用最快的那个账号：它已经拿不到流量，也就不该再定义参照系。
+    let disabled = write(
+        &client,
+        reqwest::Method::PATCH,
+        format!("{base}/admin/api/accounts/{}", accounts[0]),
+    )
+    .json(&json!({"enabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(disabled.status(), 200, "{}", disabled.text().await.unwrap());
+
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = listed["data"].as_array().unwrap();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("目标 {id} 必须出现在列表里"))
+    };
+    let live = row(&targets[1]);
+    let slower = row(&targets[2]);
+
+    // 在用最快的是 A（2000ms / 10 tok/s），参照系里就该是它：三项满分。
+    // 停用那个 100ms / 100 tok/s 若混进参照系，这里会变成 0.05 / 0.1。
+    assert_eq!(live["score"]["first_token"], 1.0, "{live}");
+    assert_eq!(live["score"]["throughput"], 1.0, "{live}");
+    assert_eq!(live["score"]["multiplier"], 1.0, "{live}");
+    assert_eq!(live["score"]["total"], 1.0, "{live}");
+    // B 的比值必须相对**在用**的那一个算：2000/4000 与 5/10。
+    assert_eq!(slower["score"]["first_token"], 0.5, "{slower}");
+    assert_eq!(slower["score"]["throughput"], 0.5, "{slower}");
+    // 停用行照常给一个参考分（重新启用大概什么水平），只是不参与参照系。
+    let dead = row(&targets[0]);
+    assert_eq!(dead["score"]["multiplier"], 1.0, "{dead}");
+}
+
 /// 配置版本乐观锁（§7.4）：带上对不上的版本写 → 409，带上当前版本 → 成功，
 /// 每次响应都回带最新版本，不带头部时保持兼容。
 #[tokio::test]

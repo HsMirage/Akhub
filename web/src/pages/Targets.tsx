@@ -37,7 +37,7 @@ interface ResolvedTarget {
   account: Account | undefined;
   /** 同一模型内从高到低排出的层号（1 起）；数字相同为同层。 */
   layer: number;
-  /** 层内按 score^8 归一化后的预计流量占比。 */
+  /** 层内按**调度器同一把抽签权重**归一化后的预计流量占比（§9.5）。 */
   share: number;
 }
 
@@ -144,12 +144,17 @@ export function Targets({
             return rightScore - leftScore;
           });
 
-        // 同优先级构成一层；层内权重取 score^8，与调度器的加权随机一致。
+        // 同优先级构成一层；层内权重与调度器的抽签权重**同一把尺子**：
+        // `分数^8 + 探索口粮`（§9.5）。
         //
-        // 停用的账号 / 目标权重是 0，不占分母：调度器在资格判定里直接把
-        // Disabled 挡在候选之外（`check_eligibility`），它们的真实占比就是 0%，
-        // 留着它们会让"预计分配"变成一个根本拿不到流量的百分比，同层其它
-        // 账号加起来也到不了 100%（§6.5）。
+        // 不能只取 `分数^8`：调度器还会给每个候选加一份与分数无关的口粮，而且
+        // 口粮随"距上次采样多久"放大到 8 倍。候选大多是冷目标时，口粮直接盖过
+        // 分数幂次——只按分数^8 显示的占比会把弱候选低估好几倍（现场 GPT-pro：
+        // 视图 0.9% / 调度器实际抽签权重 14.7%，同一行的两个数字差 16 倍）。
+        //
+        // 调度器资格判定会挡掉的目标权重是 0，不占分母：它们的真实占比就是 0%，
+        // 留着会让"预计分配"变成一个根本拿不到流量的百分比，同层其它账号加起来
+        // 也到不了 100%（§6.5）。
         const layerPriorities = [...new Set(raw.map((item) => item.target.priority))].sort(
           (a, b) => b - a,
         );
@@ -157,9 +162,7 @@ export function Targets({
         for (const priority of layerPriorities) {
           const layer = raw.filter((item) => item.target.priority === priority);
           const weights = layer.map((item) =>
-            isSchedulable(item.target, item.account)
-              ? Math.max(item.target.score?.total ?? 1, 0.01) ** 8
-              : 0,
+            isSchedulable(item.target, item.account) ? drawWeight(item.target) : 0,
           );
           // 整层都停用时没有分母可言：每一行都是 0%，不是 NaN。
           const total = weights.reduce((sum, value) => sum + value, 0);
@@ -369,13 +372,36 @@ export function Targets({
 }
 
 /**
+ * 调度器层内抽签的底权（`src/routing/score.rs` 的 `base_weight`）。
+ *
+ * 幂次、下限与中性分都写在这里，是为了让界面显示的"预计分配"与调度器用的是
+ * **同一个公式**：只取分数幂次而不加口粮，冷目标会被系统性低估。
+ */
+const DRAW_POWER = 8;
+const MIN_SCORE = 0.01;
+/** 没有评分时的保守权重，与后端的 `NEUTRAL` 一致；绝不能当成满分。 */
+const NEUTRAL_SCORE = 0.6;
+
+/** 这个目标此刻的抽签权重：`分数^8 + 探索口粮`（`score::base_weight`）。 */
+function drawWeight(target: DispatchTarget): number {
+  const score = target.score;
+  const total = Math.max(score?.total ?? NEUTRAL_SCORE, MIN_SCORE);
+  return total ** DRAW_POWER + Math.max(score?.exploration ?? 0, 0);
+}
+
+/**
  * 这个目标此刻会不会真的被调度器选中。
  *
- * 与调度器资格判定里的 Disabled 分支一致（`src/routing/mod.rs`）：账号停用或
- * 目标停用都不进候选。界面上的"预计分配"必须用同一把尺子。
+ * 与调度器的资格判定同一把尺子（`src/routing/mod.rs` 的 `check_eligibility`）：
+ * 账号 / 目标停用，以及 `pause_reason` 给出的每一种硬性不合格——倍率未知且已过
+ * 宽限期、有效倍率高于分组上限、熔断冷却或半开、额度耗尽、账号内没有可用 Key。
+ *
+ * 倍率过期但仍在宽限期内的目标照常参与调度（层内降权），所以不算不可调度。
+ * 这条尺子必须有：否则会给一个永远选不中的账号显示三成流量（现场 GPT-pro 的
+ * 冰峰：倍率未知 76 小时，视图却写着 34.4%）。
  */
 function isSchedulable(target: DispatchTarget, account: Account | undefined): boolean {
-  return target.enabled && account?.enabled !== false;
+  return target.enabled && account?.enabled !== false && target.pause_reason === null;
 }
 
 /**
@@ -384,9 +410,12 @@ function isSchedulable(target: DispatchTarget, account: Account | undefined): bo
  * **主动关闭不算异常**：停用的账号 / 目标是管理员按自己的意愿让它退出调度，
  * 不是需要处理的问题。把它算进卡片头部的"xx 个异常"，会让一张卡片永远挂着
  * 警示徽标，真正该看的冷却、倍率未知反而被淹掉（§6.5）。
+ *
+ * 前置判断用"是否启用"而不是 `isSchedulable`：后者已经把倍率未知、冷却这些
+ * 状态算作不可调度，拿它当门槛会让最该被看见的异常行反而进不了"只看异常"。
  */
 function targetHasIssue(target: DispatchTarget, account: Account | undefined): boolean {
-  if (!isSchedulable(target, account)) return false;
+  if (!target.enabled || account?.enabled === false) return false;
   return (
     target.status !== "active" ||
     account?.multiplier_status !== "known" ||
@@ -549,7 +578,9 @@ function ModelBlock({
                     <th>可用性</th>
                     <th>首字 / 速度</th>
                     <th title="当前并发 / 并发上限；下面一行是 RPM / TPM 限制">当前并发</th>
-                    <th>预计分配</th>
+                    <th title="层内按调度器同一把抽签权重（评分^8 + 探索口粮）归一化后的期望占比。强粘性命中的请求不参与抽签，短窗口的实际占比可能偏离。">
+                      预计分配
+                    </th>
                   </tr>
                 </thead>
                 <tbody>

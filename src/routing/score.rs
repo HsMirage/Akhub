@@ -525,7 +525,25 @@ pub fn score_all(
     cheapest_in_group: Option<Multiplier>,
     now: i64,
 ) -> Vec<Score> {
-    let reference = Reference::of(candidates, cheapest_in_group, now);
+    score_all_with_frame(candidates, candidates, weights, cheapest_in_group, now)
+}
+
+/// 同 [`score_all`]，但**参照系只从 `frame` 里取**。
+///
+/// 后台需要给"不能参与调度"的行也算一个参考分（停用账号：管理员想知道重新启用
+/// 它大概是什么水平），但这些行绝不能定义参照系——一个已经下线的账号只要历史
+/// 样本够快，就会按"帧内最优"把全部在用目标的性能三维压下去（§9.4）。调度器
+/// 没有这个毛病：它交给 [`score_all`] 的就是 `eligible` 那一批。
+///
+/// `frame` 为空等价于"一个热目标都没有"：性能三维对所有人取中性分。
+pub fn score_all_with_frame(
+    candidates: &[Candidate],
+    frame: &[Candidate],
+    weights: SchedulingWeights,
+    cheapest_in_group: Option<Multiplier>,
+    now: i64,
+) -> Vec<Score> {
+    let reference = Reference::of(frame, cheapest_in_group, now);
     candidates
         .iter()
         .map(|candidate| score_one(candidate, &reference, weights, now))
