@@ -33,8 +33,17 @@ pub enum Ineligible {
     MultiplierExceeded,
     /// 自动倍率未知且已超过宽限期（§11.4）。
     MultiplierUnknown,
-    /// 这个账号没有能表达本次请求的端点（§14.3、§14.8）。
+    /// 这个账号**结构上**表达不了本次请求（没有可用端点，§14.3、§14.8）。
+    ///
+    /// 静态事实：再等一会儿、再看一眼还是这个结果，所以它对外的语义是
+    /// "重试没有意义"（§18.3）。
     Unsupported(String),
+    /// 曾经从上游学到"这个账号的这个模型不支持这项能力"，还在存续期内（§16.7）。
+    ///
+    /// 与 [`Self::Unsupported`] 必须分开：这条限制**会自己过期**，也可能被
+    /// 管理员手动放行，属于"暂时不可用"。混为一谈会把一个 15 分钟的内存封禁
+    /// 报成"无法表达本次请求、别再重试"——现场事故里客户端就是这么被劝退的。
+    LearnedUnsupported(String),
     /// 动态状态不允许：熔断、额度耗尽、鉴权失败或暂时容量不足。
     ///
     /// 第二个字段是**归因到哪把 Key**（凭据摘要）。单 Key 账号与账号级原因
@@ -50,7 +59,9 @@ impl Ineligible {
             Self::Disabled => "已停用".to_string(),
             Self::MultiplierExceeded => "倍率超限".to_string(),
             Self::MultiplierUnknown => "倍率未知".to_string(),
-            Self::Unsupported(_) => "能力不支持".to_string(),
+            // 两者对外的**类别词**都是"能力不支持"：摘要用于聚合与告警，口径不变；
+            // 区别体现在对外文案、状态码与具体说明里。
+            Self::Unsupported(_) | Self::LearnedUnsupported(_) => "能力不支持".to_string(),
             Self::Unavailable(reason, key) => {
                 let base = match reason {
                     health::Unavailable::KeyInvalid => "Key 失效",
@@ -70,11 +81,47 @@ impl Ineligible {
         }
     }
 
+    /// 给对外文案用的详细说法（§18.3、§24.1）。
+    ///
+    /// [`Self::describe`] 只给类别词，够填请求记录的过滤摘要；对外报文要直接
+    /// 送到客户端与管理员眼前，必须带上**具体是哪个账号、哪项能力、哪个端点**，
+    /// 否则"模型没有可用目标"会把性质完全不同的几件事说成一句。
+    fn describe_detailed(&self) -> String {
+        match self {
+            Self::Unsupported(detail) => format!("{}（{detail}）", self.describe()),
+            Self::LearnedUnsupported(detail) => {
+                format!("{}（{detail}，可手动放行）", self.describe())
+            }
+            other => other.describe(),
+        }
+    }
+
+    /// 混合原因下"最值得报出来"的排序，小者优先（§18.3）。
+    ///
+    /// 自己会好的排最前——客户端重试有意义；其次是能指名道姓的能力/端点问题，
+    /// 管理员能直接去改；倍率与停用属于纯配置问题，排最后。早先的实现取"第一个
+    /// 非能力原因"，于是一条能力封禁会被邻居目标的"已停用"顶掉，把管理员引到
+    /// 完全错误的方向。
+    fn rank(&self) -> u8 {
+        match self {
+            // 会自己好的排最前。
+            Self::Unavailable(reason, _) if reason.is_queueable() => 0,
+            // 学到的能力限制：有存续期、可手动放行，而且指名道姓（账号 + 能力）。
+            Self::LearnedUnsupported(_) => 1,
+            Self::Unavailable(_, _) => 2,
+            Self::Unsupported(_) => 3,
+            Self::MultiplierExceeded | Self::MultiplierUnknown => 4,
+            Self::Disabled => 5,
+        }
+    }
+
     fn error_code(&self) -> ErrorCode {
         match self {
             Self::MultiplierExceeded => ErrorCode::MultiplierExceeded,
             Self::MultiplierUnknown => ErrorCode::MultiplierUnknown,
             Self::Unsupported(_) => ErrorCode::UnsupportedParameter,
+            // 学到的限制会过期：对外保留可重试语义，别把暂时状态说成终局。
+            Self::LearnedUnsupported(_) => ErrorCode::NoEligibleTarget,
             Self::Unavailable(health::Unavailable::RateLimited, _) => ErrorCode::RateLimited,
             _ => ErrorCode::NoEligibleTarget,
         }
@@ -155,7 +202,19 @@ pub struct Plan {
     pub cheapest: Option<Multiplier>,
     pub dearest: Option<Multiplier>,
     /// 被过滤掉的目标及原因，用于请求记录的"候选过滤原因"（§24.1）。
-    pub filtered: Vec<(String, usize)>,
+    pub filtered: Vec<FilteredReason>,
+}
+
+/// 一个候选被过滤掉的原因（§24.1）。
+///
+/// 分两层：[\`label\`] 是类别词，用来聚合与告警；[\`detail\`] 带上具体是哪个
+/// 账号、哪项能力、哪个端点——事后复盘时前者只能告诉你"有一类问题"，后者才能
+/// 告诉你"该去改谁"。
+#[derive(Debug, Clone)]
+pub struct FilteredReason {
+    pub label: String,
+    pub detail: String,
+    pub count: usize,
 }
 
 impl Plan {
@@ -188,11 +247,36 @@ impl Plan {
         if self.filtered.is_empty() {
             return "无".to_string();
         }
-        self.filtered
-            .iter()
-            .map(|(reason, count)| format!("{reason}×{count}"))
+        let mut grouped: Vec<(String, usize)> = Vec::new();
+        for entry in &self.filtered {
+            match grouped.iter_mut().find(|(label, _)| *label == entry.label) {
+                Some((_, count)) => *count += entry.count,
+                None => grouped.push((entry.label.clone(), entry.count)),
+            }
+        }
+        grouped
+            .into_iter()
+            .map(|(label, count)| format!("{label}×{count}"))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// 候选过滤原因的**具体**说法（§24.1）。
+    ///
+    /// 与 [`Self::filter_summary`] 分开存：摘要是给聚合与告警用的类别词，这里是
+    /// 给事后复盘用的"到底是谁、因为什么"。没有它，一条"能力不支持"要等到
+    /// 现场复现才能定位到具体账号与能力。
+    pub fn filter_details(&self) -> Option<String> {
+        if self.filtered.is_empty() {
+            return None;
+        }
+        Some(
+            self.filtered
+                .iter()
+                .map(|entry| format!("{}×{}", entry.detail, entry.count))
+                .collect::<Vec<_>>()
+                .join("；"),
+        )
     }
 
     /// 在计划里找出某个目标，供粘性命中时复用已算好的倍率与评分。
@@ -310,9 +394,9 @@ pub fn check_eligibility(
             context.now,
         ) && !capability::DEGRADABLE.contains(&capability);
         if prohibited {
-            return Err(Ineligible::Unsupported(format!(
-                "模型 {} 已被证实不支持 {capability}",
-                target.target.upstream_model
+            return Err(Ineligible::LearnedUnsupported(format!(
+                "账号「{}」的模型 {} 已被证实不支持 {capability}",
+                target.account.name, target.target.upstream_model
             )));
         }
     }
@@ -544,13 +628,22 @@ pub fn plan(
 
     let cheapest = candidates.iter().map(|c| c.multiplier).min();
     let dearest = candidates.iter().map(|c| c.multiplier).max();
-    // 过滤原因按文本合并计数，写进请求记录供诊断（§24.1）。
-    let mut filtered: Vec<(String, usize)> = Vec::new();
+    // 过滤原因按"类别 + 具体说明"合并计数，写进请求记录供诊断（§24.1）。
+    // 两层都要：类别词用于聚合与告警，具体说明用于事后定位到账号与能力。
+    let mut filtered: Vec<FilteredReason> = Vec::new();
     for reason in &reasons {
         let label = reason.describe();
-        match filtered.iter_mut().find(|(name, _)| *name == label) {
-            Some((_, count)) => *count += 1,
-            None => filtered.push((label, 1)),
+        let detail = reason.describe_detailed();
+        match filtered
+            .iter_mut()
+            .find(|entry| entry.label == label && entry.detail == detail)
+        {
+            Some(entry) => entry.count += 1,
+            None => filtered.push(FilteredReason {
+                label,
+                detail,
+                count: 1,
+            }),
         }
     }
     Ok(Plan {
@@ -676,64 +769,74 @@ fn shuffle(
 }
 
 /// 全部目标都不合格时，挑一个最值得报出的原因。
+///
+/// 状态码与文案必须来自**同一个**原因。早先的实现分开取：状态码挑"第一个非能力
+/// 原因"、文案取"第一个原因"，于是出现了"503 + 已停用"这种把管理员完全带偏的
+/// 组合——真正的拦路者其实是另一个目标上的能力封禁。
 fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> SelectionFailure {
-    // 倍率相关的原因最值得单独报出——它是"你的钱包在拦你"，客户端重试没有
-    // 意义，必须映射到不可重试的状态码（§18.3）。
     let all =
         |predicate: fn(&Ineligible) -> bool| !reasons.is_empty() && reasons.iter().all(predicate);
-    let code = if all(|r| *r == Ineligible::MultiplierExceeded) {
-        ErrorCode::MultiplierExceeded
-    } else if all(|r| {
+
+    // 没有任何目标**结构上**能表达这个请求：换目标、重试都是同样的结果，
+    // 快速失败（§18.3）。学到的能力限制不算这一类——它会过期。
+    if all(|r| matches!(r, Ineligible::Unsupported(_))) {
+        let detail = reasons.iter().find_map(|reason| match reason {
+            Ineligible::Unsupported(detail) => Some(detail.clone()),
+            _ => None,
+        });
+        return SelectionFailure {
+            code: ErrorCode::UnsupportedParameter,
+            message: match detail {
+                Some(detail) => format!("逻辑模型 {model_name} 无法表达本次请求：{detail}"),
+                None => format!("逻辑模型 {model_name} 无法表达本次请求"),
+            },
+        };
+    }
+    // 倍率相关的原因最值得单独报出——它是"你的钱包在拦你"，客户端重试没有
+    // 意义，必须映射到不可重试的状态码（§18.3）。
+    if all(|r| *r == Ineligible::MultiplierExceeded) {
+        return SelectionFailure {
+            code: ErrorCode::MultiplierExceeded,
+            message: format!(
+                "逻辑模型 {model_name} 的所有目标有效倍率都高于分组上限 {}",
+                group.group.multiplier_limit
+            ),
+        };
+    }
+    if all(|r| {
         matches!(
             r,
             Ineligible::MultiplierUnknown | Ineligible::MultiplierExceeded
         )
     }) {
-        ErrorCode::MultiplierUnknown
-    } else if all(|r| matches!(r, Ineligible::Unsupported(_))) {
-        // 没有任何目标能表达这个请求：重试不会有别的结果，快速失败（§18.3）。
-        ErrorCode::UnsupportedParameter
-    } else {
-        // 混合原因下优先报出可重试的那一个：其他目标只是暂时不可用。
-        reasons
-            .iter()
-            .find(|r| !matches!(r, Ineligible::Unsupported(_)))
-            .or(reasons.first())
-            .map(Ineligible::error_code)
-            .unwrap_or(ErrorCode::NoEligibleTarget)
+        return SelectionFailure {
+            code: ErrorCode::MultiplierUnknown,
+            message: format!("逻辑模型 {model_name} 的所有目标倍率未知且已超过宽限期"),
+        };
+    }
+
+    // 混合原因：按 [`Ineligible::rank`] 挑一个，状态码与文案都由它决定。
+    // 只说"没有可用的调度目标"会让"账号一把 Key 都没有"和"全部账号都在冷却"
+    // 看起来一模一样，而管理员要做的事完全不同（§4.2.1、§18.3）。
+    let Some(chosen) = reasons.iter().min_by_key(|reason| reason.rank()) else {
+        return SelectionFailure {
+            code: ErrorCode::NoEligibleTarget,
+            message: format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
+        };
     };
-
-    let unsupported = reasons.iter().find_map(|reason| match reason {
-        Ineligible::Unsupported(message) => Some(message.clone()),
-        _ => None,
-    });
-
+    // 状态码：静态表达问题只有在"无一例外"时才是不可重试的 400（上面已返回）。
+    // 混合原因里出现它，说明别的目标只是暂时不可用；这时候丢掉可重试语义会把
+    // "等一会儿就好"说成"永远不行"。
+    let code = match chosen {
+        Ineligible::Unsupported(_) => ErrorCode::NoEligibleTarget,
+        other => other.error_code(),
+    };
     SelectionFailure {
         code,
-        message: match code {
-            ErrorCode::MultiplierExceeded => format!(
-                "逻辑模型 {model_name} 的所有目标有效倍率都高于分组上限 {}",
-                group.group.multiplier_limit
-            ),
-            ErrorCode::MultiplierUnknown => {
-                format!("逻辑模型 {model_name} 的所有目标倍率未知且已超过宽限期")
-            }
-            ErrorCode::UnsupportedParameter => {
-                unsupported.unwrap_or_else(|| format!("逻辑模型 {model_name} 无法表达本次请求"))
-            }
-            // 带上第一个具体原因：只说"没有可用的调度目标"会让"账号一把 Key 都
-            // 没有"和"全部账号都在冷却"看起来一模一样，而管理员要做的事完全不同
-            // （§4.2.1、§18.3）。
-            _ => match reasons.first() {
-                Some(reason) => {
-                    format!(
-                        "逻辑模型 {model_name} 当前没有可用的调度目标：{}",
-                        reason.describe()
-                    )
-                }
-                None => format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
-            },
-        },
+        message: format!(
+            "逻辑模型 {model_name} 当前没有可用的调度目标：{}",
+            chosen.describe_detailed()
+        ),
     }
 }
 
@@ -827,6 +930,63 @@ mod tests {
         Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, MultiplierMode,
         Protocol, SchedulingWeights,
     };
+
+    /// 混合原因下，"最值得报出"的排序（§18.3）。
+    ///
+    /// 现场事故里：一个渠道被停用、另一个渠道上的能力被封禁，报文却只说"已停用"
+    /// ——管理员会去翻配置，而真正的拦路者是那条能力证据。
+    #[test]
+    fn a_capability_block_outranks_a_disabled_neighbour_in_the_reported_reason() {
+        let blocked = Ineligible::LearnedUnsupported(
+            "账号「A」的模型 m 已被证实不支持 forced_tool_choice".into(),
+        );
+        let disabled = Ineligible::Disabled;
+        assert!(
+            blocked.rank() < disabled.rank(),
+            "能力封禁比'已停用'更值得报出"
+        );
+        let detail = blocked.describe_detailed();
+        assert!(detail.contains("forced_tool_choice"), "{detail}");
+        assert!(
+            detail.contains("账号「A」"),
+            "具体说明要能定位到账号：{detail}"
+        );
+        assert!(detail.contains("能力不支持"), "{detail}");
+        // 摘要仍然只给类别词：聚合口径不变（§24.1）。
+        assert_eq!(blocked.describe(), "能力不支持");
+        assert_eq!(disabled.describe(), "已停用");
+    }
+
+    /// 会自己好的原因排在纯配置问题前面：客户端重试才有意义。
+    #[test]
+    fn transient_reasons_are_reported_before_permanent_ones() {
+        let transient = Ineligible::Unavailable(crate::health::Unavailable::RateLimited, None);
+        let static_gap = Ineligible::Unsupported("没有可用端点".into());
+        let disabled = Ineligible::Disabled;
+        assert!(transient.rank() < static_gap.rank());
+        assert!(static_gap.rank() < disabled.rank());
+        assert_eq!(transient.rank(), 0);
+    }
+
+    /// 学到的能力限制是**会过期**的临时状态，不能对外说成"别再重试"。
+    ///
+    /// 现场事故：一个渠道被停用 + 另一个渠道上有能力封禁，混在一起被报成 400；
+    /// 客户端于是彻底放弃，而实际上等一会儿或放行一下就能恢复。
+    #[test]
+    fn a_learned_limitation_stays_retryable_even_when_mixed_with_config_issues() {
+        let learned = Ineligible::LearnedUnsupported("账号「A」的模型 m 被证实不支持 tool".into());
+        assert_eq!(
+            learned.error_code(),
+            ErrorCode::NoEligibleTarget,
+            "学到的限制必须保留可重试语义"
+        );
+        let static_gap = Ineligible::Unsupported("账号「A」没有可用端点".into());
+        assert_eq!(static_gap.error_code(), ErrorCode::UnsupportedParameter);
+        assert!(
+            learned.rank() < static_gap.rank(),
+            "两者都报出来时，学到的限制更该被点名"
+        );
+    }
 
     fn account(id: &str, multiplier: &str, protocol: Protocol, enabled: bool) -> Arc<Account> {
         Arc::new(Account {

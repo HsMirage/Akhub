@@ -92,6 +92,7 @@ async fn record_tokens(
             multiplier_source: None,
             quota_status: None,
             filter_summary: None,
+            filter_details: None,
             selected_layer: None,
             attempts_detail: Vec::new(),
         }])

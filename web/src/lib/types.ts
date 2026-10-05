@@ -351,6 +351,8 @@ export interface RequestRecord {
   quota_status: string | null;
   /** 候选过滤原因摘要，形如 "倍率超限×2,能力不支持×1"（§24.1）。 */
   filter_summary: string | null;
+  /** 候选过滤原因的**具体**说明：哪个账号、哪项能力、哪个端点（§24.1）。 */
+  filter_details: string | null;
   /** 最终选中的层（优先级数字）（§24.1）。 */
   selected_layer: number | null;
   /** 每次上游尝试的明细（§6.6）。 */
@@ -499,6 +501,39 @@ export type SettingsNumericField =
   | "model_sync_secs";
 
 export type SettingsPatch = Partial<Pick<Settings, SettingsNumericField>>;
+
+/** 一条"能力限制"调度屏蔽（§16.7、§23.5）。 */
+export interface SchedulingBlockCapability {
+  account_id: string;
+  account_name: string;
+  /** 上游模型名：限制按"账号 × 模型 × 能力"归因。 */
+  model: string;
+  /** 词表能力名，如 function_calling / forced_tool_choice。 */
+  capability: string;
+  /** 已攒到的独立证据次数。 */
+  strikes: number;
+  /** 需要攒到几次才生效。 */
+  required_strikes: number;
+  /** 是否已经生效（生效才算硬性不合格）。 */
+  effective: boolean;
+  in_effect_secs: number;
+  expires_in_secs: number;
+}
+
+/** 一条"端点缺失证据"调度屏蔽（§14.2、§23.5）。 */
+export interface SchedulingBlockEvidence {
+  account_id: string;
+  account_name: string;
+  endpoint: string;
+  expires_in_secs: number;
+}
+
+/** 调度屏蔽总览（GET /admin/api/scheduling-blocks）。 */
+export interface SchedulingBlocks {
+  capabilities: SchedulingBlockCapability[];
+  evidence: SchedulingBlockEvidence[];
+  generated_at: number;
+}
 
 /** New API 的一个可用分组（账号编辑页的分组下拉框）。 */
 export interface NewApiGroupOption {

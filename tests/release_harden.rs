@@ -506,6 +506,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         "multiplier_source",
         "quota_status",
         "filter_summary",
+        "filter_details",
         "selected_layer",
         "cache_read_tokens",
         "cache_write_tokens",
@@ -608,6 +609,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         "multiplier_source",
         "quota_status",
         "filter_summary",
+        "filter_details",
         "selected_layer",
         "cache_read_tokens",
         "cache_write_tokens",
@@ -776,7 +778,7 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .await
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
-    assert_eq!(version, "20");
+    assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
 }
 
 /// v18 重建 `upstream_accounts` 时按列名逐列拷贝。历史上有几列是**直接
@@ -840,7 +842,7 @@ async fn a_very_old_database_migrates_all_the_way_to_the_current_version() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "20");
+    assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
 
     // 老账号还在，归属没变。
     let account = reopened
@@ -961,7 +963,7 @@ async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(version, "20");
+    assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
 }
 /// v18 把 upstream_accounts.group_id 改成可空（§4.2.3）。
 ///
@@ -1175,7 +1177,7 @@ async fn the_v19_migration_adds_the_key_digest_column_without_losing_tasks() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(version, "20");
+    assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
 
     let row = sqlx::query("SELECT key_digest FROM image_tasks WHERE task_id = 'task_v18'")
         .fetch_optional(&reopened)
@@ -1713,7 +1715,7 @@ async fn the_v20_migration_rebuilds_image_tasks_with_a_scoped_primary_key() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(version, "20");
+    assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
 
     // 老行必须原样还在（重建是"建新表 → 拷贝 → 换名"，不是重建数据）。
     let row =

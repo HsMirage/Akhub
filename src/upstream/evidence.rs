@@ -21,6 +21,14 @@ use crate::upstream::Endpoint;
 /// 限制默认 24 小时过期（§16.7）。
 pub const TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// 一条「已证实不存在」的端点证据，供后台展示（§23.5）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedEndpoint {
+    pub account_id: String,
+    pub endpoint: Endpoint,
+    pub expires_in_secs: u64,
+}
+
 /// 账号 → 端点证据及其过期时刻。
 #[derive(Default)]
 pub struct Evidence {
@@ -70,6 +78,50 @@ impl Evidence {
             .ok()
             .and_then(|map| map.get(&(account_id.to_string(), endpoint)).copied())
             .is_some_and(|expires| expires > now)
+    }
+
+    /// 当前「已证实不存在」的明细，供后台展示（§23.5）。
+    ///
+    /// 与 [`Self::unsupported_len`] 的区别：那个只回答"有几条"，这个回答
+    /// "是哪条"——没有它，一条 24 小时的端点封禁在面板上完全不可见。
+    pub fn unsupported_snapshot(&self, now: Instant) -> Vec<UnsupportedEndpoint> {
+        let Ok(map) = self.unsupported.read() else {
+            return Vec::new();
+        };
+        let mut views: Vec<UnsupportedEndpoint> = map
+            .iter()
+            .filter(|(_, expires)| **expires > now)
+            .map(|((account_id, endpoint), expires)| UnsupportedEndpoint {
+                account_id: account_id.clone(),
+                endpoint: *endpoint,
+                expires_in_secs: expires.saturating_duration_since(now).as_secs(),
+            })
+            .collect();
+        views.sort_by(|a, b| {
+            (a.account_id.as_str(), a.endpoint.as_str())
+                .cmp(&(b.account_id.as_str(), b.endpoint.as_str()))
+        });
+        views
+    }
+
+    /// 手动放行端点证据：两个条件都是可选的通配，返回删掉的条数。
+    ///
+    /// 封禁必须有出口（§23.5）：上游补上端点之后，等 24 小时自动过期太久。
+    pub fn forget_unsupported(
+        &self,
+        account_id: Option<&str>,
+        endpoint: Option<Endpoint>,
+    ) -> usize {
+        let Ok(mut map) = self.unsupported.write() else {
+            return 0;
+        };
+        let before = map.len();
+        map.retain(|(account, entry_endpoint), _| {
+            let account_matches = account_id.is_none_or(|want| want == account);
+            let endpoint_matches = endpoint.is_none_or(|want| want == *entry_endpoint);
+            !(account_matches && endpoint_matches)
+        });
+        before - map.len()
     }
 
     /// 清空全部证据。配置一旦变化就调用：账号的协议设置可能刚被改过，旧证据

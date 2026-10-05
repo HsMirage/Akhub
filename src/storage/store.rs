@@ -1543,9 +1543,9 @@ impl Store {
                     attempts, queued_ms, sticky_hit,
                     first_token_ms, input_tokens, output_tokens, config_version,
                     sticky_wait_ms, sticky_freshness, sticky_origin, output_tps, multiplier_source,
-                    quota_status, filter_summary, selected_layer,
+                    quota_status, filter_summary, filter_details, selected_layer,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -1580,6 +1580,7 @@ impl Store {
             .bind(&record.multiplier_source)
             .bind(&record.quota_status)
             .bind(&record.filter_summary)
+            .bind(&record.filter_details)
             .bind(record.selected_layer)
             .bind(record.cache_read_tokens)
             .bind(record.cache_write_tokens)
@@ -2824,6 +2825,8 @@ pub struct RequestRecord {
     pub quota_status: Option<String>,
     /// 候选过滤原因摘要（§24.1）；格式为 `原因×个数` 的逗号分隔串。
     pub filter_summary: Option<String>,
+    /// 候选过滤原因的**具体**说明（§24.1）：哪个账号、哪项能力、哪个端点。
+    pub filter_details: Option<String>,
     /// 最终选中的层（优先级数字）；粘性命中时是绑定目标所在的层（§24.1）。
     pub selected_layer: Option<i64>,
     /// 每次上游尝试的明细（§6.6）。写入时与主记录同一事务。
@@ -3368,6 +3371,7 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         multiplier_source: row.try_get("multiplier_source")?,
         quota_status: row.try_get("quota_status")?,
         filter_summary: row.try_get("filter_summary")?,
+        filter_details: row.try_get("filter_details")?,
         selected_layer: row.try_get("selected_layer")?,
         // 尝试明细由 `attach_attempts` 单独填充。
         attempts_detail: Vec::new(),
@@ -3627,6 +3631,7 @@ mod tests {
                 multiplier_source: None,
                 quota_status: None,
                 filter_summary: None,
+                filter_details: None,
                 selected_layer: None,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
@@ -3700,6 +3705,7 @@ mod tests {
                 multiplier_source: None,
                 quota_status: None,
                 filter_summary: None,
+                filter_details: None,
                 selected_layer: None,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
@@ -3914,6 +3920,7 @@ mod tests {
             multiplier_source: None,
             quota_status: None,
             filter_summary: None,
+            filter_details: None,
             selected_layer: None,
             attempts_detail: Vec::new(),
             queued_ms: 0,

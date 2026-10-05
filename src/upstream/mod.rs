@@ -242,6 +242,30 @@ impl Endpoint {
         }
     }
 
+    /// 全部端点。[`Self::parse`] 与 [`Self::as_str`] 的往返由单元测试守着：
+    /// 新增端点时漏掉这里，测试会先红。
+    pub const ALL: [Endpoint; 12] = [
+        Self::ChatCompletions,
+        Self::Responses,
+        Self::Messages,
+        Self::CountTokens,
+        Self::ResponsesCompact,
+        Self::ResponsesInputTokens,
+        Self::ImagesGenerations,
+        Self::ImagesEdits,
+        Self::ImagesVariations,
+        Self::ImagesGenerationsAsync,
+        Self::ImagesEditsAsync,
+        Self::ImagesTasks,
+    ];
+
+    /// 后台传来的稳定标识 → 端点。与 [`Self::as_str`] 严格互逆。
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|endpoint| endpoint.as_str() == name)
+    }
+
     /// 后台展示与请求记录里用的稳定标识。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -492,6 +516,20 @@ mod tests {
     fn builds_urls_from_a_bare_host() {
         let url = build_url("https://api.anthropic.com", Endpoint::Messages).unwrap();
         assert_eq!(url.as_str(), "https://api.anthropic.com/v1/messages");
+    }
+
+    /// 后台的"清除端点证据"接口按字符串收端点名，必须与 `as_str` 互逆。
+    #[test]
+    fn endpoint_names_round_trip_through_the_admin_api() {
+        for endpoint in Endpoint::ALL {
+            assert_eq!(
+                Endpoint::parse(endpoint.as_str()),
+                Some(endpoint),
+                "{} 往返失败",
+                endpoint.as_str()
+            );
+        }
+        assert_eq!(Endpoint::parse("不存在的端点"), None);
     }
 
     #[test]

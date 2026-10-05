@@ -51,7 +51,12 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 上游任务 ID 只在**上游站点**内唯一，而多个分组可以指向同一个站点；按单列
 /// 做主键时后下单的分组会覆盖先方的定位行，先方轮询变成永久 404（§14.9、§23.4）。
 /// SQLite 改不了主键，只能重建表；v18 已经示范过这件事的全部坑（见那里的注释）。
-const SCHEMA_VERSION: i64 = 20;
+/// v21：请求记录补"候选过滤原因的具体说明"\`filter_details\`（§24.1）。摘要
+/// \`filter_summary\` 只有类别词（"能力不支持×1"），事后复盘定位不到是哪个
+/// 账号、哪项能力、哪个端点；两者分开存，聚合口径不变。
+/// 对测试公开：迁移用例本该断言"升到当前版本"，写死数字会在每次加版本时
+/// 无意义地红一遍（§27）。
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -752,6 +757,17 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
             // 下次启动会重试。带着半迁移的结构继续跑比起不来更危险。
             tx.commit().await.context("提交 v20 迁移失败")?;
             tracing::info!(copied, "已迁移异步生图任务定位表的主键");
+        }
+    }
+    if from < 21 {
+        // v21：请求记录补"候选过滤原因的具体说明"（§24.1）。摘要列 v6 就有了，
+        // 但只有类别词；这一列回答"到底是哪个账号、哪项能力、哪个端点被过滤"。
+        let columns = table_columns(pool, "request_records").await?;
+        if !columns.contains("filter_details") {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN filter_details TEXT")
+                .execute(pool)
+                .await
+                .context("迁移 request_records.filter_details 失败")?;
         }
     }
     if from < 15 {

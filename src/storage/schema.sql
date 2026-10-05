@@ -286,7 +286,10 @@ CREATE TABLE IF NOT EXISTS request_records (
     multiplier_source TEXT,
     quota_status      TEXT,
     -- 候选过滤原因与最终选中的层（§24.1）。只在诊断时读，不参与调度。
+    -- 摘要只存类别词（"能力不支持×1"），具体说明另存一列：事后复盘要能定位到
+    -- 哪个账号、哪项能力、哪个端点，但聚合口径仍按摘要算。
     filter_summary   TEXT,
+    filter_details   TEXT,
     selected_layer   INTEGER
 );
 

@@ -934,6 +934,14 @@ export function Requests({
                               <span className="request-diagnostics-filter">
                                 <b>候选过滤</b>{" "}
                                 <span className="mono">{record.filter_summary ?? "—"}</span>
+                                {/* 摘要只有类别词，定位不到具体账号/能力/端点；
+                                    具体说明单独一行显示，事后复盘才有落点（§24.1）。 */}
+                                {record.filter_details && (
+                                  <span className="text-faint" title={record.filter_details}>
+                                    {" "}
+                                    {record.filter_details}
+                                  </span>
+                                )}
                               </span>
                             </div>
                             {record.attempts_detail.length === 0 ? (

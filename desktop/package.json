@@ -1,7 +1,7 @@
 {
   "name": "akhub-desktop",
   "private": true,
-  "version": "1.1.18",
+  "version": "1.1.19",
   "description": "Akhub 桌面外壳（Tauri v2）：本地拉起 akhub sidecar 并打开管理后台",
   "scripts": {
     "tauri": "tauri"

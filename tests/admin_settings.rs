@@ -331,6 +331,7 @@ async fn insert_record(
             multiplier_source: None,
             quota_status: None,
             filter_summary: None,
+            filter_details: None,
             selected_layer: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
@@ -679,6 +680,7 @@ async fn request_records_expose_scheduling_diagnostics() {
         multiplier_source: Some("manual".to_string()),
         quota_status: Some("ok".to_string()),
         filter_summary: Some("倍率超限×2".to_string()),
+        filter_details: None,
         selected_layer: Some(50),
     };
     akhub

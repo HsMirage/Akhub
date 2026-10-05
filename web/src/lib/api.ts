@@ -14,6 +14,7 @@ import type {
   LogicalModel,
   Overview,
   Page,
+  SchedulingBlocks,
   RequestFilters,
   RequestPage,
   SelectionWarning,
@@ -106,6 +107,14 @@ interface RequestOptions {
    * 只会让用户以为刚做的改动要丢了——而它其实已经自动存下来了。
    */
   quietConflict?: boolean;
+  /**
+   * 不携带配置版本号（§7.4 的乐观锁）。
+   *
+   * 只给**不修改配置**的写操作用：清除内存里的调度屏蔽、测试连接这类动作与配置
+   * 版本无关，带上版本号只会被并发的配置写入判成冲突（409），让用户看到一条与
+   * 当前操作毫无关系的"配置已被修改"。服务端把"不带头部"定义为兼容模式。
+   */
+  skipConfigVersion?: boolean;
 }
 
 async function request<T>(
@@ -131,7 +140,7 @@ async function sendOnce<T>(
     headers.set(CSRF_HEADER, "1");
     // 版本号在**真正发出前**才读取：排队等待期间前一个写操作已经把
     // `configVersion` 刷新过了。用旧值就会把自己判成冲突（见 `enqueueWrite`）。
-    if (configVersion > 0) {
+    if (configVersion > 0 && !options.skipConfigVersion) {
       headers.set(CONFIG_VERSION_HEADER, String(configVersion));
     }
   }
@@ -337,6 +346,28 @@ export const api = {
     }),
   calibrations: (id: string) =>
     request<{ data: CalibrationRecord[] }>(`/accounts/${id}/calibrations`),
+
+  /**
+   * 调度屏蔽：进程内存里的能力限制与端点缺失证据（§16.7、§23.5）。
+   *
+   * 两者都有 24 小时级别的存续期，都会让整类请求直接没有候选目标；不落库、
+   * 不进配置，所以只能靠这个接口看见与放行。
+   */
+  schedulingBlocks: () => request<SchedulingBlocks>("/scheduling-blocks"),
+  /** 手动放行：四个条件都是可选的通配，只清内存状态，不动配置（§23.5）。 */
+  clearSchedulingBlocks: (payload: {
+    scope: "all" | "capability" | "evidence";
+    account_id?: string;
+    model?: string;
+    capability?: string;
+    endpoint?: string;
+  }) =>
+    post<{ ok: boolean; capabilities_cleared: number; evidence_cleared: number; notice: string }>(
+      "/scheduling-blocks/clear",
+      payload,
+      // 只清内存状态、不动配置：不该被并发的配置写入判成版本冲突。
+      { skipConfigVersion: true },
+    ),
 
   /** 成本页：按逻辑模型分组，绝不跨模型加总（§6.8）。 */
   cost: (period: "day" | "month" = "day") =>

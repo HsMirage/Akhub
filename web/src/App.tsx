@@ -7,6 +7,7 @@ import { CommandPalette } from "./components/CommandPalette";
 import { GlossaryDialog } from "./components/GlossaryDialog";
 import { VersionDialog } from "./components/VersionDialog";
 import {
+  IconAlert,
   IconBook,
   IconGauge,
   IconKey,
@@ -30,6 +31,7 @@ import { Groups } from "./pages/Groups";
 import { Accounts } from "./pages/Accounts";
 import { Targets } from "./pages/Targets";
 import { Requests } from "./pages/Requests";
+import { SchedulingBlocks } from "./pages/SchedulingBlocks";
 import { Cost } from "./pages/Cost";
 import { Settings as SettingsPage } from "./pages/SettingsPage";
 
@@ -116,6 +118,7 @@ const NAV: { route: Route; icon: React.ReactNode }[] = [
   { route: "groups", icon: <IconKey /> },
   { route: "accounts", icon: <IconServer /> },
   { route: "targets", icon: <IconRoute /> },
+  { route: "blocks", icon: <IconAlert /> },
   { route: "requests", icon: <IconList /> },
   { route: "cost", icon: <IconLayers /> },
   { route: "settings", icon: <IconSettings /> },
@@ -126,6 +129,7 @@ const NAV_HINTS: Partial<Record<Route, string>> = {
   groups: "调度硬边界与下游 Key",
   accounts: "上游凭据、模型命名与限制",
   targets: "按模型查看账号评分与可用性",
+  blocks: "被上游拒绝过的能力与端点证据",
   requests: "请求元数据与调度诊断",
   cost: "按逻辑模型查看倍率与用量",
   settings: "系统口径、管理员与备份",
@@ -459,6 +463,7 @@ function Console({
                 {route === "targets" && (
                   <Targets data={data} navigate={navigate} />
                 )}
+                {route === "blocks" && <SchedulingBlocks />}
                 {route === "requests" && (
                   <Requests data={data} refresh={refresh} initialParams={params} />
                 )}

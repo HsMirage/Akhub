@@ -3908,6 +3908,167 @@ pub async fn clear_key_faults(
     })))
 }
 
+// --------------------------------------- 调度屏蔽（§16.7、§23.5）
+
+/// 进程内存里的调度屏蔽：**能力限制**与**端点缺失证据**。
+///
+/// 两类都有 24 小时级别的存续期，都会让整类请求直接没有候选目标；而它们既不
+/// 落库、也不在配置里，管理员此前完全看不到，唯一的"出口"是重启进程。结果是
+/// 一次上游抖动留下的限制会把流量挡在门外，面板上却只显示一句"模型没有可用
+/// 的调度目标"（§23.5）。
+pub async fn list_scheduling_blocks(
+    State(state): State<SharedState>,
+    _: Admin,
+) -> AdminResult<Json<Value>> {
+    let now = std::time::Instant::now();
+    let config = state.config.current();
+    let names = account_names(&config);
+
+    let capabilities: Vec<Value> = state
+        .runtime
+        .capabilities
+        .snapshot(now)
+        .into_iter()
+        .map(|view| {
+            json!({
+                "account_id": view.account_id,
+                "account_name": names
+                    .get(&view.account_id)
+                    .cloned()
+                    .unwrap_or_else(|| view.account_id.clone()),
+                "model": view.model,
+                "capability": view.capability,
+                "strikes": view.strikes,
+                "required_strikes": view.required_strikes,
+                "effective": view.effective,
+                "in_effect_secs": view.in_effect_secs,
+                "expires_in_secs": view.expires_in_secs,
+            })
+        })
+        .collect();
+
+    let evidence: Vec<Value> = state
+        .runtime
+        .evidence
+        .unsupported_snapshot(now)
+        .into_iter()
+        .map(|view| {
+            json!({
+                "account_id": view.account_id,
+                "account_name": names
+                    .get(&view.account_id)
+                    .cloned()
+                    .unwrap_or_else(|| view.account_id.clone()),
+                "endpoint": view.endpoint.as_str(),
+                "expires_in_secs": view.expires_in_secs,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "capabilities": capabilities,
+        "evidence": evidence,
+        "generated_at": crate::storage::now_unix(),
+    })))
+}
+
+/// 清除调度屏蔽的请求体（§23.5）。四个条件都是可选的通配。
+#[derive(Deserialize)]
+pub struct ClearSchedulingBlocks {
+    /// `capability` / `evidence` / `all`（默认 `all`）。
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// 手动放行：删掉匹配的调度屏蔽，返回两类各删了几条（§23.5）。
+///
+/// 只清内存状态，不动配置：下一次请求会重新向上游取证，真的不行还会再记一次。
+pub async fn clear_scheduling_blocks(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Json(payload): Json<ClearSchedulingBlocks>,
+) -> AdminResult<Json<Value>> {
+    // scope 必须显式给出：空体或漏字段不该等于"清空全部账号的两类屏蔽"。
+    let Some(scope) = trimmed_opt(&payload.scope).map(str::to_string) else {
+        return Err(AdminError::bad_request(
+            "缺少 scope：必须显式指定 capability / evidence / all（清空全部要写明 all）",
+        ));
+    };
+    if !matches!(scope.as_str(), "all" | "capability" | "evidence") {
+        return Err(AdminError::bad_request(format!(
+            "未知的清除范围「{scope}」。可用值：all、capability、evidence"
+        )));
+    }
+    let account_id = trimmed_opt(&payload.account_id);
+    let model = trimmed_opt(&payload.model);
+    let capability = trimmed_opt(&payload.capability);
+    let endpoint = match trimmed_opt(&payload.endpoint) {
+        Some(name) => Some(crate::upstream::Endpoint::parse(name).ok_or_else(|| {
+            AdminError::bad_request(format!(
+                "未知的端点「{name}」。可用值由请求记录里的 endpoint 列给出"
+            ))
+        })?),
+        None => None,
+    };
+
+    let capabilities_cleared = if matches!(scope.as_str(), "all" | "capability") {
+        state
+            .runtime
+            .capabilities
+            .forget(account_id, model, capability)
+    } else {
+        0
+    };
+    let evidence_cleared = if matches!(scope.as_str(), "all" | "evidence") {
+        state
+            .runtime
+            .evidence
+            .forget_unsupported(account_id, endpoint)
+    } else {
+        0
+    };
+
+    // 审计要能事后回答"清了谁的"：只写 scope 等于什么都没记（§23.5）。
+    let object = format!(
+        "scope={scope} account={} model={} capability={} endpoint={}",
+        account_id.unwrap_or("*"),
+        model.unwrap_or("*"),
+        capability.unwrap_or("*"),
+        endpoint.map(|endpoint| endpoint.as_str()).unwrap_or("*"),
+    );
+    audit(&state, &admin, "clear_scheduling_blocks", &object).await;
+    Ok(Json(json!({
+        "ok": true,
+        "scope": scope,
+        "capabilities_cleared": capabilities_cleared,
+        "evidence_cleared": evidence_cleared,
+        "notice": "已清除匹配的调度屏蔽；下一次请求会重新向上游取证",
+    })))
+}
+
+/// 账号 ID → 展示名。屏蔽表里只有 ID，面板要给人看。
+fn account_names(config: &crate::config::RuntimeConfig) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for group in &config.groups {
+        for model in group.models.values() {
+            for target in &model.targets {
+                names
+                    .entry(target.account.id.clone())
+                    .or_insert_with(|| target.account.name.clone());
+            }
+        }
+    }
+    names
+}
+
 // ------------------------------------------------- 成本页与校准（§6.8）
 
 /// 成本统计区间（§6.7 设置页口径之外的简单约定）：
@@ -4670,6 +4831,7 @@ pub async fn list_requests(
                     "multiplier_source": record.multiplier_source,
                     "quota_status": record.quota_status,
                     "filter_summary": record.filter_summary,
+                "filter_details": record.filter_details,
                     "selected_layer": record.selected_layer,
                     // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
                     "attempts_detail": attempts_detail,

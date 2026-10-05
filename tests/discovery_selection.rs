@@ -674,6 +674,7 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
             multiplier_source: None,
             quota_status: None,
             filter_summary: None,
+            filter_details: None,
             selected_layer: None,
             attempts_detail: Vec::new(),
         }])
@@ -872,6 +873,7 @@ async fn a_batch_unselect_of_a_traffic_heavy_model_needs_confirmation() {
             multiplier_source: None,
             quota_status: None,
             filter_summary: None,
+            filter_details: None,
             selected_layer: None,
             attempts_detail: Vec::new(),
         }])

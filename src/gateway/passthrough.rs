@@ -253,6 +253,8 @@ struct Telemetry {
     multiplier_source: Option<&'static str>,
     /// 候选过滤原因摘要（§24.1）。
     filter_summary: Option<String>,
+    /// 候选过滤原因的**具体**说明（§24.1）：哪个账号、哪项能力、哪个端点。
+    filter_details: Option<String>,
     /// 最终选中的层；粘性命中时是绑定目标所在的层（§24.1）。
     selected_layer: Option<i64>,
     /// 本次请求实际使用的 Key 的内部 ID 与标签（§4.2.1）。
@@ -523,6 +525,7 @@ async fn forward_inner<'a>(
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
     walk.telemetry.filter_summary = Some(plan.filter_summary());
+    walk.telemetry.filter_details = plan.filter_details();
     walk.telemetry.selected_layer = plan.layers.first().map(|layer| i64::from(layer.priority));
     // 倍率来源与额度状态：都取自账号配置与动态状态，解释"为什么它能被选中"（§24.1）。
     walk.telemetry.multiplier_source = plan
@@ -1432,6 +1435,7 @@ impl Walk<'_> {
 
             match attempt(
                 self.forward,
+                self.translation,
                 &candidate.target,
                 credential,
                 &prepared,
@@ -1827,6 +1831,7 @@ impl Walk<'_> {
             // 额度状态直接读当时的健康注册表：它解释"这次为什么被拦或放行"（§24.1）。
             quota_status: self.quota_status(candidate),
             filter_summary: self.telemetry.filter_summary.clone(),
+            filter_details: self.telemetry.filter_details.clone(),
             selected_layer: self.telemetry.selected_layer,
             attempts_detail: self.attempt_log.clone(),
         }
@@ -1984,6 +1989,8 @@ pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
 /// 改动而快照还没重建的窗口里，属于兜底而不是常规路径。
 async fn attempt(
     forward: &Forward<'_>,
+    // 能力学习的归因拿它求"本次请求真正用到的能力"的交集（§16.7）。
+    translation: &Translation<'_>,
     target: &Arc<TargetView>,
     credential: Option<&Arc<crate::credential::Credential>>,
     prepared: &Prepared,
@@ -2106,7 +2113,8 @@ async fn attempt(
         if endpoints::proves_missing_endpoint(account, prepared.endpoint, status.as_u16()) {
             return Err(AttemptFailure::MissingEndpoint);
         }
-        return classify_upstream_error(forward, target, prepared, response, status).await;
+        return classify_upstream_error(forward, translation, target, prepared, response, status)
+            .await;
     }
     // 响应头之前已经等掉的时间，之后所有"首字延迟"都必须从这一刻起算。
     let headers_wait = sent_at.elapsed();
@@ -2634,6 +2642,8 @@ async fn remember_image_task(
 /// 把上游的非 2xx 响应分成"可切换"与"必须直接返回下游"两类。
 async fn classify_upstream_error(
     forward: &Forward<'_>,
+    // 能力学习的归因要拿本次请求**真正用到**的能力求交集，所以翻译层要传进来。
+    translation: &Translation<'_>,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     response: reqwest::Response,
@@ -2687,7 +2697,7 @@ async fn classify_upstream_error(
             tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
             axum::body::Bytes::new()
         });
-    learn_capability_limitation(forward, target, status, &bytes);
+    learn_capability_limitation(forward, translation, target, status, &bytes);
     if prepared.endpoint.protocol() == forward.endpoint.protocol() {
         return Err(AttemptFailure::Terminal(Box::new(build_response(
             forward,
@@ -2729,11 +2739,18 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
 
 /// 能力学习（§16.7）：上游明确拒绝某能力时记入限制缓存。
 ///
-/// 只认 `error_proves_unsupported` 判定过的错误形状；普通 400、5xx、超时和
-/// 网络错误绝不进入缓存。同一能力的第二次请求会因此改选其它目标，而不是
-/// 再撞一次同一堵墙。
+/// 只认明确拒绝的错误形状；普通 400、5xx、超时和网络错误绝不进入缓存。
+/// 归因必须**同时**满足两条：
+///
+/// 1. 错误文案指向某项能力（词表由窄到宽匹配，[\`crate::capability::specs\`]）；
+/// 2. 这项能力**真的出现在本次请求的需求里**。
+///
+/// 第 2 条是现场事故的补丁：上游回 \`does not support forced tool_choice\` 时，
+/// 旧逻辑把它记成"不支持 function_calling"，于是这个账号模型上所有带工具的
+/// 请求被连坐。证据攒够次数才生效，生效后的存续时长由词表决定。
 fn learn_capability_limitation(
     forward: &Forward<'_>,
+    translation: &Translation<'_>,
     target: &Arc<TargetView>,
     status: StatusCode,
     bytes: &[u8],
@@ -2742,7 +2759,21 @@ fn learn_capability_limitation(
         Ok(value) => value,
         Err(_) => return,
     };
-    let Some(capability) = capability::unsupported_from_error(status.as_u16(), &parsed) else {
+    let requested = translation.requested_capabilities();
+    let Some(capability) = capability::unsupported_from_error(status.as_u16(), &parsed, &requested)
+    else {
+        if let Some(unused) =
+            capability::unrequested_capability(status.as_u16(), &parsed, &requested)
+        {
+            // 丢掉证据必须是看得见的：上游确实拒绝了某项能力，只是本次请求
+            // 没用到它，拿它去封这个组合会误伤别的流量。
+            tracing::debug!(
+                account = target.account.name,
+                model = target.target.upstream_model,
+                capability = unused,
+                "上游措辞指向的能力不在本次请求的需求里，不记证据"
+            );
+        }
         return;
     };
     forward.state.runtime.capabilities.note_unsupported(
@@ -2755,7 +2786,7 @@ fn learn_capability_limitation(
         account = target.account.name,
         model = target.target.upstream_model,
         capability,
-        "上游明确拒绝该能力，24 小时内调度避开这个组合"
+        "上游明确拒绝该能力，攒够证据后调度避开这个组合"
     );
 }
 
