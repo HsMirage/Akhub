@@ -124,6 +124,12 @@ fn find_frame_end(buffer: &[u8], from: usize) -> Option<usize> {
 }
 
 /// 三个协议共用的错误事件识别。
+///
+/// 除了通用的 `event: error` 形状，还必须认 **Responses 的失败收尾**
+///（§13.4 修订）。`response.failed` 是上游"这次回答失败了"的正式表达，
+/// 形状与 `event: error` 完全不同：错误嵌在 `response.error` 里，事件名也不是
+/// `error`。只认前者会让一条失败的流被判成"已经出现语义内容"——于是既不换号、
+/// 也不计失败，坏答案被原样端给下游（现场：可达鸭的 gpt-6.1-sol 流）。
 fn error_message(event: Option<&str>, payload: Option<&serde_json::Value>) -> Option<String> {
     let is_error_event = matches!(event, Some("error"))
         || payload
@@ -131,14 +137,56 @@ fn error_message(event: Option<&str>, payload: Option<&serde_json::Value>) -> Op
             .and_then(serde_json::Value::as_str)
             == Some("error");
     let error = payload.and_then(|value| value.get("error"));
-    if !is_error_event && error.is_none() {
+    if is_error_event || error.is_some() {
+        let message = error
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("上游返回了错误事件");
+        return Some(message.chars().take(200).collect());
+    }
+    responses_failure(event_kind(event, payload), payload)
+}
+
+/// Responses 的失败收尾：返回可以安全转达的原因文本，不是失败时返回 `None`。
+///
+/// 认三种形状，都是上游真的把这次回答判成失败：
+/// `event: response.failed` / `response.error`、负载里同名的 `type`，以及终止
+/// 对象里的 `response.status == "failed"`。
+fn responses_failure(kind: Option<&str>, payload: Option<&serde_json::Value>) -> Option<String> {
+    if !responses_failed(kind, payload) {
         return None;
     }
-    let message = error
+    Some(responses_failure_text(payload))
+}
+
+/// 事件名或负载形状是不是 Responses 的失败收尾。
+fn responses_failed(kind: Option<&str>, payload: Option<&serde_json::Value>) -> bool {
+    matches!(kind, Some("response.failed" | "response.error"))
+        || payload
+            .and_then(|value| value.get("response"))
+            .and_then(|response| response.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("failed")
+}
+
+/// 失败收尾里能拿到的原因：优先 `response.error.message`，再退到顶层 `message`。
+///
+/// 拿不到具体文案时给固定兜底——绝不把整帧 JSON 塞进记录或错误文本。
+fn responses_failure_text(payload: Option<&serde_json::Value>) -> String {
+    payload
+        .and_then(|value| value.get("response"))
+        .and_then(|response| response.get("error"))
         .and_then(|error| error.get("message"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("上游返回了错误事件");
-    Some(message.chars().take(200).collect())
+        .or_else(|| {
+            payload
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("上游返回了失败响应")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Anthropic：`message_start` 与 `ping` 是协议开始标记，不是内容。
@@ -515,8 +563,15 @@ impl StreamAccounting {
             self.error = Some(message.chars().take(200).collect());
             return;
         }
+        // Responses 的失败收尾（§9.3 修订）：`response.failed` 是一次失败，不是
+        // "上游把这次回答写完了"。字节早已发给下游、换不了号，但这条流必须记成
+        // 失败：结算侧据此把 Completed 改判为 Failed（不计成功、写 error_code）。
+        let failure = responses_failure(kind, Some(&value));
+        if let Some(message) = failure.as_ref() {
+            self.error = Some(message.clone());
+        }
         // 先认终止信号，再吸收用量：收尾事件往往同时带上用量。
-        if answers_stop_signal(self.protocol, kind, &value) {
+        if failure.is_none() && answers_stop_signal(self.protocol, kind, &value) {
             self.stop_signalled = true;
         }
         match self.protocol {
@@ -537,10 +592,12 @@ impl StreamAccounting {
             }
             Protocol::OpenAiResponses => {
                 let response = value.get("response").unwrap_or(&value);
-                if matches!(
-                    kind,
-                    Some("response.completed" | "response.incomplete" | "response.failed")
-                ) {
+                if failure.is_none()
+                    && matches!(
+                        kind,
+                        Some("response.completed" | "response.incomplete" | "response.failed")
+                    )
+                {
                     self.finished = Some(response.clone());
                 }
                 if let Some(usage) = response.get("usage") {
@@ -1049,5 +1106,84 @@ mod tests {
         );
         assert_eq!(accounting.error(), Some("boom"));
         assert_eq!(accounting.usage_tokens(), None, "失败流不编造用量");
+    }
+
+    /// 现场回归（可达鸭的 gpt-6.1-sol）：上游等到最后才回 `response.failed`，
+    /// 此前一个语义块都没有。旧逻辑把它判成"已经有语义内容"，于是既不换号、
+    /// 也不计失败，坏答案被原样端给下游。
+    #[test]
+    fn a_failed_response_before_any_content_is_switchable() {
+        let verdict = feed(
+            Protocol::OpenAiResponses,
+            &[
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"上游超时\"}}}\n\n",
+            ],
+        );
+        assert_eq!(verdict, Verdict::Error("上游超时".into()));
+    }
+
+    /// 已经在写正文之后才失败：换不了号，但这条流必须记成失败，否则这笔会被
+    /// 记成一次成功、账号永远扣不到分。
+    #[test]
+    fn a_failed_response_after_content_is_recorded_as_a_fault() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"message\":\"boom\"}}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.error(), Some("boom"));
+        assert!(
+            !accounting.answer_completed(),
+            "失败的回答不算写完，否则这笔会被记成成功"
+        );
+        assert_eq!(accounting.finished_response(), None);
+    }
+
+    /// 没有具体文案时用固定兜底，绝不把整帧 JSON 端出去。
+    #[test]
+    fn a_bare_failed_response_still_yields_a_readable_reason() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.error(), Some("上游返回了失败响应"));
+    }
+
+    /// 回归：正常的 `response.completed` 不能被这次修订影响。
+    #[test]
+    fn a_completed_response_still_counts_as_completed() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.error(), None);
+        assert!(accounting.answer_completed());
+        assert!(accounting.finished_response().is_some());
+        assert_eq!(accounting.usage_tokens(), Some(7));
+    }
+
+    /// `response.incomplete` 是"没写完就收尾"，不是失败：上游确实把这次回答
+    /// 结束了（例如打到 max_output_tokens），不能据此熔断账号。
+    #[test]
+    fn an_incomplete_response_is_not_a_failure() {
+        let mut accounting = StreamAccounting::new(Protocol::OpenAiResponses);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            ],
+        );
+        assert_eq!(accounting.error(), None);
+        assert!(accounting.answer_completed());
     }
 }

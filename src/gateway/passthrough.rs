@@ -2445,6 +2445,21 @@ async fn commit_body(
         .with_status(status)
     })?;
 
+    // Responses 的非流式失败对象：HTTP 200 + `status: "failed"` 是上游表达
+    // "这次回答失败"的另一种形状（§13.2 修订）。字节还没发给下游，可以换号；
+    // 当成成功透传则下游会收到一份 200 的失败响应，与流式那条是同一种事故。
+    if prepared.endpoint.protocol() == Protocol::OpenAiResponses
+        && parsed.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+    {
+        let message =
+            upstream_error_message(&bytes).unwrap_or_else(|| "上游返回了失败响应".to_string());
+        return Err(AttemptFailure::switchable(
+            ErrorCode::UpstreamProtocolError,
+            format!("账号「{}」的响应失败：{message}", target.account.name),
+        )
+        .with_status(status));
+    }
+
     // 异步生图下单成功：把上游任务 ID 记到接单账号与**那一把 Key** 上，
     // 客户端轮询才找得到人（§14.9、§4.2.1 的不变量 A）。
     if forward.endpoint.submits_image_task() {

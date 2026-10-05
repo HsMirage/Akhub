@@ -52,6 +52,17 @@ pub enum Behavior {
     StreamUsageThenHang,
     /// 流式：只送协议开始标记与一个错误事件，然后结束。
     StreamErrorEvent,
+    /// 流式 Responses：只送协议开始标记与 `response.failed`，然后结束。
+    ///
+    /// 现场形状（可达鸭的 gpt-6.1-sol）：HTTP 200、等到最后才回失败收尾、
+    /// 此前**一个语义块都没有**，也没有 usage。旧逻辑把 `response.failed` 当成
+    /// "上游写完了"，于是既不换号也不计失败。
+    StreamFailedResponse,
+    /// 流式 Responses：先真的吐一段正文，再回 `response.failed`。
+    ///
+    /// 这时字节早就发给下游了、换不了号，但这条流必须记成失败——否则账号的
+    /// 可靠性分永远扣不到。
+    StreamFailedAfterContent,
     /// 按协议返回一次工具调用，用于验证跨协议的工具往返。
     ToolCall,
     /// 按**凭据**决定行为（§4.2.1）：命中给定 Key 时走对应的行为，否则走
@@ -384,6 +395,18 @@ async fn inference(
             ];
             sse(&path, &frames)
         }
+        Behavior::StreamFailedResponse => {
+            let frames = [ok_frames(&path)[0].clone(), responses_failed_frame()];
+            sse(&path, &frames)
+        }
+        Behavior::StreamFailedAfterContent => {
+            let frames = [
+                ok_frames(&path)[0].clone(),
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n".to_string(),
+                responses_failed_frame(),
+            ];
+            sse(&path, &frames)
+        }
         Behavior::ToolCall => {
             if streaming {
                 sse(&path, &tool_frames(&path))
@@ -448,6 +471,12 @@ async fn models(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Res
 
 fn sse(_path: &str, frames: &[String]) -> Response {
     ([("content-type", "text/event-stream")], frames.concat()).into_response()
+}
+
+/// 线上形状的 Responses 失败收尾：HTTP 200、没有 usage，原因嵌在
+/// `response.error` 里（可达鸭的 gpt-6.1-sol 就是这么回的）。
+fn responses_failed_frame() -> String {
+    "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"上游超时\"}}}\n\n".to_string()
 }
 
 /// 按协议给出一段最小但形状正确的流：开始标记、一个语义增量、结束。
