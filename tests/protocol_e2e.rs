@@ -592,7 +592,7 @@ async fn unknown_fields_pass_through_natively_but_are_refused_across_protocols()
 // ------------------------------------------------------------ 端点选择
 
 #[tokio::test]
-async fn a_missing_native_endpoint_falls_back_to_conversion_and_is_remembered() {
+async fn a_rejected_native_endpoint_falls_back_only_for_the_current_request() {
     let upstream = FakeUpstream::spawn().await;
     let akhub = spawn_akhub().await;
     // 账号首选 Chat，但打开了运行时适配：先试上游可能有的 /v1/messages。
@@ -634,7 +634,7 @@ async fn a_missing_native_endpoint_falls_back_to_conversion_and_is_remembered() 
         "先试原生端点，证实不存在后才转换（§14.2）"
     );
 
-    // 证据已经记下：后续请求不再重复撞那扇不存在的门。
+    // 下一个请求重新从原生端点开始，不能沿用上一次的拒绝。
     assert_eq!(messages(&akhub, body).await.status(), 200);
     let paths: Vec<String> = upstream
         .seen
@@ -644,7 +644,7 @@ async fn a_missing_native_endpoint_falls_back_to_conversion_and_is_remembered() 
         .map(|seen| seen.path.clone())
         .collect();
     assert_eq!(paths.len(), 3);
-    assert_eq!(paths[2], "/v1/chat/completions");
+    assert_eq!(paths[2], "/v1/messages");
 }
 
 #[tokio::test]
@@ -667,7 +667,6 @@ async fn a_missing_endpoint_does_not_count_as_a_target_fault() {
     // 连续多次原生 404 都只是"走错门"，不该把账号熔断（§16.7）。
     for _ in 0..6 {
         upstream.script([Behavior::Status(404, None)]);
-        akhub.state.runtime.evidence.clear();
         let body = json!({
             "model": MODEL, "max_tokens": 64,
             "messages": [{"role": "user", "content": "hi"}]

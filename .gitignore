@@ -34,4 +34,5 @@ web/tsconfig.tsbuildinfo
 # 浏览器自动化快照与本地编辑器/代理配置。
 /.playwright-mcp
 /.claude
+/.codegraph
 .DS_Store

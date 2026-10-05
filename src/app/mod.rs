@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::auth::session::SessionStore;
-use crate::capability;
 use crate::config::ConfigService;
 use crate::credential::CredentialPool;
 use crate::health;
@@ -225,10 +224,8 @@ pub struct Runtime {
     pub multipliers: Arc<multiplier::Registry>,
     /// 分组级排队总容量。
     pub queues: queue::GroupQueues,
-    /// 端点能力证据：已证实不存在的上游路由（§14.2、§16.7）。
+    /// 端点成功记录：供协议选择排序使用（§14.3）。
     pub evidence: Evidence,
-    /// 模型能力限制：已证实不支持某能力的账号模型（§16.7）。
-    pub capabilities: capability::Capabilities,
     /// 账号内 Key 池的快照（§4.2.1）。在途请求持有的那一份在整个请求内不变，
     /// 这正是"一次下游调用只使用一把 Key"的实现基础。
     pub credentials: CredentialService,
@@ -263,7 +260,6 @@ impl Default for Runtime {
             multipliers: Default::default(),
             queues: Default::default(),
             evidence: Default::default(),
-            capabilities: Default::default(),
             credentials: CredentialService::default(),
             shutdown: tokio::sync::watch::channel(false).0,
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -330,10 +326,9 @@ impl Runtime {
                 .map(|g| g.group.id.clone())
                 .collect::<Vec<_>>(),
         );
-        // 账号的协议设置、模型列表或适配器版本可能刚被改过，旧的端点与能力
+        // 账号的协议设置、模型列表或适配器版本可能刚被改过，旧的端点
         // 证据前提已经不成立（§16.7）。
         self.evidence.clear();
-        self.capabilities.clear();
     }
 }
 

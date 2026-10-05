@@ -44,7 +44,7 @@ impl<'a> Translation<'a> {
             .map_err(Clone::clone)
     }
 
-    /// 本次请求用到的能力名，供调度前的能力限制查询（§9.1、§16.7）。
+    /// 本次请求用到的能力名，供内置目录参与候选排序（§16.6）。
     ///
     /// 解析失败时返回空：请求本身有问题，错误会在发射环节原样报出。
     pub fn requested_capabilities(&self) -> Vec<&'static str> {

@@ -539,13 +539,6 @@ function Alerts({
       route: "accounts",
     });
   }
-  if (overview.missing_endpoints > 0) {
-    items.push({
-      tone: "warn",
-      text: `有 ${overview.missing_endpoints} 条「上游没有这个端点」的证据。这本身不是故障——Akhub 已经改走跨协议转换——但如果账号的首选协议填对了，通常不该出现它。证据 24 小时后自动过期。`,
-      route: "accounts",
-    });
-  }
   const hardStopped = unhealthy.filter(([status]) => status === "key_invalid" || status === "quota_exhausted");
   if (hardStopped.length > 0) {
     items.push({

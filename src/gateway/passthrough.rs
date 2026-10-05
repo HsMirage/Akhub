@@ -18,7 +18,6 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 
 use crate::app::SharedState;
-use crate::capability;
 use crate::config::{GroupView, TargetView};
 use crate::domain::{Multiplier, Protocol};
 use crate::gateway::error::{ErrorCode, GatewayError};
@@ -192,10 +191,9 @@ enum AttemptFailure {
     /// 装箱是因为 `Response` 比其余变体大一个数量级，而这是**失败**分支：
     /// 让成功路径为它多搬 128 字节不划算。
     Terminal(Box<Response>),
-    /// 这条路由不存在。换个端点再试**同一个**目标，不算这个目标失败——
-    /// 账号首选 Chat 但上游也有 Messages 时，正是靠这一步学会走哪条路
-    /// （§14.2、§16.7）。
-    MissingEndpoint,
+    /// 本次请求可尝试其他端点。404/405 不证明整个账号缺少接口，
+    /// 保留真实错误，转换不可行时仍能解释失败原因。
+    EndpointRejected { status: StatusCode, body: Vec<u8> },
 }
 
 impl AttemptFailure {
@@ -408,7 +406,6 @@ async fn forward_inner<'a>(
         multipliers,
         credentials: &credentials,
         evidence: &forward.state.runtime.evidence,
-        capabilities: &forward.state.runtime.capabilities,
         translation: &translation,
         endpoint: forward.endpoint,
         allow_degrade: forward.group.group.allow_degrade,
@@ -1327,7 +1324,7 @@ impl Walk<'_> {
                 )))
             }
             // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
-            Err(AttemptFailure::MissingEndpoint) => {
+            Err(AttemptFailure::EndpointRejected { .. }) => {
                 admission.settle(health::Outcome::Neutral, None);
                 // 走错门是廉价失败：不计入尝试预算（§13.1）。
                 self.note_attempt(candidate, started, "missing_endpoint", None, false);
@@ -1415,14 +1412,16 @@ impl Walk<'_> {
 
     /// 按 §14.3 的顺序试这个目标的端点。
     ///
-    /// 路由不存在只是"走错了门"，不是这个目标坏了：记下证据，重新排一次端点
-    /// 顺序继续试同一个账号。全部端点都不存在时才把它当作这个目标的失败。
+    /// 404/405 只影响本次端点尝试，不能据此屏蔽后续请求或其他模型。
+    /// 每个端点最多尝试一次；没有可用转换时保留上游原始错误。
     async fn walk_endpoints(
         &mut self,
         candidate: &routing::Candidate,
         credential: Option<&Arc<crate::credential::Credential>>,
     ) -> Result<Success, AttemptFailure> {
         let mut plan = candidate.endpoints.clone();
+        let mut rejected = Vec::new();
+        let mut last_rejection = None;
 
         for _ in 0..endpoints::MAX_ENDPOINTS_PER_TARGET {
             let Some(choice) = plan.first().cloned() else {
@@ -1435,7 +1434,6 @@ impl Walk<'_> {
 
             match attempt(
                 self.forward,
-                self.translation,
                 &candidate.target,
                 credential,
                 &prepared,
@@ -1444,16 +1442,15 @@ impl Walk<'_> {
             )
             .await
             {
-                Err(AttemptFailure::MissingEndpoint) => {
-                    self.forward.state.runtime.evidence.note_unsupported(
-                        &candidate.target.account.id,
-                        prepared.endpoint,
-                        Instant::now(),
-                    );
+                Err(AttemptFailure::EndpointRejected { status, body }) => {
+                    rejected.push(prepared.endpoint);
                     tracing::info!(
+                        request_id = self.forward.request_id,
                         account = candidate.target.account.name,
+                        model = candidate.target.target.upstream_model,
                         endpoint = prepared.endpoint.as_str(),
-                        "上游没有这个端点，改走转换后的端点"
+                        upstream_status = status.as_u16(),
+                        "本次请求的端点被拒绝，尝试其他可表达的端点"
                     );
                     // 辅助端点（count_tokens / compact / input_tokens）没有
                     // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
@@ -1473,8 +1470,23 @@ impl Walk<'_> {
                             .into_response(),
                         )));
                     }
-                    // 证据变了，端点顺序要重排：刚证实缺失的那个会被排除掉。
-                    plan = self.endpoint_plan(candidate).unwrap_or_default();
+                    let detail = upstream_error_message(&body)
+                        .map(|message| format!("：{message}"))
+                        .unwrap_or_default();
+                    last_rejection = Some(AttemptFailure::Switchable {
+                        code: ErrorCode::UpstreamExhausted,
+                        message: format!(
+                            "账号「{}」的 {} 返回 {}{}；本次请求没有其他可用端点",
+                            candidate.target.account.name,
+                            prepared.endpoint.as_str(),
+                            status.as_u16(),
+                            detail,
+                        ),
+                        upstream_status: Some(status),
+                        retry_after: None,
+                        upstream_body: Some(body),
+                    });
+                    plan = self.endpoint_plan(candidate, &rejected).unwrap_or_default();
                 }
                 other => return other,
             }
@@ -1483,17 +1495,23 @@ impl Walk<'_> {
             }
         }
 
-        Err(AttemptFailure::switchable(
-            ErrorCode::UpstreamExhausted,
-            format!(
-                "账号「{}」没有可用于本次请求的端点",
-                candidate.target.account.name
-            ),
-        ))
+        Err(last_rejection.unwrap_or_else(|| {
+            AttemptFailure::switchable(
+                ErrorCode::UpstreamExhausted,
+                format!(
+                    "账号「{}」没有可用于本次请求的端点",
+                    candidate.target.account.name
+                ),
+            )
+        }))
     }
 
-    /// 用最新的能力证据重排这个目标的端点顺序。
-    fn endpoint_plan(&self, candidate: &routing::Candidate) -> Option<Vec<Choice>> {
+    /// 只排除当前请求已经拒绝过的端点。
+    fn endpoint_plan(
+        &self,
+        candidate: &routing::Candidate,
+        rejected: &[Endpoint],
+    ) -> Option<Vec<Choice>> {
         endpoints::choices(
             &candidate.target.account,
             self.forward.endpoint,
@@ -1501,6 +1519,7 @@ impl Walk<'_> {
             &self.forward.state.runtime.evidence,
             self.forward.group.group.allow_degrade,
             Instant::now(),
+            rejected,
         )
         .ok()
     }
@@ -1960,6 +1979,8 @@ fn classify_outcome(
         Some(StatusCode::UNAUTHORIZED) | Some(StatusCode::FORBIDDEN) => health::Outcome::KeyInvalid,
         Some(StatusCode::PAYMENT_REQUIRED) => health::Outcome::QuotaExhausted { retry_after },
         Some(StatusCode::TOO_MANY_REQUESTS) => health::Outcome::RateLimited { retry_after },
+        // 模型、资源或接口不存在不代表账号/Key 故障，不能让其他模型一起冷却。
+        Some(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) => health::Outcome::Neutral,
         // 上游 408 / 504 是它自己承认的超时，按故障计；没有状态码的超时则是
         // 我们等不下去了——"单纯变慢"只降评分，不熔断（§12.1）。
         Some(_) => health::Outcome::Fault,
@@ -1989,8 +2010,6 @@ pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
 /// 改动而快照还没重建的窗口里，属于兜底而不是常规路径。
 async fn attempt(
     forward: &Forward<'_>,
-    // 能力学习的归因拿它求"本次请求真正用到的能力"的交集（§16.7）。
-    translation: &Translation<'_>,
     target: &Arc<TargetView>,
     credential: Option<&Arc<crate::credential::Credential>>,
     prepared: &Prepared,
@@ -2109,12 +2128,20 @@ async fn attempt(
 
     let status = response.status();
     if !status.is_success() {
-        // 推测端点上的 404 / 405 证明这条路由不存在：换个端点，不算目标失败。
-        if endpoints::proves_missing_endpoint(account, prepared.endpoint, status.as_u16()) {
-            return Err(AttemptFailure::MissingEndpoint);
+        // 只为本次请求尝试其他端点，保留原始响应供失败诊断。
+        if endpoints::may_try_other_endpoint(account, prepared.endpoint, status.as_u16()) {
+            let body = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
+                .await
+                .unwrap_or_else(|reason| {
+                    tracing::warn!(%reason, "读取端点拒绝响应失败，保留状态码");
+                    axum::body::Bytes::new()
+                });
+            return Err(AttemptFailure::EndpointRejected {
+                status,
+                body: body.to_vec(),
+            });
         }
-        return classify_upstream_error(forward, translation, target, prepared, response, status)
-            .await;
+        return classify_upstream_error(forward, target, prepared, response, status).await;
     }
     // 响应头之前已经等掉的时间，之后所有"首字延迟"都必须从这一刻起算。
     let headers_wait = sent_at.elapsed();
@@ -2657,8 +2684,6 @@ async fn remember_image_task(
 /// 把上游的非 2xx 响应分成"可切换"与"必须直接返回下游"两类。
 async fn classify_upstream_error(
     forward: &Forward<'_>,
-    // 能力学习的归因要拿本次请求**真正用到**的能力求交集，所以翻译层要传进来。
-    translation: &Translation<'_>,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     response: reqwest::Response,
@@ -2668,7 +2693,14 @@ async fn classify_upstream_error(
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(|v| v.parse::<u64>().ok())
+        // 上游头部不可信：超出时钟可表示范围的等待时间必须视为无效，
+        // 否则健康结算中的 Instant + Duration 会 panic，打断故障切换。
+        .filter(|seconds| {
+            Instant::now()
+                .checked_add(Duration::from_secs(*seconds))
+                .is_some()
+        });
 
     if is_switchable_status(status) {
         let code = match status {
@@ -2700,7 +2732,7 @@ async fn classify_upstream_error(
         });
     }
 
-    // 400、413、422 这类错误换个目标结果一样，直接把上游的判断转达给客户端
+    // 400、413、422 等参数错误只属于本次请求，转达客户端后不写跨请求限制
     // （§13.3）。同协议时原样透传上游的错误体，它本身是有用的诊断信息；跨
     // 协议时上游的错误体是另一套形状，改用网关自己的错误对象，客户端的 SDK
     // 才解析得了（§18.2）。
@@ -2712,7 +2744,6 @@ async fn classify_upstream_error(
             tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
             axum::body::Bytes::new()
         });
-    learn_capability_limitation(forward, translation, target, status, &bytes);
     if prepared.endpoint.protocol() == forward.endpoint.protocol() {
         return Err(AttemptFailure::Terminal(Box::new(build_response(
             forward,
@@ -2750,59 +2781,6 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
             .take(400)
             .collect(),
     )
-}
-
-/// 能力学习（§16.7）：上游明确拒绝某能力时记入限制缓存。
-///
-/// 只认明确拒绝的错误形状；普通 400、5xx、超时和网络错误绝不进入缓存。
-/// 归因必须**同时**满足两条：
-///
-/// 1. 错误文案指向某项能力（词表由窄到宽匹配，[\`crate::capability::specs\`]）；
-/// 2. 这项能力**真的出现在本次请求的需求里**。
-///
-/// 第 2 条是现场事故的补丁：上游回 \`does not support forced tool_choice\` 时，
-/// 旧逻辑把它记成"不支持 function_calling"，于是这个账号模型上所有带工具的
-/// 请求被连坐。证据攒够次数才生效，生效后的存续时长由词表决定。
-fn learn_capability_limitation(
-    forward: &Forward<'_>,
-    translation: &Translation<'_>,
-    target: &Arc<TargetView>,
-    status: StatusCode,
-    bytes: &[u8],
-) {
-    let parsed: serde_json::Value = match serde_json::from_slice(bytes) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let requested = translation.requested_capabilities();
-    let Some(capability) = capability::unsupported_from_error(status.as_u16(), &parsed, &requested)
-    else {
-        if let Some(unused) =
-            capability::unrequested_capability(status.as_u16(), &parsed, &requested)
-        {
-            // 丢掉证据必须是看得见的：上游确实拒绝了某项能力，只是本次请求
-            // 没用到它，拿它去封这个组合会误伤别的流量。
-            tracing::debug!(
-                account = target.account.name,
-                model = target.target.upstream_model,
-                capability = unused,
-                "上游措辞指向的能力不在本次请求的需求里，不记证据"
-            );
-        }
-        return;
-    };
-    forward.state.runtime.capabilities.note_unsupported(
-        &target.account.id,
-        &target.target.upstream_model,
-        capability,
-        Instant::now(),
-    );
-    tracing::info!(
-        account = target.account.name,
-        model = target.target.upstream_model,
-        capability,
-        "上游明确拒绝该能力，攒够证据后调度避开这个组合"
-    );
 }
 
 /// 该上游状态码是否意味着"换个目标可能就成了"（§13.2）。

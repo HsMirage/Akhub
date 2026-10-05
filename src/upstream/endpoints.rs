@@ -17,7 +17,7 @@
 //! 降级端点排在最后，等价于"降级只在故障切换时生效"：层内的无损端点全部试完
 //! 之前，需要降级的端点根本轮不到（§14.8）。分组关掉降级开关时它们直接被剔除。
 //!
-//! 已证实**不支持**的端点在证据过期或配置变化前不会重复尝试。
+//! 本次请求拒绝过的端点不再重试；下一次请求重新从原生端点开始。
 
 use std::time::Instant;
 
@@ -42,8 +42,8 @@ impl Choice {
 
 /// 一次尝试最多试几个端点。
 ///
-/// 纯失控保护：真正有价值的只有"原生优先，不行就转换"这两步。同一个账号连
-/// 换三个端点都 404，说明 Base URL 本身就是错的，再试也是浪费预算（§13.1）。
+/// 每轮最多试原生端点和一个可转换端点，同一端点不重复尝试，
+/// 避免 404/405 导致转换循环（§13.1）。
 pub const MAX_ENDPOINTS_PER_TARGET: usize = 2;
 
 /// 排出某个账号对这次请求的端点尝试顺序。
@@ -56,6 +56,7 @@ pub fn choices(
     evidence: &Evidence,
     allow_degrade: bool,
     now: Instant,
+    rejected: &[Endpoint],
 ) -> Result<Vec<Choice>, Unsupported> {
     // `count_tokens`、`compact` 与 `input_tokens` 只能原生转发：没有跨协议
     // 等价物，本地精确计数也不可行，按 §15.4、§15.5 直接返回不支持，而不是
@@ -90,7 +91,7 @@ pub fn choices(
                     "该账号没有 /{} 端点（图片接口仅支持 OpenAI 兼容上游原生转发）",
                     downstream.path()
                 );
-                if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
+                if !plausible || rejected.contains(&downstream) {
                     return Err(Unsupported::new(missing));
                 }
                 return Ok(vec![Choice {
@@ -100,7 +101,7 @@ pub fn choices(
             }
             _ => unreachable!("is_native_only 只覆盖辅助端点"),
         };
-        if !plausible || evidence.is_unsupported(&account.id, downstream, now) {
+        if !plausible || rejected.contains(&downstream) {
             return Err(Unsupported::new(missing));
         }
         return Ok(vec![Choice {
@@ -127,10 +128,10 @@ pub fn choices(
         if choices.iter().any(|choice| choice.endpoint == endpoint) {
             continue;
         }
-        if evidence.is_unsupported(&account.id, endpoint, now) {
+        if rejected.contains(&endpoint) {
             continue;
         }
-        // 与下游同协议的端点是纯透传：它没被证实缺失之前就是最优解，后面的
+        // 与下游同协议的端点是纯透传：本次尚未拒绝时就是最优解，后面的
         // 端点连算都不用算。热路径因此不会为一个用不上的备胎解析整个请求体
         // （§14.3 的第 1 档、§19.4）。
         if endpoint.protocol() == translation.downstream() {
@@ -186,12 +187,11 @@ fn tier(
     if supported { 4 } else { 5 }
 }
 
-/// 该端点的 404 / 405 是否足以证明"这条路由不存在"（§16.7）。
+/// 这次 404/405 是否允许尝试同账号的其他端点。
 ///
-/// 只有**推测性**尝试才算数：账号首选端点上的 404 更可能是"模型不存在"，把它
-/// 当成端点缺失会误关一条本来可用的通路。推测端点上猜错的代价只是接下来 24
-/// 小时改走转换，不影响正确性。
-pub fn proves_missing_endpoint(account: &Account, endpoint: Endpoint, status: u16) -> bool {
+/// 首选端点保持既有错误处理；其余端点可在本次请求内试一次转换。
+/// 这个判断不能用于推断整个账号的接口是否存在，也不写跨请求限制。
+pub fn may_try_other_endpoint(account: &Account, endpoint: Endpoint, status: u16) -> bool {
     let speculative = endpoint != Endpoint::native(account.preferred_protocol);
     speculative && matches!(status, 404 | 405)
 }
@@ -242,10 +242,11 @@ mod tests {
             &Evidence::new(),
             true,
             Instant::now(),
+            &[],
         )
         .unwrap();
 
-        // 同协议端点未被证实缺失时就是最优解，不必再为备胎做一次转换。
+        // 同协议端点本次尚未拒绝时就是最优解，不必再为备胎做一次转换。
         assert_eq!(
             picked,
             vec![Choice {
@@ -261,7 +262,7 @@ mod tests {
         let translation = Translation::new(Protocol::AnthropicMessages, &body);
         let evidence = Evidence::new();
         let now = Instant::now();
-        evidence.note_unsupported("acc", Endpoint::Messages, now);
+        let rejected = [Endpoint::Messages];
 
         let picked = choices(
             &account(Protocol::OpenAiChat, true),
@@ -270,12 +271,13 @@ mod tests {
             &evidence,
             true,
             now,
+            &rejected,
         )
         .unwrap();
         assert_eq!(picked[0].endpoint, Endpoint::ChatCompletions, "改走转换");
         assert!(
             picked.iter().all(|c| c.endpoint != Endpoint::Messages),
-            "已证实不存在的端点不再重复尝试"
+            "本次请求拒绝的端点不再重复尝试"
         );
     }
 
@@ -290,6 +292,7 @@ mod tests {
             &Evidence::new(),
             true,
             Instant::now(),
+            &[],
         )
         .unwrap();
         assert_eq!(picked.len(), 1);
@@ -319,13 +322,14 @@ mod tests {
             &evidence,
             true,
             now,
+            &[],
         )
         .unwrap();
         assert_eq!(picked[0].endpoint, Endpoint::Messages);
         assert!(picked[0].is_lossless(), "无损端点必须排在最前");
 
-        // 原生端点已经证实不存在：只剩需要降级的端点，仍然可用但被标记。
-        evidence.note_unsupported("acc", Endpoint::Messages, now);
+        // 本次原生端点被拒绝：只剩需要降级的端点，仍然可用但被标记。
+        let rejected = [Endpoint::Messages];
         let picked = choices(
             &account,
             Endpoint::Messages,
@@ -333,6 +337,7 @@ mod tests {
             &evidence,
             true,
             now,
+            &rejected,
         )
         .unwrap();
         assert!(picked.iter().all(|choice| !choice.is_lossless()));
@@ -349,6 +354,7 @@ mod tests {
             &evidence,
             false,
             now,
+            &rejected,
         );
         assert!(refused.is_err());
     }
@@ -368,6 +374,7 @@ mod tests {
             &evidence,
             true,
             now,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -378,8 +385,7 @@ mod tests {
             }]
         );
 
-        // 证实没有这个端点之后返回不支持，而不是估算一个 Token 数（§15.5）。
-        evidence.note_unsupported("acc", Endpoint::CountTokens, now);
+        // 本次没有转换端点时返回不支持，而不是估算 Token 数（§15.5）。
         assert!(
             choices(
                 &account(Protocol::OpenAiChat, true),
@@ -387,7 +393,8 @@ mod tests {
                 &translation,
                 &evidence,
                 true,
-                now
+                now,
+                &[Endpoint::CountTokens]
             )
             .is_err()
         );
@@ -400,7 +407,8 @@ mod tests {
                 &translation,
                 &Evidence::new(),
                 true,
-                now
+                now,
+                &[]
             )
             .is_err()
         );
@@ -412,7 +420,8 @@ mod tests {
                 &translation,
                 &Evidence::new(),
                 true,
-                now
+                now,
+                &[]
             )
             .is_ok()
         );
@@ -432,6 +441,7 @@ mod tests {
                 &Evidence::new(),
                 true,
                 now,
+                &[],
             )
             .unwrap_err();
             assert!(refused.to_string().contains(endpoint.path()));
@@ -443,12 +453,12 @@ mod tests {
                 &Evidence::new(),
                 true,
                 now,
+                &[],
             )
             .unwrap();
             assert_eq!(picked[0].endpoint, endpoint);
 
             let evidence = Evidence::new();
-            evidence.note_unsupported("acc", endpoint, now);
             assert!(
                 choices(
                     &account(Protocol::OpenAiResponses, false),
@@ -457,6 +467,7 @@ mod tests {
                     &evidence,
                     true,
                     now,
+                    &[endpoint]
                 )
                 .is_err()
             );
@@ -475,6 +486,7 @@ mod tests {
             &Evidence::new(),
             true,
             Instant::now(),
+            &[],
         )
         .unwrap();
         assert_eq!(picked.len(), 1);
@@ -482,19 +494,19 @@ mod tests {
     }
 
     #[test]
-    fn only_speculative_endpoints_can_prove_a_missing_route() {
+    fn only_speculative_rejections_try_another_endpoint() {
         let account = account(Protocol::OpenAiChat, true);
-        // 首选端点上的 404 更可能是"模型不存在"，不能当作端点缺失。
-        assert!(!proves_missing_endpoint(
+        // 首选端点上的 404 走正常的换目标流程。
+        assert!(!may_try_other_endpoint(
             &account,
             Endpoint::ChatCompletions,
             404
         ));
-        assert!(proves_missing_endpoint(&account, Endpoint::Messages, 404));
-        assert!(proves_missing_endpoint(&account, Endpoint::Messages, 405));
-        // 5xx 与超时不能证明任何能力（§16.7）。
-        assert!(!proves_missing_endpoint(&account, Endpoint::Messages, 500));
-        assert!(!proves_missing_endpoint(&account, Endpoint::Messages, 429));
+        assert!(may_try_other_endpoint(&account, Endpoint::Messages, 404));
+        assert!(may_try_other_endpoint(&account, Endpoint::Messages, 405));
+        // 5xx 与限流仍走各自的故障切换与等待流程。
+        assert!(!may_try_other_endpoint(&account, Endpoint::Messages, 500));
+        assert!(!may_try_other_endpoint(&account, Endpoint::Messages, 429));
     }
     /// 五档排序：已确认支持的原生端点最前，其次是能力未知的原生端点，
     /// 然后是账号首选端点，再是已确认支持的其他端点，降级端点永远最后（§14.3）。

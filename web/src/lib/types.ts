@@ -443,8 +443,6 @@ export interface Overview {
   /** 超过半数账号同一轮刷新失败：探针侧系统性故障（§11.4）。 */
   probe_systemic_failure: boolean;
   sticky_bindings: number;
-  /** 已证实不存在的上游端点条数（§14.2）。 */
-  missing_endpoints: number;
   dropped_request_records: number;
   master_key_from_env: boolean;
   /** 数据目录（§6.1）：主密钥、SQLite 与临时文件都在这里。 */
@@ -501,39 +499,6 @@ export type SettingsNumericField =
   | "model_sync_secs";
 
 export type SettingsPatch = Partial<Pick<Settings, SettingsNumericField>>;
-
-/** 一条"能力限制"调度屏蔽（§16.7、§23.5）。 */
-export interface SchedulingBlockCapability {
-  account_id: string;
-  account_name: string;
-  /** 上游模型名：限制按"账号 × 模型 × 能力"归因。 */
-  model: string;
-  /** 词表能力名，如 function_calling / forced_tool_choice。 */
-  capability: string;
-  /** 已攒到的独立证据次数。 */
-  strikes: number;
-  /** 需要攒到几次才生效。 */
-  required_strikes: number;
-  /** 是否已经生效（生效才算硬性不合格）。 */
-  effective: boolean;
-  in_effect_secs: number;
-  expires_in_secs: number;
-}
-
-/** 一条"端点缺失证据"调度屏蔽（§14.2、§23.5）。 */
-export interface SchedulingBlockEvidence {
-  account_id: string;
-  account_name: string;
-  endpoint: string;
-  expires_in_secs: number;
-}
-
-/** 调度屏蔽总览（GET /admin/api/scheduling-blocks）。 */
-export interface SchedulingBlocks {
-  capabilities: SchedulingBlockCapability[];
-  evidence: SchedulingBlockEvidence[];
-  generated_at: number;
-}
 
 /** New API 的一个可用分组（账号编辑页的分组下拉框）。 */
 export interface NewApiGroupOption {

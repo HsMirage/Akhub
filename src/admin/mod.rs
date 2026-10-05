@@ -324,15 +324,6 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/targets/{id}",
             patch_or_delete(r::update_target, r::delete_target),
         )
-        // 调度屏蔽：能力限制与端点缺失证据的可见性与出口（§16.7、§23.5）。
-        .route(
-            "/admin/api/scheduling-blocks",
-            get(r::list_scheduling_blocks),
-        )
-        .route(
-            "/admin/api/scheduling-blocks/clear",
-            post(r::clear_scheduling_blocks),
-        )
         .route("/admin/api/requests", get(r::list_requests))
         .route("/admin/api/metrics", get(r::metrics))
         // 版本检查与自更新（顶部版本号点开的面板）。

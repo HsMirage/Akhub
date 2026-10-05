@@ -589,24 +589,16 @@ pub async fn maybe_start_managed(
 
 /// 这次请求的目标里有没有上游原生支持 Responses 后台。
 ///
-/// 判据是端点：账号首选 Responses 协议、且该端点没有被证实缺失时，就认为上游
-/// 有机会原生支持——此时不该由网关托管（计划 §29.1 的"优先原生"）。
+/// 账号首选 Responses 协议时优先交由上游实际处理（计划 §29.1）。
+/// 历史请求的 404/405 不影响后续后台请求的协议选择。
 fn native_background_available(forward: &crate::gateway::passthrough::Forward<'_>) -> bool {
     if forward.chain.pinned.is_some() {
         return true;
     }
-    let now = std::time::Instant::now();
     forward
         .group
         .models
         .values()
         .flat_map(|model| model.targets.iter())
-        .any(|target| {
-            target.account.preferred_protocol == crate::domain::Protocol::OpenAiResponses
-                && !forward.state.runtime.evidence.is_unsupported(
-                    &target.account.id,
-                    crate::upstream::Endpoint::Responses,
-                    now,
-                )
-        })
+        .any(|target| target.account.preferred_protocol == crate::domain::Protocol::OpenAiResponses)
 }

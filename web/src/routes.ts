@@ -4,7 +4,6 @@ export const ROUTES = [
   "groups",
   "accounts",
   "targets",
-  "blocks",
   "requests",
   "cost",
   "settings",
@@ -17,10 +16,6 @@ export const ROUTE_META: Record<Route, { title: string; subtitle: string }> = {
   groups: { title: "分组", subtitle: "调度硬边界，每组一把下游 Key" },
   accounts: { title: "上游账号", subtitle: "凭据、模型命名与限制" },
   targets: { title: "调度视图", subtitle: "按模型查看账号评分、可用性与速度" },
-  blocks: {
-    title: "调度屏蔽",
-    subtitle: "被上游拒绝过的能力与端点证据，可逐条放行",
-  },
   requests: { title: "请求记录", subtitle: "只含元数据，不含正文" },
   cost: { title: "成本视图", subtitle: "按逻辑模型分组，不做跨模型加总" },
   settings: { title: "设置", subtitle: "系统口径、版本与配置备份" },

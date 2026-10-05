@@ -307,7 +307,12 @@ impl Registry {
 
     /// 读取一个目标在某个维度上的当前统计。
     pub fn stats(&self, target_id: &str, dimension: Dimension) -> Stats {
-        let entry = self.entry(target_id);
+        // 读取不能创建空条目：管理页遍历大量未采样目标时，否则会占满
+        // 容量并淘汰真实历史，让成熟目标无故退回冷启动评分。
+        let entry = crate::sync::read(&self.inner).get(target_id).cloned();
+        let Some(entry) = entry else {
+            return Stats::default();
+        };
         let stats = crate::sync::lock(&entry);
         stats.get(&dimension).copied().unwrap_or_default()
     }
@@ -1758,6 +1763,22 @@ mod tests {
             let value = random_unit();
             assert!((0.0..1.0).contains(&value), "{value}");
         }
+    }
+
+    #[test]
+    fn reading_unknown_targets_never_allocates_or_evicts_performance_history() {
+        let registry = Registry::new();
+        let dimension = Dimension {
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+        };
+        for i in 0..MAX_TRACKED_TARGETS + 1 {
+            assert_eq!(
+                registry.stats(&format!("missing-{i}"), dimension).samples,
+                0
+            );
+        }
+        assert!(registry.is_empty(), "管理页面读取未知目标不应占据统计容量");
     }
 
     /// 性能统计表有兜底上限，即使 retain 没被调用也不会无界增长（§19.4）。

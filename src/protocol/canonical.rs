@@ -296,10 +296,7 @@ impl Request {
         self.thinking.is_some_and(|t| t.enabled)
     }
 
-    /// 本次请求用到的可缓存能力，按"证据查询用的能力名"给出（§16.7）。
-    ///
-    /// 调度前用它逐个目标查询能力限制：已被证实不支持的项按 §9.1 处理。
-    /// 图片与文档输入共享 `vision` 一词——上游拒绝时也分不清两者。
+    /// 本次请求使用的能力，只供内置目录参与候选排序（§16.6）。
     pub fn requested_capabilities(&self) -> Vec<&'static str> {
         let mut caps = Vec::new();
         let mut push = |name: &'static str| {
@@ -309,15 +306,6 @@ impl Request {
         };
         if !self.tools.is_empty() {
             push("function_calling");
-            // 强制型工具选择是**窄能力**：上游可以支持工具、却不支持强制指定
-            // （现场案例：\`does not support forced tool_choice; use auto or none\`）。
-            // 把它单独列出来，一次这样的拒绝才不会连坐整类工具调用（§16.7）。
-            if matches!(
-                self.tool_choice,
-                Some(ToolChoice::Required | ToolChoice::Named(_))
-            ) {
-                push("forced_tool_choice");
-            }
         }
         if self.output_format.is_some() {
             push("response_schema");

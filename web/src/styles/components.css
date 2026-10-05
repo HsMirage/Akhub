@@ -2444,6 +2444,19 @@ table.data td.table-empty-cell {
 }
 
 @media (max-width: 560px) {
+  /* 手机端先读说明再操作，按钮不能把标题区挤成竖排。 */
+  .card-head {
+    flex-direction: column;
+    align-items: stretch;
+    padding: var(--space-4);
+  }
+  .card-actions {
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+  .card-actions .btn {
+    flex: 1;
+  }
   .request-filters .table-filter-fields,
   .account-filters .table-filter-fields {
     grid-template-columns: 1fr;

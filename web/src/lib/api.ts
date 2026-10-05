@@ -14,7 +14,6 @@ import type {
   LogicalModel,
   Overview,
   Page,
-  SchedulingBlocks,
   RequestFilters,
   RequestPage,
   SelectionWarning,
@@ -110,7 +109,7 @@ interface RequestOptions {
   /**
    * 不携带配置版本号（§7.4 的乐观锁）。
    *
-   * 只给**不修改配置**的写操作用：清除内存里的调度屏蔽、测试连接这类动作与配置
+   * 只给**不修改配置**的写操作用：测试连接这类动作与配置
    * 版本无关，带上版本号只会被并发的配置写入判成冲突（409），让用户看到一条与
    * 当前操作毫无关系的"配置已被修改"。服务端把"不带头部"定义为兼容模式。
    */
@@ -135,6 +134,7 @@ async function sendOnce<T>(
   options: RequestOptions = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
+  const versionAtSend = configVersion;
   if (init.body) headers.set("content-type", "application/json");
   if (method !== "GET") {
     headers.set(CSRF_HEADER, "1");
@@ -162,7 +162,12 @@ async function sendOnce<T>(
   const returned = response.headers.get(CONFIG_VERSION_HEADER);
   if (returned && response.ok) {
     const parsed = Number.parseInt(returned, 10);
-    if (Number.isFinite(parsed)) configVersion = parsed;
+    // 并发 GET 可以晚于保存完成；不能让旧响应把新版本倒退。
+    // 若在途期间版本未变则接受较小值：服务重启会将版本重置为 1。
+    if (Number.isSafeInteger(parsed) && parsed > 0 &&
+        (parsed >= configVersion || configVersion === versionAtSend)) {
+      configVersion = parsed;
+    }
   }
 
   if (response.status === 204) return undefined as T;
@@ -185,6 +190,9 @@ async function sendOnce<T>(
       window.dispatchEvent(new CustomEvent("akhub-config-conflict"));
     }
     throw new ApiError(message, response.status, body);
+  }
+  if (body === null) {
+    throw new ApiError("服务返回了无效数据，请刷新重试；若仍失败，请检查反向代理", response.status);
   }
   return body as T;
 }
@@ -346,28 +354,6 @@ export const api = {
     }),
   calibrations: (id: string) =>
     request<{ data: CalibrationRecord[] }>(`/accounts/${id}/calibrations`),
-
-  /**
-   * 调度屏蔽：进程内存里的能力限制与端点缺失证据（§16.7、§23.5）。
-   *
-   * 两者都有 24 小时级别的存续期，都会让整类请求直接没有候选目标；不落库、
-   * 不进配置，所以只能靠这个接口看见与放行。
-   */
-  schedulingBlocks: () => request<SchedulingBlocks>("/scheduling-blocks"),
-  /** 手动放行：四个条件都是可选的通配，只清内存状态，不动配置（§23.5）。 */
-  clearSchedulingBlocks: (payload: {
-    scope: "all" | "capability" | "evidence";
-    account_id?: string;
-    model?: string;
-    capability?: string;
-    endpoint?: string;
-  }) =>
-    post<{ ok: boolean; capabilities_cleared: number; evidence_cleared: number; notice: string }>(
-      "/scheduling-blocks/clear",
-      payload,
-      // 只清内存状态、不动配置：不该被并发的配置写入判成版本冲突。
-      { skipConfigVersion: true },
-    ),
 
   /** 成本页：按逻辑模型分组，绝不跨模型加总（§6.8）。 */
   cost: (period: "day" | "month" = "day") =>

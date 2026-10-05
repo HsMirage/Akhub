@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test:key-paste": "tsc src/lib/key-paste.ts src/lib/key-paste.check.ts --module esnext --target es2022 --moduleResolution bundler --outDir node_modules/.cache/key-paste-check --skipLibCheck && node node_modules/.cache/key-paste-check/key-paste.check.js",
-    "test": "npm run typecheck && npm run test:key-paste"
+    "test:api": "tsc src/lib/api.ts src/lib/api.check.ts --module esnext --target es2022 --moduleResolution bundler --outDir node_modules/.cache/api-check --skipLibCheck && node node_modules/.cache/api-check/api.check.js",
+    "test:browser": "node tests/smoke.mjs",
+    "test": "npm run typecheck && npm run test:key-paste && npm run test:api"
   },
   "dependencies": {
     "react": "^19.2.0",
@@ -19,6 +21,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",
+    "playwright-core": "^1.63.0",
     "typescript": "^5.9.0",
     "vite": "^8.0.0"
   }

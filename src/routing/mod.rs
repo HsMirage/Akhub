@@ -11,7 +11,6 @@ pub mod sticky;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::capability;
 use crate::config::{GroupView, TargetView};
 use crate::domain::{Multiplier, Protocol};
 use crate::gateway::error::ErrorCode;
@@ -38,12 +37,6 @@ pub enum Ineligible {
     /// 静态事实：再等一会儿、再看一眼还是这个结果，所以它对外的语义是
     /// "重试没有意义"（§18.3）。
     Unsupported(String),
-    /// 曾经从上游学到"这个账号的这个模型不支持这项能力"，还在存续期内（§16.7）。
-    ///
-    /// 与 [`Self::Unsupported`] 必须分开：这条限制**会自己过期**，也可能被
-    /// 管理员手动放行，属于"暂时不可用"。混为一谈会把一个 15 分钟的内存封禁
-    /// 报成"无法表达本次请求、别再重试"——现场事故里客户端就是这么被劝退的。
-    LearnedUnsupported(String),
     /// 动态状态不允许：熔断、额度耗尽、鉴权失败或暂时容量不足。
     ///
     /// 第二个字段是**归因到哪把 Key**（凭据摘要）。单 Key 账号与账号级原因
@@ -59,9 +52,7 @@ impl Ineligible {
             Self::Disabled => "已停用".to_string(),
             Self::MultiplierExceeded => "倍率超限".to_string(),
             Self::MultiplierUnknown => "倍率未知".to_string(),
-            // 两者对外的**类别词**都是"能力不支持"：摘要用于聚合与告警，口径不变；
-            // 区别体现在对外文案、状态码与具体说明里。
-            Self::Unsupported(_) | Self::LearnedUnsupported(_) => "能力不支持".to_string(),
+            Self::Unsupported(_) => "能力不支持".to_string(),
             Self::Unavailable(reason, key) => {
                 let base = match reason {
                     health::Unavailable::KeyInvalid => "Key 失效",
@@ -89,9 +80,6 @@ impl Ineligible {
     fn describe_detailed(&self) -> String {
         match self {
             Self::Unsupported(detail) => format!("{}（{detail}）", self.describe()),
-            Self::LearnedUnsupported(detail) => {
-                format!("{}（{detail}，可手动放行）", self.describe())
-            }
             other => other.describe(),
         }
     }
@@ -106,8 +94,6 @@ impl Ineligible {
         match self {
             // 会自己好的排最前。
             Self::Unavailable(reason, _) if reason.is_queueable() => 0,
-            // 学到的能力限制：有存续期、可手动放行，而且指名道姓（账号 + 能力）。
-            Self::LearnedUnsupported(_) => 1,
             Self::Unavailable(_, _) => 2,
             Self::Unsupported(_) => 3,
             Self::MultiplierExceeded | Self::MultiplierUnknown => 4,
@@ -120,8 +106,6 @@ impl Ineligible {
             Self::MultiplierExceeded => ErrorCode::MultiplierExceeded,
             Self::MultiplierUnknown => ErrorCode::MultiplierUnknown,
             Self::Unsupported(_) => ErrorCode::UnsupportedParameter,
-            // 学到的限制会过期：对外保留可重试语义，别把暂时状态说成终局。
-            Self::LearnedUnsupported(_) => ErrorCode::NoEligibleTarget,
             Self::Unavailable(health::Unavailable::RateLimited, _) => ErrorCode::RateLimited,
             _ => ErrorCode::NoEligibleTarget,
         }
@@ -295,10 +279,8 @@ pub struct Context<'a> {
     pub multipliers: &'a multiplier::View,
     /// 账号内 Key 池的快照（§4.2.1）。
     pub credentials: &'a crate::credential::CredentialPool,
-    /// 端点能力证据：已证实不存在的路由不再重复尝试（§14.2）。
+    /// 端点成功记录：只作为本次候选的排序提示（§14.3）。
     pub evidence: &'a Evidence,
-    /// 模型能力限制：已证实不支持某能力的账号模型（§16.7）。
-    pub capabilities: &'a capability::Capabilities,
     /// 一次请求在三个协议上的转换缓存（§14.3）。
     pub translation: &'a Translation<'a>,
     /// 下游入口端点。`count_tokens` 与推理端点的可转换性不同（§15.5）。
@@ -329,7 +311,6 @@ impl Context<'_> {
             multipliers: self.multipliers,
             credentials: self.credentials,
             evidence: self.evidence,
-            capabilities: self.capabilities,
             translation: self.translation,
             endpoint: self.endpoint,
             allow_degrade: self.allow_degrade,
@@ -381,25 +362,10 @@ pub fn check_eligibility(
         context.evidence,
         context.allow_degrade,
         context.now,
+        &[],
     )
     .map_err(|reason| Ineligible::Unsupported(reason.to_string()))?;
 
-    // 已被明确证实不支持、且不在降级白名单内的能力是硬性不合格（§9.1、§16.7）。
-    // 白名单内的能力仍可参与——真要丢的时候由降级标记显式呈现（§14.8）。
-    for capability in context.translation.requested_capabilities() {
-        let prohibited = context.capabilities.is_unsupported(
-            &target.account.id,
-            &target.target.upstream_model,
-            capability,
-            context.now,
-        ) && !capability::DEGRADABLE.contains(&capability);
-        if prohibited {
-            return Err(Ineligible::LearnedUnsupported(format!(
-                "账号「{}」的模型 {} 已被证实不支持 {capability}",
-                target.account.name, target.target.upstream_model
-            )));
-        }
-    }
     // 三级门限逐级收紧，Key 级取**这一把**的覆盖值。
     let limits = health::AdmissionLimits {
         account: target.account.limits,
@@ -539,6 +505,7 @@ pub fn plan(
                         context.evidence,
                         context.allow_degrade,
                         context.now,
+                        &[],
                     )
                 {
                     let multiplier = context
@@ -615,7 +582,7 @@ pub fn plan(
         .into_iter()
         .zip(scores)
         .map(|((target, multiplier, endpoints), score)| {
-            let catalog_discouraged = catalog_discouraged(context, &target, &requested);
+            let catalog_discouraged = catalog_discouraged(&target, &requested);
             Candidate {
                 target,
                 multiplier,
@@ -654,26 +621,11 @@ pub fn plan(
     })
 }
 
-/// 内置能力目录是否明确说这个目标缺本次请求需要的能力（§16.6）。
-///
-/// **只在该能力没有任何真实证据时才看目录**——证据优先级是
-/// `明确的真实请求结果 > 上游接口返回 > 内置适配规则 > 开源目录`，
-/// 有了更高优先级的证据，目录的意见就作废。
-fn catalog_discouraged(
-    context: &Context<'_>,
-    target: &TargetView,
-    requested: &[&'static str],
-) -> bool {
+/// 目录只参与层内排序，不因历史参数错误跳过候选目标（§16.6）。
+fn catalog_discouraged(target: &TargetView, requested: &[&'static str]) -> bool {
     let catalog = crate::capability::builtin();
     requested.iter().any(|capability| {
-        // 已经学到证据的能力不归目录管：支持或不支持都由证据说话。
-        let learned = context.capabilities.is_unsupported(
-            &target.account.id,
-            &target.target.upstream_model,
-            capability,
-            context.now,
-        );
-        !learned && catalog.supports(&target.target.upstream_model, capability) == Some(false)
+        catalog.supports(&target.target.upstream_model, capability) == Some(false)
     })
 }
 
@@ -778,7 +730,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
         |predicate: fn(&Ineligible) -> bool| !reasons.is_empty() && reasons.iter().all(predicate);
 
     // 没有任何目标**结构上**能表达这个请求：换目标、重试都是同样的结果，
-    // 快速失败（§18.3）。学到的能力限制不算这一类——它会过期。
+    // 快速失败（§18.3）。这里只判断协议结构能否表达本次请求。
     if all(|r| matches!(r, Ineligible::Unsupported(_))) {
         let detail = reasons.iter().find_map(|reason| match reason {
             Ineligible::Unsupported(detail) => Some(detail.clone()),
@@ -931,32 +883,6 @@ mod tests {
         Protocol, SchedulingWeights,
     };
 
-    /// 混合原因下，"最值得报出"的排序（§18.3）。
-    ///
-    /// 现场事故里：一个渠道被停用、另一个渠道上的能力被封禁，报文却只说"已停用"
-    /// ——管理员会去翻配置，而真正的拦路者是那条能力证据。
-    #[test]
-    fn a_capability_block_outranks_a_disabled_neighbour_in_the_reported_reason() {
-        let blocked = Ineligible::LearnedUnsupported(
-            "账号「A」的模型 m 已被证实不支持 forced_tool_choice".into(),
-        );
-        let disabled = Ineligible::Disabled;
-        assert!(
-            blocked.rank() < disabled.rank(),
-            "能力封禁比'已停用'更值得报出"
-        );
-        let detail = blocked.describe_detailed();
-        assert!(detail.contains("forced_tool_choice"), "{detail}");
-        assert!(
-            detail.contains("账号「A」"),
-            "具体说明要能定位到账号：{detail}"
-        );
-        assert!(detail.contains("能力不支持"), "{detail}");
-        // 摘要仍然只给类别词：聚合口径不变（§24.1）。
-        assert_eq!(blocked.describe(), "能力不支持");
-        assert_eq!(disabled.describe(), "已停用");
-    }
-
     /// 会自己好的原因排在纯配置问题前面：客户端重试才有意义。
     #[test]
     fn transient_reasons_are_reported_before_permanent_ones() {
@@ -966,26 +892,6 @@ mod tests {
         assert!(transient.rank() < static_gap.rank());
         assert!(static_gap.rank() < disabled.rank());
         assert_eq!(transient.rank(), 0);
-    }
-
-    /// 学到的能力限制是**会过期**的临时状态，不能对外说成"别再重试"。
-    ///
-    /// 现场事故：一个渠道被停用 + 另一个渠道上有能力封禁，混在一起被报成 400；
-    /// 客户端于是彻底放弃，而实际上等一会儿或放行一下就能恢复。
-    #[test]
-    fn a_learned_limitation_stays_retryable_even_when_mixed_with_config_issues() {
-        let learned = Ineligible::LearnedUnsupported("账号「A」的模型 m 被证实不支持 tool".into());
-        assert_eq!(
-            learned.error_code(),
-            ErrorCode::NoEligibleTarget,
-            "学到的限制必须保留可重试语义"
-        );
-        let static_gap = Ineligible::Unsupported("账号「A」没有可用端点".into());
-        assert_eq!(static_gap.error_code(), ErrorCode::UnsupportedParameter);
-        assert!(
-            learned.rank() < static_gap.rank(),
-            "两者都报出来时，学到的限制更该被点名"
-        );
     }
 
     fn account(id: &str, multiplier: &str, protocol: Protocol, enabled: bool) -> Arc<Account> {
@@ -1101,7 +1007,6 @@ mod tests {
         perf: score::Registry,
         multipliers: multiplier::Registry,
         evidence: Evidence,
-        capabilities: capability::Capabilities,
         /// 账号内 Key 池。测试账号各带一把健康的 Key，与引入 Key 池之前的
         /// 行为等价：凭据从不不合格，Key 级状态不参与调度（§4.2.1）。
         credentials: crate::credential::CredentialPool,
@@ -1126,7 +1031,6 @@ mod tests {
                 perf: score::Registry::new(),
                 multipliers: multiplier::Registry::new(),
                 evidence: Evidence::new(),
-                capabilities: capability::Capabilities::new(),
                 credentials,
                 body: serde_json::json!({
                     "model": "glm-4.6",
@@ -1157,7 +1061,6 @@ mod tests {
                 multipliers: &$view,
                 credentials: &$fixture.credentials,
                 evidence: &$fixture.evidence,
-                capabilities: &$fixture.capabilities,
                 translation: &$translation,
                 endpoint: Endpoint::ChatCompletions,
                 allow_degrade: true,
@@ -1357,7 +1260,6 @@ mod tests {
             multipliers: &view,
             credentials: &fixture.credentials,
             evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
             translation: &translation,
             endpoint: Endpoint::Messages,
             allow_degrade: true,
@@ -1370,18 +1272,15 @@ mod tests {
         let native = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
         let candidate = &native.attempts()[0];
         assert!(candidate.is_lossless(), "纯文本请求跨协议无损");
-        // 原生端点未被证实缺失时先走它：上游很可能两个端点都有（§14.2）。
+        // 每次新请求先试原生端点：上游可能两个端点都有（§14.2）。
         assert_eq!(candidate.endpoints[0].endpoint, Endpoint::Messages);
 
-        // 证实上游没有 /v1/messages 之后，同一个账号改走转换后的 Chat 端点。
+        // 即使另一个协议成功过，新请求仍然优先原生端点。
         fixture
             .evidence
-            .note_unsupported("a1", Endpoint::Messages, context.now);
-        let converted = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
-        assert_eq!(
-            converted.attempts()[0].endpoints[0].endpoint,
-            Endpoint::ChatCompletions
-        );
+            .note_supported("a1", Endpoint::ChatCompletions, context.now);
+        let next = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
+        assert_eq!(next.attempts()[0].endpoints[0].endpoint, Endpoint::Messages);
     }
 
     #[test]
@@ -1405,7 +1304,6 @@ mod tests {
             multipliers: &view,
             credentials: &fixture.credentials,
             evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
             translation: &translation,
             endpoint: Endpoint::ChatCompletions,
             allow_degrade: true,
@@ -1455,7 +1353,6 @@ mod tests {
             multipliers: &view,
             credentials: &fixture.credentials,
             evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
             translation: &translation,
             endpoint: Endpoint::Messages,
             allow_degrade,
@@ -1615,7 +1512,6 @@ mod tests {
             multipliers: &view,
             credentials: &fixture.credentials,
             evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
             translation: &translation,
             endpoint: Endpoint::ChatCompletions,
             allow_degrade: true,
@@ -1796,7 +1692,6 @@ mod tests {
             multipliers: &view,
             credentials: &fixture.credentials,
             evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
             translation: &translation,
             endpoint: Endpoint::ChatCompletions,
             allow_degrade: true,
@@ -1821,53 +1716,5 @@ mod tests {
             !layer.candidates[0].catalog_discouraged && layer.candidates[1].catalog_discouraged,
             "档位应当反映目录的意见"
         );
-    }
-
-    /// 有了真实证据就不再听目录的（§16.6 的证据优先级）。
-    #[test]
-    fn learned_evidence_outranks_the_catalog() {
-        let fixture = Fixture::new();
-        let view = fixture.multipliers.view();
-        let body = serde_json::json!({
-            "model": "glm-4.6",
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "看图"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-            ]}]
-        });
-        let translation = Translation::new(Protocol::OpenAiChat, &body);
-        let group = group_with(
-            "1",
-            vec![target(
-                "t1",
-                account("a1", "0.1", Protocol::OpenAiChat, true),
-                50,
-            )],
-        );
-        let now = std::time::Instant::now();
-        // 假设这个模型被真实请求证实"支持 vision"——目录就算说不行也不算数。
-        // 这里用"学到的是别的能力"来间接表达：学到证据的能力不归目录管。
-        fixture
-            .capabilities
-            .note_unsupported("a1", "glm-4.6", "reasoning", now);
-        let context = Context {
-            health: &fixture.health,
-            perf: &fixture.perf,
-            multipliers: &view,
-            credentials: &fixture.credentials,
-            evidence: &fixture.evidence,
-            capabilities: &fixture.capabilities,
-            translation: &translation,
-            endpoint: Endpoint::ChatCompletions,
-            allow_degrade: true,
-            protocol: Protocol::OpenAiChat,
-            streaming: false,
-            bound_credential: None,
-            now_unix: 0,
-            now,
-        };
-        let planned = plan(&group, "glm-4.6", &context, None, &mut fixed(0.5)).unwrap();
-        // 图片请求仍然只有一个候选，且没有因为目录被降权之外的影响。
-        assert_eq!(planned.attempts().len(), 1);
     }
 }

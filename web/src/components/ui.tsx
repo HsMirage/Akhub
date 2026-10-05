@@ -231,6 +231,10 @@ export function Switch({
 
 /* ------------------------------------------------------------ 抽屉/弹窗 */
 
+// 弹层共享一个滚动锁与键盘栈；嵌套确认只能由最上层处理 Esc/Tab。
+const dismissableStack: HTMLElement[] = [];
+let unlockedOverflow = "";
+
 /**
  * Esc 关闭 + 背景滚动锁定 + 焦点陷阱 + 关闭后焦点归还。
  *
@@ -246,9 +250,15 @@ function useDismissable(
   closeRef.current = onClose;
 
   useEffect(() => {
-    if (!open) return;
+    const dialog = container.current;
+    if (!open || !dialog) return;
     const previouslyFocused =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (dismissableStack.length === 0) {
+      unlockedOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+    dismissableStack.push(dialog);
 
     const focusables = () =>
       Array.from(
@@ -258,8 +268,10 @@ function useDismissable(
       ).filter((el) => el.offsetParent !== null || el === document.activeElement);
 
     const onKey = (event: KeyboardEvent) => {
+      if (dismissableStack.at(-1) !== dialog) return;
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopImmediatePropagation();
         closeRef.current();
         return;
       }
@@ -283,13 +295,20 @@ function useDismissable(
     };
 
     document.addEventListener("keydown", onKey, true);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const focusFrame = requestAnimationFrame(() => {
+      if (dismissableStack.at(-1) === dialog && !dialog.contains(document.activeElement)) {
+        (focusables()[0] ?? dialog).focus({ preventScroll: true });
+      }
+    });
     return () => {
+      cancelAnimationFrame(focusFrame);
       document.removeEventListener("keydown", onKey, true);
-      document.body.style.overflow = previousOverflow;
+      const wasTop = dismissableStack.at(-1) === dialog;
+      const index = dismissableStack.indexOf(dialog);
+      if (index >= 0) dismissableStack.splice(index, 1);
+      if (dismissableStack.length === 0) document.body.style.overflow = unlockedOverflow;
       // 关闭时把焦点还给触发按钮；找不到目标时退回原处，不影响后续 Tab。
-      previouslyFocused?.focus?.({ preventScroll: true });
+      if (wasTop && previouslyFocused?.isConnected) previouslyFocused.focus({ preventScroll: true });
     };
   }, [open, container]);
 }
@@ -351,6 +370,7 @@ export function Drawer({
       <aside
         className={size === "lg" ? "drawer drawer-lg" : "drawer"}
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-label={title}
         ref={dialogRef}
@@ -420,6 +440,7 @@ export function Modal({
           .filter(Boolean)
           .join(" ")}
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-label={title}
         ref={dialogRef}
