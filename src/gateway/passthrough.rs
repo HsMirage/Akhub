@@ -191,6 +191,8 @@ enum AttemptFailure {
     /// 装箱是因为 `Response` 比其余变体大一个数量级，而这是**失败**分支：
     /// 让成功路径为它多搬 128 字节不划算。
     Terminal(Box<Response>),
+    /// 已接单的异步图片任务失败：不得换号或再次下单，但必须记为失败。
+    AcceptedJob(GatewayError),
     /// 本次请求可尝试其他端点。404/405 不证明整个账号缺少接口，
     /// 保留真实错误，转换不可行时仍能解释失败原因。
     EndpointRejected { status: StatusCode, body: Vec<u8> },
@@ -1311,6 +1313,27 @@ impl Walk<'_> {
                     )))
                 }
             }
+            Err(AttemptFailure::AcceptedJob(error)) => {
+                tracing::warn!(request_id = self.forward.request_id, account = candidate.target.account.name,
+                    detail = %error.message, "已接单的图片任务未交付，不重新下单");
+                let code = error.code;
+                admission.settle(
+                    if code == ErrorCode::UpstreamTimeout {
+                        health::Outcome::Neutral
+                    } else {
+                        health::Outcome::Fault
+                    },
+                    None,
+                );
+                self.note_attempt(candidate, started, "failed", Some(code), true);
+                Attempted::Done(Flow::Done(self.finish(
+                    Some(candidate),
+                    code.status(),
+                    Some(code),
+                    Some(StatusCode::ACCEPTED),
+                    error.into_response(),
+                )))
+            }
             Err(AttemptFailure::Terminal(response)) => {
                 admission.settle(health::Outcome::Neutral, None);
                 let status = response.status();
@@ -1402,6 +1425,7 @@ impl Walk<'_> {
                     account = candidate.target.account.name,
                     upstream_status = upstream_status.map(|s| s.as_u16()),
                     error_code = code.as_str(),
+                    detail = %crate::security::redact::text(&message),
                     "目标尝试失败，切换到下一个候选"
                 );
                 self.last = Some((code, message));
@@ -1459,11 +1483,7 @@ impl Walk<'_> {
                         return Err(AttemptFailure::Terminal(Box::new(
                             GatewayError::new(
                                 ErrorCode::UnsupportedParameter,
-                                format!(
-                                    "账号「{}」没有 /{} 端点",
-                                    candidate.target.account.name,
-                                    self.forward.endpoint.path()
-                                ),
+                                format!("当前模型不支持 /{} 端点", self.forward.endpoint.path()),
                             )
                             .with_protocol(self.forward.endpoint.protocol())
                             .with_request_id(self.forward.request_id)
@@ -2143,6 +2163,42 @@ async fn attempt(
         }
         return classify_upstream_error(forward, target, prepared, response, status).await;
     }
+    if status == StatusCode::ACCEPTED
+        && prepared.endpoint.is_image()
+        && !forward.endpoint.submits_image_task()
+    {
+        let parsed = crate::gateway::images::complete_job(
+            forward.state,
+            target,
+            &api_key,
+            response,
+            timeout.saturating_sub(sent_at.elapsed()),
+            forward.request_id,
+        )
+        .await
+        .map_err(AttemptFailure::AcceptedJob)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        return Ok(Success {
+            status: StatusCode::OK,
+            streamed: false,
+            response: build_response(
+                forward,
+                StatusCode::OK,
+                &headers,
+                prepared,
+                Body::from(parsed.to_string()),
+            ),
+            first_token: Some(sent_at.elapsed()),
+            first_byte: None,
+            output_tokens: stream::output_tokens(&parsed),
+            usage_tokens: stream::usage_tokens(&parsed),
+            usage_parts: stream::usage_parts(&parsed),
+            usage_detail: Some(stream::usage_breakdown(&parsed)),
+            stream_state: None,
+            degraded: None,
+        });
+    }
     // 响应头之前已经等掉的时间，之后所有"首字延迟"都必须从这一刻起算。
     let headers_wait = sent_at.elapsed();
     // 图片端点以**上游实际返回的形状**为准（§14.9）：这类端点没有跨协议转换，
@@ -2252,7 +2308,17 @@ async fn commit_stream(
             Ok(committed) => Ok(Success {
                 status,
                 streamed: true,
-                response: build_response(forward, status, &headers, prepared, committed.body),
+                response: build_response(
+                    forward,
+                    status,
+                    &headers,
+                    prepared,
+                    crate::gateway::error::private_stream(
+                        committed.body,
+                        downstream,
+                        forward.request_id,
+                    ),
+                ),
                 first_token: Some(committed.first_token),
                 first_byte: Some(headers_wait + committed.first_token),
                 output_tokens: None,
@@ -2311,6 +2377,11 @@ async fn commit_stream(
                                 prefix,
                                 response,
                                 &gateway,
+                                forward.request_id,
+                            );
+                            let body = crate::gateway::error::private_stream(
+                                body,
+                                downstream,
                                 forward.request_id,
                             );
                             return Ok(Success {
@@ -2386,6 +2457,8 @@ async fn commit_stream(
                         downstream,
                         forward.request_id,
                     );
+                    let body =
+                        crate::gateway::error::private_stream(body, downstream, forward.request_id);
                     return Ok(Success {
                         status,
                         streamed: true,
@@ -2472,12 +2545,21 @@ async fn commit_body(
         .with_status(status)
     })?;
 
+    if parsed.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(AttemptFailure::switchable(
+            ErrorCode::UpstreamProtocolError,
+            "供应商返回了错误对象".into(),
+        )
+        .with_status(status));
+    }
+
     // Responses 的非流式失败对象：HTTP 200 + `status: "failed"` 是上游表达
     // "这次回答失败"的另一种形状（§13.2 修订）。字节还没发给下游，可以换号；
     // 当成成功透传则下游会收到一份 200 的失败响应，与流式那条是同一种事故。
-    if prepared.endpoint.protocol() == Protocol::OpenAiResponses
-        && parsed.get("status").and_then(serde_json::Value::as_str) == Some("failed")
-    {
+    if matches!(
+        parsed.get("status").and_then(serde_json::Value::as_str),
+        Some("failed" | "error")
+    ) {
         let message =
             upstream_error_message(&bytes).unwrap_or_else(|| "上游返回了失败响应".to_string());
         return Err(AttemptFailure::switchable(
@@ -2685,7 +2767,7 @@ async fn remember_image_task(
 async fn classify_upstream_error(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
-    prepared: &Prepared,
+    _prepared: &Prepared,
     response: reqwest::Response,
     status: StatusCode,
 ) -> Result<Success, AttemptFailure> {
@@ -2732,11 +2814,7 @@ async fn classify_upstream_error(
         });
     }
 
-    // 400、413、422 等参数错误只属于本次请求，转达客户端后不写跨请求限制
-    // （§13.3）。同协议时原样透传上游的错误体，它本身是有用的诊断信息；跨
-    // 协议时上游的错误体是另一套形状，改用网关自己的错误对象，客户端的 SDK
-    // 才解析得了（§18.2）。
-    let headers = response.headers().clone();
+    // 参数错误保留 HTTP 状态；供应商正文只进入服务端诊断，不向客户透传。
     // 错误体同样有上限：异常上游不能靠一个超大错误体把网关拖垮。
     let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
         .await
@@ -2744,21 +2822,16 @@ async fn classify_upstream_error(
             tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
             axum::body::Bytes::new()
         });
-    if prepared.endpoint.protocol() == forward.endpoint.protocol() {
-        return Err(AttemptFailure::Terminal(Box::new(build_response(
-            forward,
-            status,
-            &headers,
-            prepared,
-            Body::from(bytes),
-        ))));
-    }
-
     let message =
         upstream_error_message(&bytes).unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
-    let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, message)
-        .with_protocol(forward.endpoint.protocol())
-        .with_request_id(forward.request_id);
+    tracing::warn!(request_id = forward.request_id, account = target.account.name,
+        upstream_status = status.as_u16(), detail = %message, "上游拒绝请求");
+    let mut error = GatewayError::new(
+        ErrorCode::UnsupportedParameter,
+        "请求未被接受，请检查模型、接口及请求参数；如需帮助请提供请求编号",
+    )
+    .with_protocol(forward.endpoint.protocol())
+    .with_request_id(forward.request_id);
     if let Some(seconds) = retry_after {
         error = error.with_retry_after(seconds);
     }

@@ -376,6 +376,7 @@ async fn proxy_lifecycle(
         GatewayError::new(ErrorCode::UpstreamProtocolError, "上游返回了无法解析的响应")
             .with_protocol(protocol)
     })?;
+    crate::gateway::error::sanitize_failure(&mut value);
     // 对外只暴露网关 ID（§15.1）；列表类响应的项 ID 不是响应身份，保持原样。
     if let Some(object) = value.as_object_mut()
         && object.contains_key("id")

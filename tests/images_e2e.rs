@@ -15,6 +15,287 @@ use axum::routing::post;
 use common::{TargetSpec, api_key_of, client, spawn_akhub, wire_target};
 use serde_json::{Value, json};
 
+/// 同步入口接到任务式供应商：只 POST 一次，其后通过同账号 GET 取结果。
+async fn spawn_job_upstream(
+    initial: Value,
+    polls: Vec<(StatusCode, Value)>,
+) -> (String, ImageUpstream) {
+    let upstream = ImageUpstream {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        response_body: Vec::new(),
+        content_type: "application/json",
+    };
+    let seen = upstream.seen.clone();
+    let polls = Arc::new(Mutex::new(std::collections::VecDeque::from(polls)));
+    let handler = move |method: axum::http::Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+        let seen = seen.clone();
+        let initial = initial.clone();
+        let polls = polls.clone();
+        async move {
+            seen.lock().unwrap().push(SeenImageRequest {
+                method: method.to_string(),
+                path: uri.path().into(),
+                headers,
+                body: body.to_vec(),
+            });
+            let (status, value) = if method == axum::http::Method::POST {
+                (StatusCode::ACCEPTED, initial)
+            } else {
+                polls.lock().unwrap().pop_front().unwrap_or((
+                    StatusCode::OK,
+                    json!({"id":"job_1","object":"image.generation.job","status":"processing"}),
+                ))
+            };
+            (status, [("retry-after", "1")], axum::Json(value))
+        }
+    };
+    let app = Router::new()
+        .route("/v1/images/generations", post(handler.clone()))
+        .route("/v1/images/edits", post(handler.clone()))
+        .route(
+            "/v1/images/generations/{id}",
+            axum::routing::get(handler.clone()),
+        )
+        .route("/v1/images/tasks/{id}", axum::routing::get(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, upstream)
+}
+
+fn processing_job() -> Value {
+    json!({"id":"job_1","object":"image.generation.job","status":"processing","created":1})
+}
+
+#[tokio::test]
+async fn sub2api_task_results_are_unwrapped_on_synchronous_endpoints() {
+    let initial = json!({"id":"job_1","object":"image.generation.task","status":"processing"});
+    let (url, upstream) = spawn_job_upstream(
+        initial,
+        vec![(
+            StatusCode::OK,
+            json!({"id":"job_1","object":"image.generation.task","status":"completed",
+            "result":{"created":10,"data":[{"b64_json":"YWJj"}]}}),
+        )],
+    )
+    .await;
+    let hub = spawn_akhub().await;
+    wire_target(
+        &hub,
+        TargetSpec::new("sub2api", &url, Protocol::OpenAiChat, "m", "m", 100),
+    )
+    .await;
+    let response = client()
+        .post(format!("{}/v1/images/generations", hub.base_url))
+        .bearer_auth(&hub.key)
+        .json(&json!({"model":"m","prompt":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"created":10,"data":[{"b64_json":"YWJj"}]})
+    );
+    assert_eq!(
+        upstream.seen.lock().unwrap()[1].path,
+        "/v1/images/tasks/job_1"
+    );
+}
+
+#[tokio::test]
+async fn synchronous_images_wait_for_a_job_and_return_standard_images() {
+    for endpoint in ["generations", "edits"] {
+        let (url, upstream) = spawn_job_upstream(
+            processing_job(),
+            vec![
+                (StatusCode::TOO_MANY_REQUESTS, json!({"error":"busy"})),
+                (
+                    StatusCode::OK,
+                    json!({"id":"job_1","object":"image.generation.job","status":"succeeded",
+                "created":123,"model":"private-provider-model","prompt":"private",
+                "data":[{"url":"https://images.example/test.png","vendor":"private"}]}),
+                ),
+            ],
+        )
+        .await;
+        let hub = spawn_akhub().await;
+        let wired = wire_target(
+            &hub,
+            TargetSpec::new(
+                "private-provider",
+                &url,
+                Protocol::OpenAiChat,
+                "image-model",
+                "vendor-image",
+                100,
+            ),
+        )
+        .await;
+        let request = client()
+            .post(format!("{}/v1/images/{endpoint}", hub.base_url))
+            .bearer_auth(&hub.key);
+        let response = if endpoint == "edits" {
+            request
+                .header("content-type", "multipart/form-data; boundary=test")
+                .body(multipart_body("test", Some("image-model"), b"image"))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            request
+                .json(&json!({"model":"image-model","prompt":"test"}))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(
+            result,
+            json!({"created":123,"data":[{"url":"https://images.example/test.png"}]})
+        );
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].method, "POST");
+        for query in &seen[1..] {
+            assert_eq!(query.method, "GET");
+            assert_eq!(query.path, "/v1/images/generations/job_1");
+            assert!(query.body.is_empty());
+            assert_eq!(
+                api_key_of(&query.headers).as_deref(),
+                Some(wired.api_key.as_str())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn accepted_image_jobs_never_fail_over_or_repost() {
+    for poll in [
+        (StatusCode::FORBIDDEN, json!({"error":"private-provider"})),
+        (
+            StatusCode::OK,
+            json!({"id":"job_1","object":"image.generation.job","status":"failed","error":"private-provider"}),
+        ),
+        (
+            StatusCode::OK,
+            json!({"id":"job_1","object":"image.generation.job","status":"blocked"}),
+        ),
+        (
+            StatusCode::OK,
+            json!({"id":"wrong_job","object":"image.generation.job","status":"succeeded","data":[{"url":"bad"}]}),
+        ),
+        (
+            StatusCode::OK,
+            json!({"id":"job_1","object":"image.generation.job","status":"succeeded","data":[]}),
+        ),
+    ] {
+        let (url, upstream) = spawn_job_upstream(processing_job(), vec![poll]).await;
+        let hub = spawn_akhub().await;
+        wire_target(
+            &hub,
+            TargetSpec::new(
+                "private-provider",
+                &url,
+                Protocol::OpenAiChat,
+                "image-model",
+                "vendor-image",
+                100,
+            ),
+        )
+        .await;
+        let (backup_url, backup) =
+            spawn_image_upstream_at(br#"{"created":1,"data":[{"url":"backup"}]}"#).await;
+        wire_target(
+            &hub,
+            TargetSpec::new(
+                "backup",
+                &backup_url,
+                Protocol::OpenAiChat,
+                "image-model",
+                "vendor-image",
+                10,
+            ),
+        )
+        .await;
+        let response = client()
+            .post(format!("{}/v1/images/generations", hub.base_url))
+            .bearer_auth(&hub.key)
+            .json(&json!({"model":"image-model","prompt":"test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let result = response.text().await.unwrap();
+        assert!(result.contains("upstream_protocol_error"));
+        assert!(!result.contains("private-provider"));
+        assert_eq!(
+            upstream
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count(),
+            1
+        );
+        assert!(
+            backup.seen.lock().unwrap().is_empty(),
+            "已接单后不得换号重复计费"
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_jobs_obey_total_timeout_and_reject_unsafe_ids() {
+    for id in ["job_1", "../../other"] {
+        let mut initial = processing_job();
+        initial["id"] = json!(id);
+        let (url, upstream) = spawn_job_upstream(initial, vec![]).await;
+        let hub = common::spawn_akhub_with(
+            akhub::app::Settings {
+                request_timeout: std::time::Duration::from_millis(150),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        wire_target(
+            &hub,
+            TargetSpec::new(
+                "private-provider",
+                &url,
+                Protocol::OpenAiChat,
+                "image-model",
+                "vendor-image",
+                100,
+            ),
+        )
+        .await;
+        let response = client()
+            .post(format!("{}/v1/images/generations", hub.base_url))
+            .bearer_auth(&hub.key)
+            .json(&json!({"model":"image-model","prompt":"test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if id == "job_1" {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        );
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "只应下单一次，不能查询危险路径"
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SeenImageRequest {
     method: String,

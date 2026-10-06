@@ -43,7 +43,11 @@ async fn repeated_parameter_errors_never_become_a_local_503() {
     for _ in 0..4 {
         let response = messages(&akhub, payload.clone()).await;
         assert_eq!(response.status(), 400, "上游参数错误不能被本地屏蔽改成 503");
-        assert_eq!(response.json::<Value>().await.unwrap(), error);
+        let public = response.json::<Value>().await.unwrap();
+        assert_eq!(public["error"]["type"], "invalid_request_error");
+        assert_eq!(public["akhub_error_code"], "unsupported_parameter");
+        assert!(public["request_id"].is_string());
+        assert!(!public.to_string().contains("claude-opus-5-5"));
     }
     assert_eq!(up.requests(), 4, "每一次请求都必须到达上游");
     for seen in up.seen.lock().unwrap().iter() {

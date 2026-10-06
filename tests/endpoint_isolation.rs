@@ -121,7 +121,7 @@ async fn conversion_is_local_to_the_request_and_each_endpoint_is_tried_once() {
 }
 
 #[tokio::test]
-async fn exhausted_endpoints_keep_the_real_error_and_do_not_loop() {
+async fn exhausted_endpoints_hide_provider_details_and_do_not_loop() {
     for status in [404, 405] {
         let up = FakeUpstream::spawn().await;
         let hub = spawn_akhub().await;
@@ -134,10 +134,8 @@ async fn exhausted_endpoints_keep_the_real_error_and_do_not_loop() {
         let response = responses(&hub, native_only(BAD, false)).await;
         let error: Value = response.json().await.unwrap();
         let message = error["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains(&status.to_string()),
-            "不能把原始状态码丢成泛化的无可用端点：{error}"
-        );
+        assert_eq!(error["error"]["code"], "upstream_exhausted");
+        assert!(!message.contains("账号"), "不得暴露渠道详情：{error}");
         assert_eq!(up.requests(), 1, "无法转换时不应改写原生请求");
 
         // 可转换请求遇到所有端点都被拒绝，也必须有界结束。

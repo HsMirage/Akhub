@@ -31,6 +31,169 @@ use crate::upstream;
 /// 十分钟。
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 普通图片入口的 202 已经是接单承诺。只查询同一账号、同一凭据的任务，
+/// 任何后续失败都交由调用方终止本次请求，绝不能重新 POST 或换号生成。
+pub(crate) async fn complete_job(
+    state: &SharedState,
+    target: &TargetView,
+    api_key: &str,
+    response: reqwest::Response,
+    remaining: Duration,
+    request_id: &str,
+) -> Result<serde_json::Value, GatewayError> {
+    let result = tokio::time::timeout(remaining, async {
+        let mut wait = poll_delay(response.headers());
+        let mut value = read_job(response).await?;
+        let kind = value
+            .get("object")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let path = match kind.as_str() {
+            "image.generation.job" => "v1/images/generations",
+            "image.generation.task" => "v1/images/tasks",
+            _ => return Err(job_error("图片入口返回了无法识别的接单对象")),
+        };
+        let id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 256
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .ok_or_else(|| job_error("生图任务缺少合法的任务编号"))?
+            .to_owned();
+        let url = upstream::build_url_with_segments(&target.account.base_url, path, [id.as_str()])
+            .map_err(|_| job_error("无法构造生图任务查询地址"))?;
+        tracing::info!(
+            request_id,
+            account = target.account.name,
+            task_id = id,
+            "图片请求已接单，等待同一任务完成"
+        );
+        loop {
+            match value.get("status").and_then(|v| v.as_str()) {
+                Some("succeeded") => return completed_image(&value),
+                Some("completed") if kind == "image.generation.task" => {
+                    return completed_image(
+                        value
+                            .get("result")
+                            .ok_or_else(|| job_error("任务缺少图片结果"))?,
+                    );
+                }
+                Some("failed" | "blocked" | "cancelled") => {
+                    return Err(job_error("生图任务未成功完成"));
+                }
+                Some("processing") => {}
+                _ => return Err(job_error("生图任务返回了未知状态")),
+            }
+            tokio::time::sleep(wait).await;
+            crate::security::url_guard::assert_resolvable(
+                &url,
+                target.account.allow_private_network,
+            )
+            .await
+            .map_err(|_| job_error("生图任务查询地址被拒绝"))?;
+            let response = match state
+                .upstream
+                .http_for(target.account.allow_private_network)
+                .get(url.clone())
+                .bearer_auth(api_key)
+                .timeout(POLL_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                // 查询可重试，但始终只查同一个任务；总截止时间覆盖连接与正文。
+                Err(_) => {
+                    wait = Duration::from_secs(2);
+                    continue;
+                }
+            };
+            wait = poll_delay(response.headers());
+            let status = response.status();
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                continue;
+            }
+            if !status.is_success() {
+                return Err(job_error(format!("生图任务查询返回 {}", status.as_u16())));
+            }
+            value = read_job(response).await?;
+            if value.get("id").and_then(|v| v.as_str()) != Some(id.as_str())
+                || value.get("object").and_then(|v| v.as_str()) != Some(kind.as_str())
+            {
+                return Err(job_error("生图任务查询返回了不匹配的任务"));
+            }
+        }
+    })
+    .await;
+    result
+        .unwrap_or_else(|_| {
+            Err(GatewayError::new(
+                ErrorCode::UpstreamTimeout,
+                "图片任务已接单，但等待结果超时；未重复下单",
+            ))
+        })
+        .map_err(|error| error.with_request_id(request_id))
+}
+
+fn job_error(message: impl Into<String>) -> GatewayError {
+    GatewayError::new(ErrorCode::UpstreamProtocolError, message)
+}
+
+fn poll_delay(headers: &HeaderMap) -> Duration {
+    Duration::from_secs(
+        headers
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2)
+            .clamp(1, 30),
+    )
+}
+
+async fn read_job(response: reqwest::Response) -> Result<serde_json::Value, GatewayError> {
+    let bytes = passthrough::read_upstream_body(response, passthrough::MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .map_err(|_| job_error("无法读取生图任务响应"))?;
+    serde_json::from_slice(&bytes).map_err(|_| job_error("生图任务返回的正文不是 JSON"))
+}
+
+/// 去掉供应商任务元数据，只返回标准图片响应；不访问或下载图片 URL。
+fn completed_image(job: &serde_json::Value) -> Result<serde_json::Value, GatewayError> {
+    let data = job
+        .get("data")
+        .and_then(|v| v.as_array())
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| job_error("任务成功但没有图片"))?;
+    let mut images = Vec::with_capacity(data.len());
+    for item in data {
+        let mut image = serde_json::Map::new();
+        for field in ["url", "b64_json", "revised_prompt"] {
+            if let Some(value) = item
+                .get(field)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                image.insert(field.into(), serde_json::json!(value));
+            }
+        }
+        if !image.contains_key("url") && !image.contains_key("b64_json") {
+            return Err(job_error("任务成功但图片数据不完整"));
+        }
+        images.push(serde_json::Value::Object(image));
+    }
+    let mut result = serde_json::json!({"created": job.get("created").and_then(|v| v.as_i64())
+        .unwrap_or_else(crate::storage::now_unix), "data":images});
+    if let Some(usage) = job.get("usage") {
+        result["usage"] = usage.clone();
+    }
+    Ok(result)
+}
+
 /// `GET /v1/images/tasks/{task_id}`：把轮询送回当初接单的账号。
 pub async fn task_status(
     State(state): State<SharedState>,
@@ -276,6 +439,36 @@ pub async fn task_status(
         None,
     );
 
+    if !upstream_status.is_success() {
+        let mut response =
+            crate::gateway::error::upstream_response(upstream_status, protocol, &request_id);
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        if let Some(value) = upstream_headers.get(header::RETRY_AFTER) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, value.clone());
+        }
+        return response;
+    }
+    let bytes = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut value) => {
+            if crate::gateway::error::sanitize_failure(&mut value) {
+                axum::body::Bytes::from(value.to_string())
+            } else {
+                bytes
+            }
+        }
+        Err(_) => {
+            return crate::gateway::error::upstream_response(
+                StatusCode::BAD_GATEWAY,
+                protocol,
+                &request_id,
+            );
+        }
+    };
     // 原样回传：状态码、正文与 Retry-After 都是上游对"这个任务现在怎么样"的
     // 权威回答，网关不加工（§14.9 与图片端点同一口径）。
     //

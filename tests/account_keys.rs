@@ -970,8 +970,8 @@ async fn an_account_without_keys_fails_before_reaching_the_upstream() {
     assert_eq!(payload["error"]["code"], "no_eligible_target");
     let message = payload["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("Key"),
-        "错误信息要说清是没有可用凭据：{message}"
+        !message.contains("Key"),
+        "客户错误信息不得透露上游凭据状态：{message}"
     );
 }
 

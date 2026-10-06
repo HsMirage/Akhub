@@ -795,7 +795,11 @@ mod tests {
         .unwrap();
         let text = text_of(committed.body).await;
         assert!(text.contains("半"), "已经发出的内容必须送达");
-        assert!(text.contains("boom"), "提交后只能在流内报错");
+        assert!(
+            text.contains("upstream_protocol_error"),
+            "提交后只能在流内报错"
+        );
+        assert!(!text.contains("boom"), "不得泄漏供应商错误");
         assert!(!text.contains("[DONE]"), "不得伪造正常完成");
     }
 

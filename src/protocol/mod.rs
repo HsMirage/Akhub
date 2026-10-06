@@ -409,6 +409,7 @@ pub fn stream_error(
     message: &str,
     request_id: Option<&str>,
 ) -> axum::body::Bytes {
+    let message = code.public_message(message);
     match protocol {
         Protocol::OpenAiChat => sse::format_frame(
             None,
@@ -820,7 +821,8 @@ mod tests {
                 Some("req_stream_1"),
             );
             let text = String::from_utf8_lossy(&bytes);
-            assert!(text.contains("上游中断"));
+            assert!(text.contains("服务响应异常"));
+            assert!(!text.contains("上游中断"));
             // 流内错误必须带稳定错误码与请求 ID，否则客户端只剩一句人话（§18.2）。
             assert!(
                 text.contains("upstream_protocol_error"),

@@ -9,6 +9,143 @@ use serde_json::json;
 
 use crate::domain::Protocol;
 
+/// 所有供应商错误统一生成自己的响应，保留状态，不保留供应商正文或字段。
+pub(crate) fn upstream_response(
+    status: StatusCode,
+    protocol: Protocol,
+    request_id: &str,
+) -> Response {
+    let code = if status.is_server_error() {
+        ErrorCode::UpstreamProtocolError
+    } else {
+        ErrorCode::UnsupportedParameter
+    };
+    let mut response = GatewayError::new(code, "请求未被接受，请检查模型、接口及请求参数")
+        .with_protocol(protocol)
+        .with_request_id(request_id)
+        .into_response();
+    *response.status_mut() = status;
+    response
+}
+
+/// 完整错误帧不能透传；正常帧逐字保留，跨网络分块的半帧有界缓冲。
+pub(crate) fn private_stream(
+    body: axum::body::Body,
+    protocol: Protocol,
+    request_id: &str,
+) -> axum::body::Body {
+    use futures::StreamExt as _;
+    let request_id = request_id.to_owned();
+    axum::body::Body::from_stream(async_stream::stream! {
+        let mut input = body.into_data_stream();
+        let mut buffer = Vec::new();
+        while let Some(chunk) = input.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    yield Ok::<_, std::io::Error>(crate::protocol::stream_error(protocol,
+                        ErrorCode::UpstreamProtocolError, "", Some(&request_id)));
+                    return;
+                }
+            };
+            for segment in chunk.split_inclusive(|b| *b == b'\n') {
+                if buffer.len().saturating_add(segment.len()) > 64 * 1024 * 1024 {
+                    yield Ok(crate::protocol::stream_error(protocol,
+                        ErrorCode::UpstreamProtocolError, "", Some(&request_id)));
+                    return;
+                }
+                buffer.extend_from_slice(segment);
+                if crate::protocol::sse::find_frame_end(&buffer, buffer.len().saturating_sub(4)).is_some() {
+                    if is_error_frame(&buffer) {
+                        tracing::warn!(request_id, "供应商流式错误已对外隐藏");
+                        yield Ok(private_error_frame(&buffer, protocol, &request_id));
+                        return;
+                    }
+                    yield Ok(axum::body::Bytes::from(std::mem::take(&mut buffer)));
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            if is_error_frame(&buffer) {
+                yield Ok(private_error_frame(&buffer, protocol, &request_id));
+            } else {
+                yield Ok(axum::body::Bytes::from(buffer));
+            }
+        }
+    })
+}
+
+fn is_error_frame(raw: &[u8]) -> bool {
+    let frame = crate::protocol::sse::parse_frame(&String::from_utf8_lossy(raw));
+    let payload = serde_json::from_str::<serde_json::Value>(&frame.data).ok();
+    if frame.event.as_deref() == Some("error")
+        || payload.as_ref().is_some_and(|p| {
+            p.get("type").and_then(|v| v.as_str()) == Some("error")
+                || p.get("error").is_some_and(|e| !e.is_null())
+        })
+    {
+        return true;
+    }
+    matches!(
+        frame.event.as_deref(),
+        Some("response.failed" | "response.error")
+    ) || payload.as_ref().is_some_and(|p| {
+        matches!(
+            p.get("type").and_then(|v| v.as_str()),
+            Some("response.failed" | "response.error")
+        ) || p.pointer("/response/status").and_then(|v| v.as_str()) == Some("failed")
+    })
+}
+
+fn private_error_frame(raw: &[u8], protocol: Protocol, request_id: &str) -> axum::body::Bytes {
+    let frame = crate::protocol::sse::parse_frame(&String::from_utf8_lossy(raw));
+    let payload = serde_json::from_str::<serde_json::Value>(&frame.data).ok();
+    if protocol == Protocol::OpenAiResponses
+        && let Some(mut response) =
+            payload.and_then(|mut p| p.get_mut("response").map(serde_json::Value::take))
+        && sanitize_failure(&mut response)
+    {
+        return crate::protocol::sse::format_frame(
+            Some("response.failed"),
+            &json!({"type":"response.failed", "response":response, "request_id":request_id})
+                .to_string(),
+        );
+    }
+    crate::protocol::stream_error(
+        protocol,
+        ErrorCode::UpstreamProtocolError,
+        "",
+        Some(request_id),
+    )
+}
+
+/// HTTP 200 的异步失败也不能携带供应商诊断字段。
+pub(crate) fn sanitize_failure(value: &mut serde_json::Value) -> bool {
+    let failed = matches!(
+        value.get("status").and_then(|v| v.as_str()),
+        Some("failed" | "error" | "blocked")
+    ) || value.get("error").is_some_and(|v| !v.is_null());
+    if failed && let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "id" | "task_id"
+                    | "object"
+                    | "status"
+                    | "created_at"
+                    | "expires_at"
+                    | "completed_at"
+                    | "usage"
+            )
+        });
+        object.insert(
+            "error".into(),
+            json!({"code":"upstream_protocol_error", "message":"服务响应异常，请稍后重试"}),
+        );
+    }
+    failed
+}
+
 /// 第一期定义的全部网关错误码（§18.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -38,6 +175,20 @@ pub enum ErrorCode {
 pub const CLIENT_GONE: &str = "client_gone";
 
 impl ErrorCode {
+    /// 服务端诊断与客户提示分离，不从任意供应商文本猜测渠道名称。
+    pub fn public_message(self, detail: &str) -> &str {
+        match self {
+            Self::UpstreamTimeout => "请求处理超时，请稍后重试",
+            Self::UpstreamExhausted | Self::NoEligibleTarget => "服务暂时不可用，请稍后重试",
+            Self::UpstreamProtocolError => "服务响应异常，请稍后重试",
+            Self::InternalError => "服务内部错误，请联系管理员并提供请求编号",
+            Self::RateLimited => "请求频率超限，请稍后重试",
+            Self::QueueFull => "请求队列已满，请稍后重试",
+            Self::QueueTimeout => "请求排队超时，请稍后重试",
+            Self::MultiplierUnknown | Self::MultiplierExceeded => "当前模型暂不可用，请联系管理员",
+            _ => detail,
+        }
+    }
     /// 全部稳定错误码。
     ///
     /// 后台按它校验请求记录的 `error_code` 筛选参数：有了这份清单，填错一个码
@@ -213,19 +364,20 @@ impl GatewayError {
 
     /// 按下游协议构造错误体（§18.2）。
     pub fn body(&self) -> serde_json::Value {
+        let message = self.code.public_message(&self.message);
         match self.protocol {
             Protocol::AnthropicMessages => json!({
                 "type": "error",
                 "error": {
                     "type": self.code.anthropic_type(),
-                    "message": self.message,
+                    "message": message,
                 },
                 "akhub_error_code": self.code.as_str(),
                 "request_id": self.request_id,
             }),
             Protocol::OpenAiChat | Protocol::OpenAiResponses => json!({
                 "error": {
-                    "message": self.message,
+                    "message": message,
                     "type": self.code.openai_type(),
                     "code": self.code.as_str(),
                     "param": serde_json::Value::Null,
@@ -250,6 +402,8 @@ impl GatewayError {
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
+        tracing::debug!(request_id = self.request_id, code = self.code.as_str(),
+            detail = %crate::security::redact::text(&self.message), "网关错误诊断");
         let mut response = (self.code.status(), axum::Json(self.body())).into_response();
         let headers = response.headers_mut();
         if let Some(request_id) = self
@@ -280,6 +434,71 @@ fn default_retry_after(code: ErrorCode) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fragmented_native_error_frames_are_replaced_without_touching_content() {
+        use axum::body::{Body, Bytes, to_bytes};
+        let normal = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\r\n\r\n";
+        for error in [
+            "event: error\ndata: {\"error\":{\"message\":\"private-channel\"},\"provider\":\"secret\"}\n\n",
+            "event: response.failed\ndata: {\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"private-channel\"}}}\n\n",
+            "data: {\"error\":{\"message\":\"private-channel\"}}",
+        ] {
+            let input = format!("{normal}{error}");
+            let chunks: Vec<Result<Bytes, std::io::Error>> = input
+                .as_bytes()
+                .chunks(3)
+                .map(|b| Ok(Bytes::copy_from_slice(b)))
+                .collect();
+            let body = private_stream(
+                Body::from_stream(futures::stream::iter(chunks)),
+                Protocol::OpenAiChat,
+                "req_private",
+            );
+            let output = to_bytes(body, 10000).await.unwrap();
+            let text = String::from_utf8(output.to_vec()).unwrap();
+            assert!(text.starts_with(normal));
+            assert!(text.contains("req_private"));
+            assert!(text.contains("upstream_protocol_error"));
+            assert!(!text.contains("private-channel"));
+            assert!(!text.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn asynchronous_failure_drops_vendor_fields() {
+        let mut value = json!({"id":"task_1","status":"failed","message":"private-channel",
+            "debug":"secret","error":{"provider":"private-channel"}});
+        assert!(sanitize_failure(&mut value));
+        assert_eq!(value["id"], "task_1");
+        assert!(!value.to_string().contains("private-channel"));
+        assert!(!value.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn upstream_details_never_reach_clients() {
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            for code in [
+                ErrorCode::UpstreamExhausted,
+                ErrorCode::UpstreamTimeout,
+                ErrorCode::UpstreamProtocolError,
+                ErrorCode::InternalError,
+                ErrorCode::NoEligibleTarget,
+                ErrorCode::RateLimited,
+            ] {
+                let error = GatewayError::new(code, "账号「私人渠道」 upstream.example secret")
+                    .with_protocol(protocol)
+                    .with_request_id("req_test");
+                assert!(!error.body().to_string().contains("私人渠道"));
+                assert!(!error.sse_event().contains("upstream.example"));
+                assert!(error.sse_event().contains("req_test"));
+            }
+        }
+    }
 
     /// 每个错误码都必须登记进 [`ErrorCode::ALL`]。
     ///

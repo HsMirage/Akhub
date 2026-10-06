@@ -215,6 +215,66 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test]
+async fn vendor_errors_do_not_disclose_channel_or_body() {
+    for status in [
+        axum::http::StatusCode::BAD_REQUEST,
+        axum::http::StatusCode::BAD_GATEWAY,
+    ] {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                (
+                    status,
+                    axum::Json(
+                        json!({"error":{"message":"private-provider at https://private.example",
+                "channel":"internal-channel"},"debug":"secret-detail"}),
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (akhub, key, state, _dir) = spawn_akhub().await;
+        wire_target(
+            &state,
+            "internal-channel",
+            &url,
+            Protocol::OpenAiChat,
+            "test-model",
+            "vendor-model",
+            50,
+        )
+        .await;
+        let response = client()
+            .post(format!("{akhub}/v1/chat/completions"))
+            .bearer_auth(key)
+            .json(&json!({"model":"test-model","messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            if status.as_u16() == 400 { 400 } else { 503 }
+        );
+        let request_id = response.headers()["x-akhub-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let text = response.text().await.unwrap();
+        for secret in [
+            "private-provider",
+            "private.example",
+            "internal-channel",
+            "secret-detail",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains(&request_id));
+    }
+}
+
+#[tokio::test]
 async fn anthropic_messages_pass_through_with_the_model_rewritten() {
     let (upstream_url, upstream) = spawn_upstream(0).await;
     let (akhub, key, state, _dir) = spawn_akhub().await;
