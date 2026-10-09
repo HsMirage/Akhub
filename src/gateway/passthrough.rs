@@ -2094,7 +2094,7 @@ async fn attempt(
     .unwrap_or_else(|_| {
         Err(AttemptFailure::switchable(
             ErrorCode::UpstreamTimeout,
-            "上游未在请求期限内开始响应或完成普通请求".into(),
+            "上游超时：未在请求期限内开始响应或完成普通请求".into(),
         ))
     })
 }
