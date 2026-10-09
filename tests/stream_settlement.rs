@@ -570,13 +570,12 @@ async fn an_anthropic_truncation_before_output_is_not_evidence() {
 
     let record = wait_for_record(&akhub, 1).await;
     assert_eq!(record.error_code.as_deref(), Some("client_gone"));
-    // 关键证据：这一帧真的报了 `output_tokens: 1`（上游的占位值），但回答
-    // 根本没写完。所以"有没有 output_tokens"完全不能当判据——这行断言把这个
-    // 陷阱钉在测试里，免得将来有人又拿用量去猜"跑完了没有"。
+    // 夹具确实发送了 output_tokens: 1，但它只是开场占位。
+    // 输入可保留，输出必须未知，不能拿它退款或当成性能样本。
+    assert_eq!(record.input_tokens, Some(120));
     assert_eq!(
-        record.output_tokens,
-        Some(1),
-        "夹具必须还原真实 Anthropic 的占位 output_tokens，否则测不到这个陷阱：{record:?}"
+        record.output_tokens, None,
+        "开场占位不能冒充最终用量：{record:?}"
     );
     let after = akhub.state.runtime.perf.stats(&wired.target_id, dimension);
     assert_eq!(

@@ -281,6 +281,7 @@ fn percentile(sorted: &[i64], quantile: f64) -> Option<i64> {
 /// 系统设置的可改范围；前端用它做输入校验，后端保存时再校验一次。
 const SETTINGS_LIMITS: &str = r#"{
     "request_timeout_secs": {"min": 5, "max": 86400},
+    "stream_idle_timeout_secs": {"min": 5, "max": 3600},
     "max_request_bytes": {"min": 1024, "max": 268435456},
     "retention_days": {"min": 0, "max": 3650},
     "response_state_days": {"min": 0, "max": 3650},
@@ -292,6 +293,7 @@ const SETTINGS_LIMITS: &str = r#"{
 fn settings_json(settings: &crate::app::Settings) -> Value {
     json!({
         "request_timeout_secs": settings.request_timeout.as_secs(),
+        "stream_idle_timeout_secs": settings.stream_idle_timeout.as_secs(),
         "max_request_bytes": settings.max_request_bytes,
         "retention_days": settings.retention_days,
         "response_state_days": settings.response_state_days,

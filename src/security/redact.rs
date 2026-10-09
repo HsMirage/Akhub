@@ -47,6 +47,122 @@ const OPAQUE_LEN: usize = 32;
 /// 词两侧允许剥掉的标点。
 const PUNCTUATION: &str = "\"'`,;()[]{}<>";
 
+/// 只有经过当前账号上下文脱敏的原因，才允许覆盖通用客户提示。
+#[derive(Debug, Clone)]
+pub(crate) struct PublicMessage(String);
+
+impl PublicMessage {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ErrorRedactor {
+    private_values: Vec<zeroize::Zeroizing<String>>,
+}
+
+impl ErrorRedactor {
+    pub(crate) fn new(account: &str, base_url: &str, key: &str) -> Self {
+        let host = reqwest::Url::parse(base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        let mut values: Vec<_> = [account, base_url, &host, key]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .map(|value| zeroize::Zeroizing::new(value.to_owned()))
+            .collect();
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self {
+            private_values: values,
+        }
+    }
+
+    pub(crate) fn message(&self, raw: &str) -> PublicMessage {
+        let mut result = raw.to_owned();
+        for value in &self.private_values {
+            let lower = result.to_ascii_lowercase();
+            let needle = value.to_ascii_lowercase();
+            let mut masked = String::new();
+            let mut previous = 0;
+            for (offset, _) in lower.match_indices(&needle) {
+                // 短账号名 A / 10 不应误伤 auto 或 1024x1024。
+                if value.is_ascii() && value.len() <= 2 {
+                    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+                    if offset
+                        .checked_sub(1)
+                        .and_then(|i| result.as_bytes().get(i))
+                        .is_some_and(word)
+                        || result
+                            .as_bytes()
+                            .get(offset + value.len())
+                            .is_some_and(word)
+                    {
+                        continue;
+                    }
+                }
+                masked.push_str(&result[previous..offset]);
+                masked.push_str("[已隐藏]");
+                previous = offset + value.len();
+            }
+            masked.push_str(&result[previous..]);
+            result = masked;
+        }
+        // 完整 URL 可能带凭据、私有地址或查询令牌，不应进入客户消息。
+        let lower = result.to_ascii_lowercase();
+        let mut masked = String::new();
+        let mut previous = 0;
+        for (start, _) in lower.match_indices("http") {
+            if start < previous
+                || !(lower[start..].starts_with("https://")
+                    || lower[start..].starts_with("http://"))
+            {
+                continue;
+            }
+            let end = result[start..]
+                .find(|c: char| c.is_whitespace() || "\"'<>),;".contains(c))
+                .map(|length| start + length)
+                .unwrap_or(result.len());
+            masked.push_str(&result[previous..start]);
+            masked.push_str("[地址已隐藏]");
+            previous = end;
+        }
+        masked.push_str(&result[previous..]);
+        result = masked;
+        let result: String = text(&result)
+            .chars()
+            .filter(|c| !c.is_control() || c.is_whitespace())
+            .take(1200)
+            .collect();
+        PublicMessage(if result.trim().is_empty() {
+            "服务未返回具体错误原因，请提供请求编号联系管理员".into()
+        } else {
+            result
+        })
+    }
+
+    pub(crate) fn payload(&self, value: &serde_json::Value) -> PublicMessage {
+        let message = [
+            "/error/message",
+            "/response/error/message",
+            "/message",
+            "/error",
+            "/detail",
+        ]
+        .iter()
+        .find_map(|path| {
+            value
+                .pointer(path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or("");
+        self.message(message)
+    }
+}
+
 /// 脱敏一段自由文本：把看起来像密钥的片段替换成"前缀 + 长度"。
 ///
 /// 宁可多脱一点也不能漏：误伤一个长哈希只是日志难看一点，漏掉一把 Key 是
@@ -98,6 +214,53 @@ fn looks_like_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_error_keeps_parameters_but_removes_private_identity_and_credentials() {
+        let redactor = ErrorRedactor::new(
+            "私人渠道-xkiro",
+            "https://upstream.example/api",
+            "tiny-secret",
+        );
+        let message = "私人渠道-xkiro: Unsupported size \"auto\". Supported: 1024x1024, 1024x1536. upstream.example key=tiny-secret https://another.example/debug?token=foo";
+        let public = redactor.message(message);
+        for private in [
+            "私人渠道-xkiro",
+            "upstream.example",
+            "tiny-secret",
+            "another.example",
+            "token=foo",
+        ] {
+            assert!(!public.as_str().contains(private), "{public:?}");
+        }
+        assert!(public.as_str().contains("Unsupported size \"auto\""));
+        assert!(public.as_str().contains("1024x1024, 1024x1536"));
+        assert_eq!(redactor.message(public.as_str()).as_str(), public.as_str());
+    }
+
+    #[test]
+    fn structured_error_only_exposes_message_not_debug_fields() {
+        let redactor =
+            ErrorRedactor::new("Private-Channel", "https://upstream.example", "short-key");
+        let public = redactor.payload(&serde_json::json!({"error":{"message":null},"message":"PRIVATE-CHANNEL: invalid size auto","debug":"never exposed"}));
+        assert!(public.as_str().contains("invalid size auto"));
+        assert!(!public.as_str().contains("PRIVATE-CHANNEL"));
+        assert!(!public.as_str().contains("never exposed"));
+    }
+
+    #[test]
+    fn short_account_names_do_not_destroy_parameter_values() {
+        let redactor = ErrorRedactor::new("A", "", "");
+        assert_eq!(
+            redactor.message("A: size auto; 1024x1024").as_str(),
+            "[已隐藏]: size auto; 1024x1024"
+        );
+        let redactor = ErrorRedactor::new("10", "", "");
+        assert_eq!(
+            redactor.message("10: size 1024x1024").as_str(),
+            "[已隐藏]: size 1024x1024"
+        );
+    }
 
     /// 脱敏必须幂等：全局日志层会对所有输出再过一遍，而调用点自己也常常
     /// 先脱敏一次。不幂等的话日志里会出现"脱敏的脱敏"。

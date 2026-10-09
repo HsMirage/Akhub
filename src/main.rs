@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
 
     let settings = Settings {
         request_timeout: env_duration("AKHUB_REQUEST_TIMEOUT_SECS", 600)?,
+        stream_idle_timeout: env_duration("AKHUB_STREAM_IDLE_TIMEOUT_SECS", 180)?,
         max_request_bytes: env_usize("AKHUB_MAX_REQUEST_BYTES", 64 * 1024 * 1024)?,
         shutdown_grace: env_duration("AKHUB_SHUTDOWN_GRACE_SECS", 180)?,
         multiplier_refresh: env_duration("AKHUB_MULTIPLIER_REFRESH_SECS", 300)?,

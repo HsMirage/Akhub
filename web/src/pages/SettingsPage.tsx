@@ -17,9 +17,17 @@ const SETTING_FIELDS: readonly {
 }[] = [
   {
     key: "request_timeout_secs",
-    label: "请求总超时",
+    label: "普通请求 / 流开始超时",
     unit: "秒",
     presets: [300, 600, 1800],
+    hint: "普通请求限制总时长；推理流只限制排队到开始输出，不截断持续输出的长思考。图片任务仍受总时长限制。",
+  },
+  {
+    key: "stream_idle_timeout_secs",
+    label: "流式空闲超时",
+    unit: "秒",
+    presets: [60, 180, 300],
+    hint: "推理流开始后，连续未收到数据才超时；收到数据后重新计时。超时会结束本轮，不自动换上游重放。",
   },
   {
     key: "max_request_bytes",
@@ -67,6 +75,7 @@ type SettingsForm = Record<SettingsNumericField, string>;
 function settingsToForm(settings: Settings): SettingsForm {
   return {
     request_timeout_secs: String(settings.request_timeout_secs),
+    stream_idle_timeout_secs: String(settings.stream_idle_timeout_secs),
     max_request_bytes: String(settings.max_request_bytes),
     retention_days: String(settings.retention_days),
     response_state_days: String(settings.response_state_days),

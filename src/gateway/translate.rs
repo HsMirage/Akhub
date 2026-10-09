@@ -62,6 +62,7 @@ pub async fn commit_stream(request: StreamRequest<'_>) -> Result<Committed, Fail
         responses_id,
         request_id,
         degraded,
+        redactor,
     } = request;
     let started = Instant::now();
     let mut reader = sse::FrameReader::new();
@@ -128,6 +129,7 @@ pub async fn commit_stream(request: StreamRequest<'_>) -> Result<Committed, Fail
                         response,
                         account,
                         request_id,
+                        redactor,
                     }),
                 });
             }
@@ -146,6 +148,7 @@ pub async fn commit_stream(request: StreamRequest<'_>) -> Result<Committed, Fail
                     response,
                     account,
                     request_id,
+                    redactor,
                 }),
             });
         }
@@ -157,6 +160,7 @@ pub async fn commit_stream(request: StreamRequest<'_>) -> Result<Committed, Fail
 /// 打包成一个结构体而不是八个参数：这些字段总是一起传递，散开之后既容易
 /// 传错位置，也超出函数参数个数的合理范围。
 struct StreamPlumbing<'a> {
+    redactor: crate::security::redact::ErrorRedactor,
     prefix: Vec<Bytes>,
     degraded: DegradationSink,
     /// 提交那一刻还留在同一块字节里、尚未处理的帧。
@@ -174,6 +178,7 @@ struct StreamPlumbing<'a> {
 /// 打包成结构体而不是八个参数：这些字段总是一起传递，散开之后既容易传错位置，
 /// 也超出函数参数个数的合理范围。
 pub struct StreamRequest<'a> {
+    pub(crate) redactor: crate::security::redact::ErrorRedactor,
     /// 上游协议：决定怎么解析帧。
     pub upstream: Protocol,
     /// 下游协议：决定怎么发射帧。
@@ -231,6 +236,7 @@ fn continue_stream(plumbing: StreamPlumbing<'_>) -> Body {
         response,
         account,
         request_id,
+        redactor,
     } = plumbing;
     let account = account.to_string();
     let request_id = request_id.to_string();
@@ -240,9 +246,9 @@ fn continue_stream(plumbing: StreamPlumbing<'_>) -> Body {
         }
         for frame in pending {
             if let Some(message) = protocol::frame_error(&frame) {
-                yield Ok(emitter.error(
+                yield Ok(emitter.error_public(
                     ErrorCode::UpstreamProtocolError,
-                    &message,
+                    &redactor.message(&message),
                     Some(&request_id),
                 ));
                 return;
@@ -268,9 +274,9 @@ fn continue_stream(plumbing: StreamPlumbing<'_>) -> Body {
             for frame in reader.push(&chunk) {
                 if let Some(message) = protocol::frame_error(&frame) {
                     // 已经提交，只能在流内报错（§18.2）；绝不伪造正常完成。
-                    yield Ok(emitter.error(
+                    yield Ok(emitter.error_public(
                         ErrorCode::UpstreamProtocolError,
-                        &message,
+                        &redactor.message(&message),
                         Some(&request_id),
                     ));
                     return;
@@ -712,6 +718,7 @@ mod tests {
             downstream: Protocol::AnthropicMessages,
             include_usage: true,
             account: "账号A",
+            redactor: crate::security::redact::ErrorRedactor::new("账号A", "", ""),
             response,
             responses_id: None,
             request_id: "req_test",
@@ -739,6 +746,7 @@ mod tests {
             downstream: Protocol::OpenAiChat,
             include_usage: false,
             account: "账号A",
+            redactor: crate::security::redact::ErrorRedactor::new("账号A", "", ""),
             response,
             responses_id: None,
             request_id: "req_test",
@@ -760,6 +768,7 @@ mod tests {
             downstream: Protocol::OpenAiChat,
             include_usage: false,
             account: "账号A",
+            redactor: crate::security::redact::ErrorRedactor::new("账号A", "", ""),
             response,
             responses_id: None,
             request_id: "req_test",
@@ -786,6 +795,7 @@ mod tests {
             downstream: Protocol::OpenAiChat,
             include_usage: false,
             account: "账号A",
+            redactor: crate::security::redact::ErrorRedactor::new("账号A", "", ""),
             response,
             responses_id: None,
             request_id: "req_test",
@@ -799,7 +809,7 @@ mod tests {
             text.contains("upstream_protocol_error"),
             "提交后只能在流内报错"
         );
-        assert!(!text.contains("boom"), "不得泄漏供应商错误");
+        assert!(text.contains("boom"), "业务原因必须保留");
         assert!(!text.contains("[DONE]"), "不得伪造正常完成");
     }
 

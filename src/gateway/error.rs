@@ -8,12 +8,14 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::domain::Protocol;
+use crate::security::redact::{ErrorRedactor, PublicMessage};
 
-/// 所有供应商错误统一生成自己的响应，保留状态，不保留供应商正文或字段。
+/// 保留 HTTP 状态与已脱敏的具体原因，不透传供应商的其它字段。
 pub(crate) fn upstream_response(
     status: StatusCode,
     protocol: Protocol,
     request_id: &str,
+    detail: PublicMessage,
 ) -> Response {
     let code = if status.is_server_error() {
         ErrorCode::UpstreamProtocolError
@@ -21,6 +23,7 @@ pub(crate) fn upstream_response(
         ErrorCode::UnsupportedParameter
     };
     let mut response = GatewayError::new(code, "请求未被接受，请检查模型、接口及请求参数")
+        .with_public_message(detail)
         .with_protocol(protocol)
         .with_request_id(request_id)
         .into_response();
@@ -33,6 +36,7 @@ pub(crate) fn private_stream(
     body: axum::body::Body,
     protocol: Protocol,
     request_id: &str,
+    redactor: ErrorRedactor,
 ) -> axum::body::Body {
     use futures::StreamExt as _;
     let request_id = request_id.to_owned();
@@ -57,8 +61,8 @@ pub(crate) fn private_stream(
                 buffer.extend_from_slice(segment);
                 if crate::protocol::sse::find_frame_end(&buffer, buffer.len().saturating_sub(4)).is_some() {
                     if is_error_frame(&buffer) {
-                        tracing::warn!(request_id, "供应商流式错误已对外隐藏");
-                        yield Ok(private_error_frame(&buffer, protocol, &request_id));
+                        tracing::warn!(request_id, "供应商流式错误已脱敏");
+                        yield Ok(private_error_frame(&buffer, protocol, &request_id, &redactor));
                         return;
                     }
                     yield Ok(axum::body::Bytes::from(std::mem::take(&mut buffer)));
@@ -67,7 +71,7 @@ pub(crate) fn private_stream(
         }
         if !buffer.is_empty() {
             if is_error_frame(&buffer) {
-                yield Ok(private_error_frame(&buffer, protocol, &request_id));
+                yield Ok(private_error_frame(&buffer, protocol, &request_id, &redactor));
             } else {
                 yield Ok(axum::body::Bytes::from(buffer));
             }
@@ -97,13 +101,20 @@ fn is_error_frame(raw: &[u8]) -> bool {
     })
 }
 
-fn private_error_frame(raw: &[u8], protocol: Protocol, request_id: &str) -> axum::body::Bytes {
+fn private_error_frame(
+    raw: &[u8],
+    protocol: Protocol,
+    request_id: &str,
+    redactor: &ErrorRedactor,
+) -> axum::body::Bytes {
     let frame = crate::protocol::sse::parse_frame(&String::from_utf8_lossy(raw));
     let payload = serde_json::from_str::<serde_json::Value>(&frame.data).ok();
+    let detail = redactor.payload(payload.as_ref().unwrap_or(&serde_json::Value::Null));
+    tracing::warn!(request_id, detail = %detail.as_str(), "上游流式错误原因（已脱敏）");
     if protocol == Protocol::OpenAiResponses
         && let Some(mut response) =
             payload.and_then(|mut p| p.get_mut("response").map(serde_json::Value::take))
-        && sanitize_failure(&mut response)
+        && sanitize_failure(&mut response, redactor)
     {
         return crate::protocol::sse::format_frame(
             Some("response.failed"),
@@ -111,16 +122,17 @@ fn private_error_frame(raw: &[u8], protocol: Protocol, request_id: &str) -> axum
                 .to_string(),
         );
     }
-    crate::protocol::stream_error(
+    crate::protocol::stream_error_public(
         protocol,
         ErrorCode::UpstreamProtocolError,
-        "",
+        &detail,
         Some(request_id),
     )
 }
 
-/// HTTP 200 的异步失败也不能携带供应商诊断字段。
-pub(crate) fn sanitize_failure(value: &mut serde_json::Value) -> bool {
+/// HTTP 200 的异步失败只保留安全任务字段和脱敏原因。
+pub(crate) fn sanitize_failure(value: &mut serde_json::Value, redactor: &ErrorRedactor) -> bool {
+    let detail = redactor.payload(value);
     let failed = matches!(
         value.get("status").and_then(|v| v.as_str()),
         Some("failed" | "error" | "blocked")
@@ -140,7 +152,7 @@ pub(crate) fn sanitize_failure(value: &mut serde_json::Value) -> bool {
         });
         object.insert(
             "error".into(),
-            json!({"code":"upstream_protocol_error", "message":"服务响应异常，请稍后重试"}),
+            json!({"code":"upstream_protocol_error", "message":detail.as_str()}),
         );
     }
     failed
@@ -175,7 +187,7 @@ pub enum ErrorCode {
 pub const CLIENT_GONE: &str = "client_gone";
 
 impl ErrorCode {
-    /// 服务端诊断与客户提示分离，不从任意供应商文本猜测渠道名称。
+    /// 未经过账号上下文脱敏的内部诊断使用通用提示；业务原因走 PublicMessage。
     pub fn public_message(self, detail: &str) -> &str {
         match self {
             Self::UpstreamTimeout => "请求处理超时，请稍后重试",
@@ -334,6 +346,7 @@ pub struct GatewayError {
     pub request_id: Option<String>,
     /// 可重试错误附带的建议等待秒数。
     pub retry_after: Option<u64>,
+    public_detail: Option<PublicMessage>,
 }
 
 impl GatewayError {
@@ -344,11 +357,17 @@ impl GatewayError {
             protocol: Protocol::OpenAiChat,
             request_id: None,
             retry_after: None,
+            public_detail: None,
         }
     }
 
     pub fn with_protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    pub(crate) fn with_public_message(mut self, message: PublicMessage) -> Self {
+        self.public_detail = Some(message);
         self
     }
 
@@ -364,7 +383,11 @@ impl GatewayError {
 
     /// 按下游协议构造错误体（§18.2）。
     pub fn body(&self) -> serde_json::Value {
-        let message = self.code.public_message(&self.message);
+        let message = self
+            .public_detail
+            .as_ref()
+            .map(PublicMessage::as_str)
+            .unwrap_or_else(|| self.code.public_message(&self.message));
         match self.protocol {
             Protocol::AnthropicMessages => json!({
                 "type": "error",
@@ -454,6 +477,7 @@ mod tests {
                 Body::from_stream(futures::stream::iter(chunks)),
                 Protocol::OpenAiChat,
                 "req_private",
+                ErrorRedactor::new("private-channel", "https://upstream.example", "secret"),
             );
             let output = to_bytes(body, 10000).await.unwrap();
             let text = String::from_utf8(output.to_vec()).unwrap();
@@ -469,10 +493,40 @@ mod tests {
     fn asynchronous_failure_drops_vendor_fields() {
         let mut value = json!({"id":"task_1","status":"failed","message":"private-channel",
             "debug":"secret","error":{"provider":"private-channel"}});
-        assert!(sanitize_failure(&mut value));
+        assert!(sanitize_failure(
+            &mut value,
+            &ErrorRedactor::new("private-channel", "https://upstream.example", "secret")
+        ));
         assert_eq!(value["id"], "task_1");
         assert!(!value.to_string().contains("private-channel"));
         assert!(!value.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn asynchronous_and_responses_errors_keep_actionable_reason() {
+        let redactor = ErrorRedactor::new("private-channel", "https://private.example", "tiny-key");
+        let detail = "private-channel: Unsupported size auto; use 1024x1024. tiny-key";
+        let mut task = json!({"id":"task_1","status":"failed","error":{"message":detail},"debug":"private-channel"});
+        assert!(sanitize_failure(&mut task, &redactor));
+        let text = task.to_string();
+        assert!(text.contains("Unsupported size auto; use 1024x1024"));
+        assert!(!text.contains("private-channel") && !text.contains("tiny-key"));
+        let raw = format!(
+            "event: response.failed\ndata: {}\n\n",
+            json!({"response":{
+                "id":"resp_1","status":"failed","error":{"message":detail},"provider":"private-channel"
+            }})
+        );
+        let output = private_error_frame(
+            raw.as_bytes(),
+            Protocol::OpenAiResponses,
+            "req_public",
+            &redactor,
+        );
+        let text = String::from_utf8(output.to_vec()).unwrap();
+        assert!(text.contains("response.failed") && text.contains("req_public"));
+        assert!(text.contains("Unsupported size auto; use 1024x1024"));
+        assert!(!text.contains("private-channel") && !text.contains("tiny-key"));
     }
 
     #[test]

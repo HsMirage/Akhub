@@ -47,7 +47,9 @@ async fn repeated_parameter_errors_never_become_a_local_503() {
         assert_eq!(public["error"]["type"], "invalid_request_error");
         assert_eq!(public["akhub_error_code"], "unsupported_parameter");
         assert!(public["request_id"].is_string());
-        assert!(!public.to_string().contains("claude-opus-5-5"));
+        assert!(public.to_string().contains("claude-opus-5-5"));
+        assert!(public.to_string().contains("use auto or none"));
+        assert!(!public.to_string().contains("kiro"));
     }
     assert_eq!(up.requests(), 4, "每一次请求都必须到达上游");
     for seen in up.seen.lock().unwrap().iter() {

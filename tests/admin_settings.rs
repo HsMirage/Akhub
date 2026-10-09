@@ -39,7 +39,7 @@ async fn settings_can_be_edited_persisted_and_hot_applied() {
     let updated: Value = write(
         http.patch(format!("{}/admin/api/settings", akhub.base_url))
             .header("cookie", &cookie)
-            .json(&json!({"request_timeout_secs": 42, "retention_days": 7})),
+            .json(&json!({"request_timeout_secs": 42, "stream_idle_timeout_secs": 90, "retention_days": 7})),
     )
     .send()
     .await
@@ -49,6 +49,7 @@ async fn settings_can_be_edited_persisted_and_hot_applied() {
     .unwrap();
     assert_eq!(updated["request_timeout_secs"], 42, "{updated}");
     assert_eq!(updated["retention_days"], 7, "{updated}");
+    assert_eq!(updated["stream_idle_timeout_secs"], 90);
     assert_eq!(
         updated["restart_required"][0], "shutdown_grace_secs",
         "关闭宽限期要等重启"
@@ -56,6 +57,7 @@ async fn settings_can_be_edited_persisted_and_hot_applied() {
 
     // 热生效：运行中的状态立刻是新值。
     assert_eq!(akhub.state.settings.get().request_timeout.as_secs(), 42);
+    assert_eq!(akhub.state.settings.get().stream_idle_timeout.as_secs(), 90);
 
     // 越界拒绝。
     let rejected = write(
@@ -69,6 +71,19 @@ async fn settings_can_be_edited_persisted_and_hot_applied() {
     assert_eq!(rejected.status(), 400);
     assert_eq!(akhub.state.settings.get().request_timeout.as_secs(), 42);
 
+    for seconds in [0, 4, 3601] {
+        let rejected = write(
+            http.patch(format!("{}/admin/api/settings", akhub.base_url))
+                .header("cookie", &cookie)
+                .json(&json!({"stream_idle_timeout_secs": seconds})),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(rejected.status(), 400);
+        assert_eq!(akhub.state.settings.get().stream_idle_timeout.as_secs(), 90);
+    }
+
     // 重启后仍然是新值。
     let dir = akhub.data_dir().to_path_buf();
     let port = akhub.base_url.clone();
@@ -77,6 +92,7 @@ async fn settings_can_be_edited_persisted_and_hot_applied() {
         .await
         .unwrap();
     assert_eq!(restarted.settings.get().request_timeout.as_secs(), 42);
+    assert_eq!(restarted.settings.get().stream_idle_timeout.as_secs(), 90);
     assert_eq!(restarted.settings.get().retention_days, 7);
     drop(restarted);
     let _ = port;

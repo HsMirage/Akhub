@@ -127,6 +127,10 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    /// 4.7 起在 high 与 max 之间新增的一档（自适应契约专有，OpenAI 两个协议没有）。
+    XHigh,
+    /// 自适应契约的最高一档。
+    Max,
 }
 
 impl Effort {
@@ -136,6 +140,8 @@ impl Effort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -145,17 +151,31 @@ impl Effort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
 
-    /// 思考预算的近似换算：档位 → Token 数。
+    /// OpenAI 两个协议只认 minimal/low/medium/high。把 Anthropic 专有的两档
+    /// 折到最接近的 high，而不是把一个上游从不认识的取值发过去换一个 400。
+    pub fn as_openai_level(self) -> &'static str {
+        match self {
+            Self::XHigh | Self::Max => "high",
+            other => other.as_str(),
+        }
+    }
+
+    /// 思考预算的近似换算：档位 → Token 数（只对手工契约的模型有意义）。
     pub fn budget_tokens(self) -> u32 {
         match self {
             Self::Minimal => 1_024,
             Self::Low => 2_048,
             Self::Medium => 8_192,
             Self::High => 16_384,
+            // 手工契约的最后一代（4.5 系）thinking 上限就是 32k；再往上只会把
+            // max_tokens 顶穿，所以 xhigh 与 max 都封在这里。
+            Self::XHigh | Self::Max => 32_000,
         }
     }
 
@@ -165,8 +185,35 @@ impl Effort {
             Self::Low
         } else if budget <= 8_192 {
             Self::Medium
-        } else {
+        } else if budget <= 16_384 {
             Self::High
+        } else {
+            Self::XHigh
+        }
+    }
+}
+
+/// 思考文本的展示方式。4.7 起默认 `omitted`（只回签名与加密内容），想让客户端
+/// 看见推理过程必须显式要 `summarized`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "summarized" => Some(Self::Summarized),
+            "omitted" => Some(Self::Omitted),
+            _ => None,
         }
     }
 }
@@ -177,13 +224,22 @@ pub struct ThinkingConfig {
     pub enabled: bool,
     pub budget_tokens: Option<u32>,
     pub effort: Option<Effort>,
+    /// 客户端显式要求的展示方式；`None` 表示它没表态。
+    pub display: Option<ThinkingDisplay>,
 }
 
 impl ThinkingConfig {
-    pub fn effort(&self) -> Effort {
+    /// 客户端**显式**表达的档位。`None` 表示"没说要多少"。
+    ///
+    /// 自适应契约下这两者必须分开：模型自己的默认档位通常比中间格式猜的那个
+    /// 高，替客户端选一档等于悄悄削弱它要的推理深度。
+    pub fn explicit_effort(&self) -> Option<Effort> {
         self.effort
             .or_else(|| self.budget_tokens.map(Effort::from_budget))
-            .unwrap_or(Effort::Medium)
+    }
+
+    pub fn effort(&self) -> Effort {
+        self.explicit_effort().unwrap_or(Effort::Medium)
     }
 
     pub fn budget(&self) -> u32 {
@@ -499,9 +555,20 @@ mod tests {
     fn effort_and_budget_convert_both_ways() {
         assert_eq!(Effort::from_budget(1_024), Effort::Low);
         assert_eq!(Effort::from_budget(8_192), Effort::Medium);
-        assert_eq!(Effort::from_budget(30_000), Effort::High);
+        assert_eq!(Effort::from_budget(30_000), Effort::XHigh);
         assert_eq!(Effort::High.budget_tokens(), 16_384);
         assert_eq!(Effort::parse("medium"), Some(Effort::Medium));
         assert_eq!(Effort::parse("极高"), None);
+        // 自适应契约新增的两档只在 Anthropic 侧成立。
+        assert_eq!(Effort::parse("xhigh"), Some(Effort::XHigh));
+        assert_eq!(Effort::parse("max"), Some(Effort::Max));
+        assert_eq!(Effort::Max.as_str(), "max");
+        assert_eq!(Effort::Max.as_openai_level(), "high");
+        assert_eq!(Effort::Low.as_openai_level(), "low");
+        assert_eq!(
+            ThinkingDisplay::parse("summarized"),
+            Some(ThinkingDisplay::Summarized)
+        );
+        assert_eq!(ThinkingDisplay::Omitted.as_str(), "omitted");
     }
 }

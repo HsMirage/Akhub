@@ -469,6 +469,7 @@ export interface Overview {
 
 export interface Settings {
   request_timeout_secs: number;
+  stream_idle_timeout_secs: number;
   max_request_bytes: number;
   retention_days: number;
   /** Responses 可重放状态的保留天数（§15.2）。 */
@@ -491,6 +492,7 @@ export interface Settings {
 /** 设置接口允许通过 PATCH 修改的数字字段。 */
 export type SettingsNumericField =
   | "request_timeout_secs"
+  | "stream_idle_timeout_secs"
   | "max_request_bytes"
   | "retention_days"
   | "response_state_days"

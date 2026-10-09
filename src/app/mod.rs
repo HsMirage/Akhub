@@ -25,8 +25,10 @@ pub use recorder::RequestRecorder;
 /// 系统设置。第一期只保留 §6.7 中真正需要的几项。
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// 请求总超时，达到后取消上游请求且不再重放（§13.5）。
+    /// 非流式请求总超时；流式请求仅约束排队到首个语义事件的阶段。
     pub request_timeout: Duration,
+    /// 推理流提交后连续无数据的等待上限；收到数据后重新计时。
+    pub stream_idle_timeout: Duration,
     /// 单请求体上限，超过返回 `413 request_too_large`（§17.3）。
     pub max_request_bytes: usize,
     /// 请求元数据保留天数；0 表示不新增历史明细（§24.2）。
@@ -46,6 +48,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(600),
+            stream_idle_timeout: Duration::from_secs(180),
             max_request_bytes: 64 * 1024 * 1024,
             retention_days: 30,
             response_state_days: 30,
@@ -63,6 +66,7 @@ impl Default for Settings {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PersistedSettings {
     pub request_timeout_secs: Option<u64>,
+    pub stream_idle_timeout_secs: Option<u64>,
     pub max_request_bytes: Option<usize>,
     pub retention_days: Option<u32>,
     pub response_state_days: Option<u32>,
@@ -79,6 +83,10 @@ impl PersistedSettings {
                 .request_timeout_secs
                 .map(Duration::from_secs)
                 .unwrap_or(base.request_timeout),
+            stream_idle_timeout: self
+                .stream_idle_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.stream_idle_timeout),
             max_request_bytes: self.max_request_bytes.unwrap_or(base.max_request_bytes),
             retention_days: self.retention_days.unwrap_or(base.retention_days),
             response_state_days: self.response_state_days.unwrap_or(base.response_state_days),
@@ -100,6 +108,7 @@ impl PersistedSettings {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
             request_timeout_secs: Some(settings.request_timeout.as_secs()),
+            stream_idle_timeout_secs: Some(settings.stream_idle_timeout.as_secs()),
             max_request_bytes: Some(settings.max_request_bytes),
             retention_days: Some(settings.retention_days),
             response_state_days: Some(settings.response_state_days),
@@ -119,7 +128,13 @@ impl PersistedSettings {
                 _ => Ok(()),
             }
         };
-        range("请求总超时（秒）", self.request_timeout_secs, 5, 86_400)?;
+        range(
+            "普通请求 / 流开始超时（秒）",
+            self.request_timeout_secs,
+            5,
+            86_400,
+        )?;
+        range("流式空闲超时（秒）", self.stream_idle_timeout_secs, 5, 3600)?;
         range("关闭宽限期（秒）", self.shutdown_grace_secs, 5, 3600)?;
         range(
             "自动倍率刷新间隔（秒）",

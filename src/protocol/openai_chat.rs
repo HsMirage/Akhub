@@ -122,12 +122,14 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
                 enabled: true,
                 budget_tokens: None,
                 effort: Some(effort),
+                display: None,
             },
             // `reasoning_effort: "none"` 是显式关闭。
             None => ThinkingConfig {
                 enabled: false,
                 budget_tokens: None,
                 effort: None,
+                display: None,
             },
         });
     }
@@ -485,9 +487,10 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
         body.insert("response_format".into(), emit_response_format(format));
     }
     if let Some(thinking) = request.thinking {
-        // Chat 只有档位，没有预算；Anthropic 的 budget_tokens 按档位换算。
+        // Chat 只有档位，没有预算；Anthropic 的 budget_tokens 按档位换算，
+        // 上游不认识的 xhigh/max 折到 high。
         let effort = if thinking.enabled {
-            thinking.effort().as_str()
+            thinking.effort().as_openai_level()
         } else {
             "none"
         };
@@ -1185,6 +1188,7 @@ mod tests {
             enabled: true,
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         });
         request.messages.push(Message {
             role: Role::Assistant,

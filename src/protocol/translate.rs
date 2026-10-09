@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::Value;
 
 use crate::domain::Protocol;
-use crate::protocol::canonical::Request;
+use crate::protocol::canonical::{Request, ThinkingConfig};
 use crate::protocol::degrade::{Emitted, Fidelity, Unsupported};
 
 /// 一次请求在三个协议上的转换结果缓存。
@@ -52,6 +52,13 @@ impl<'a> Translation<'a> {
             Ok(request) => request.requested_capabilities(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// 下游请求的思考意图，供发射之后按上游模型再对齐一次（§14.6）。
+    ///
+    /// 解析失败时返回 `None`：请求本身有问题，错误会在发射环节原样报出。
+    pub fn thinking(&self) -> Option<ThinkingConfig> {
+        self.canonical().ok().and_then(|request| request.thinking)
     }
 
     /// 发往 `target` 协议的请求体，以及为此丢弃的白名单能力。

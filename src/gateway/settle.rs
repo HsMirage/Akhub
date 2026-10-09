@@ -39,6 +39,8 @@ pub struct StreamSettlement {
     pub state: SharedState,
     /// 下游协议：决定怎么从字节流里读 usage 与最终响应对象。
     pub protocol: Protocol,
+    /// 推理流的无数据超时；图片流沿用它自己的总时长限制。
+    pub idle_timeout: Option<Duration>,
     pub target_id: String,
     pub dimension: score::Dimension,
     /// 上游尝试开始的时间，用于真实总耗时。
@@ -119,6 +121,8 @@ pub fn settle_stream(
 ) -> Response {
     let (parts, body) = response.into_parts();
     let protocol = settlement.protocol;
+    let idle_timeout = settlement.idle_timeout;
+    let request_id = settlement.record.request_id.clone();
     let guard = SettlementGuard {
         settlement: Some(settlement),
         accounting: StreamAccounting::new(protocol),
@@ -129,7 +133,25 @@ pub fn settle_stream(
         let mut filter = crate::gateway::translate::UnrequestedUsageFilter::new(strip_unrequested_usage);
         let mut upstream = body.into_data_stream();
         loop {
-            match upstream.next().await {
+            let next = if let Some(timeout) = idle_timeout {
+                match tokio::time::timeout(timeout, upstream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        tracing::warn!(%request_id, idle_secs = timeout.as_secs(), "流式响应连续无数据，结束等待");
+                        guard.settle(Ending::Failed("upstream_timeout"));
+                        yield Ok::<_, axum::Error>(crate::protocol::stream_error(
+                            protocol,
+                            crate::gateway::error::ErrorCode::UpstreamTimeout,
+                            "上游流式响应长时间未返回数据，请重试",
+                            Some(&request_id),
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                upstream.next().await
+            };
+            match next {
                 Some(Ok(chunk)) => {
                     guard.accounting.push(&chunk);
                     if strip_unrequested_usage {
@@ -193,6 +215,7 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     let usage = accounting.usage_tokens();
     let outcome = match ending {
         Ending::Completed => health::Outcome::Success,
+        Ending::Failed("upstream_timeout") => health::Outcome::Neutral,
         Ending::Failed(_) => health::Outcome::Fault,
         Ending::Aborted => health::Outcome::Neutral,
     };

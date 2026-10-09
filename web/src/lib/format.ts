@@ -1,6 +1,17 @@
 /** 展示层的格式化工具。只做显示，不参与任何判定逻辑。 */
 import type { Limits } from "./types";
 
+/** 每项独立保留已知用量；未知不是 0，也不能把已知输入一起隐藏。 */
+export function formatTokenPair(input: number | null, output: number | null): string {
+  const token = (value: number | null) => value === null ? "未知" : value.toLocaleString();
+  return `${token(input)} / ${token(output)}`;
+}
+
+export function outputUsageNote(output: number | null, streaming: boolean, error: string | null): string | null {
+  if (output !== null) return null;
+  return streaming && error !== null ? "输出用量未知 · 未完成统计" : "输出用量未知 · 上游未上报";
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB"];

@@ -77,11 +77,16 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     // 那时 [`apply_schema`] 会建表并读结构版本）。因此这里在**运行时之前**就
     // 建立起整套连接，真正的数据库打开是异步的，不会阻塞 tokio 的工作线程。
     //
-    // 这一点是刻意的：配置写操作（勾选模型、改名、调和调度目标）都是短事务，
-    // 单个连接就够用，也不会互相撞 SQLite 写锁；而多连接会让"每次写操作
-    // 都新开一次数据库文件"这类操作付出成倍的打开/关闭成本。
+    // 配置写操作（勾选模型、改名、调和调度目标）都是短事务，写仍然会被 SQLite
+    // 串行化，冲突由 `busy_timeout` 兜底。但"一个连接就够"同时意味着**单点**：
+    // 一条连接被卡住以后，请求记录、Responses 状态、粘性落盘与 /health/ready
+    // 会一起挂住，而 SQLite 那边并没有任何锁——2026-10-08 线上就是这样卡了
+    // 31 小时，直到重启才恢复。所以这里留出几条备用连接。
     let pool = SqlitePoolOptions::new()
-        .max_connections(1)
+        .max_connections(4)
+        // 拿不到连接就快速失败：默认 30 秒会让每个调用点长时间挂住，
+        // 日志里也看不出是谁占着连接。
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect_lazy_with(options);
 
     apply_schema(&pool).await?;

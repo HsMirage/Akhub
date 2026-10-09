@@ -41,6 +41,11 @@ pub(crate) async fn complete_job(
     remaining: Duration,
     request_id: &str,
 ) -> Result<serde_json::Value, GatewayError> {
+    let redactor = crate::security::redact::ErrorRedactor::new(
+        &target.account.name,
+        &target.account.base_url,
+        api_key,
+    );
     let result = tokio::time::timeout(remaining, async {
         let mut wait = poll_delay(response.headers());
         let mut value = read_job(response).await?;
@@ -85,7 +90,10 @@ pub(crate) async fn complete_job(
                     );
                 }
                 Some("failed" | "blocked" | "cancelled") => {
-                    return Err(job_error("生图任务未成功完成"));
+                    let detail = passthrough::upstream_error_message(value.to_string().as_bytes())
+                        .unwrap_or_else(|| "生图任务未成功完成".into());
+                    tracing::warn!(request_id, account = target.account.name, %detail, "生图任务失败");
+                    return Err(job_error(detail));
                 }
                 Some("processing") => {}
                 _ => return Err(job_error("生图任务返回了未知状态")),
@@ -119,7 +127,10 @@ pub(crate) async fn complete_job(
                 continue;
             }
             if !status.is_success() {
-                return Err(job_error(format!("生图任务查询返回 {}", status.as_u16())));
+                let bytes = passthrough::read_upstream_body(response, passthrough::MAX_UPSTREAM_BODY_BYTES).await.unwrap_or_default();
+                let detail = passthrough::upstream_error_message(&bytes)
+                    .unwrap_or_else(|| format!("生图任务查询返回 {}", status.as_u16()));
+                return Err(job_error(detail));
             }
             value = read_job(response).await?;
             if value.get("id").and_then(|v| v.as_str()) != Some(id.as_str())
@@ -137,7 +148,12 @@ pub(crate) async fn complete_job(
                 "图片任务已接单，但等待结果超时；未重复下单",
             ))
         })
-        .map_err(|error| error.with_request_id(request_id))
+        .map_err(|error| {
+            let detail = redactor.message(&error.message);
+            error
+                .with_public_message(detail)
+                .with_request_id(request_id)
+        })
 }
 
 fn job_error(message: impl Into<String>) -> GatewayError {
@@ -440,8 +456,17 @@ pub async fn task_status(
     );
 
     if !upstream_status.is_success() {
-        let mut response =
-            crate::gateway::error::upstream_response(upstream_status, protocol, &request_id);
+        let redactor = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            credential.secret.as_ref(),
+        );
+        let mut response = crate::gateway::error::upstream_response(
+            upstream_status,
+            protocol,
+            &request_id,
+            redactor.payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)),
+        );
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
@@ -453,9 +478,14 @@ pub async fn task_status(
         }
         return response;
     }
+    let redactor = crate::security::redact::ErrorRedactor::new(
+        &target.account.name,
+        &target.account.base_url,
+        credential.secret.as_ref(),
+    );
     let bytes = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(mut value) => {
-            if crate::gateway::error::sanitize_failure(&mut value) {
+            if crate::gateway::error::sanitize_failure(&mut value, &redactor) {
                 axum::body::Bytes::from(value.to_string())
             } else {
                 bytes
@@ -466,6 +496,7 @@ pub async fn task_status(
                 StatusCode::BAD_GATEWAY,
                 protocol,
                 &request_id,
+                redactor.message("上游任务查询响应不是合法 JSON"),
             );
         }
     };

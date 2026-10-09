@@ -918,8 +918,13 @@ async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
     let pool = state.store.pool().clone();
 
     // 关着外键写进几条引用不存在账号的行，再把版本退回 v17 逼 v18 重跑。
+    //
+    // `PRAGMA foreign_keys` 是**连接级**的，而池子里不止一条连接：这个开关必须和
+    // 后面的写入共用同一条连接，否则写的可能是另一条仍然开着外键的连接。迁移代码
+    // 自己也走"独占一条连接"这条规矩（`storage::migrate_v18`）。
+    let mut conn = pool.acquire().await.unwrap();
     sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(&pool)
+        .execute(&mut *conn)
         .await
         .unwrap();
     sqlx::query(
@@ -927,20 +932,21 @@ async fn orphan_rows_are_cleaned_instead_of_blocking_startup() {
             (account_id, upstream_model, public_name, hide_original, selected, missing, discovered_at)
          VALUES ('acc-ghost', 'm-ghost', 'm-ghost', 0, 1, 0, 1)",
     )
-    .execute(&pool)
+    .execute(&mut *conn)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO multiplier_snapshots (account_id, multiplier, source, status, refreshed_at)
          VALUES ('acc-ghost', 1000000, 'manual', 'known', 1)",
     )
-    .execute(&pool)
+    .execute(&mut *conn)
     .await
     .unwrap();
     sqlx::query("UPDATE app_settings SET value = '17' WHERE key = 'schema_version'")
-        .execute(&pool)
+        .execute(&mut *conn)
         .await
         .unwrap();
+    drop(conn);
     drop(state);
 
     let reopened = AppState::bootstrap(dir.path(), Settings::default())

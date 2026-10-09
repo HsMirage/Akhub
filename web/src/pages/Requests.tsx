@@ -17,6 +17,8 @@ import {
   formatBytes,
   formatDuration,
   formatTime,
+  formatTokenPair,
+  outputUsageNote,
   statusTone,
 } from "../lib/format";
 import {
@@ -87,15 +89,9 @@ function toRequestFilters(form: RequestFilterForm): RequestFilters {
 
 /** 上游没上报用量时的提示：说清"是没人报"，而不是"没记录"。 */
 const USAGE_MISSING_HINT =
-  "上游没有在这次响应里上报 usage（或流没走到收尾事件）。Akhub 不估算 Token，缺就是空。" +
+  "上游未上报完整用量，或响应在最终用量事件之前中断。未知不代表没有输出，可能已经传输了思考或正文。Akhub 不估算 Token。" +
   "如果整个上游都不上报，请确认它的 OpenAI/Anthropic 兼容实现是否返回 usage。" +
   "请求记录里已点的行会显示这次流的结尾状态（中断的记 client_gone）。";
-
-/** Token 一栏：缺失时不留白，明确说"上游未上报"（§6.6、§6.8）。 */
-function formatTokenPair(input: number | null, output: number | null): string {
-  if (input === null || output === null) return "上游未上报";
-  return `${input.toLocaleString()} / ${output.toLocaleString()}`;
-}
 
 /** 命中前缀缓存的那部分 Token（§11.6）。上游一项都没报时返回 null，不写 0。 */
 function formatCacheTokens(
@@ -805,16 +801,19 @@ export function Requests({
                           // 二选一：上游只报了缓存读写的记录，那两行数字恰恰是唯一
                           // 的用量信号，不能在这一格被藏起来（§6.6、§11.6）。
                           const parts: string[] = [];
-                          if (record.input_tokens !== null && record.output_tokens !== null) {
-                            parts.push(
-                              `输入 ${record.input_tokens.toLocaleString()} · 输出 ${record.output_tokens.toLocaleString()}`,
-                            );
-                          }
+                          if (record.input_tokens !== null) parts.push(`输入 ${record.input_tokens.toLocaleString()}`);
+                          if (record.output_tokens !== null) parts.push(`输出 ${record.output_tokens.toLocaleString()}`);
+                          if (record.input_tokens === null || record.output_tokens === null) parts.push(USAGE_MISSING_HINT);
                           if (cacheTokens) parts.push(cacheTokens);
                           return parts.length > 0 ? parts.join(" · ") : USAGE_MISSING_HINT;
                         })()}
                       >
                         {formatTokenPair(record.input_tokens, record.output_tokens)}
+                        {record.output_tokens === null && (
+                          <div className="text-faint" style={{ fontSize: 11, fontWeight: 400 }}>
+                            {outputUsageNote(record.output_tokens, record.streaming, record.error_code)}
+                          </div>
+                        )}
                         {/* 缓存读写单独一行：它既不属于输入也不属于输出，混进
                             输入里会让"这次到底花了多少钱"完全看不出来（§11.6）。 */}
                         {cacheTokens && (

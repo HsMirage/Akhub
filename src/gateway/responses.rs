@@ -368,7 +368,21 @@ async fn proxy_lifecycle(
             ),
             _ => (ErrorCode::UpstreamExhausted, "上游生命周期调用失败"),
         };
-        return Err(GatewayError::new(code, message).with_protocol(protocol));
+        let bytes = crate::gateway::passthrough::read_upstream_body(
+            response,
+            crate::gateway::passthrough::MAX_UPSTREAM_BODY_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        let detail = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            &target.api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(Value::Null));
+        return Err(GatewayError::new(code, message)
+            .with_public_message(detail)
+            .with_protocol(protocol));
     }
 
     let mut value: Value = response.json().await.map_err(|error| {
@@ -376,7 +390,14 @@ async fn proxy_lifecycle(
         GatewayError::new(ErrorCode::UpstreamProtocolError, "上游返回了无法解析的响应")
             .with_protocol(protocol)
     })?;
-    crate::gateway::error::sanitize_failure(&mut value);
+    crate::gateway::error::sanitize_failure(
+        &mut value,
+        &crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            &target.api_key,
+        ),
+    );
     // 对外只暴露网关 ID（§15.1）；列表类响应的项 ID 不是响应身份，保持原样。
     if let Some(object) = value.as_object_mut()
         && object.contains_key("id")

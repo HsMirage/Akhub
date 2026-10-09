@@ -215,7 +215,7 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn vendor_errors_do_not_disclose_channel_or_body() {
+async fn vendor_errors_keep_reason_without_disclosing_channel_or_debug_fields() {
     for status in [
         axum::http::StatusCode::BAD_REQUEST,
         axum::http::StatusCode::BAD_GATEWAY,
@@ -226,7 +226,7 @@ async fn vendor_errors_do_not_disclose_channel_or_body() {
                 (
                     status,
                     axum::Json(
-                        json!({"error":{"message":"private-provider at https://private.example",
+                        json!({"error":{"message":"internal-channel: Unsupported size auto. Supported: 1024x1024. See https://private.example",
                 "channel":"internal-channel"},"debug":"secret-detail"}),
                     ),
                 )
@@ -262,15 +262,12 @@ async fn vendor_errors_do_not_disclose_channel_or_body() {
             .unwrap()
             .to_owned();
         let text = response.text().await.unwrap();
-        for secret in [
-            "private-provider",
-            "private.example",
-            "internal-channel",
-            "secret-detail",
-        ] {
+        for secret in ["private.example", "internal-channel", "secret-detail"] {
             assert!(!text.contains(secret), "{text}");
         }
         assert!(text.contains(&request_id));
+        assert!(text.contains("Unsupported size auto"), "{text}");
+        assert!(text.contains("1024x1024"), "{text}");
     }
 }
 

@@ -359,6 +359,15 @@ impl StreamEmitter {
         stream_error(self.protocol(), code, message, request_id)
     }
 
+    pub(crate) fn error_public(
+        &self,
+        code: crate::gateway::error::ErrorCode,
+        message: &crate::security::redact::PublicMessage,
+        request_id: Option<&str>,
+    ) -> axum::body::Bytes {
+        stream_error_public(self.protocol(), code, message, request_id)
+    }
+
     fn protocol(&self) -> Protocol {
         match self {
             Self::Chat(_) => Protocol::OpenAiChat,
@@ -410,6 +419,24 @@ pub fn stream_error(
     request_id: Option<&str>,
 ) -> axum::body::Bytes {
     let message = code.public_message(message);
+    encode_stream_error(protocol, code, message, request_id)
+}
+
+pub(crate) fn stream_error_public(
+    protocol: Protocol,
+    code: crate::gateway::error::ErrorCode,
+    message: &crate::security::redact::PublicMessage,
+    request_id: Option<&str>,
+) -> axum::body::Bytes {
+    encode_stream_error(protocol, code, message.as_str(), request_id)
+}
+
+fn encode_stream_error(
+    protocol: Protocol,
+    code: crate::gateway::error::ErrorCode,
+    message: &str,
+    request_id: Option<&str>,
+) -> axum::body::Bytes {
     match protocol {
         Protocol::OpenAiChat => sse::format_frame(
             None,

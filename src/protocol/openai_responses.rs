@@ -123,11 +123,13 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
                 enabled: false,
                 budget_tokens: None,
                 effort: None,
+                display: None,
             },
             other => ThinkingConfig {
                 enabled: true,
                 budget_tokens: None,
                 effort: other.and_then(Effort::parse),
+                display: None,
             },
         });
     }
@@ -534,7 +536,7 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
         if thinking.enabled {
             body.insert(
                 "reasoning".into(),
-                json!({"effort": thinking.effort().as_str(), "summary": "auto"}),
+                json!({"effort": thinking.effort().as_openai_level(), "summary": "auto"}),
             );
         } else {
             body.insert("reasoning".into(), json!({"effort": "none"}));

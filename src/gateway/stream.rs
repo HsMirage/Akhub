@@ -587,7 +587,7 @@ impl StreamAccounting {
                     _ => value.get("usage"),
                 };
                 if let Some(usage) = usage {
-                    self.absorb_anthropic_usage(usage);
+                    self.absorb_anthropic_usage(usage, kind != Some("message_start"));
                 }
             }
             Protocol::OpenAiResponses => {
@@ -642,7 +642,7 @@ impl StreamAccounting {
     }
 
     /// Anthropic 的 `usage`：缓存读写单独上报，必须并入输入侧。
-    fn absorb_anthropic_usage(&mut self, usage: &serde_json::Value) {
+    fn absorb_anthropic_usage(&mut self, usage: &serde_json::Value, final_output: bool) {
         let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
         if let Some(input) = field("input_tokens") {
             let cache = field("cache_creation_input_tokens").unwrap_or(0)
@@ -653,10 +653,12 @@ impl StreamAccounting {
             self.usage.cache_read = field("cache_read_input_tokens");
             self.usage.cache_write = field("cache_creation_input_tokens");
         }
-        if let Some(output) = field("output_tokens") {
+        // message_start 的 0/1 是开场占位，不是本轮的输出用量。
+        // 中途断开仍保留真实输入，但输出未知，不能退款或计算虚假的速度。
+        if final_output && let Some(output) = field("output_tokens") {
             self.usage.output = Some(output);
         }
-        if let Some(total) = field("total_tokens") {
+        if final_output && let Some(total) = field("total_tokens") {
             self.total_tokens = Some(total);
         }
     }
@@ -971,6 +973,9 @@ mod tests {
         let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":20}}}\n\n";
         let mut early = StreamAccounting::new(Protocol::AnthropicMessages);
         feed_all(&mut early, &[start]);
+        assert_eq!(early.input_tokens(), Some(120));
+        assert_eq!(early.output_tokens(), None);
+        assert_eq!(early.usage_tokens(), None, "不能按开场占位退还 TPM 预留");
         assert!(
             !early.answer_completed(),
             "开头帧带 output_tokens 占位值也不算写完：上游还没吐正文"

@@ -282,6 +282,7 @@ struct Walk<'a> {
     attempted: Vec<AttemptedKey>,
     /// 最后一次可切换失败，用来在候选耗尽时决定错误码。
     last: Option<(ErrorCode, String)>,
+    last_public: Option<crate::security::redact::PublicMessage>,
     /// 最后一次失败附带的 `Retry-After` 原文（秒），粘性路径据此决定是否
     /// 原地等待（§10.3）。
     ///
@@ -441,6 +442,7 @@ async fn forward_inner<'a>(
         now_unix,
         attempted: Vec::new(),
         last: None,
+        last_public: None,
         last_retry_after: None,
         last_credential_outcome: None,
         usage_parts: (None, None),
@@ -689,7 +691,7 @@ async fn forward_inner<'a>(
     }
 
     // 候选全部用尽。用最后一次失败的性质决定错误码，让客户端的重试行为正确。
-    let (code, message) = walk.last.take().unwrap_or((
+    let (code, message) = walk.last.clone().unwrap_or((
         ErrorCode::NoEligibleTarget,
         format!("逻辑模型 {} 当前没有可用的调度目标", forward.logical_model),
     ));
@@ -791,6 +793,7 @@ impl Walk<'_> {
                 // 没有可用 Key 是"坏"：这个候选本次彻底不可用。
                 Picked::Unavailable(message) => {
                     self.last = Some((ErrorCode::NoEligibleTarget, message));
+                    self.last_public = None;
                 }
             }
         }
@@ -848,6 +851,7 @@ impl Walk<'_> {
                     }
                     Picked::Unavailable(message) => {
                         self.last = Some((ErrorCode::NoEligibleTarget, message));
+                        self.last_public = None;
                         pending.remove(index);
                         continue;
                     }
@@ -987,6 +991,7 @@ impl Walk<'_> {
                     Picked::Busy => continue,
                     Picked::Unavailable(message) => {
                         self.last = Some((ErrorCode::NoEligibleTarget, message));
+                        self.last_public = None;
                         pending.remove(index);
                         continue;
                     }
@@ -1090,6 +1095,7 @@ impl Walk<'_> {
             // 预扣的 RPM/TPM 必须完整退回，且不能留下半开试运行占用。
             admission.cancel_before_upstream();
             self.last = Some((code, message));
+            self.last_public = None;
             return Flow::Continue;
         }
         // 这次调用用哪把 Key。选到之后**整个请求内不再改变**，除非换 Key 重试
@@ -1108,6 +1114,7 @@ impl Walk<'_> {
             Picked::Unavailable(message) => {
                 admission.cancel_before_upstream();
                 self.last = Some((ErrorCode::NoEligibleTarget, message));
+                self.last_public = None;
                 return Flow::Continue;
             }
         };
@@ -1267,6 +1274,8 @@ impl Walk<'_> {
                         settle::StreamSettlement {
                             state: self.forward.state.clone(),
                             protocol: self.forward.endpoint.protocol(),
+                            idle_timeout: (!self.forward.endpoint.is_image())
+                                .then(|| self.forward.state.settings.get().stream_idle_timeout),
                             target_id: candidate.target.target.id.clone(),
                             dimension,
                             started,
@@ -1360,6 +1369,19 @@ impl Walk<'_> {
                 retry_after,
                 upstream_body,
             }) => {
+                let key: &str = credential.as_ref().map(|c| c.secret.as_ref()).unwrap_or("");
+                let redactor = crate::security::redact::ErrorRedactor::new(
+                    &candidate.target.account.name,
+                    &candidate.target.account.base_url,
+                    key,
+                );
+                self.last_public = Some(
+                    upstream_body
+                        .as_deref()
+                        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                        .map(|value| redactor.payload(&value))
+                        .unwrap_or_else(|| redactor.message(&message)),
+                );
                 let mut outcome = classify_outcome(code, upstream_status, retry_after);
                 // 401 与 403 分开看（§12.3）。判据只作用于这两个状态码：402/429
                 // 根本不是"凭据不对"的信号，拿它们去查正文会把已经判定的额度耗尽
@@ -1621,6 +1643,26 @@ impl Walk<'_> {
             emitted.body.clone()
         };
         rewrite_model(&mut body, &candidate.target.target.upstream_model);
+        // 逻辑模型名常常只是一个别名，发射时按它猜出来的思考契约可能与真正要
+        // 发出去的上游模型不一致。这里按上游模型名再对齐一次：新模型不接受
+        // 手工预算形状，老模型也不认识 adaptive（§14.6）。
+        if target_protocol == Protocol::AnthropicMessages
+            && let Some(object) = body.as_object_mut()
+        {
+            let mut extra = degrade::Degradations::default();
+            crate::protocol::anthropic::align_thinking(
+                object,
+                &candidate.target.target.upstream_model,
+                downstream,
+                self.translation.thinking().as_ref(),
+                &mut extra,
+            );
+            for name in extra.into_list() {
+                if !degraded.contains(&name) {
+                    degraded.push(name);
+                }
+            }
+        }
         // 同协议快路径不经过 `emit_request`，所以"向上游索取 usage"这件事
         // 必须在这里再补一次。网关自己需要 usage：输出速度评分（默认权重 15）
         // 与 TPM 归还都依赖它，而下游客户端多数不会主动写 stream_options
@@ -1734,6 +1776,7 @@ impl Walk<'_> {
     }
 
     fn note_unavailable(&mut self, candidate: &routing::Candidate, reason: health::Unavailable) {
+        self.last_public = None;
         self.last = Some((
             unavailable_code(reason),
             format!(
@@ -1785,9 +1828,14 @@ impl Walk<'_> {
 
     /// 生成网关错误响应并记录元数据。
     fn fail(&self, code: ErrorCode, message: String) -> Response {
-        let error = GatewayError::new(code, message)
+        let mut error = GatewayError::new(code, message)
             .with_protocol(self.forward.endpoint.protocol())
             .with_request_id(self.forward.request_id);
+        if self.last.as_ref().is_some_and(|(last, _)| *last == code)
+            && let Some(detail) = self.last_public.clone()
+        {
+            error = error.with_public_message(detail);
+        }
         let status = error.code.status();
         self.finish(None, status, Some(code), None, error.into_response())
     }
@@ -2036,6 +2084,29 @@ async fn attempt(
     streaming: bool,
     timeout: Duration,
 ) -> Result<Success, AttemptFailure> {
+    // 只限制提交前的等待。不能把总超时绑在 reqwest 的响应体上：
+    // 长思考即使一直有数据，也会在十分钟整被它掐断。
+    tokio::time::timeout(
+        timeout,
+        attempt_inner(forward, target, credential, prepared, streaming, timeout),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(AttemptFailure::switchable(
+            ErrorCode::UpstreamTimeout,
+            "上游未在请求期限内开始响应或完成普通请求".into(),
+        ))
+    })
+}
+
+async fn attempt_inner(
+    forward: &Forward<'_>,
+    target: &Arc<TargetView>,
+    credential: Option<&Arc<crate::credential::Credential>>,
+    prepared: &Prepared,
+    streaming: bool,
+    timeout: Duration,
+) -> Result<Success, AttemptFailure> {
     let account = &target.account;
     if timeout.is_zero() {
         return Err(AttemptFailure::switchable(
@@ -2113,16 +2184,21 @@ async fn attempt(
     // 再憋很久才吐第一个事件"是常见故障，此时首字延迟接近 0，只有把这段等待
     // 一并计入，评分才看得见这次卡顿（§6.6、§9.3）。
     let sent_at = Instant::now();
-    let response = forward
+    let request = forward
         .state
         .upstream
         .http_for(account.allow_private_network)
         .post(url)
         .headers(headers)
-        .body(payload)
-        .timeout(timeout)
-        .send()
-        .await;
+        .body(payload);
+    // 图片任务和普通响应仍有总时长边界；推理流提交后的生命期由
+    // settle_stream 的空闲超时负责，不能继承这次尝试的剩余总预算。
+    let request = if streaming && !prepared.endpoint.is_image() {
+        request
+    } else {
+        request.timeout(timeout)
+    };
+    let response = request.send().await;
 
     let response = match response {
         Ok(response) => response,
@@ -2161,7 +2237,8 @@ async fn attempt(
                 body: body.to_vec(),
             });
         }
-        return classify_upstream_error(forward, target, prepared, response, status).await;
+        return classify_upstream_error(forward, target, prepared, response, status, &api_key)
+            .await;
     }
     if status == StatusCode::ACCEPTED
         && prepared.endpoint.is_image()
@@ -2221,7 +2298,16 @@ async fn attempt(
     // 轮询换一把 Key 去问，它只会当作没这个任务（§4.2.1 的不变量 A）。
     let key_digest = credential.map(|credential| credential.credential_digest.as_str());
     if streamed {
-        commit_stream(forward, target, prepared, response, status, headers_wait).await
+        commit_stream(
+            forward,
+            target,
+            prepared,
+            response,
+            status,
+            headers_wait,
+            crate::security::redact::ErrorRedactor::new(&account.name, &account.base_url, &api_key),
+        )
+        .await
     } else {
         commit_body(
             forward, target, prepared, response, status, sent_at, key_digest,
@@ -2255,18 +2341,15 @@ async fn commit_stream(
     response: reqwest::Response,
     status: StatusCode,
     headers_wait: Duration,
+    redactor: crate::security::redact::ErrorRedactor,
 ) -> Result<Success, AttemptFailure> {
     let downstream = forward.endpoint.protocol();
     let upstream_protocol = prepared.endpoint.protocol();
     let headers = response.headers().clone();
 
     if upstream_protocol != downstream {
-        let include_usage = forward
-            .body
-            .get("stream_options")
-            .and_then(|options| options.get("include_usage"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(downstream != Protocol::OpenAiChat);
+        // 先给内部结算器完整用量，再由 settle_stream 按下游需求移除
+        // Chat 的可选 usage 帧；不能在结算前丢掉真实统计。
         // 跨协议进入 Responses 时，客户端引用的 ID 同样必须是网关 ID：
         // 上游是 Chat/Messages，根本没有可复用的 Responses ID（§15.1）。
         let stream_state = if downstream == Protocol::OpenAiResponses {
@@ -2295,13 +2378,14 @@ async fn commit_stream(
         return match translate::commit_stream(translate::StreamRequest {
             upstream: upstream_protocol,
             downstream,
-            include_usage,
+            include_usage: true,
             account: &target.account.name,
             response,
             responses_id,
             request_id: forward.request_id,
             // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
             degraded: degraded.clone(),
+            redactor: redactor.clone(),
         })
         .await
         {
@@ -2317,6 +2401,7 @@ async fn commit_stream(
                         committed.body,
                         downstream,
                         forward.request_id,
+                        redactor.clone(),
                     ),
                 ),
                 first_token: Some(committed.first_token),
@@ -2383,6 +2468,7 @@ async fn commit_stream(
                                 body,
                                 downstream,
                                 forward.request_id,
+                                redactor.clone(),
                             );
                             return Ok(Success {
                                 status,
@@ -2457,8 +2543,12 @@ async fn commit_stream(
                         downstream,
                         forward.request_id,
                     );
-                    let body =
-                        crate::gateway::error::private_stream(body, downstream, forward.request_id);
+                    let body = crate::gateway::error::private_stream(
+                        body,
+                        downstream,
+                        forward.request_id,
+                        redactor.clone(),
+                    );
                     return Ok(Success {
                         status,
                         streamed: true,
@@ -2770,6 +2860,7 @@ async fn classify_upstream_error(
     _prepared: &Prepared,
     response: reqwest::Response,
     status: StatusCode,
+    api_key: &str,
 ) -> Result<Success, AttemptFailure> {
     let retry_after = response
         .headers()
@@ -2826,12 +2917,17 @@ async fn classify_upstream_error(
         upstream_error_message(&bytes).unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
     tracing::warn!(request_id = forward.request_id, account = target.account.name,
         upstream_status = status.as_u16(), detail = %message, "上游拒绝请求");
-    let mut error = GatewayError::new(
-        ErrorCode::UnsupportedParameter,
-        "请求未被接受，请检查模型、接口及请求参数；如需帮助请提供请求编号",
-    )
-    .with_protocol(forward.endpoint.protocol())
-    .with_request_id(forward.request_id);
+    let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
+        .with_public_message(
+            crate::security::redact::ErrorRedactor::new(
+                &target.account.name,
+                &target.account.base_url,
+                api_key,
+            )
+            .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)),
+        )
+        .with_protocol(forward.endpoint.protocol())
+        .with_request_id(forward.request_id);
     if let Some(seconds) = retry_after {
         error = error.with_retry_after(seconds);
     }

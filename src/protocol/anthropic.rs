@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::domain::Protocol;
 use crate::protocol::canonical::{
     Effort, Event, ItemKind, MediaSource, Message, OutputFormat, Part, Request, Response, Role,
-    StopReason, ThinkingBlock, ThinkingConfig, Tool, ToolChoice, Usage,
+    StopReason, ThinkingBlock, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, Usage,
 };
 use crate::protocol::degrade::{Degradations, Emitted, Unsupported};
 use crate::protocol::{known, sampling_key, string_list};
@@ -30,6 +30,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "top_p",
     "stop_sequences",
     "thinking",
+    "output_config",
     "metadata",
     "service_tier",
 ];
@@ -125,6 +126,7 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
     }
 
     if let Some(thinking) = object.get("thinking") {
+        // `enabled` 与 `adaptive` 都是"要思考"，只有 `disabled` 是显式关闭。
         let enabled = thinking.get("type").and_then(Value::as_str) != Some("disabled");
         request.thinking = Some(ThinkingConfig {
             enabled,
@@ -133,7 +135,41 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
                 .and_then(Value::as_u64)
                 .map(|v| v as u32),
             effort: None,
+            display: thinking
+                .get("display")
+                .and_then(Value::as_str)
+                .and_then(ThinkingDisplay::parse),
         });
+    }
+
+    // 4.6 起档位搬到顶层 `output_config.effort`，`thinking` 只剩开关与展示方式。
+    if let Some(config) = object.get("output_config") {
+        if let Some(effort) = config
+            .get("effort")
+            .and_then(Value::as_str)
+            .and_then(Effort::parse)
+        {
+            request
+                .thinking
+                .get_or_insert(ThinkingConfig {
+                    enabled: true,
+                    budget_tokens: None,
+                    effort: None,
+                    display: None,
+                })
+                .effort = Some(effort);
+        }
+        // `output_config` 的其他子字段（结构化输出的 `format`……）这一层还表达
+        // 不了：按"不能表达就报错"处理，而不是静默丢给上游。
+        for field in config
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys())
+        {
+            if field.as_str() != "effort" {
+                request.unknown.push(format!("output_config.{field}"));
+            }
+        }
     }
 
     for field in SAMPLING_FIELDS {
@@ -417,15 +453,17 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
         body.insert("tool_choice".into(), value);
     }
 
+    let contract = ThinkingContract::of(&request.model);
     if let Some(thinking) = request.thinking {
         if thinking.enabled {
             body.insert(
                 "thinking".into(),
                 json!({"type": "enabled", "budget_tokens": thinking.budget()}),
             );
-            // 思考预算必须小于 max_tokens，否则 Anthropic 直接 400。
+            // 思考预算必须小于 max_tokens，否则 Anthropic 直接 400。自适应契约
+            // 不发预算，也就没有这条约束，不该为它把 max_tokens 抬上去。
             let max = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-            if max <= thinking.budget() {
+            if !contract.adaptive && max <= thinking.budget() {
                 body.insert("max_tokens".into(), json!(thinking.budget() + 4_096));
             }
         } else {
@@ -434,6 +472,14 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     }
 
     insert_common(&mut body, request, &mut degraded);
+    // 上面发的是手工形状；认不认它由**上游模型**决定，不由下游协议决定。
+    align_thinking(
+        &mut body,
+        &request.model,
+        request.origin,
+        request.thinking.as_ref(),
+        &mut degraded,
+    );
     Ok(Emitted {
         body: Value::Object(body),
         degraded: degraded.into_list(),
@@ -625,7 +671,10 @@ pub fn parse_event(event: Option<&str>, data: &Value) -> Vec<Event> {
                 id: field(message, "id"),
                 model: field(message, "model"),
             }];
-            let usage = parse_usage(message.and_then(|m| m.get("usage")));
+            let mut usage = parse_usage(message.and_then(|m| m.get("usage")));
+            // 开场的输出占位不能经跨协议转换变成最终的真实用量。
+            usage.output = None;
+            usage.reasoning = None;
             if !usage.is_empty() {
                 events.push(Event::Usage(usage));
             }
@@ -863,6 +912,249 @@ pub fn supports_output_format(format: Option<&OutputFormat>) -> bool {
     format.is_none()
 }
 
+// ------------------------------------------------------------ 思考契约（§14.6）
+
+/// 只认手工预算（`enabled`/`disabled` + `budget_tokens`）的老家族。
+///
+/// 这张表是**回落名单**：新的 Claude 版本不需要往这里加东西，只有想把某个
+/// 家族从自适应契约里排除出去时才需要动它。
+const LEGACY_THINKING_FAMILIES: &[&str] = &[
+    "claude-3", // 3、3.5、3.7
+    "claude-opus-4-0",
+    "claude-opus-4.0",
+    "claude-opus-4-1",
+    "claude-opus-4.1",
+    "claude-opus-4-5",
+    "claude-opus-4.5",
+    "claude-sonnet-4-0",
+    "claude-sonnet-4.0",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4.5",
+    "claude-haiku-4-5",
+    "claude-haiku-4.5",
+    "claude-opus-4-2025", // 带日期的 4.0 命名
+    "claude-sonnet-4-2025",
+];
+
+/// 自适应但还没有 `display`、也还收采样参数的一代。
+const ADAPTIVE_WITHOUT_DISPLAY: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-opus-4.6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4.6",
+];
+
+/// 上游模型对思考参数的接受契约。
+///
+/// 4.6 把手工预算换成了自适应思考（`thinking.type = "adaptive"` +
+/// `output_config.effort`），4.7 起连旧形状一起拒掉，还收走
+/// `temperature`/`top_p`/`top_k`。这些差异只能看**模型**：同一个
+/// `/v1/messages` 上游既可能是 4.5，也可能是 5.x。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingContract {
+    /// 用自适应形状表达思考，而不是 `enabled` + `budget_tokens`。
+    pub adaptive: bool,
+    /// 接受 `thinking.display`（4.7 起思考文本默认不回）。
+    pub display: bool,
+    /// 不接受 `temperature` / `top_p` / `top_k`。
+    pub no_sampling: bool,
+}
+
+impl ThinkingContract {
+    /// 手工预算：老 Claude 家族与非 Claude 的 Anthropic 兼容端点。
+    pub const MANUAL: Self = Self {
+        adaptive: false,
+        display: false,
+        no_sampling: false,
+    };
+
+    /// 按要发出去的那个模型名判断契约。
+    ///
+    /// 白名单式的版本号匹配会在下一个模型发布时失效——`claude-opus-5-5` 里
+    /// 没有任何 "4.x" 子串，按老路走下去就是把新模型 400 掉。所以这里反过来：
+    /// 只有**已知的老家族**回落到手工契约，其余 Claude（含还没见过的下一代）
+    /// 一律按现代契约走。
+    pub fn of(model: &str) -> Self {
+        let name = model.to_ascii_lowercase();
+        // Kimi / Moonshot 的 Anthropic 兼容端点实现了自适应契约（含 display）。
+        if name.contains("kimi") || name.contains("moonshot") {
+            return Self {
+                adaptive: true,
+                display: true,
+                no_sampling: false,
+            };
+        }
+        if !name.contains("claude") {
+            // GLM、qwen、minimax 这些 Anthropic 兼容端点只实现了老形状。
+            return Self::MANUAL;
+        }
+        if LEGACY_THINKING_FAMILIES
+            .iter()
+            .any(|family| name.contains(family))
+        {
+            return Self::MANUAL;
+        }
+        if ADAPTIVE_WITHOUT_DISPLAY
+            .iter()
+            .any(|family| name.contains(family))
+        {
+            return Self {
+                adaptive: true,
+                display: false,
+                no_sampling: false,
+            };
+        }
+        // 真实型号名里一定有版本数字（3、4.5、5.5、fable-5……）。没有数字的名字
+        // 多半是别名或自定义端点名，这时按手工契约走：两条路猜错的代价都是一个
+        // 400，但"老形状"至少是历史最长、兼容面最广的那一种。
+        if !name.chars().any(|c| c.is_ascii_digit()) {
+            return Self::MANUAL;
+        }
+        Self {
+            adaptive: true,
+            display: true,
+            no_sampling: true,
+        }
+    }
+}
+
+/// 客户端想要的思考形态，与上游模型无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThinkingIntent {
+    enabled: bool,
+    /// 客户端**显式**表达的档位；`None` 表示"没说要多少"。
+    effort: Option<Effort>,
+    display: Option<ThinkingDisplay>,
+}
+
+impl ThinkingIntent {
+    fn of(config: &ThinkingConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            effort: config.explicit_effort(),
+            display: config.display,
+        }
+    }
+
+    /// 只有请求体、没有中间格式时的回读（按上游模型名二次对齐用）。
+    fn from_body(body: &Map<String, Value>) -> Option<Self> {
+        let thinking = body.get("thinking");
+        let effort = body
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .and_then(Effort::parse)
+            .or_else(|| {
+                thinking
+                    .and_then(|thinking| thinking.get("budget_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|budget| Effort::from_budget(budget as u32))
+            });
+        if thinking.is_none() && effort.is_none() {
+            return None;
+        }
+        Some(Self {
+            enabled: thinking
+                .and_then(|thinking| thinking.get("type"))
+                .and_then(Value::as_str)
+                != Some("disabled"),
+            effort,
+            display: thinking
+                .and_then(|thinking| thinking.get("display"))
+                .and_then(Value::as_str)
+                .and_then(ThinkingDisplay::parse),
+        })
+    }
+}
+
+/// 把已经发射好的 Messages 请求体对齐到**真正要发出去的那个模型**的契约。
+///
+/// 跨协议路径上 `emit_request` 只看得见下游的逻辑模型名，而逻辑模型常常只是
+/// 一个别名（`claude-opus-5-5[1M]`、分组名……）。调用方因此可以在知道上游
+/// 模型之后再对齐一次。两次调用是同一条规则，可以重复执行：形状不对就改成
+/// 对的，已经对的不动。
+pub fn align_thinking(
+    body: &mut Map<String, Value>,
+    model: &str,
+    origin: Protocol,
+    thinking: Option<&ThinkingConfig>,
+    degraded: &mut Degradations,
+) {
+    let contract = ThinkingContract::of(model);
+    if contract.no_sampling {
+        // 4.7 起这三个参数一律不被接受：留着只会换回一个 400，按白名单降级。
+        for field in ["temperature", "top_p", "top_k"] {
+            if body.remove(field).is_some() {
+                degraded.drop(field);
+            }
+        }
+    }
+
+    let intent = match thinking {
+        Some(config) => Some(ThinkingIntent::of(config)),
+        None => ThinkingIntent::from_body(body),
+    };
+    let Some(intent) = intent else {
+        return;
+    };
+
+    if contract.adaptive {
+        body.remove("thinking");
+        body.remove("output_config");
+        if !intent.enabled {
+            // 自适应模型默认就思考，`{"type": "disabled"}` 会被上游 400 拒掉：
+            // 只能省掉这个字段，并把"客户端明确要求不思考"记成一次降级。
+            degraded.drop("thinking");
+            return;
+        }
+        let mut block = json!({"type": "adaptive"});
+        let display = match intent.display {
+            Some(display) => Some(display),
+            // 跨协议时思考文本要去填另一个协议的推理通道，而 4.7 起默认
+            // `omitted`——不显式要就一个字都拿不到。同协议交给客户端自己决定。
+            None if contract.display && origin != Protocol::AnthropicMessages => {
+                Some(ThinkingDisplay::Summarized)
+            }
+            None => None,
+        };
+        if let Some(display) = display {
+            block["display"] = json!(display.as_str());
+        }
+        body.insert("thinking".into(), block);
+        // 客户端没表态就不替它选档位：自适应模型的默认档位比中间格式猜的高。
+        if let Some(effort) = intent.effort {
+            body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+        }
+        return;
+    }
+
+    // 手工契约不认识 `adaptive` 与 `output_config`。发射出来的通常已经是老
+    // 形状，只有"逻辑模型名像新模型、真上游是老模型"时才需要改回来。
+    let adaptive_form = body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("adaptive");
+    if !adaptive_form {
+        return;
+    }
+    body.remove("output_config");
+    body.remove("thinking");
+    if !intent.enabled {
+        body.insert("thinking".into(), json!({"type": "disabled"}));
+        return;
+    }
+    let budget = intent.effort.unwrap_or(Effort::Medium).budget_tokens();
+    body.insert(
+        "thinking".into(),
+        json!({"type": "enabled", "budget_tokens": budget}),
+    );
+    let max = body.get("max_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+    if max <= budget {
+        body.insert("max_tokens".into(), json!(budget + 4_096));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1276,7 @@ mod tests {
             enabled: true,
             budget_tokens: None,
             effort: Some(Effort::High),
+            display: None,
         });
         let emitted = emit_request(&request).unwrap();
         let budget = emitted.body["thinking"]["budget_tokens"].as_u64().unwrap();
@@ -1082,5 +1375,231 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // -------------------------------------------------------- 思考契约（§14.6）
+
+    /// 5.x 的命名里没有任何 "4.x" 子串：契约必须由"是不是已知的老家族"决定，
+    /// 而不是由"认不认识这个版本号"决定——后者会在下一个模型发布时失效。
+    #[test]
+    fn thinking_contract_follows_the_model_family_not_the_version_number() {
+        assert!(!ThinkingContract::of("claude-opus-4-5").adaptive);
+        assert!(!ThinkingContract::of("us.anthropic.claude-sonnet-4-5-20250929-v1:0").adaptive);
+        assert!(ThinkingContract::of("claude-opus-4-6").adaptive);
+        assert!(!ThinkingContract::of("claude-opus-4-6").display);
+        assert!(ThinkingContract::of("claude-opus-5-5[1M]").adaptive);
+        assert!(ThinkingContract::of("claude-fable-5").no_sampling);
+        assert!(ThinkingContract::of("kimi-k2").adaptive);
+        assert!(ThinkingContract::of("claude-mythos-6").adaptive);
+        // 非 Claude 的 Anthropic 兼容端点还停在老形状上。
+        assert!(!ThinkingContract::of("glm-4.6").adaptive);
+        assert!(!ThinkingContract::of("gpt-6-astra-cc-format").adaptive);
+        // 没有版本数字的 Claude 名字认不出来，按兼容面最广的老形状走。
+        assert!(!ThinkingContract::of("claude-up").adaptive);
+        assert!(!ThinkingContract::of("Claude-Relay").adaptive);
+    }
+
+    #[test]
+    fn adaptive_models_get_adaptive_thinking_instead_of_a_budget() {
+        let mut request = Request::new(Protocol::OpenAiResponses, "claude-opus-5-5");
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::XHigh),
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert_eq!(emitted.body["thinking"]["type"], "adaptive");
+        assert!(
+            emitted.body["thinking"].get("budget_tokens").is_none(),
+            "新契约里预算字段会被 400 拒掉"
+        );
+        assert_eq!(emitted.body["output_config"]["effort"], "xhigh");
+        // 跨协议时替客户端要摘要，否则 4.7 起思考文本一个字都拿不到。
+        assert_eq!(emitted.body["thinking"]["display"], "summarized");
+        assert!(emitted.is_lossless(), "换成新形状不是降级");
+    }
+
+    #[test]
+    fn an_absent_level_is_not_replaced_by_a_guess() {
+        let mut request = Request::new(Protocol::OpenAiResponses, "claude-opus-5-5");
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: None,
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert_eq!(emitted.body["thinking"]["type"], "adaptive");
+        // 客户端没表态就用模型自己的默认档位，不替它挑一个 medium。
+        assert!(emitted.body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adaptive_models_never_receive_a_disabled_thinking_block() {
+        let mut request = Request::new(Protocol::OpenAiChat, "claude-sonnet-5");
+        request.thinking = Some(ThinkingConfig {
+            enabled: false,
+            budget_tokens: None,
+            effort: None,
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert!(
+            emitted.body.get("thinking").is_none(),
+            "省略才是新契约下关掉思考的写法"
+        );
+        assert_eq!(emitted.degraded, vec!["thinking".to_string()]);
+    }
+
+    #[test]
+    fn legacy_models_keep_the_manual_budget_and_its_max_tokens_guard() {
+        let mut request = Request::new(Protocol::OpenAiResponses, "claude-sonnet-4-5-20250929");
+        request.max_tokens = Some(4_096);
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::High),
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert_eq!(emitted.body["thinking"]["type"], "enabled");
+        assert_eq!(emitted.body["thinking"]["budget_tokens"], 16_384);
+        assert!(emitted.body.get("output_config").is_none());
+        let max = emitted.body["max_tokens"].as_u64().unwrap();
+        assert!(max > 16_384, "预算必须小于 max_tokens，否则上游直接 400");
+    }
+
+    #[test]
+    fn strict_models_drop_the_sampling_parameters_they_would_reject() {
+        let mut request = Request::new(Protocol::OpenAiChat, "claude-opus-5-5");
+        request.temperature = Some(0.3);
+        request.top_p = Some(0.9);
+        request.sampling.insert("top_k".into(), json!(40));
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::High),
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert!(emitted.body.get("temperature").is_none());
+        assert!(emitted.body.get("top_p").is_none());
+        assert!(emitted.body.get("top_k").is_none());
+        assert_eq!(
+            emitted.degraded,
+            vec!["temperature".to_string(), "top_p".into(), "top_k".into()]
+        );
+
+        // 4.5 系还收这些参数，不能顺手丢。
+        let mut legacy = Request::new(Protocol::OpenAiChat, "claude-opus-4-5");
+        legacy.temperature = Some(0.3);
+        legacy.sampling.insert("top_k".into(), json!(40));
+        let legacy = emit_request(&legacy).unwrap();
+        assert_eq!(legacy.body["temperature"], 0.3);
+        assert_eq!(legacy.body["top_k"], 40);
+        assert!(legacy.is_lossless());
+    }
+
+    #[test]
+    fn adaptive_thinking_and_effort_survive_parsing() {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 4_096,
+            "messages": [],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "max"}
+        });
+        let request = parse_request(&body).unwrap();
+        let thinking = request.thinking.unwrap();
+        assert!(thinking.enabled);
+        assert_eq!(thinking.effort, Some(Effort::Max));
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Omitted));
+        assert!(
+            request.unknown.is_empty(),
+            "output_config 是已知字段，不该把整条请求判成不可转换"
+        );
+        // 转给 Chat：Anthropic 专有的 max 折到 high，别的选择原样保留。
+        let emitted = crate::protocol::openai_chat::emit_request(&request).unwrap();
+        assert_eq!(emitted.body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn unexpressible_output_config_subfields_block_cross_protocol() {
+        let body = json!({
+            "model": "m", "max_tokens": 16, "messages": [],
+            "output_config": {"format": {"type": "json_schema"}}
+        });
+        let request = parse_request(&body).unwrap();
+        assert_eq!(request.unknown, vec!["output_config.format".to_string()]);
+        assert!(request.reject_inexpressible().is_err());
+    }
+
+    /// 逻辑模型名只是别名，真上游是老模型：按上游名再对齐一次要能改回来，
+    /// 而且重复执行不能改出新花样。
+    #[test]
+    fn alignment_follows_the_real_upstream_model_and_is_idempotent() {
+        let mut request = Request::new(Protocol::OpenAiChat, "claude-opus-5-5");
+        request.max_tokens = Some(4_096);
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::Max),
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert_eq!(emitted.body["thinking"]["type"], "adaptive");
+
+        let mut body = emitted.body.as_object().unwrap().clone();
+        let mut degraded = Degradations::default();
+        align_thinking(
+            &mut body,
+            "claude-opus-4-5",
+            Protocol::OpenAiChat,
+            request.thinking.as_ref(),
+            &mut degraded,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(
+            body.get("output_config").is_none(),
+            "老模型不认识 output_config"
+        );
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(body["max_tokens"].as_u64().unwrap() > budget);
+
+        let once = body.clone();
+        align_thinking(
+            &mut body,
+            "claude-opus-4-5",
+            Protocol::OpenAiChat,
+            request.thinking.as_ref(),
+            &mut degraded,
+        );
+        assert_eq!(body, once);
+        assert!(degraded.into_list().is_empty());
+    }
+
+    #[test]
+    fn adaptive_alignment_reads_the_intent_back_from_a_body_it_did_not_emit() {
+        let mut body = Map::new();
+        body.insert("model".into(), json!("claude-opus-5-5"));
+        body.insert("max_tokens".into(), json!(4_096));
+        body.insert(
+            "thinking".into(),
+            json!({"type": "enabled", "budget_tokens": 10_000}),
+        );
+        let mut degraded = Degradations::default();
+        align_thinking(
+            &mut body,
+            "claude-opus-5-5",
+            Protocol::AnthropicMessages,
+            None,
+            &mut degraded,
+        );
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+        // 同协议：客户端自己管 display，不替它加。
+        assert!(body["thinking"].get("display").is_none());
+        assert!(degraded.into_list().is_empty());
     }
 }

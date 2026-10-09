@@ -884,3 +884,95 @@ async fn responses_entry_reaches_a_messages_only_upstream() {
     assert_eq!(body["output"][0]["content"][0]["text"], "你好");
     assert_eq!(body["usage"]["input_tokens"], 10);
 }
+
+#[tokio::test]
+async fn a_modern_messages_upstream_gets_the_adaptive_contract_even_behind_an_alias() {
+    // 逻辑模型名只是个别名（"m1"），真上游是 5.x。发射时按逻辑名猜出来的是手工
+    // 形状，必须在上游模型名对齐后改成自适应形状——否则 5.x 直接 400：
+    // "claude-opus-5-5 requires adaptive thinking; omit thinking or use
+    //  thinking.type=adaptive and output_config.effort"。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "A",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = responses(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "input": "北京天气如何",
+            "reasoning": {"effort": "xhigh"},
+            "max_output_tokens": 512
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let seen = upstream.seen.lock().unwrap().last().unwrap().clone();
+    assert_eq!(seen.path, "/v1/messages");
+    assert_eq!(seen.body["model"], "claude-opus-5-5");
+    assert_eq!(seen.body["thinking"]["type"], "adaptive");
+    assert!(
+        seen.body["thinking"].get("budget_tokens").is_none(),
+        "新契约不接受手工预算：\n{}",
+        seen.body
+    );
+    // 跨协议时替客户端要摘要，否则 4.7 起思考文本一个字都拿不到。
+    assert_eq!(seen.body["thinking"]["display"], "summarized");
+    assert_eq!(seen.body["output_config"]["effort"], "xhigh");
+}
+
+#[tokio::test]
+async fn a_legacy_messages_upstream_is_not_sent_the_adaptive_shape() {
+    // 反过来的别名：逻辑名看起来是新模型，真上游是 4.5。自适应形状与
+    // output_config 对老模型都是 400，必须还原成手工预算。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "A",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            "claude-opus-5-5",
+            "claude-opus-4-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = responses(
+        &akhub,
+        json!({
+            "model": "claude-opus-5-5",
+            "input": "北京天气如何",
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 512
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let seen = upstream.seen.lock().unwrap().last().unwrap().clone();
+    assert_eq!(seen.body["model"], "claude-opus-4-5");
+    assert_eq!(seen.body["thinking"]["type"], "enabled");
+    assert!(
+        seen.body.get("output_config").is_none(),
+        "老模型不认识 output_config：\n{}",
+        seen.body
+    );
+    let budget = seen.body["thinking"]["budget_tokens"].as_u64().unwrap();
+    assert!(seen.body["max_tokens"].as_u64().unwrap() > budget);
+}
