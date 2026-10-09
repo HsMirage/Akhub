@@ -1,6 +1,6 @@
 [package]
 name = "akhub-desktop"
-version = "1.1.26"
+version = "1.1.27"
 edition = "2021"
 description = "Akhub 桌面外壳：以 sidecar 方式拉起 akhub 并打开本机管理后台"
 license-file = "../LICENSE"

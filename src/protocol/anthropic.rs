@@ -956,6 +956,8 @@ pub struct ThinkingContract {
     pub adaptive: bool,
     /// 接受 `thinking.display`（4.7 起思考文本默认不回）。
     pub display: bool,
+    /// 接受 `xhigh` 档位（4.7 起才有；4.6 只认 low/medium/high/max）。
+    pub xhigh: bool,
     /// 不接受 `temperature` / `top_p` / `top_k`。
     pub no_sampling: bool,
 }
@@ -965,6 +967,7 @@ impl ThinkingContract {
     pub const MANUAL: Self = Self {
         adaptive: false,
         display: false,
+        xhigh: false,
         no_sampling: false,
     };
 
@@ -981,6 +984,7 @@ impl ThinkingContract {
             return Self {
                 adaptive: true,
                 display: true,
+                xhigh: true,
                 no_sampling: false,
             };
         }
@@ -1001,6 +1005,7 @@ impl ThinkingContract {
             return Self {
                 adaptive: true,
                 display: false,
+                xhigh: false,
                 no_sampling: false,
             };
         }
@@ -1013,6 +1018,7 @@ impl ThinkingContract {
         Self {
             adaptive: true,
             display: true,
+            xhigh: true,
             no_sampling: true,
         }
     }
@@ -1123,6 +1129,14 @@ pub fn align_thinking(
         body.insert("thinking".into(), block);
         // 客户端没表态就不替它选档位：自适应模型的默认档位比中间格式猜的高。
         if let Some(effort) = intent.effort {
+            // 4.6 只认 low/medium/high/max：把 xhigh 原样发过去只会换回一个
+            // "This model does not support effort level 'xhigh'" 的 400，
+            // 折到它接受的最强档位。
+            let effort = if effort == Effort::XHigh && !contract.xhigh {
+                Effort::Max
+            } else {
+                effort
+            };
             body.insert("output_config".into(), json!({"effort": effort.as_str()}));
         }
         return;
@@ -1433,6 +1447,27 @@ mod tests {
         assert_eq!(emitted.body["thinking"]["type"], "adaptive");
         // 客户端没表态就用模型自己的默认档位，不替它挑一个 medium。
         assert!(emitted.body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn xhigh_is_folded_to_max_on_models_that_do_not_accept_it() {
+        // 4.6 只认 low/medium/high/max：xhigh 会被上游 400 拒掉。
+        let mut request = Request::new(Protocol::OpenAiResponses, "claude-opus-4-6");
+        request.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::XHigh),
+            display: None,
+        });
+        let emitted = emit_request(&request).unwrap();
+        assert_eq!(emitted.body["thinking"]["type"], "adaptive");
+        assert_eq!(emitted.body["output_config"]["effort"], "max");
+
+        // 4.7 起 xhigh 是独立档位，原样保留。
+        let mut modern = Request::new(Protocol::OpenAiResponses, "claude-opus-5-5");
+        modern.thinking = request.thinking;
+        let emitted = emit_request(&modern).unwrap();
+        assert_eq!(emitted.body["output_config"]["effort"], "xhigh");
     }
 
     #[test]
