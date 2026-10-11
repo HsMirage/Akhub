@@ -339,7 +339,12 @@ async fn set_key_concurrency(
 
 /// 按**明文**取账号内一把 Key 的凭据摘要（动态状态表的归类键）。
 fn key_digest(akhub: &Akhub, account_id: &str, secret: &str) -> String {
-    akhub.state.runtime.credentials.current().keys_of(account_id)
+    akhub
+        .state
+        .runtime
+        .credentials
+        .current()
+        .keys_of(account_id)
         .iter()
         .find(|key| key.secret.as_ref() == secret)
         .map(|key| key.credential_digest.clone())
@@ -1099,7 +1104,11 @@ async fn a_busy_bound_key_is_waited_for_instead_of_swapped() {
     // 给它足够时间去做选择：如果实现会静默换 Key，这一刻就已经打到第二把上了。
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
-        upstream.key_histogram().get("sk-other").copied().unwrap_or(0),
+        upstream
+            .key_histogram()
+            .get("sk-other")
+            .copied()
+            .unwrap_or(0),
         0,
         "绑定那把只是忙，绝不该换到另一把 Key（换了就打碎上游前缀缓存）：{:?}",
         upstream.key_histogram()
@@ -1110,7 +1119,11 @@ async fn a_busy_bound_key_is_waited_for_instead_of_swapped() {
     assert_eq!(holder.await.unwrap(), 200);
     assert_eq!(waiter.await.unwrap(), 200);
     assert_eq!(
-        upstream.key_histogram().get("sk-other").copied().unwrap_or(0),
+        upstream
+            .key_histogram()
+            .get("sk-other")
+            .copied()
+            .unwrap_or(0),
         0,
         "整个过程中第二把 Key 都不该被用到：{:?}",
         upstream.key_histogram()
@@ -1156,7 +1169,12 @@ async fn a_disabled_bound_key_still_yields_to_another_key() {
         200
     );
     assert!(
-        upstream.key_histogram().get("sk-other").copied().unwrap_or(0) > 0,
+        upstream
+            .key_histogram()
+            .get("sk-other")
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "绑定的 Key 被停用后必须换到另一把：{:?}",
         upstream.key_histogram()
     );
@@ -1190,16 +1208,16 @@ async fn a_429_also_pauses_the_key_that_was_used_in_a_multi_key_account() {
     .await;
 
     // 两把都启用 → 这是一个真正的多 Key 账号；两把都回 429。
-    upstream.script([Behavior::Status(429, Some(30)), Behavior::Status(429, Some(30))]);
+    upstream.script([
+        Behavior::Status(429, Some(30)),
+        Behavior::Status(429, Some(30)),
+    ]);
     upstream.fallback(Behavior::Status(429, Some(30)));
     let _ = chat(&akhub, plain_body("hi")).await;
 
     let histogram = upstream.key_histogram();
     let used: Vec<&String> = histogram.keys().collect();
-    assert!(
-        !used.is_empty(),
-        "请求必须打到上游：{histogram:?}"
-    );
+    assert!(!used.is_empty(), "请求必须打到上游：{histogram:?}");
 
     let health = &akhub.state.runtime.health;
     let cooling = |secret: &str| {
@@ -1226,16 +1244,21 @@ async fn a_429_also_pauses_the_key_that_was_used_in_a_multi_key_account() {
     }
 }
 
-
-
 #[tokio::test]
 async fn request_records_carry_the_key_that_served_them() {
     let upstream = FakeUpstream::spawn().await;
     let akhub = spawn_akhub().await;
     let account_id = wire_account_with_keys(
-        &akhub, "落库", &upstream.base_url,
-        &[KeySpec::new("first", "sk-first"), KeySpec::new("second", "sk-second")], 50,
-    ).await;
+        &akhub,
+        "落库",
+        &upstream.base_url,
+        &[
+            KeySpec::new("first", "sk-first"),
+            KeySpec::new("second", "sk-second"),
+        ],
+        50,
+    )
+    .await;
     set_key_enabled(&akhub, &account_id, 1, false).await;
     assert_eq!(chat(&akhub, plain_body("hi")).await.status(), 200);
 
@@ -1249,16 +1272,33 @@ async fn request_records_carry_the_key_that_served_them() {
         }
     }
     let record = records.first().expect("应当留下一条请求记录");
-    let expected_id = akhub.state.runtime.credentials.current()
-        .keys_of(&account_id).iter()
-        .find(|k| k.secret.as_ref() == "sk-first").unwrap().id.clone();
-    assert_eq!(record.key_id.as_deref(), Some(expected_id.as_str()),
-        "请求记录必须记下这次用的那把 Key 的行 ID");
-    assert_eq!(record.key_label.as_deref(), Some("first"),
-        "标签也要落库，诊断时不用再去解密数据库");
+    let expected_id = akhub
+        .state
+        .runtime
+        .credentials
+        .current()
+        .keys_of(&account_id)
+        .iter()
+        .find(|k| k.secret.as_ref() == "sk-first")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        record.key_id.as_deref(),
+        Some(expected_id.as_str()),
+        "请求记录必须记下这次用的那把 Key 的行 ID"
+    );
+    assert_eq!(
+        record.key_label.as_deref(),
+        Some("first"),
+        "标签也要落库，诊断时不用再去解密数据库"
+    );
     let attempt = record.attempts_detail.first().expect("应当留下尝试明细");
-    assert_eq!(attempt.key_id.as_deref(), Some(expected_id.as_str()),
-        "尝试明细同样要记下用的是哪把 Key");
+    assert_eq!(
+        attempt.key_id.as_deref(),
+        Some(expected_id.as_str()),
+        "尝试明细同样要记下用的是哪把 Key"
+    );
 }
 
 // ------------------------------------------------------------- 辅助结构

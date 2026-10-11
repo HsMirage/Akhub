@@ -1099,9 +1099,7 @@ impl Walk<'_> {
             // 全部在忙不是失败：交给上层的排队路径，与 §13.6 同一条规则。
             crate::credential::KeyChoice::Busy => Picked::Busy,
             // 绑定的那把忙：等它，不换 Key（§2.2 的不变量 B）。
-            crate::credential::KeyChoice::BoundBusy(key) => {
-                Picked::BoundBusy(Arc::clone(key))
-            }
+            crate::credential::KeyChoice::BoundBusy(key) => Picked::BoundBusy(Arc::clone(key)),
         }
     }
 
@@ -1133,9 +1131,7 @@ impl Walk<'_> {
             return Flow::Continue;
         }
         // 粘性/钉住命中的那把要跨重试保留：换 Key 只发生在凭据真的被拒绝之后。
-        let mut digest = credential
-            .as_ref()
-            .map(|key| key.credential_digest.clone());
+        let mut digest = credential.as_ref().map(|key| key.credential_digest.clone());
         let mut admission = Some(admission);
         let mut switches = 0usize;
 
