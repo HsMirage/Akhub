@@ -287,6 +287,65 @@ async fn set_key_enabled(akhub: &Akhub, account_id: &str, index: usize, enabled:
     akhub.state.reload_config().await.unwrap();
 }
 
+/// 按**明文**定位账号内的一把 Key，改它的并发上限（`None` = 不限）。
+///
+/// 按明文而不是按下标定位：Key 池的排序是 `created_at, id`，而 SQLite 的时间
+/// 戳只到秒——同一秒内建的两把 Key 会退化成按随机 id 排，下标不可靠。
+/// 明文与摘要是一一对应的，用它定位才是确定的。
+///
+/// "忙"与"坏"必须能分开构造：这把 Key 满了（忙）和这把 Key 被停用（坏）在
+/// 调度上是两种完全不同的处理。
+async fn set_key_concurrency(
+    akhub: &Akhub,
+    account_id: &str,
+    secret: &str,
+    max_concurrency: Option<u32>,
+) {
+    let mut rows: Vec<AccountKeyWrite> = Vec::new();
+    for row in akhub
+        .state
+        .store
+        .list_account_key_rows(account_id)
+        .await
+        .unwrap()
+    {
+        let plaintext = akhub.state.cipher.open(&row.sealed_key).unwrap();
+        let plaintext = String::from_utf8_lossy(&plaintext).to_string();
+        let limits = if plaintext == secret {
+            Limits {
+                max_concurrency,
+                ..Limits::default()
+            }
+        } else {
+            row.limits
+        };
+        rows.push(AccountKeyWrite {
+            id: row.id,
+            label: row.label,
+            sealed_key: row.sealed_key,
+            credential_digest: akhub::security::credential_digest(&plaintext),
+            limits,
+            enabled: row.enabled,
+        });
+    }
+    akhub
+        .state
+        .store
+        .upsert_account_keys(account_id, &rows)
+        .await
+        .unwrap();
+    akhub.state.reload_config().await.unwrap();
+}
+
+/// 按**明文**取账号内一把 Key 的凭据摘要（动态状态表的归类键）。
+fn key_digest(akhub: &Akhub, account_id: &str, secret: &str) -> String {
+    akhub.state.runtime.credentials.current().keys_of(account_id)
+        .iter()
+        .find(|key| key.secret.as_ref() == secret)
+        .map(|key| key.credential_digest.clone())
+        .unwrap_or_else(|| panic!("账号里没有明文为 {secret} 的 Key"))
+}
+
 /// 换 Key 次数有上限：一个账号全是坏 Key 时，一次请求不会打出几十次上游调用。
 #[tokio::test]
 async fn key_switching_is_capped_per_request() {
@@ -973,6 +1032,233 @@ async fn an_account_without_keys_fails_before_reaching_the_upstream() {
         !message.contains("Key"),
         "客户错误信息不得透露上游凭据状态：{message}"
     );
+}
+
+// ------------------------------------ 粘性：绑定的 Key 只是"忙"时必须等它
+
+/// 绑定的 Key 只是**忙**（并发名额占满）时，请求必须等它，而不是换池里另一把。
+///
+/// 上游的前缀缓存按凭据隔离（实测：同一前缀换 Key 立刻 `cached=None`，换回来
+/// 又命中），所以换 Key 等于把整段缓存作废。设计文档 §2.2 把允许换 Key 的条件
+/// 写得很死——只有绑定那把**不再合格**（停用、熔断、额度耗尽、被删）时才换；
+/// "限额满"要超出等待预算之后才降级成换 Key。"忙"不是"坏"。
+///
+/// 构造：绑定的那把并发上限 1，另一把不限。先用 Hang 占住绑定那把的唯一名额，
+/// 再发同一个前缀。若实现退化成"回落到抽签"，第二个请求会立刻跑到另一把 Key 上。
+#[tokio::test]
+async fn a_busy_bound_key_is_waited_for_instead_of_swapped() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let account_id = wire_account_with_keys(
+        &akhub,
+        "忙绑定",
+        &upstream.base_url,
+        &[
+            KeySpec::new("bound", "sk-bound"),
+            KeySpec::new("other", "sk-other"),
+        ],
+        50,
+    )
+    .await;
+
+    // 把 "other" 关掉，先让粘性绑定确定地落在 "bound" 上。
+    set_key_enabled(&akhub, &account_id, 1, false).await;
+    assert_eq!(
+        chat(&akhub, sticky_body("项目", "第一轮")).await.status(),
+        200
+    );
+    assert_eq!(
+        upstream.key_histogram().get("sk-bound").copied(),
+        Some(1),
+        "第一次应当落在 bound 上：{:?}",
+        upstream.key_histogram()
+    );
+    // 绑定已经落在 bound 上；现在把 other 放回来（可用），并给 bound 设并发 1。
+    set_key_enabled(&akhub, &account_id, 1, true).await;
+    set_key_concurrency(&akhub, &account_id, "sk-bound", Some(1)).await;
+
+    // 占住第一把 Key 的唯一并发名额。
+    upstream.script([Behavior::Hang]);
+    let base_url = akhub.base_url.clone();
+    let key = akhub.key.clone();
+    let holder = tokio::spawn(async move {
+        common::chat_at(&base_url, &key, sticky_body("项目", "占位"))
+            .await
+            .status()
+    });
+    upstream.wait_for_requests(2).await;
+
+    // 同一个前缀再来一次：绑定的那把满了，但它是"忙"不是"坏"。
+    let base_url = akhub.base_url.clone();
+    let key = akhub.key.clone();
+    let waiter = tokio::spawn(async move {
+        common::chat_at(&base_url, &key, sticky_body("项目", "第二轮"))
+            .await
+            .status()
+    });
+    // 给它足够时间去做选择：如果实现会静默换 Key，这一刻就已经打到第二把上了。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        upstream.key_histogram().get("sk-other").copied().unwrap_or(0),
+        0,
+        "绑定那把只是忙，绝不该换到另一把 Key（换了就打碎上游前缀缓存）：{:?}",
+        upstream.key_histogram()
+    );
+
+    // 放掉占位请求：等待者应当拿到名额并成功，全程只用绑定那把。
+    upstream.release();
+    assert_eq!(holder.await.unwrap(), 200);
+    assert_eq!(waiter.await.unwrap(), 200);
+    assert_eq!(
+        upstream.key_histogram().get("sk-other").copied().unwrap_or(0),
+        0,
+        "整个过程中第二把 Key 都不该被用到：{:?}",
+        upstream.key_histogram()
+    );
+}
+
+/// 绑定那把**真的坏了**（被停用）时才允许在同一账号内换 Key。
+///
+/// 与上一条互为对照：区分"忙"与"坏"正是这次修正的核心。
+#[tokio::test]
+async fn a_disabled_bound_key_still_yields_to_another_key() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let account_id = wire_account_with_keys(
+        &akhub,
+        "坏绑定",
+        &upstream.base_url,
+        &[
+            KeySpec::new("bound", "sk-bound"),
+            KeySpec::new("other", "sk-other"),
+        ],
+        50,
+    )
+    .await;
+
+    // 先只留 bound 可用，让粘性绑定确定地落在它身上。
+    set_key_enabled(&akhub, &account_id, 1, false).await;
+    assert_eq!(
+        chat(&akhub, sticky_body("项目", "第一轮")).await.status(),
+        200
+    );
+    assert_eq!(
+        upstream.key_histogram().get("sk-bound").copied(),
+        Some(1),
+        "第一次应当落在 bound 上：{:?}",
+        upstream.key_histogram()
+    );
+    // 把 other 放回来，再停用绑定的 bound：它"不再合格"，必须让位。
+    set_key_enabled(&akhub, &account_id, 1, true).await;
+    set_key_enabled(&akhub, &account_id, 0, false).await;
+    assert_eq!(
+        chat(&akhub, sticky_body("项目", "第二轮")).await.status(),
+        200
+    );
+    assert!(
+        upstream.key_histogram().get("sk-other").copied().unwrap_or(0) > 0,
+        "绑定的 Key 被停用后必须换到另一把：{:?}",
+        upstream.key_histogram()
+    );
+}
+
+// ------------------------------------------ 429 落到这次真正用的那把 Key 上
+
+/// 多 Key 账号里，429 除了记在"账号 + 模型"上，还要记在**这次用的那把 Key** 上。
+///
+/// 上游的限流可能是按凭据计的，而 Key 池里每把 Key 是独立额度：只记目标会让
+/// "某把 Key 被限流"连累同账号其他 Key，也会让这把 Key 在下一轮抽签里继续被
+/// 选中、继续撞 429（§4.2.1、§12.3）。
+///
+/// 两把 Key 都启用（这样才是真正的"多 Key 账号"），但**哪一把被抽中不确定**，
+/// 所以让两把都回 429，再用假上游记录的凭据反查"这次到底用了哪把"，断言冷却的
+/// 正好是它。这样断言与抽签结果无关，不会因为抽到另一把而假绿。
+#[tokio::test]
+async fn a_429_also_pauses_the_key_that_was_used_in_a_multi_key_account() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let account_id = wire_account_with_keys(
+        &akhub,
+        "多Key限流",
+        &upstream.base_url,
+        &[
+            KeySpec::new("first", "sk-first"),
+            KeySpec::new("second", "sk-second"),
+        ],
+        50,
+    )
+    .await;
+
+    // 两把都启用 → 这是一个真正的多 Key 账号；两把都回 429。
+    upstream.script([Behavior::Status(429, Some(30)), Behavior::Status(429, Some(30))]);
+    upstream.fallback(Behavior::Status(429, Some(30)));
+    let _ = chat(&akhub, plain_body("hi")).await;
+
+    let histogram = upstream.key_histogram();
+    let used: Vec<&String> = histogram.keys().collect();
+    assert!(
+        !used.is_empty(),
+        "请求必须打到上游：{histogram:?}"
+    );
+
+    let health = &akhub.state.runtime.health;
+    let cooling = |secret: &str| {
+        let digest = key_digest(&akhub, &account_id, secret);
+        health
+            .key(&akhub::credential::credential_id(&account_id, &digest))
+            .quota_exhausted()
+    };
+
+    // 被用过的那把（可能不止一把，取决于是否换 Key 重试）必须全部进入冷却；
+    // 没被用过的那把绝不能受连累。
+    for secret in ["sk-first", "sk-second"] {
+        if histogram.contains_key(secret) {
+            assert!(
+                cooling(secret),
+                "{secret} 被 429 打过，必须进入冷却（只记目标的话这里会漏）：{histogram:?}"
+            );
+        } else {
+            assert!(
+                !cooling(secret),
+                "{secret} 没被用过，不该被别的 Key 的 429 连累：{histogram:?}"
+            );
+        }
+    }
+}
+
+
+
+#[tokio::test]
+async fn request_records_carry_the_key_that_served_them() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let account_id = wire_account_with_keys(
+        &akhub, "落库", &upstream.base_url,
+        &[KeySpec::new("first", "sk-first"), KeySpec::new("second", "sk-second")], 50,
+    ).await;
+    set_key_enabled(&akhub, &account_id, 1, false).await;
+    assert_eq!(chat(&akhub, plain_body("hi")).await.status(), 200);
+
+    // 请求记录由后台异步写入：等它落库再断言。
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if !records.is_empty() {
+            break;
+        }
+    }
+    let record = records.first().expect("应当留下一条请求记录");
+    let expected_id = akhub.state.runtime.credentials.current()
+        .keys_of(&account_id).iter()
+        .find(|k| k.secret.as_ref() == "sk-first").unwrap().id.clone();
+    assert_eq!(record.key_id.as_deref(), Some(expected_id.as_str()),
+        "请求记录必须记下这次用的那把 Key 的行 ID");
+    assert_eq!(record.key_label.as_deref(), Some("first"),
+        "标签也要落库，诊断时不用再去解密数据库");
+    let attempt = record.attempts_detail.first().expect("应当留下尝试明细");
+    assert_eq!(attempt.key_id.as_deref(), Some(expected_id.as_str()),
+        "尝试明细同样要记下用的是哪把 Key");
 }
 
 // ------------------------------------------------------------- 辅助结构

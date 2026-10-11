@@ -398,6 +398,7 @@ mod tests {
                     logical_model: "m".into(),
                     account_id: None,
                     target_id: None,
+                    key_id: None,
                     endpoint: None,
                     upstream_id: None,
                     sealed_body: None,

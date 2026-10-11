@@ -676,6 +676,8 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
             filter_summary: None,
             filter_details: None,
             selected_layer: None,
+            key_id: None,
+            key_label: None,
             attempts_detail: Vec::new(),
         }])
         .await
@@ -875,6 +877,8 @@ async fn a_batch_unselect_of_a_traffic_heavy_model_needs_confirmation() {
             filter_summary: None,
             filter_details: None,
             selected_layer: None,
+            key_id: None,
+            key_label: None,
             attempts_detail: Vec::new(),
         }])
         .await

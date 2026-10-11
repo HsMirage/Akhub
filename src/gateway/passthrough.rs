@@ -75,6 +75,12 @@ enum Picked {
     Ready(Option<Arc<crate::credential::Credential>>),
     /// 账号里所有 Key 都只是忙——等一会儿就有名额。
     Busy,
+    /// 绑定/钉住的那把 Key 只是忙：应当**等它**，而不是换一把别的。
+    ///
+    /// 与 `Busy` 分开是必要的：`Busy` 表示"任意一把的名额都能唤醒我"，
+    /// 而这里必须只等**这一把**——否则唤醒之后重新抽签会落到别的 Key 上，
+    /// 上游按凭据隔离的前缀缓存照样被作废（§2.2 的不变量 B）。
+    BoundBusy(Arc<crate::credential::Credential>),
     /// 账号一把能用的 Key 都没有。
     Unavailable(String),
 }
@@ -779,7 +785,7 @@ impl Walk<'_> {
             match self.select_credential(candidate, None, None, None) {
                 Picked::Ready(credential) => match self.try_admit(candidate, credential.as_ref()) {
                     Ok(admission) => {
-                        match self.run(candidate, admission, sticky_key, None, None).await {
+                        match self.run(candidate, admission, sticky_key, credential).await {
                             Flow::Continue => {}
                             other => return Err(other),
                         }
@@ -788,8 +794,9 @@ impl Walk<'_> {
                     Err(reason) => self.note_unavailable(candidate, reason),
                 },
                 // 选不出 Key（全忙或一把能用的都没有）在本层排队等名额：
-                // 与 §13.6 同一条规则，忙不等于坏。
-                Picked::Busy => busy.push(candidate),
+                // 与 §13.6 同一条规则，忙不等于坏。绑定那把忙也走同一条路——
+                // 排队阶段会**只为它**等名额（§2.2 的不变量 B）。
+                Picked::Busy | Picked::BoundBusy(_) => busy.push(candidate),
                 // 没有可用 Key 是"坏"：这个候选本次彻底不可用。
                 Picked::Unavailable(message) => {
                     self.last = Some((ErrorCode::NoEligibleTarget, message));
@@ -844,8 +851,9 @@ impl Walk<'_> {
                 let candidate = pending[index];
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
                     Picked::Ready(credential) => credential,
-                    // 忙：留在 pending 里，稍后按信号量唤醒再试。
-                    Picked::Busy => {
+                    // 忙：留在 pending 里，稍后按信号量唤醒再试。绑定那把忙
+                    // 同样留在这里——下面的名额计算会只为它等。
+                    Picked::Busy | Picked::BoundBusy(_) => {
                         index += 1;
                         continue;
                     }
@@ -859,10 +867,7 @@ impl Walk<'_> {
                 match self.try_admit(candidate, credential.as_ref()) {
                     Ok(admission) => {
                         pending.remove(index);
-                        match self
-                            .run(candidate, admission, sticky_key, pinned, preferred)
-                            .await
-                        {
+                        match self.run(candidate, admission, sticky_key, credential).await {
                             Flow::Continue => {
                                 if sticky
                                     && !retried_after_429
@@ -915,7 +920,9 @@ impl Walk<'_> {
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
                     Picked::Ready(credential) => credential,
                     // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
-                    // 用短轮询比干等到底更早恢复。
+                    // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
+                    // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
+                    Picked::BoundBusy(key) => Some(key),
                     Picked::Busy | Picked::Unavailable(_) => None,
                 };
                 matches!(
@@ -939,7 +946,13 @@ impl Walk<'_> {
                     match self.select_credential(candidate, pinned, preferred, None) {
                         Picked::Ready(credential) => {
                             let caller = health::Caller {
-                                key_id: credential.as_ref().map(|key| key.id.as_str()),
+                                // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
+                                // 用 `credential_id(account_id, digest)` 归类 Key 状态，
+                                // 传行 ID 会另开一份永远匹配不上的"影子状态"——
+                                // 排队等的是影子，真正那把 Key 的名额照样被占着。
+                                key_id: credential
+                                    .as_ref()
+                                    .map(|key| key.credential_digest.as_str()),
                                 ..caller
                             };
                             self.forward
@@ -947,6 +960,20 @@ impl Walk<'_> {
                                 .runtime
                                 .health
                                 .capacity(caller, admission_limits(candidate, credential.as_ref()))
+                        }
+                        // 绑定的那把忙：**只等它**。等"任意一把"会在唤醒后
+                        // 重新抽签落到别的 Key 上，上游按凭据隔离的前缀缓存
+                        // 照样作废——这正是要修的病（§2.2 的不变量 B）。
+                        Picked::BoundBusy(key) => {
+                            let caller = health::Caller {
+                                key_id: Some(key.credential_digest.as_str()),
+                                ..caller
+                            };
+                            self.forward
+                                .state
+                                .runtime
+                                .health
+                                .capacity(caller, admission_limits(candidate, Some(&key)))
                         }
                         // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
                         // 否则"两把都满"会等一个永远不会到来的唤醒。
@@ -987,8 +1014,9 @@ impl Walk<'_> {
                 // Key 的健康状态都可能已经变了（§13.6）。
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
                     Picked::Ready(credential) => credential,
-                    // 忙：名额已经到手，先还回去，回到等待循环。
-                    Picked::Busy => continue,
+                    // 忙：名额已经到手，先还回去，回到等待循环。绑定那把忙也
+                    // 一样——唤醒的是**它的**名额，拿到手就能直接用它。
+                    Picked::Busy | Picked::BoundBusy(_) => continue,
                     Picked::Unavailable(message) => {
                         self.last = Some((ErrorCode::NoEligibleTarget, message));
                         self.last_public = None;
@@ -999,10 +1027,7 @@ impl Walk<'_> {
                 match self.admit_with_permit(candidate, credential.as_ref(), permit) {
                     Ok(admission) => {
                         pending.remove(index);
-                        match self
-                            .run(candidate, admission, sticky_key, pinned, preferred)
-                            .await
-                        {
+                        match self.run(candidate, admission, sticky_key, credential).await {
                             Flow::Continue => {}
                             other => return other,
                         }
@@ -1073,6 +1098,10 @@ impl Walk<'_> {
             )),
             // 全部在忙不是失败：交给上层的排队路径，与 §13.6 同一条规则。
             crate::credential::KeyChoice::Busy => Picked::Busy,
+            // 绑定的那把忙：等它，不换 Key（§2.2 的不变量 B）。
+            crate::credential::KeyChoice::BoundBusy(key) => {
+                Picked::BoundBusy(Arc::clone(key))
+            }
         }
     }
 
@@ -1082,13 +1111,18 @@ impl Walk<'_> {
     ///
     /// 凭据级失败（401/403、额度耗尽）会在**同一个目标内换成另一把 Key** 重试，
     /// 换 Key 次数受 [`MAX_KEY_SWITCHES_PER_TARGET`] 限制（§4.2.1）。
+    ///
+    /// `credential` 是**调用方已经选定并据此完成准入**的那把 Key。这里绝不能再
+    /// 选一次：调用方（`try_candidates` / `wait_and_run`）选完之后立刻用**那一把**
+    /// 的额度做了准入，占的是它的并发名额。重选不仅可能选出另一把（"名额记在 A
+    /// 上、请求发给 B"，不变量 A 被破坏），还会让刚占下名额的那把 Key 在自己的
+    /// 准入检查里显示"已满"——它会把自己挡在门外。
     async fn run(
         &mut self,
         candidate: &routing::Candidate,
         admission: health::Admission,
         sticky_key: &Option<(sticky::Key, sticky::Origin)>,
-        pinned: Option<&str>,
-        preferred: Option<&str>,
+        mut credential: Option<Arc<crate::credential::Credential>>,
     ) -> Flow {
         if let Err((code, message)) = self.recheck_multiplier(candidate) {
             // 倍率终检发生在准入之后；终检失败时本次请求从未发给上游，
@@ -1098,29 +1132,10 @@ impl Walk<'_> {
             self.last_public = None;
             return Flow::Continue;
         }
-        // 这次调用用哪把 Key。选到之后**整个请求内不再改变**，除非换 Key 重试
-        // 显式发生——这就是"一次下游调用只使用一把 Key"（不变量 A）。
-        //
-        // 所有 Key 都只是"忙"时把名额还回去：调用方（`try_candidates` /
-        // `wait_and_run`）会把这个候选放进排队集合，等到有名额再回来。在这里
-        // 直接放弃会让"两把 Key 都满"变成一个立刻失败的账号，而不是等一会儿
-        // 就能用的账号（§13.6）。
-        let first = match self.select_credential(candidate, pinned, preferred, None) {
-            Picked::Ready(credential) => credential,
-            Picked::Busy => {
-                admission.cancel_before_upstream();
-                return Flow::Continue;
-            }
-            Picked::Unavailable(message) => {
-                admission.cancel_before_upstream();
-                self.last = Some((ErrorCode::NoEligibleTarget, message));
-                self.last_public = None;
-                return Flow::Continue;
-            }
-        };
         // 粘性/钉住命中的那把要跨重试保留：换 Key 只发生在凭据真的被拒绝之后。
-        let mut digest = first.as_ref().map(|key| key.credential_digest.clone());
-        let mut credential = first;
+        let mut digest = credential
+            .as_ref()
+            .map(|key| key.credential_digest.clone());
         let mut admission = Some(admission);
         let mut switches = 0usize;
 
@@ -1257,6 +1272,9 @@ impl Walk<'_> {
                                 upstream_id: seed.upstream_id,
                                 account_id: Some(candidate.target.account.id.clone()),
                                 target_id: Some(candidate.target.target.id.clone()),
+                                // 创建这条响应用的那把 Key：续写必须回到它
+                                // （§15.1，凭据隔离的资源）。
+                                key_id: credential.as_ref().map(|key| key.id.clone()),
                                 endpoint: Some(seed.endpoint),
                             },
                             entry_body: self.forward.body.clone(),
@@ -1740,11 +1758,30 @@ impl Walk<'_> {
         credential: Option<&Arc<crate::credential::Credential>>,
     ) -> Result<health::Admission, health::Unavailable> {
         let caller = admission_caller(candidate, credential);
-        self.forward.state.runtime.health.try_admit(
-            caller,
-            admission_limits(candidate, credential),
-            self.estimated_tokens,
-        )
+        let shared = self.account_is_shared(&candidate.target.account.id);
+        Ok(self
+            .forward
+            .state
+            .runtime
+            .health
+            .try_admit(
+                caller,
+                admission_limits(candidate, credential),
+                self.estimated_tokens,
+            )?
+            .with_shared_key(shared))
+    }
+
+    /// 这个账号的 Key 池里是不是有多把启用中的 Key（§4.2.1）。
+    ///
+    /// 只影响 429 的落点：多 Key 账号里限流要同时记在用的那把 Key 上。
+    fn account_is_shared(&self, account_id: &str) -> bool {
+        self.forward
+            .state
+            .runtime
+            .credentials
+            .current()
+            .is_shared(account_id)
     }
 
     fn admit_with_permit(
@@ -1754,12 +1791,19 @@ impl Walk<'_> {
         permit: health::CapacityPermit,
     ) -> Result<health::Admission, health::Unavailable> {
         let caller = admission_caller(candidate, credential);
-        self.forward.state.runtime.health.admit_with_permit(
-            caller,
-            admission_limits(candidate, credential),
-            self.estimated_tokens,
-            permit,
-        )
+        let shared = self.account_is_shared(&candidate.target.account.id);
+        Ok(self
+            .forward
+            .state
+            .runtime
+            .health
+            .admit_with_permit(
+                caller,
+                admission_limits(candidate, credential),
+                self.estimated_tokens,
+                permit,
+            )?
+            .with_shared_key(shared))
     }
 
     fn check(
@@ -1920,6 +1964,9 @@ impl Walk<'_> {
             filter_summary: self.telemetry.filter_summary.clone(),
             filter_details: self.telemetry.filter_details.clone(),
             selected_layer: self.telemetry.selected_layer,
+            // 这次请求最终落在哪把 Key 上（§3.3）。诊断字段，绝不含凭据本身。
+            key_id: self.telemetry.key_id.clone(),
+            key_label: self.telemetry.key_label.clone(),
             attempts_detail: self.attempt_log.clone(),
         }
     }
@@ -1983,6 +2030,10 @@ impl Walk<'_> {
             outcome: outcome.to_string(),
             error_code: error_code.map(|code| code.as_str().to_string()),
             counts_against_budget,
+            // 这一次尝试用的是哪把 Key：换 Key 重试时同一条请求会留下多条
+            // 不同 Key 的明细（§7.3）。
+            key_id: self.telemetry.key_id.clone(),
+            key_label: self.telemetry.key_label.clone(),
         });
         // 成功的尝试就是这个端点"已确认支持"的证据（§14.3 第 1、4 档）。
         // 只认真正服务过的：发出去被拒绝不构成支持证据。
@@ -2296,7 +2347,6 @@ async fn attempt_inner(
     };
     // 异步生图任务要记住"是哪把 Key 接的单"：上游的任务按凭据隔离，
     // 轮询换一把 Key 去问，它只会当作没这个任务（§4.2.1 的不变量 A）。
-    let key_digest = credential.map(|credential| credential.credential_digest.as_str());
     if streamed {
         commit_stream(
             forward,
@@ -2306,11 +2356,12 @@ async fn attempt_inner(
             status,
             headers_wait,
             crate::security::redact::ErrorRedactor::new(&account.name, &account.base_url, &api_key),
+            credential,
         )
         .await
     } else {
         commit_body(
-            forward, target, prepared, response, status, sent_at, key_digest,
+            forward, target, prepared, response, status, sent_at, credential,
         )
         .await
     }
@@ -2334,6 +2385,7 @@ fn upstream_streams(response: &reqwest::Response) -> bool {
 ///
 /// 同协议时字节原样转发，一次都不重新编码；跨协议时交给
 /// [`translate::commit_stream`]，判据从"上游的字节"换成"中间事件"。
+#[allow(clippy::too_many_arguments)]
 async fn commit_stream(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
@@ -2342,6 +2394,8 @@ async fn commit_stream(
     status: StatusCode,
     headers_wait: Duration,
     redactor: crate::security::redact::ErrorRedactor,
+    // 这次尝试用的那把 Key（§4.2.1 的不变量 A）：Responses 状态链要记住它。
+    credential: Option<&Arc<crate::credential::Credential>>,
 ) -> Result<Success, AttemptFailure> {
     let downstream = forward.endpoint.protocol();
     let upstream_protocol = prepared.endpoint.protocol();
@@ -2362,6 +2416,7 @@ async fn commit_stream(
                 &serde_json::Value::Null,
                 None,
                 upstream_protocol,
+                credential,
             )
             .await;
             Some(StreamStateSeed {
@@ -2456,6 +2511,7 @@ async fn commit_stream(
                                     .unwrap_or(&serde_json::Value::Null),
                                 None,
                                 upstream_protocol,
+                                credential,
                             )
                             .await;
                             let body = translate::passthrough_responses_stream(
@@ -2614,8 +2670,11 @@ async fn commit_body(
     response: reqwest::Response,
     status: StatusCode,
     sent_at: Instant,
-    key_digest: Option<&str>,
+    // 这次尝试用的那把 Key（§4.2.1 的不变量 A）：异步生图任务要记住它，
+    // Responses 状态链同样要记住它。
+    credential: Option<&Arc<crate::credential::Credential>>,
 ) -> Result<Success, AttemptFailure> {
+    let key_digest = credential.map(|credential| credential.credential_digest.as_str());
     let headers = response.headers().clone();
     let bytes = read_upstream_body(response, MAX_UPSTREAM_BODY_BYTES)
         .await
@@ -2686,6 +2745,7 @@ async fn commit_body(
                 &parsed,
                 Some(&value),
                 upstream_protocol,
+                credential,
             )
             .await;
             Body::from(value.to_string())
@@ -2721,6 +2781,7 @@ async fn commit_body(
                 &value,
                 Some(&value),
                 upstream_protocol,
+                credential,
             )
             .await;
             Body::from(value.to_string())
@@ -2756,6 +2817,7 @@ async fn commit_body(
 /// 请求体加输出项。**在返回响应之前同步落库**：客户端拿到响应 ID 后可能
 /// 立刻引用它，晚一步写入就会出现竞态。写失败只记日志——状态链是增强
 /// 能力，不能让它影响主流程。
+#[allow(clippy::too_many_arguments)]
 async fn record_response_state(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
@@ -2764,6 +2826,9 @@ async fn record_response_state(
     upstream_body: &serde_json::Value,
     final_response: Option<&serde_json::Value>,
     upstream_protocol: Protocol,
+    // 创建这条响应用的那把 Key（§4.2.1 的不变量 A、§15.1）。上游的
+    // `resp_xxx` 按凭据隔离，续写与生命周期代理必须回到同一把 Key。
+    credential: Option<&Arc<crate::credential::Credential>>,
 ) {
     // 只有上游本身是 Responses 时才有可续链的上游 ID；跨协议转来的响应
     // 没有原生 Responses ID，续链只能靠保存的正文。
@@ -2793,6 +2858,7 @@ async fn record_response_state(
             upstream_id,
             account_id: Some(account_id),
             target_id: Some(target_id),
+            key_id: credential.map(|key| key.id.clone()),
             endpoint: Some(endpoint),
         },
         &entry_body,

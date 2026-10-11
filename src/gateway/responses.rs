@@ -812,6 +812,11 @@ pub struct PendingState {
     pub upstream_id: Option<String>,
     pub account_id: Option<String>,
     pub target_id: Option<String>,
+    /// 创建这条响应用的那把 Key 的行 ID（§4.2.1、§15.1）。
+    ///
+    /// 上游的 `resp_xxx` 按凭据隔离，续写与生命周期代理必须回到同一把 Key；
+    /// 多 Key 账号里"账号对、Key 不对"会被上游当成 404，必须能在记录里区分。
+    pub key_id: Option<String>,
     pub endpoint: Option<String>,
 }
 
@@ -840,6 +845,7 @@ pub async fn record_state(
         logical_model: chain.logical_model.clone(),
         account_id: pending.account_id,
         target_id: pending.target_id,
+        key_id: pending.key_id,
         endpoint: pending.endpoint,
         upstream_id: pending.upstream_id,
         sealed_body: sealed_body.transpose().ok().flatten(),

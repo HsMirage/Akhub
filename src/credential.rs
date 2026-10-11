@@ -182,6 +182,20 @@ impl CredentialPool {
         self.keys_of(account_id).is_empty()
     }
 
+    /// 这个账号是不是**多 Key**：池里启用中的 Key 多于一把（§4.2.1）。
+    ///
+    /// 只用来决定 429 的落点。单 Key 账号里 Key 与账号是同一个调度单位，
+    /// 把限流同时记在两级上只是把同一个事实数两遍；多 Key 账号里每把 Key 是
+    /// 独立额度，必须同时记在用的那把上，否则"某把 Key 被限流"会连累其他 Key。
+    pub fn is_shared(&self, account_id: &str) -> bool {
+        self.keys_of(account_id)
+            .iter()
+            .filter(|key| key.enabled)
+            .take(2)
+            .count()
+            > 1
+    }
+
     /// 当前快照里全部 Key 的归类键，供动态状态表清理已消失的条目。
     pub fn live_credential_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
@@ -226,6 +240,17 @@ pub enum KeyChoice<'a> {
     /// §13.6 完全一致——否则一个满负荷的账号会因为"它的 Key 都在忙"而被
     /// 判成不可用，白白让出本可以排队等到的流量。
     Busy,
+    /// 绑定/钉住的那把 Key 只是"忙"，不是"坏"。
+    ///
+    /// 调用方应当**为它等待**，而不是换池里另一把。上游的前缀缓存按凭据隔离
+    /// （实测：同一前缀换 Key 立刻 `cached=None`，换回来又命中），所以换 Key
+    /// 等于把整段缓存作废。设计文档 §2.2 把允许换 Key 的条件写得很死——只有
+    /// 绑定那把**不再合格**（停用、熔断、额度耗尽、被管理员删除）时才换；
+    /// "限额满"要**超出等待预算**之后才降级成换 Key，而预算由调用方掌握。
+    ///
+    /// 带出这把 Key，是为了让调用方等待**它**的名额，而不是"任意一把"的名额：
+    /// 等错了对象会在唤醒之后重新抽到别的 Key，正是这条规则要避免的事。
+    BoundBusy(&'a Arc<Credential>),
 }
 
 /// 在一组 Key 里挑一把。
@@ -258,6 +283,9 @@ where
     let mut available: Vec<&Arc<Credential>> = Vec::with_capacity(keys.len());
     let mut enabled = 0usize;
     let mut busy = 0usize;
+    // 只是"忙"的那些 Key 留一份索引：绑定的那把落在其中时要**为它等待**，
+    // 而不是换一把别的（见 `KeyChoice::BoundBusy`）。
+    let mut busy_keys: Vec<&Arc<Credential>> = Vec::new();
     for key in keys.iter().filter(|key| key.enabled) {
         enabled += 1;
         // 已经试过的这把不参与抽签，也不计入 busy：它是"这次不行"，
@@ -268,19 +296,31 @@ where
         match selectable(key) {
             Ok(true) => available.push(key),
             Ok(false) => continue,
-            Err(()) => busy += 1,
+            Err(()) => {
+                busy += 1;
+                busy_keys.push(key);
+            }
         }
     }
 
     // 钉住与粘性都只在"这把 Key 现在能用"时生效。它不可用时才轮到下一把：
     // 这正是"换掉一把坏 Key 就该重新开始"的语义。
-    // 钉住与粘性只在"这把 Key 现在能用、且这次还没试过"时生效。
+    //
+    // 但"不可用"与"忙"必须分开：**忙**只是这一刻没有名额，等一会儿就有；
+    // 这时候换 Key 会白扔掉上游按凭据隔离的前缀缓存，所以要为它等待
+    // （§2.2 的不变量 B、§10.3 的等待预算）。**坏**才立刻让位。
     for preferred in [pinned, sticky] {
-        if let Some(id) = preferred
-            && !excluded.is_some_and(|digest| digest == id)
-            && let Some(found) = available.iter().find(|key| key.credential_digest == id)
-        {
+        let Some(id) = preferred else {
+            continue;
+        };
+        if excluded.is_some_and(|digest| digest == id) {
+            continue;
+        }
+        if let Some(found) = available.iter().find(|key| key.credential_digest == id) {
             return KeyChoice::Ready(Some(found));
+        }
+        if let Some(found) = busy_keys.iter().find(|key| key.credential_digest == id) {
+            return KeyChoice::BoundBusy(found);
         }
     }
 

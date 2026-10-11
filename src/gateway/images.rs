@@ -7,6 +7,7 @@
 //! 定位表只存"任务 ID → 接单账号"，不存任务结果。查不到、已过期、或不属于
 //! 当前分组，一律同样的 404：对外不区分"从来没存在过"和"过期了"（§26.8）。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -393,6 +394,7 @@ pub async fn task_status(
                 None,
                 code.status(),
                 Some(code),
+                Some(&credential),
             );
             return GatewayError::new(
                 code,
@@ -422,6 +424,7 @@ pub async fn task_status(
                     Some(upstream_status.as_u16()),
                     StatusCode::BAD_GATEWAY,
                     Some(ErrorCode::UpstreamProtocolError),
+                    Some(&credential),
                 );
                 return GatewayError::new(
                     ErrorCode::UpstreamProtocolError,
@@ -453,6 +456,7 @@ pub async fn task_status(
         Some(upstream_status.as_u16()),
         upstream_status,
         None,
+        Some(&credential),
     );
 
     if !upstream_status.is_success() {
@@ -544,6 +548,8 @@ fn missing_task(
         None,
         ErrorCode::ImageTaskNotFound.status(),
         Some(ErrorCode::ImageTaskNotFound),
+        // 任务都查不到，谈不上用了哪把 Key：不编造。
+        None,
     );
     GatewayError::new(
         ErrorCode::ImageTaskNotFound,
@@ -568,6 +574,9 @@ fn record_poll(
     upstream_status: Option<u16>,
     http_status: StatusCode,
     error_code: Option<ErrorCode>,
+    // 这次轮询用的是哪把 Key（§4.2.1 的不变量 A）：异步任务回到接单那把
+    // Key 上，记录里必须能看出这一点。没有目标时（任务查不到）为 None。
+    credential: Option<&Arc<crate::credential::Credential>>,
 ) {
     state.recorder.record(RequestRecord {
         request_id: request_id.to_string(),
@@ -608,6 +617,8 @@ fn record_poll(
         filter_summary: None,
         filter_details: None,
         selected_layer: None,
+        key_id: credential.map(|key| key.id.clone()),
+        key_label: credential.map(|key| key.label.clone()),
         attempts_detail: Vec::new(),
     });
 }

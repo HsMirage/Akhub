@@ -875,6 +875,15 @@ pub struct Admission {
     reservations: RateReservations,
     /// 本次准入用的三级额度。取消时据此把并发容量补回配置值。
     limits: AdmissionLimits,
+    /// 这个账号是不是**多 Key**（池里启用中的 Key 多于一把）。
+    ///
+    /// 只影响 429 的落点：多 Key 账号里每把 Key 是独立额度，限流必须同时记在
+    /// 用的那把 Key 上，否则"某把 Key 被限流"会连累其他 Key，而这把 Key 还会
+    /// 在下一轮抽签里继续被选中（§4.2.1、§12.3）。单 Key 账号里 Key 与账号是
+    /// 同一个调度单位，多记一笔只是把同一个事实数两遍。
+    ///
+    /// 默认关闭：探针、后台测试这类不带池语义的调用不该凭空产生 Key 状态。
+    shared_key: bool,
     settled: bool,
 }
 
@@ -887,6 +896,15 @@ impl Admission {
     /// 绑定到本次尝试的 Key 状态。
     pub fn key_state(&self) -> Option<&Arc<KeyState>> {
         self.key.as_ref()
+    }
+
+    /// 标记"这个账号的 Key 池里有多把启用中的 Key"（§4.2.1）。
+    ///
+    /// 由调用方在拿到凭据快照后设置：健康状态表看不到凭据池，而 429 的落点
+    /// 需要这个事实。
+    pub fn with_shared_key(mut self, shared: bool) -> Self {
+        self.shared_key = shared;
+        self
     }
 
     fn release_account_half_open(&self) {
@@ -983,12 +1001,34 @@ impl Admission {
             Outcome::RateLimited { retry_after } => {
                 self.release_account_half_open();
                 self.release_key_half_open();
+                // 429 记在**目标**上（账号 + 模型）：这是既有口径，也是上游
+                // 限流最常见的粒度——同一个模型的配额被别的调用方占满时，
+                // 换一把 Key 或换一个账号都救不了这个模型（§12.3）。
                 let mut circuit = crate::sync::lock(&self.target.circuit);
                 match retry_after {
                     // 上游明确说了多久，就照做，不叠加自己的指数退避。
                     Some(wait) => circuit.trip(now, Some(wait)),
                     // 没给恢复时间的孤立 429 只触发本次切换，够多够密才熔断。
                     None => circuit.on_fault(now),
+                }
+                drop(circuit);
+                // 额外记一笔在**这把 Key** 上：上游的限流也可能是按凭据计的，
+                // 而 Key 池里的每把 Key 是独立额度——只记目标会让"某一把 Key
+                // 被限流"连累同账号其他 Key 一起停摆，也会让这把 Key 在下一轮
+                // 抽签里继续被选中、继续撞 429。
+                //
+                // 只在**多 Key 账号**上记：单 Key 账号里 Key 与账号是同一个
+                // 调度单位，多记一笔等于把同一个事实数两遍，还会让 Key 的
+                // 冷却与目标的冷却互相错位。
+                if let Some(key) = &self.key
+                    && self.shared_key
+                {
+                    // 与目标同样的判据：给了恢复时间就照做，孤立 429 走故障计数。
+                    let mut quota = crate::sync::lock(&key.quota);
+                    match retry_after {
+                        Some(wait) => quota.trip(now, Some(wait)),
+                        None => quota.on_fault(now),
+                    }
                 }
             }
             Outcome::Fault => {
@@ -1190,6 +1230,7 @@ impl Registry {
             half_open,
             reservations,
             limits,
+            shared_key: false,
             settled: false,
         })
     }

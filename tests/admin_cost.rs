@@ -94,6 +94,8 @@ async fn record_tokens(
             filter_summary: None,
             filter_details: None,
             selected_layer: None,
+            key_id: None,
+            key_label: None,
             attempts_detail: Vec::new(),
         }])
         .await

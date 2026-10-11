@@ -882,15 +882,16 @@ impl Store {
     pub async fn upsert_response_state(&self, state: &ResponseStateRow) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO response_states (gateway_id, group_id, logical_model,
-                account_id, target_id, endpoint, upstream_id, sealed_body, protocol,
+                account_id, target_id, key_id, endpoint, upstream_id, sealed_body, protocol,
                 created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&state.gateway_id)
         .bind(&state.group_id)
         .bind(&state.logical_model)
         .bind(&state.account_id)
         .bind(&state.target_id)
+        .bind(&state.key_id)
         .bind(&state.endpoint)
         .bind(&state.upstream_id)
         .bind(&state.sealed_body)
@@ -925,6 +926,7 @@ impl Store {
             logical_model: row.try_get("logical_model")?,
             account_id: row.try_get("account_id")?,
             target_id: row.try_get("target_id")?,
+            key_id: row.try_get("key_id")?,
             endpoint: row.try_get("endpoint")?,
             upstream_id: row.try_get("upstream_id")?,
             sealed_body: row.try_get("sealed_body")?,
@@ -1544,8 +1546,9 @@ impl Store {
                     first_token_ms, input_tokens, output_tokens, config_version,
                     sticky_wait_ms, sticky_freshness, sticky_origin, output_tps, multiplier_source,
                     quota_status, filter_summary, filter_details, selected_layer,
-                    cache_read_tokens, cache_write_tokens, reasoning_tokens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    key_id, key_label)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -1585,6 +1588,8 @@ impl Store {
             .bind(record.cache_read_tokens)
             .bind(record.cache_write_tokens)
             .bind(record.reasoning_tokens)
+            .bind(&record.key_id)
+            .bind(&record.key_label)
             .execute(&mut *tx)
             .await?;
 
@@ -1597,8 +1602,8 @@ impl Store {
                 sqlx::query(
                     "INSERT INTO request_attempts (request_id, seq, target_id, account_id,
                         upstream_model, endpoint, started_at, duration_ms, outcome,
-                        error_code, counts_against_budget)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        error_code, counts_against_budget, key_id, key_label)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&record.request_id)
                 .bind(attempt.seq)
@@ -1611,6 +1616,8 @@ impl Store {
                 .bind(&attempt.outcome)
                 .bind(&attempt.error_code)
                 .bind(attempt.counts_against_budget)
+                .bind(&attempt.key_id)
+                .bind(&attempt.key_label)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1820,6 +1827,8 @@ impl Store {
                     outcome: row.try_get("outcome")?,
                     error_code: row.try_get("error_code")?,
                     counts_against_budget: row.try_get("counts_against_budget")?,
+                    key_id: row.try_get("key_id")?,
+                    key_label: row.try_get("key_label")?,
                 });
         }
         for record in records.iter_mut() {
@@ -2829,6 +2838,16 @@ pub struct RequestRecord {
     pub filter_details: Option<String>,
     /// 最终选中的层（优先级数字）；粘性命中时是绑定目标所在的层（§24.1）。
     pub selected_layer: Option<i64>,
+    /// 这次请求最终落在哪把 Key 上（§4.2.1、§3.3）。
+    ///
+    /// 存**行 ID**（不是凭据摘要）：这是给人看的诊断字段，用来回答"这次走的
+    /// 哪把 Key"。凭据本身绝不落库，标签是管理员自己填的（§23.4、§24.1）。
+    ///
+    /// 多 Key 账号里"同一个目标、不同 Key"的性能与缓存表现完全不同——上游的
+    /// 前缀缓存按凭据隔离，而 Key 是随机抽的。没有这一列就无从判断一次缓存
+    /// 未命中到底是因为换了账号还是换了 Key。
+    pub key_id: Option<String>,
+    pub key_label: Option<String>,
     /// 每次上游尝试的明细（§6.6）。写入时与主记录同一事务。
     pub attempts_detail: Vec<AttemptRecord>,
 }
@@ -2848,6 +2867,12 @@ pub struct AttemptRecord {
     pub error_code: Option<String>,
     /// 这次失败是否计入尝试预算：廉价的连接失败不计（§13.1）。
     pub counts_against_budget: bool,
+    /// 这一次尝试用的是哪把 Key（§4.2.1）。
+    ///
+    /// 换 Key 重试时同一条请求会留下多条不同 Key 的明细——"换了三把 Key 才通"
+    /// 在请求记录里因此一目了然（§7.3）。
+    pub key_id: Option<String>,
+    pub key_label: Option<String>,
 }
 
 /// 一条网关托管的后台任务（计划 §29.1）。
@@ -3123,6 +3148,13 @@ pub struct ResponseStateRow {
     pub logical_model: String,
     pub account_id: Option<String>,
     pub target_id: Option<String>,
+    /// 创建这条响应时用的那把 Key 的行 ID（§4.2.1、§15.1）。
+    ///
+    /// 上游的 `resp_xxx` 是**凭据隔离**的资源：生命周期代理（retrieve /
+    /// input_items / cancel / delete）与链式续写都必须回到同一把 Key，否则
+    /// 上游只会回 404。多 Key 账号里"账号对但 Key 不对"是最容易被误判成
+    /// "响应已过期"的一种现场。
+    pub key_id: Option<String>,
     pub endpoint: Option<String>,
     pub upstream_id: Option<String>,
     /// 加密的可重放正文。`None` 即 store:false 或保留期为 0 的最小定位模式。
@@ -3373,6 +3405,8 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         filter_summary: row.try_get("filter_summary")?,
         filter_details: row.try_get("filter_details")?,
         selected_layer: row.try_get("selected_layer")?,
+        key_id: row.try_get("key_id")?,
+        key_label: row.try_get("key_label")?,
         // 尝试明细由 `attach_attempts` 单独填充。
         attempts_detail: Vec::new(),
     })
@@ -3633,6 +3667,8 @@ mod tests {
                 filter_summary: None,
                 filter_details: None,
                 selected_layer: None,
+                key_id: None,
+                key_label: None,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
@@ -3707,6 +3743,8 @@ mod tests {
                 filter_summary: None,
                 filter_details: None,
                 selected_layer: None,
+                key_id: None,
+                key_label: None,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
@@ -3922,6 +3960,8 @@ mod tests {
             filter_summary: None,
             filter_details: None,
             selected_layer: None,
+            key_id: None,
+            key_label: None,
             attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,
