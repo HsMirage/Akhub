@@ -24,11 +24,13 @@ use crate::gateway::error::{ErrorCode, GatewayError};
 use crate::gateway::{responses, settle, stream, translate};
 use crate::health;
 use crate::multiplier;
+use crate::protocol::canonical::Effort;
 use crate::protocol::degrade;
 use crate::protocol::translate::Translation;
 use crate::routing::{self, queue, score, sticky};
 use crate::storage::store::{AttemptRecord, RequestRecord};
 use crate::upstream::endpoints::{self, Choice};
+use crate::upstream::evidence::EffortFacts;
 use crate::upstream::{self, Endpoint};
 
 /// 允许从上游回传给下游的响应头。其余一律丢弃，避免泄漏上游身份（§14.7）。
@@ -58,6 +60,16 @@ const RATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 按上游的 `Retry-After` 等待时额外多等的余量，避免卡在冷却结束的临界点上。
 const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
+
+/// 同一个端点最多为"思考档位被上游拒绝"重发几次（§14.6）。
+///
+/// 6 次是这条阶梯的全部长度：从最低的 minimal 出发，逐档往上试到 max，最后
+/// 再试一次"不指定"，正好 6 步。实际几乎走不满——循环真正的刹车是"这次要发的
+/// 形状和上次一样就不再重发"，而试探结果会被记住，所以这条阶梯在
+/// （账号，上游模型，档位）上**只会走一次**，之后直接跳到结论。
+///
+/// 有界是硬要求：没有界就是拿上游当重试靶子。
+const MAX_EFFORT_RETRIES: u8 = 6;
 
 /// 一次请求针对**同一个目标**最多换几把 Key（§4.2.1）。
 ///
@@ -199,6 +211,16 @@ enum AttemptFailure {
     Terminal(Box<Response>),
     /// 已接单的异步图片任务失败：不得换号或再次下单，但必须记为失败。
     AcceptedJob(GatewayError),
+    /// 上游拒绝了自适应思考的档位，但形状是对的（§14.6）。
+    ///
+    /// 这是**同一个目标**上的一次廉价失败：上游没有开始生成，而我们知道该改成
+    /// 什么——换一个这个账号能接受的档位再发一次，客户端不该为"这个中转站少
+    /// 实现了两档"看见 400。升无可升、试无可试时退回 `response`，与普通参数
+    /// 错误同形。
+    EffortRejected {
+        rejected: crate::protocol::canonical::Effort,
+        response: Box<Response>,
+    },
     /// 本次请求可尝试其他端点。404/405 不证明整个账号缺少接口，
     /// 保留真实错误，转换不可行时仍能解释失败原因。
     EndpointRejected { status: StatusCode, body: Vec<u8> },
@@ -263,6 +285,8 @@ struct Telemetry {
     filter_details: Option<String>,
     /// 最终选中的层；粘性命中时是绑定目标所在的层（§24.1）。
     selected_layer: Option<i64>,
+    /// 这次实际发出去的思考档位；成功后用它记下"这一档在这个账号上可用"（§14.6）。
+    sent_effort: Option<crate::protocol::canonical::Effort>,
     /// 本次请求实际使用的 Key 的内部 ID 与标签（§4.2.1）。
     ///
     /// **只记 ID 与标签，绝不记凭据本身**：请求记录要能回答"这次走的哪把
@@ -1369,6 +1393,23 @@ impl Walk<'_> {
                     *response,
                 )))
             }
+            // 防御性分支：`walk_endpoints` 目前把所有"升无可升、试无可试"的
+            // 情况都翻译成了 `Terminal`，所以这里走不到。留着是因为它把
+            // `EffortRejected` 与普通参数错误一视同仁——将来若有人让这个变体
+            // 逃出内层循环，行为仍然是"如实报上游的 400"，而不是掉进某个
+            // 会换账号重试的分支（§14.6）。
+            Err(AttemptFailure::EffortRejected { response, .. }) => {
+                admission.settle(health::Outcome::Neutral, None);
+                let status = response.status();
+                self.note_attempt(candidate, started, "failed", None, true);
+                Attempted::Done(Flow::Done(self.finish(
+                    Some(candidate),
+                    status,
+                    None,
+                    None,
+                    *response,
+                )))
+            }
             // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
             Err(AttemptFailure::EndpointRejected { .. }) => {
                 admission.settle(health::Outcome::Neutral, None);
@@ -1487,64 +1528,110 @@ impl Walk<'_> {
             let Some(choice) = plan.first().cloned() else {
                 break;
             };
-            let prepared = self.prepare(candidate, &choice).await?;
-            let timeout = self.deadline.saturating_duration_since(Instant::now());
-            self.telemetry.endpoint = Some(prepared.endpoint);
-            self.telemetry.degraded = prepared.degraded.clone();
+            let mut prepared = self.prepare(candidate, &choice).await?;
+            let mut effort_retries = MAX_EFFORT_RETRIES;
+            loop {
+                let timeout = self.deadline.saturating_duration_since(Instant::now());
+                self.telemetry.endpoint = Some(prepared.endpoint);
+                self.telemetry.degraded = prepared.degraded.clone();
+                self.telemetry.sent_effort = adaptive_shape(&prepared.body).effort;
 
-            match attempt(
-                self.forward,
-                &candidate.target,
-                credential,
-                &prepared,
-                self.streaming,
-                timeout,
-            )
-            .await
-            {
-                Err(AttemptFailure::EndpointRejected { status, body }) => {
-                    rejected.push(prepared.endpoint);
-                    tracing::info!(
-                        request_id = self.forward.request_id,
-                        account = candidate.target.account.name,
-                        model = candidate.target.target.upstream_model,
-                        endpoint = prepared.endpoint.as_str(),
-                        upstream_status = status.as_u16(),
-                        "本次请求的端点被拒绝，尝试其他可表达的端点"
-                    );
-                    // 辅助端点（count_tokens / compact / input_tokens）没有
-                    // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
-                    // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
-                    if self.forward.endpoint.is_native_only() {
-                        return Err(AttemptFailure::Terminal(Box::new(
-                            GatewayError::new(
-                                ErrorCode::UnsupportedParameter,
-                                format!("当前模型不支持 /{} 端点", self.forward.endpoint.path()),
-                            )
-                            .with_protocol(self.forward.endpoint.protocol())
-                            .with_request_id(self.forward.request_id)
-                            .into_response(),
-                        )));
+                match attempt(
+                    self.forward,
+                    &candidate.target,
+                    credential,
+                    &prepared,
+                    self.streaming,
+                    timeout,
+                )
+                .await
+                {
+                    Err(AttemptFailure::EffortRejected { rejected, response }) => {
+                        // 记下这一档被拒，再按新的事实重发**一次**。
+                        //
+                        // 重发的内容一定与上一次不同：被拒的那一档在解析器里
+                        // 已经变成"升到已确认可用的更高档"或"不指定"。若换算
+                        // 结果还是原来那一档（说明没有任何新事实可用），就没有
+                        // 理由再打一次上游，直接把上游的拒绝报出去（§14.6）。
+                        if effort_retries == 0 || Instant::now() >= self.deadline {
+                            return Err(AttemptFailure::Terminal(response));
+                        }
+                        effort_retries -= 1;
+                        // 重新准备失败时**报上游这次的拒绝**，而不是把准备阶段的
+                        // 错误抛出去：上游的 400 才是客户端这次请求真正遇到的
+                        // 问题，准备阶段的失败只是"没能替它换一档重试"。
+                        let Ok(next) = self
+                            .prepare_with_reject(candidate, &choice, Some(rejected))
+                            .await
+                        else {
+                            return Err(AttemptFailure::Terminal(response));
+                        };
+                        // 形状没变就不重发：拿同一个请求再撞一次是白费上游。
+                        if adaptive_shape(&next.body) == adaptive_shape(&prepared.body) {
+                            return Err(AttemptFailure::Terminal(response));
+                        }
+                        prepared = next;
+                        tracing::info!(
+                            request_id = self.forward.request_id,
+                            account = candidate.target.account.name,
+                            model = candidate.target.target.upstream_model,
+                            rejected_effort = rejected.as_str(),
+                            sent_effort = adaptive_shape(&prepared.body)
+                                .effort
+                                .map(Effort::as_str)
+                                .unwrap_or("默认"),
+                            "上游不接受这个思考档位，改按可用档位重发"
+                        );
+                        continue;
                     }
-                    let detail = upstream_error_message(&body)
-                        .map(|message| format!("：{message}"))
-                        .unwrap_or_default();
-                    last_rejection = Some(AttemptFailure::Switchable {
-                        code: ErrorCode::UpstreamExhausted,
-                        message: format!(
-                            "账号「{}」的 {} 返回 {}{}；本次请求没有其他可用端点",
-                            candidate.target.account.name,
-                            prepared.endpoint.as_str(),
-                            status.as_u16(),
-                            detail,
-                        ),
-                        upstream_status: Some(status),
-                        retry_after: None,
-                        upstream_body: Some(body),
-                    });
-                    plan = self.endpoint_plan(candidate, &rejected).unwrap_or_default();
+                    Err(AttemptFailure::EndpointRejected { status, body }) => {
+                        rejected.push(prepared.endpoint);
+                        tracing::info!(
+                            request_id = self.forward.request_id,
+                            account = candidate.target.account.name,
+                            model = candidate.target.target.upstream_model,
+                            endpoint = prepared.endpoint.as_str(),
+                            upstream_status = status.as_u16(),
+                            "本次请求的端点被拒绝，尝试其他可表达的端点"
+                        );
+                        // 辅助端点（count_tokens / compact / input_tokens）没有
+                        // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
+                        // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
+                        if self.forward.endpoint.is_native_only() {
+                            return Err(AttemptFailure::Terminal(Box::new(
+                                GatewayError::new(
+                                    ErrorCode::UnsupportedParameter,
+                                    format!(
+                                        "当前模型不支持 /{} 端点",
+                                        self.forward.endpoint.path()
+                                    ),
+                                )
+                                .with_protocol(self.forward.endpoint.protocol())
+                                .with_request_id(self.forward.request_id)
+                                .into_response(),
+                            )));
+                        }
+                        let detail = upstream_error_message(&body)
+                            .map(|message| format!("：{message}"))
+                            .unwrap_or_default();
+                        last_rejection = Some(AttemptFailure::Switchable {
+                            code: ErrorCode::UpstreamExhausted,
+                            message: format!(
+                                "账号「{}」的 {} 返回 {}{}；本次请求没有其他可用端点",
+                                candidate.target.account.name,
+                                prepared.endpoint.as_str(),
+                                status.as_u16(),
+                                detail,
+                            ),
+                            upstream_status: Some(status),
+                            retry_after: None,
+                            upstream_body: Some(body),
+                        });
+                        plan = self.endpoint_plan(candidate, &rejected).unwrap_or_default();
+                    }
+                    other => return other,
                 }
-                other => return other,
+                break;
             }
             if Instant::now() >= self.deadline {
                 break;
@@ -1589,6 +1676,39 @@ impl Walk<'_> {
         &self,
         candidate: &routing::Candidate,
         choice: &Choice,
+    ) -> Result<Prepared, AttemptFailure> {
+        self.prepare_with_reject(candidate, choice, None).await
+    }
+
+    /// 准备一次尝试；`just_rejected` 是刚刚被上游拒掉的档位（如果有）。
+    ///
+    /// 档位换算需要知道**客户端要的是哪一档**，而那一档只有发射时才从请求体里
+    /// 读得出来，所以这里把"账号上这个模型能接受什么"包成一个解析器交给
+    /// [`align_thinking`]，由它在拿到客户端意图之后再定这次该发哪一档（§14.6）。
+    async fn prepare_with_reject(
+        &self,
+        candidate: &routing::Candidate,
+        choice: &Choice,
+        just_rejected: Option<Effort>,
+    ) -> Result<Prepared, AttemptFailure> {
+        let evidence = &self.forward.state.runtime.evidence;
+        let account_id = &candidate.target.account.id;
+        let upstream_model = &candidate.target.target.upstream_model;
+        let now = Instant::now();
+        // 刚被拒的那一档要立刻算进决策：这次重发不能原样再发一遍。
+        if let Some(rejected) = just_rejected {
+            evidence.note_effort_rejected(account_id, upstream_model, rejected, now);
+        }
+        // 快照按值带进发射：它 `Copy` 且与锁无关，闭包因此能安全跨 `await`。
+        let facts = evidence.effort_facts(account_id, upstream_model, now);
+        self.prepare_inner(candidate, choice, Some(facts)).await
+    }
+
+    async fn prepare_inner(
+        &self,
+        candidate: &routing::Candidate,
+        choice: &Choice,
+        facts: Option<EffortFacts>,
     ) -> Result<Prepared, AttemptFailure> {
         let target_protocol = choice.endpoint.protocol();
         let downstream = self.forward.endpoint.protocol();
@@ -1669,6 +1789,7 @@ impl Walk<'_> {
                 &candidate.target.target.upstream_model,
                 downstream,
                 self.translation.thinking().as_ref(),
+                facts,
                 &mut extra,
             );
             for name in extra.into_list() {
@@ -2036,11 +2157,25 @@ impl Walk<'_> {
         if outcome == "ok"
             && let Some(endpoint) = self.telemetry.endpoint
         {
+            let now = Instant::now();
             self.forward.state.runtime.evidence.note_supported(
                 &candidate.target.account.id,
                 endpoint,
-                Instant::now(),
+                now,
             );
+            // 这一档是**这个（账号，上游模型）**真的接受过的：记下来，之后客户端
+            // 要一个被拒的档位时，才有"升到已确认可用的档位"这条路可走（§14.6）。
+            //
+            // 不指定档位时 `sent_effort` 是 `None`，什么都不记——"没发档位"
+            // 不构成任何档位可用的证据。
+            if let Some(effort) = self.telemetry.sent_effort {
+                self.forward.state.runtime.evidence.note_effort_accepted(
+                    &candidate.target.account.id,
+                    &candidate.target.target.upstream_model,
+                    effort,
+                    now,
+                );
+            }
         }
     }
 }
@@ -2919,7 +3054,7 @@ async fn remember_image_task(
 async fn classify_upstream_error(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
-    _prepared: &Prepared,
+    prepared: &Prepared,
     response: reqwest::Response,
     status: StatusCode,
     api_key: &str,
@@ -2977,6 +3112,30 @@ async fn classify_upstream_error(
         });
     let message =
         upstream_error_message(&bytes).unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
+    // 形状已经发对了却还是收到"requires adaptive thinking"，被拒的是**档位**：
+    // 这是（账号，上游模型）级的事实，记下来让重试与之后的请求都换一个这个账号
+    // 能接受的档位（§14.6）。
+    let shape = adaptive_shape(&prepared.body);
+    if adaptive_effort_rejection(status, &message, shape)
+        && let Some(effort) = shape.effort
+    {
+        // 先记下这次拒绝，再由调用方按新事实决定重发什么（§14.6）。
+        forward.state.runtime.evidence.note_effort_rejected(
+            &target.account.id,
+            &target.target.upstream_model,
+            effort,
+            Instant::now(),
+        );
+        let mut response = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
+            .with_protocol(forward.endpoint.protocol())
+            .with_request_id(forward.request_id)
+            .into_response();
+        *response.status_mut() = status;
+        return Err(AttemptFailure::EffortRejected {
+            rejected: effort,
+            response: Box::new(response),
+        });
+    }
     tracing::warn!(request_id = forward.request_id, account = target.account.name,
         upstream_status = status.as_u16(), detail = %message, "上游拒绝请求");
     let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
@@ -3012,6 +3171,42 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
             .take(400)
             .collect(),
     )
+}
+
+/// 上游这句 400 是不是"自适应思考的档位/形状不被这个账号接受"（§14.6）。
+///
+/// 现场形态（supeai.top 的 claude-opus-5-5）：同一个上游站的两个域名实现不同，
+/// 一个收 `low/medium/high/max`，另一个只收 `low`，其余档位回同一句
+/// `claude-opus-5-5 requires adaptive thinking; omit thinking or use
+/// thinking.type=adaptive and output_config.effort`。它和"形状不对"共用一句话，
+/// 所以只能连形状一起判：形状已经对了还收到这句话，被拒的就是**档位**。
+fn adaptive_effort_rejection(status: StatusCode, message: &str, shape: AdaptiveShape) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && shape.adaptive
+        && shape.effort.is_some()
+        && message.contains("adaptive thinking")
+}
+
+/// 本次发出去的思考形状（判定"被拒的是档位"要看它）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AdaptiveShape {
+    adaptive: bool,
+    effort: Option<crate::protocol::canonical::Effort>,
+}
+
+/// 从已经准备好的请求体里读回这次发射的形状。
+fn adaptive_shape(body: &serde_json::Value) -> AdaptiveShape {
+    let adaptive = body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("adaptive");
+    let effort = body
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::protocol::canonical::Effort::parse);
+    AdaptiveShape { adaptive, effort }
 }
 
 /// 该上游状态码是否意味着"换个目标可能就成了"（§13.2）。
@@ -3615,6 +3810,67 @@ fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_a_correctly_shaped_adaptive_request_counts_as_an_effort_rejection() {
+        use crate::protocol::canonical::Effort;
+        let shaped = AdaptiveShape {
+            adaptive: true,
+            effort: Some(Effort::High),
+        };
+        let message = "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort";
+        assert!(adaptive_effort_rejection(
+            StatusCode::BAD_REQUEST,
+            message,
+            shaped
+        ));
+
+        // 形状不对时同一句话说的是形状问题，不是档位问题：换档重发没有意义。
+        assert!(!adaptive_effort_rejection(
+            StatusCode::BAD_REQUEST,
+            message,
+            AdaptiveShape {
+                adaptive: false,
+                effort: None
+            }
+        ));
+        // 没发档位就无从降起。
+        assert!(!adaptive_effort_rejection(
+            StatusCode::BAD_REQUEST,
+            message,
+            AdaptiveShape {
+                adaptive: true,
+                effort: None
+            }
+        ));
+        // 别的 400 不是这件事。
+        assert!(!adaptive_effort_rejection(
+            StatusCode::BAD_REQUEST,
+            "max_tokens: must be greater than thinking.budget_tokens",
+            shaped
+        ));
+        assert!(!adaptive_effort_rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            message,
+            shaped
+        ));
+    }
+
+    #[test]
+    fn the_emitted_shape_is_read_back_from_the_body() {
+        use crate::protocol::canonical::Effort;
+        let adaptive = json!({
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "xhigh"}
+        });
+        assert_eq!(adaptive_shape(&adaptive).effort, Some(Effort::XHigh));
+        assert!(adaptive_shape(&adaptive).adaptive);
+
+        let manual = json!({"thinking": {"type": "enabled", "budget_tokens": 4096}});
+        assert!(!adaptive_shape(&manual).adaptive);
+        assert_eq!(adaptive_shape(&manual).effort, None);
+        assert_eq!(adaptive_shape(&json!({})).effort, None);
+    }
 
     #[test]
     fn model_rewrite_touches_only_the_model_field() {

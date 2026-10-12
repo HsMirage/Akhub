@@ -976,3 +976,371 @@ async fn a_legacy_messages_upstream_is_not_sent_the_adaptive_shape() {
     let budget = seen.body["thinking"]["budget_tokens"].as_u64().unwrap();
     assert!(seen.body["max_tokens"].as_u64().unwrap() > budget);
 }
+
+#[tokio::test]
+async fn a_rejected_level_is_first_retried_one_step_higher() {
+    // 现场（supeai.top 的 claude-opus-5-5）：形状完全正确、只有档位不被接受，
+    // 上游回的还是同一句 "requires adaptive thinking"。中转站实现的档位**不单调**
+    // （一个站收 low 却拒 medium），所以"这一档不行"推不出"更高的也不行"。
+    //
+    // 处置方向是**往上**：客户端要 high 被拒，就试 xhigh。试中就是真的升档，
+    // 客户端拿到的比它要的还强。绝不发更低的一档——那是替客户端降智（§14.6）。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "拒 high",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    // 第一次拒（high），第二次放行（xhigh）。
+    upstream.script([Behavior::Json(400, rejected)]);
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "客户端不该看见这个 400");
+
+    let levels = {
+        let seen = upstream.seen.lock().unwrap();
+        seen.iter()
+            .map(|s| {
+                s.body["output_config"]["effort"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        levels,
+        vec![Some("high".to_string()), Some("xhigh".to_string())],
+        "往上试一档，而不是往下退"
+    );
+
+    // 事实已经学到：这个账号拒 high、收 xhigh。下一次要 high 就直接发 xhigh。
+    let before = upstream.requests();
+    assert_eq!(
+        messages(
+            &akhub,
+            json!({
+                "model": MODEL,
+                "max_tokens": 4_096,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }),
+        )
+        .await
+        .status(),
+        200
+    );
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), before + 1, "第二次请求只打一次上游");
+    assert_eq!(
+        seen[before].body["output_config"]["effort"], "xhigh",
+        "学到的升档直接生效：{:?}",
+        seen[before].body
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_level_with_no_higher_option_omits_the_level_instead_of_lowering_it() {
+    // 客户端要 max（已经最高档），这个账号拒 max。没有更高的档可试，那就
+    // **不指定档位**，把强度交回上游自己的默认——而不是发一个更低的档位。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "拒 max",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    upstream.script([Behavior::Json(400, rejected)]);
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "重发之后应当成功");
+
+    let seen = upstream.seen.lock().unwrap();
+    let levels: Vec<Option<&str>> = seen
+        .iter()
+        .map(|s| s.body["output_config"]["effort"].as_str())
+        .collect();
+    assert_eq!(
+        levels,
+        vec![Some("max"), None],
+        "第二次不带档位；绝不换成更低的一档"
+    );
+    // 思考本身照常要，只是不再指定强度。
+    assert_eq!(seen[1].body["thinking"]["type"], "adaptive");
+}
+
+#[tokio::test]
+async fn a_rejected_level_upgrades_to_a_level_this_account_is_known_to_accept() {
+    // 升档优于不指定：客户端要 medium、这个账号拒 medium，而 high 已经被
+    // 证明可用——那就发 high。宁可给多一点推理，也不替客户端降智（§14.6）。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "拒 medium",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+
+    // 第一次：客户端要 high，上游接受 → 这个账号上"high 可用"成为事实。
+    assert_eq!(
+        messages(
+            &akhub,
+            json!({
+                "model": MODEL,
+                "max_tokens": 4_096,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            }),
+        )
+        .await
+        .status(),
+        200
+    );
+
+    // 第二次：客户端要 medium，上游拒一次。
+    upstream.script([Behavior::Json(400, rejected)]);
+    assert_eq!(
+        messages(
+            &akhub,
+            json!({
+                "model": MODEL,
+                "max_tokens": 4_096,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"}
+            }),
+        )
+        .await
+        .status(),
+        200
+    );
+
+    let seen = upstream.seen.lock().unwrap();
+    let levels: Vec<Option<&str>> = seen
+        .iter()
+        .map(|s| s.body["output_config"]["effort"].as_str())
+        .collect();
+    assert_eq!(
+        levels,
+        vec![Some("high"), Some("medium"), Some("high")],
+        "medium 被拒后升到已确认可用的 high，而不是降档"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_level_is_bounded_and_reports_the_upstream_error() {
+    // 上游什么都拒：往上试探一档、再改成不指定，然后把上游的原始 400 报出去。
+    // 不做无界重试，也不偷偷降档去凑一个 200。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "谁都拒",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    upstream.fallback(Behavior::Json(400, rejected));
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let text = response.text().await.unwrap_or_default();
+    assert!(text.contains("adaptive thinking"), "原因要如实转达：{text}");
+    let levels = {
+        let seen = upstream.seen.lock().unwrap();
+        seen.iter()
+            .map(|s| {
+                s.body["output_config"]["effort"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        levels,
+        vec![
+            Some("high".to_string()),
+            Some("xhigh".to_string()),
+            Some("max".to_string()),
+            None,
+        ],
+        "逐档往上试到底，最后改成不指定，然后收手"
+    );
+    // 每一档只试一次：试探结果被记住了，阶梯不会重走。
+    let mut tried = levels.iter().flatten().cloned().collect::<Vec<_>>();
+    let total = tried.len();
+    tried.sort();
+    tried.dedup();
+    assert_eq!(tried.len(), total, "不重复试同一档：{levels:?}");
+    // 全程没有出现过比客户端要的 high 更低的档位。
+    for level in levels.iter().flatten() {
+        assert!(
+            matches!(level.as_str(), "high" | "xhigh" | "max"),
+            "绝不降档：{levels:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn what_one_account_learns_about_a_level_never_leaks_to_another() {
+    // 同一个站的两个域名实现不同档位，是本次现场的形态。实测结果必须记在
+    // （账号，上游模型）上：一个账号被拒不能顺手改掉另一个账号的发射形状。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let first = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "A",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+    let second = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "B",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    upstream.script([Behavior::Json(400, rejected)]);
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "改按可用档位重发之后应当成功");
+
+    let now = std::time::Instant::now();
+    let evidence = &akhub.state.runtime.evidence;
+    // 请求里的 budget_tokens 16384 换算成 High——被拒的就是这一档。
+    let effort = akhub::protocol::canonical::Effort::High;
+    let plans = [
+        evidence
+            .effort_facts(&first.account_id, "claude-opus-5-5", now)
+            .plan(effort),
+        evidence
+            .effort_facts(&second.account_id, "claude-opus-5-5", now)
+            .plan(effort),
+    ];
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| **plan == akhub::upstream::evidence::EffortPlan::Send(effort))
+            .count(),
+        1,
+        "只有被拒的那个账号记住了这一档：{plans:?}"
+    );
+    // 同一个账号的别的模型不受牵连。
+    let learned = if plans[0] == akhub::upstream::evidence::EffortPlan::Send(effort) {
+        &second.account_id
+    } else {
+        &first.account_id
+    };
+    assert_eq!(
+        evidence
+            .effort_facts(learned, "claude-sonnet-5", now)
+            .plan(effort),
+        akhub::upstream::evidence::EffortPlan::Send(effort)
+    );
+}

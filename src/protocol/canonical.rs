@@ -179,6 +179,22 @@ impl Effort {
         }
     }
 
+    /// 比这一档更高的最弱档；已经是最高档时给 `None`。
+    ///
+    /// 上游拒了客户端要的档位时用它往上试探：中转站实现的档位并不单调
+    /// （现场就是一个站收 low 却拒 medium），所以"更低的不行"推不出"更高的
+    /// 也不行"，只能自己试一次（§14.6）。
+    pub fn above(self) -> Option<Self> {
+        match self {
+            Self::Minimal => Some(Self::Low),
+            Self::Low => Some(Self::Medium),
+            Self::Medium => Some(Self::High),
+            Self::High => Some(Self::XHigh),
+            Self::XHigh => Some(Self::Max),
+            Self::Max => None,
+        }
+    }
+
     /// Token 数 → 档位。
     pub fn from_budget(budget: u32) -> Self {
         if budget <= 2_048 {

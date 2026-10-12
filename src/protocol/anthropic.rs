@@ -16,6 +16,7 @@ use crate::protocol::canonical::{
 };
 use crate::protocol::degrade::{Degradations, Emitted, Unsupported};
 use crate::protocol::{known, sampling_key, string_list};
+use crate::upstream::evidence::{EffortFacts, EffortPlan};
 
 /// Messages 请求体里所有被显式处理的顶层字段。
 const KNOWN_FIELDS: &[&str] = &[
@@ -478,6 +479,7 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
         &request.model,
         request.origin,
         request.thinking.as_ref(),
+        None,
         &mut degraded,
     );
     Ok(Emitted {
@@ -1084,6 +1086,9 @@ pub fn align_thinking(
     model: &str,
     origin: Protocol,
     thinking: Option<&ThinkingConfig>,
+    // 这个（账号，上游模型）上的档位实测结果。调用方知道账号时传它，就能把
+    // 实测接进来；不知道时传 `None`，按客户端要的档位乐观发射。
+    facts: Option<EffortFacts>,
     degraded: &mut Degradations,
 ) {
     let contract = ThinkingContract::of(model);
@@ -1128,16 +1133,25 @@ pub fn align_thinking(
         }
         body.insert("thinking".into(), block);
         // 客户端没表态就不替它选档位：自适应模型的默认档位比中间格式猜的高。
-        if let Some(effort) = intent.effort {
+        if let Some(requested) = intent.effort {
             // 4.6 只认 low/medium/high/max：把 xhigh 原样发过去只会换回一个
             // "This model does not support effort level 'xhigh'" 的 400，
             // 折到它接受的最强档位。
-            let effort = if effort == Effort::XHigh && !contract.xhigh {
+            let requested = if requested == Effort::XHigh && !contract.xhigh {
                 Effort::Max
             } else {
-                effort
+                requested
             };
-            body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+            // 这一档在这个（账号，上游模型）上被拒过时的处置：升到已确认可用的
+            // 更高档，或者**不指定**（把强度交回上游自己的默认）。绝不发更低的
+            // 一档——那是替客户端降智，用户会直接感觉到（§14.6）。
+            let plan = match facts {
+                Some(facts) => facts.plan(requested),
+                None => EffortPlan::Send(requested),
+            };
+            if let EffortPlan::Send(effort) = plan {
+                body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+            }
         }
         return;
     }
@@ -1592,6 +1606,7 @@ mod tests {
             "claude-opus-4-5",
             Protocol::OpenAiChat,
             request.thinking.as_ref(),
+            None,
             &mut degraded,
         );
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -1608,10 +1623,90 @@ mod tests {
             "claude-opus-4-5",
             Protocol::OpenAiChat,
             request.thinking.as_ref(),
+            None,
             &mut degraded,
         );
         assert_eq!(body, once);
         assert!(degraded.into_list().is_empty());
+    }
+
+    fn emit_with_facts(config: &ThinkingConfig, facts: Option<EffortFacts>) -> Map<String, Value> {
+        let mut body = Map::new();
+        body.insert("model".into(), json!("claude-opus-5-5"));
+        body.insert("max_tokens".into(), json!(4_096));
+        let mut degraded = Degradations::default();
+        align_thinking(
+            &mut body,
+            "claude-opus-5-5",
+            Protocol::AnthropicMessages,
+            Some(config),
+            facts,
+            &mut degraded,
+        );
+        body
+    }
+
+    #[test]
+    fn a_rejected_level_is_never_replaced_by_a_lower_one() {
+        let config = ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::High),
+            display: None,
+        };
+        // 实测：high 被拒 → 往上一档试 xhigh，**不是**降到 medium。
+        let mut facts = EffortFacts::default();
+        facts.reject_for_test(Effort::High);
+        let body = emit_with_facts(&config, Some(facts));
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["thinking"]["type"], "adaptive", "思考本身照常要");
+    }
+
+    #[test]
+    fn a_rejected_top_level_omits_the_level_rather_than_lowering_it() {
+        let config = ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::Max),
+            display: None,
+        };
+        // max 已经最高：没有更高的档可试 → **不指定**，而不是降到 xhigh。
+        let mut facts = EffortFacts::default();
+        facts.reject_for_test(Effort::Max);
+        let body = emit_with_facts(&config, Some(facts));
+        assert!(
+            body.get("output_config").is_none(),
+            "不指定 output_config，把强度交回上游默认：{body:?}"
+        );
+        assert_eq!(body["thinking"]["type"], "adaptive", "思考本身照常要");
+    }
+
+    #[test]
+    fn a_rejected_level_upgrades_to_a_known_good_higher_one() {
+        let config = ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::Medium),
+            display: None,
+        };
+        // 实测：medium 被拒、high 可用 → 升到 high，绝不降档。
+        let mut facts = EffortFacts::default();
+        facts.reject_for_test(Effort::Medium);
+        facts.accept_for_test(Effort::High);
+        let body = emit_with_facts(&config, Some(facts));
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn without_account_facts_the_client_gets_exactly_what_it_asked_for() {
+        let config = ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(Effort::XHigh),
+            display: None,
+        };
+        let body = emit_with_facts(&config, None);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
     }
 
     #[test]
@@ -1628,6 +1723,7 @@ mod tests {
             &mut body,
             "claude-opus-5-5",
             Protocol::AnthropicMessages,
+            None,
             None,
             &mut degraded,
         );
