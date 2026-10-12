@@ -89,6 +89,12 @@ pub struct FakeUpstream {
     billing: Arc<Mutex<Option<Value>>>,
     /// `/api/user/self/groups` 的响应体；`None` 时返回 500。
     groups: Arc<Mutex<Option<Value>>>,
+    /// `/api/token/search` 的响应体：这把 Key 自己绑定的分组（§11.2）。
+    /// `None` 时按"令牌存在但没绑分组"回一张空 items 表。
+    token_search: Arc<Mutex<Option<Value>>>,
+    /// `/api/user/self` 的响应体：用户的默认分组。`None` 时返回 404，
+    /// 模拟老版本 New API 没有这个路由——解析必须能优雅降级。
+    user_self: Arc<Mutex<Option<Value>>>,
     /// 两个管理接口是否"不存在"（404）。识别动作只认这一类失败为"不是这个站"。
     billing_absent: Arc<Mutex<bool>>,
     groups_absent: Arc<Mutex<bool>>,
@@ -111,6 +117,8 @@ impl FakeUpstream {
             release,
             billing: Arc::new(Mutex::new(None)),
             groups: Arc::new(Mutex::new(None)),
+            token_search: Arc::new(Mutex::new(None)),
+            user_self: Arc::new(Mutex::new(None)),
             models: Arc::new(Mutex::new(None)),
             billing_absent: Arc::new(Mutex::new(false)),
             groups_absent: Arc::new(Mutex::new(false)),
@@ -125,6 +133,8 @@ impl FakeUpstream {
             .route("/v1/models", get(models))
             .route("/v1/sub2api/billing", get(billing))
             .route("/api/user/self/groups", get(groups))
+            .route("/api/token/search", get(token_search))
+            .route("/api/user/self", get(user_self))
             .with_state(upstream.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -159,6 +169,17 @@ impl FakeUpstream {
 
     pub fn set_groups(&self, body: Option<Value>) {
         *self.groups.lock().unwrap() = body;
+    }
+
+    /// 设置 `/api/token/search` 的响应：`{"group": "ccmax"}` 或 `{"group": ""}`。
+    pub fn set_token_search(&self, body: Option<Value>) {
+        *self.token_search.lock().unwrap() = body;
+    }
+
+    /// 设置 `/api/user/self` 的响应：`{"group": "default"}`。
+    /// 不设置时该路由回 404，用于验证解析链的降级行为。
+    pub fn set_user_self(&self, body: Option<Value>) {
+        *self.user_self.lock().unwrap() = body;
     }
 
     pub fn set_models(&self, body: Option<Value>) {
@@ -454,6 +475,38 @@ async fn groups(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Res
     match upstream.groups.lock().unwrap().clone() {
         Some(body) => axum::Json(body).into_response(),
         None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `/api/token/search?token=sk-...`：这把 Key 自己绑定的分组（§11.2）。
+///
+/// 未配置时按"令牌存在但没绑分组"回一张空 items 表——这正是 relay 会用用户
+/// 默认分组的正常状态，而不是错误。
+async fn token_search(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Response {
+    upstream.seen.lock().unwrap().push(Seen {
+        path: "/api/token/search".into(),
+        body: Value::Null,
+        headers,
+    });
+    let body = upstream
+        .token_search
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| json!({"success": true, "message": "", "data": {"items": []}}));
+    axum::Json(body).into_response()
+}
+
+/// `/api/user/self`：用户的默认分组。未配置时回 404，模拟老版本没有这个路由。
+async fn user_self(State(upstream): State<FakeUpstream>, headers: HeaderMap) -> Response {
+    upstream.seen.lock().unwrap().push(Seen {
+        path: "/api/user/self".into(),
+        body: Value::Null,
+        headers,
+    });
+    match upstream.user_self.lock().unwrap().clone() {
+        Some(body) => axum::Json(body).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

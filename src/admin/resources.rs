@@ -881,8 +881,12 @@ pub struct AccountDto {
     pub multiplier_error: Option<String>,
     pub new_api_user_id: Option<String>,
     pub new_api_group: Option<String>,
-    /// New API 自动倍率的提示：没填分组时按最高档保守估算（§11.2）。
+    /// New API 自动倍率的提示：说明这个倍率取自哪一档、可信度如何（§11.2）。
     pub multiplier_note: Option<&'static str>,
+    /// 这次倍率取自哪个分组。Sub2API 是 Key 级计费，恒为 `null`。
+    pub multiplier_group: Option<String>,
+    /// 分组是怎么定下来的：`configured` / `token` / `user` / `highest_fallback`。
+    pub multiplier_group_source: Option<&'static str>,
     /// 是否已保存 New API 访问令牌。绝不回吐令牌本身。
     pub has_new_api_token: bool,
     /// 账号自己没填凭据、但该 Base URL 有站点级凭据（§6.4）。
@@ -1055,13 +1059,33 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
             .multipliers
             .view()
             .effective(account, limit, crate::storage::now_unix());
-    let last_error = state
+    let entry = state
         .runtime
         .multipliers
         .view()
         .entries()
         .find(|(id, _)| *id == &account.id)
-        .and_then(|(_, entry)| entry.last_error.clone());
+        .map(|(_, entry)| entry.clone());
+    let last_error = entry.as_ref().and_then(|entry| entry.last_error.clone());
+
+    // 倍率取自哪个分组、这个分组是怎么定下来的。旧版只在一处写死"没填分组就用
+    // 最高档估算"，而真正的判定早就细化成四级了——提示语必须跟着实际取值走，
+    // 否则界面会一边显示正确的 0.85 一边说"这是最高档估算"。
+    let multiplier_group = entry.as_ref().and_then(|entry| entry.group.clone());
+    let multiplier_group_source = entry
+        .as_ref()
+        .and_then(|entry| entry.group_source)
+        .map(crate::multiplier::probe::GroupSource::as_str);
+    let multiplier_note = match (account.multiplier_mode, multiplier_group_source) {
+        (MultiplierMode::NewApi, Some("highest_fallback")) => Some(
+            "未能确认这把 Key 的分组归属，暂按可用分组的最高倍率保守估算；可在账号上直接指定分组",
+        ),
+        (MultiplierMode::NewApi, Some("token")) => Some("倍率取自这把 Key 在 New API 上绑定的分组"),
+        (MultiplierMode::NewApi, Some("user")) => {
+            Some("这把 Key 未绑定分组，倍率取自已配置的默认分组")
+        }
+        _ => None,
+    };
     // 账号自己没存令牌、但站点级凭据已配置：界面上要显示"使用站点凭据"。
     let uses_site_credentials = account.multiplier_mode == MultiplierMode::NewApi
         && !has_token
@@ -1108,9 +1132,9 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
         multiplier_error: last_error,
         new_api_user_id: account.new_api_user_id.clone(),
         new_api_group: account.new_api_group.clone(),
-        multiplier_note: (account.multiplier_mode == MultiplierMode::NewApi
-            && account.new_api_group.is_none())
-        .then_some("未填写分组：探针按可用分组的最高倍率保守估算，可能高于这把 Key 的真实档位"),
+        multiplier_note,
+        multiplier_group,
+        multiplier_group_source,
         has_new_api_token: has_token,
         uses_site_credentials,
         limits: account.limits,
@@ -1486,6 +1510,7 @@ pub async fn create_account(
         .map_err(AdminError::internal)?;
     reload(&state).await?;
     audit(&state, &admin, "create_account", &account.id).await;
+    kick_multiplier_refresh(&state, &account);
 
     let has_token = token.is_some();
     Ok((
@@ -1729,6 +1754,9 @@ pub async fn update_account(
             .map_err(AdminError::internal)?;
     }
     audit(&state, &admin, "update_account", &account.id).await;
+    // 改过凭据/分组/来源之后立刻插队探一次：否则列表上会继续显示旧的占位值，
+    // 管理员会以为刚才的修改没生效。
+    kick_multiplier_refresh(&state, &account);
 
     Ok(Json(
         account_dto(&state, &account, had_token || token.is_some()).await,
@@ -1996,6 +2024,135 @@ pub async fn account_multiplier_groups(
             }))
             .collect::<Vec<_>>()
     })))
+}
+
+/// 无状态预览：**不落库**地按给定凭据拉取 New API 分组，并解析出这把 Key 的档位。
+///
+/// 存在的理由是一个很具体的体验缺陷：账号必须先保存、再点开，才能拉分组。新建时
+/// 下拉框是禁用的（还没有账号 ID），于是 `new_api_group` 只能留空，后台就退回
+/// "可用分组最高档"的保守估算——现场症状是倍率显示 1X，而实际是 0.85x。
+///
+/// 这里让表单在**保存之前**就能把凭据发过来验证一次，顺带把分组与倍率一起带回去。
+/// 凭据只用于这一次请求，绝不写库、绝不进日志。
+pub async fn preview_new_api_groups(
+    State(state): State<SharedState>,
+    _: Admin,
+    Json(payload): Json<NewApiPreviewPayload>,
+) -> AdminResult<Json<Value>> {
+    let base_url = validate_base_url(&payload.base_url, payload.allow_private_network)?;
+    let context = crate::multiplier::refresh::Context {
+        store: state.store.clone(),
+        cipher: state.cipher.clone(),
+        upstream: state.upstream.clone(),
+        registry: std::sync::Arc::clone(&state.runtime.multipliers),
+    };
+
+    // 凭据来源与正式探测完全一致：表单里现填的优先，其次站点级凭据（§6.4）。
+    // 表单里可能只填了其中一项（比如令牌已存过、这次只想改用户 ID），所以
+    // 两项分别回落到已保存的值，而不是要求管理员再抄一遍。
+    let stored = context
+        .store
+        .new_api_site(&base_url)
+        .await
+        .map_err(AdminError::internal)?;
+    let token = match trimmed(payload.access_token) {
+        Some(token) => token,
+        None => match stored.as_ref() {
+            Some((_, sealed)) => decrypt_new_api_token(&state, sealed)?,
+            None => {
+                return Err(AdminError::bad_request(
+                    "请先填写 New API 访问令牌（个人设置页生成），或在设置页按站点配置一次",
+                ));
+            }
+        },
+    };
+    let user_id = trimmed(payload.user_id).or_else(|| stored.map(|(user_id, _)| user_id));
+    let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) else {
+        return Err(AdminError::bad_request(
+            "请先填写 New API 用户 ID（New-Api-User 请求头）",
+        ));
+    };
+
+    let groups = crate::multiplier::probe::new_api_groups(
+        &state.upstream,
+        &base_url,
+        &token,
+        &user_id,
+        payload.allow_private_network,
+    )
+    .await
+    .map_err(|error| {
+        AdminError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "拉取分组失败：{}",
+                crate::security::redact::text(&error.to_string())
+            ),
+        )
+    })?;
+
+    // 顺手解析出这把 Key 实际落在哪一档。解析失败不算错误——分组表已经拿到了，
+    // 管理员照样能手动选；只是"自动选中"这一步做不了。
+    let resolved = match crate::multiplier::probe::resolve_group_for_preview(
+        &state.upstream,
+        &base_url,
+        &token,
+        &user_id,
+        payload.api_key.as_deref(),
+        payload.allow_private_network,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::debug!(%error, "预览时未能解析 New API 分组归属，交由管理员手选");
+            None
+        }
+    };
+
+    let resolved_group = resolved.as_ref().map(|(name, _)| name.clone());
+    let resolved_ratio = resolved_group.as_ref().and_then(|name| {
+        groups
+            .iter()
+            .find(|group| &group.name == name)
+            .map(|group| group.ratio)
+    });
+
+    Ok(Json(json!({
+        "groups": groups
+            .iter()
+            .map(|group| json!({
+                "name": group.name,
+                "ratio": group.ratio,
+                "description": group.description,
+            }))
+            .collect::<Vec<_>>(),
+        "resolved_group": resolved_group,
+        "resolved_ratio": resolved_ratio,
+        "resolved_source": resolved.as_ref().map(|(_, source)| source.as_str()),
+    })))
+}
+
+/// 无状态预览的入参。
+#[derive(Deserialize)]
+pub struct NewApiPreviewPayload {
+    pub base_url: String,
+    /// 留空则回落到该 Base URL 已保存的站点级令牌。
+    pub access_token: Option<String>,
+    pub user_id: Option<String>,
+    /// Key 池的第一把（或表单里现填的 Key），用于反查它绑定的分组。
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub allow_private_network: bool,
+}
+
+fn decrypt_new_api_token(state: &SharedState, sealed: &[u8]) -> AdminResult<String> {
+    let plaintext = state
+        .cipher
+        .open(sealed)
+        .map_err(|error| AdminError::internal(anyhow::anyhow!("{error}")))?;
+    String::from_utf8(plaintext.to_vec())
+        .map_err(|error| AdminError::internal(anyhow::anyhow!("{error}")))
 }
 
 // ------------------------------------------------- New API 站点级凭据（§6.4）
@@ -4975,6 +5132,20 @@ async fn reload(state: &SharedState) -> AdminResult<()> {
     // 新增的自动倍率账号也要立刻进入刷新轮次（§21）。
     state.reload_config().await.map_err(AdminError::internal)?;
     Ok(())
+}
+
+/// 把账号插队到下一轮倍率刷新。
+///
+/// 建号/改号之后必须做这一步。定时刷新是 5 分钟一轮、再叠加 0–25% 的稳定抖动
+/// （§11.3），最坏要等 6.25 分钟才首次探测；这期间列表上显示的是"初始倍率"
+/// 占位值（前端留空补 1），管理员会以为倍率配错了——现场就是这个观感。
+/// 插队把它压到一次 tick（10 秒）以内。
+///
+/// 手动来源不插队：它不需要探测，插了也只是白跑一轮。
+fn kick_multiplier_refresh(state: &SharedState, account: &Account) {
+    if account.multiplier_mode.is_automatic() {
+        state.refresh.force(&account.id);
+    }
 }
 
 async fn audit(state: &SharedState, admin: &Admin, action: &str, object: &str) {

@@ -27,6 +27,49 @@ pub struct Reading {
     pub observed_at: Option<i64>,
     /// 峰值时段。存在时由 Akhub 本地换算当前倍率，不必等下一轮刷新（§11.3）。
     pub peak: Option<PeakSchedule>,
+    /// 这次倍率取自哪个分组。Sub2API 是 Key 级计费，没有分组概念，恒为 `None`。
+    pub group: Option<String>,
+    /// 分组是从哪来的，供后台说明"这个倍率凭什么可信"。
+    pub group_source: Option<GroupSource>,
+}
+
+/// 倍率取自哪个分组、这个分组是怎么定下来的。
+///
+/// New API 的 relay 计费看的是**令牌分组**：`sk-` 令牌自己绑了分组时，它覆盖
+/// 用户的默认分组（`middleware/auth.go` 的 TokenAuth）。而 `/api/user/self/groups`
+/// 返回的倍率矩阵是按**用户分组**算的。两者在"令牌绑了分组"时不是同一个数，
+/// 所以必须把"这个倍率代表哪个分组"一并记下来，后台才能说清它可不可信。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSource {
+    /// 管理员在账号上显式填的分组：以它为准，拿不到就报错。
+    Configured,
+    /// 这把 Key 自己在 New API 上绑定的分组（`/api/token/search`）。
+    Token,
+    /// 令牌没绑分组时，用户的默认分组（`/api/user/self`）。
+    User,
+    /// 以上都问不出来时的兜底：可用分组里的最高档，保守估高。
+    HighestFallback,
+}
+
+impl GroupSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Token => "token",
+            Self::User => "user",
+            Self::HighestFallback => "highest_fallback",
+        }
+    }
+
+    /// 人话说明，直接进后台提示语。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "账号上填写的分组",
+            Self::Token => "这把 Key 在 New API 上绑定的分组",
+            Self::User => "该用户在 New API 上的默认分组",
+            Self::HighestFallback => "可用分组中的最高档（保守估算，可能高于真实档位）",
+        }
+    }
 }
 
 impl Reading {
@@ -234,7 +277,20 @@ pub async fn detect(
             Detected::NewApi.probe_label()
         )
     };
-    match verdict(new_api(client, base_url, token, user_id, None, allow_private).await) {
+    // 识别时也带上这把 Key：New API 会用 `api_key` 反查它自己绑的分组，
+    // 让"识别成功"与"之后每轮刷新的取值口径"保持一致。
+    match verdict(
+        new_api(
+            client,
+            base_url,
+            token,
+            user_id,
+            None,
+            Some(api_key),
+            allow_private,
+        )
+        .await,
+    ) {
         Verdict::Ok(_) => Ok(Detected::NewApi),
         Verdict::Inconclusive(error) => bail!(
             "识别失败：{}：{}",
@@ -387,6 +443,9 @@ pub async fn sub2api(
         multiplier,
         observed_at,
         peak,
+        // Sub2API 是 Key 级计费，没有"我属于哪个分组"这一层。
+        group: None,
+        group_source: None,
     })
 }
 
@@ -401,42 +460,141 @@ struct NewApiGroups {
     data: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
-/// 调用 `GET /api/user/self/groups`。
+/// 调用 `GET /api/user/self/groups` 取倍率，并**先问清楚这把 Key 属于哪个分组**。
 ///
-/// 必须用这个接口而不是 `/api/pricing` 或 `/api/ratio_config`：后两者返回的是
+/// 必须用分组接口而不是 `/api/pricing` 或 `/api/ratio_config`：后两者返回的是
 /// 全站倍率表，回答不了"我这把 Key 属于哪一档"（§11.2）。
 ///
-/// `group` 为空时取可用分组中的**最高**倍率——不知道自己在哪一档时，把成本
-/// 估高才是安全方向。后台账号表单会提示这一点，并提供"拉取可用分组"。
+/// **分组解析顺序**（这是本函数与旧版最大的区别）：
+///
+/// 1. 账号上显式填的 `group`：管理员说了算，取不到就报错，绝不静默换一个档位；
+/// 2. 这把 Key 自己在 New API 上绑定的分组（`/api/token/search`）；
+/// 3. 用户的默认分组（`/api/user/self`）；
+/// 4. 以上都问不出来，才退回"可用分组的最高档"。
+///
+/// 前两步都不能省。New API 的 relay 计费按 **令牌分组** 走：令牌绑了分组时它
+/// 覆盖用户默认分组；而分组接口返回的倍率矩阵是按 **用户分组** 算的。旧版直接
+/// 拿整个矩阵取 `max()`，于是"令牌绑在 ccmax（0.85）"的账号会被算成该用户可用
+/// 分组里的最高档——现场症状就是倍率显示 1X 而实际是 0.85x。
 pub async fn new_api(
     client: &UpstreamClient,
     base_url: &str,
     access_token: &str,
     user_id: &str,
     group: Option<&str>,
+    api_key: Option<&str>,
     allow_private: bool,
 ) -> Result<Reading> {
     let data = fetch_new_api_groups(client, base_url, access_token, user_id, allow_private).await?;
 
-    let multiplier = match group {
-        Some(name) => {
-            let raw = data
-                .get(name)
-                .with_context(|| format!("New API 上不存在分组「{name}」，或这把 Key 无权使用"))?;
-            group_ratio(raw).with_context(|| format!("New API 分组「{name}」的倍率非法"))?
-        }
-        None => data
-            .values()
-            .filter_map(|raw| group_ratio(raw).ok())
-            .max()
-            .context("New API 返回的分组中没有一个带合法倍率")?,
-    };
+    // 显式配置优先：管理员填了分组就只认它。
+    if let Some(name) = group.filter(|name| !name.trim().is_empty()) {
+        let raw = data
+            .get(name)
+            .with_context(|| format!("New API 上不存在分组「{name}」，或这把 Key 无权使用"))?;
+        let multiplier =
+            group_ratio(raw).with_context(|| format!("New API 分组「{name}」的倍率非法"))?;
+        return Ok(reading(multiplier, name, GroupSource::Configured));
+    }
 
-    Ok(Reading {
+    // 没填分组：问出这把 Key 实际落在哪一档。两步查询都是**尽力而为**——
+    // 老版本 New API 可能没有这些路由，站点也可能限流；问不出来就降级，
+    // 绝不让一次倍率刷新整体失败（拿不到准确档位 ≠ 拿不到倍率）。
+    if let Some((name, source)) = resolve_new_api_group(
+        client,
+        base_url,
+        access_token,
+        user_id,
+        api_key,
+        allow_private,
+    )
+    .await
+    {
+        if let Some(Ok(multiplier)) = data.get(&name).map(group_ratio) {
+            return Ok(reading(multiplier, &name, source));
+        }
+        tracing::warn!(
+            group = name,
+            "New API 上解析出的分组不在可用分组表里，退回按最高档保守估算"
+        );
+    }
+
+    // 兜底：不知道自己在哪一档时，把成本估高才是安全方向。
+    let (name, raw) = data
+        .iter()
+        .filter_map(|(name, raw)| group_ratio(raw).ok().map(|ratio| (ratio, name, raw)))
+        .max_by_key(|(ratio, _, _)| *ratio)
+        .map(|(_, name, raw)| (name.clone(), raw))
+        .context("New API 返回的分组中没有一个带合法倍率")?;
+    let multiplier = group_ratio(raw).context("New API 最高档分组的倍率非法")?;
+    Ok(reading(multiplier, &name, GroupSource::HighestFallback))
+}
+
+fn reading(multiplier: Multiplier, group: &str, source: GroupSource) -> Reading {
+    Reading {
         multiplier,
         observed_at: None,
         peak: None,
-    })
+        group: Some(group.to_string()),
+        group_source: Some(source),
+    }
+}
+
+/// 问出这把 Key 实际生效的分组：先看令牌自己绑的分组，再看用户的默认分组。
+///
+/// 两个接口都要"访问令牌 + `New-Api-User`"这一对凭据。任何一步失败都只是
+/// **这一次问不出来**，返回 `None` 让调用方走保守兜底，而不是让倍率刷新失败。
+///
+/// 后台的"预览"动作也走这里：让表单在保存前就能显示"这把 Key 落在哪一档"，
+/// 与保存之后每轮刷新用的判定口径完全一致。
+pub async fn resolve_group_for_preview(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    api_key: Option<&str>,
+    allow_private: bool,
+) -> Result<Option<(String, GroupSource)>> {
+    Ok(resolve_new_api_group(
+        client,
+        base_url,
+        access_token,
+        user_id,
+        api_key,
+        allow_private,
+    )
+    .await)
+}
+
+async fn resolve_new_api_group(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    api_key: Option<&str>,
+    allow_private: bool,
+) -> Option<(String, GroupSource)> {
+    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        match new_api_key_group(client, base_url, access_token, user_id, key, allow_private).await {
+            Ok(Some(group)) if !group.trim().is_empty() => {
+                return Some((group, GroupSource::Token));
+            }
+            // 令牌没绑分组是**正常状态**：relay 此时用用户分组。
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                %error,
+                "查不到 New API 令牌分组，改用用户默认分组"
+            ),
+        }
+    }
+    match new_api_user_group(client, base_url, access_token, user_id, allow_private).await {
+        Ok(Some(group)) if !group.trim().is_empty() => Some((group, GroupSource::User)),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(%error, "查不到 New API 用户分组，退回按最高档保守估算");
+            None
+        }
+    }
 }
 
 /// 一个可选的 New API 分组。
@@ -527,6 +685,149 @@ async fn fetch_new_api_groups(
         .data
         .filter(|data| !data.is_empty())
         .context("New API 分组接口没有返回任何可用分组")
+}
+
+/// 查这把 Key 在 New API 上**自己绑定的分组**（`GET /api/token/search?token=sk-...`）。
+///
+/// 这是 relay 计费真正用的分组：令牌绑了分组时它覆盖用户默认分组。返回 `None`
+/// 表示令牌存在但没绑分组（正常状态），此时应由用户默认分组接管。
+///
+/// 为什么用 `search` 而不是列表接口：`GET /api/token/` 只支持分页，无法按 Key
+/// 过滤，逐页翻找既慢又会在令牌多时漏掉。`search` 的 `token` 参数正是按 Key 值
+/// 精确匹配（服务端自己会剥掉 `sk-` 前缀），且强制限定在本人名下。
+///
+/// 返回体里 Key 是**掩码**的，但服务端是用完整 Key 匹配的，掩码不影响我们读
+/// `group` 字段——它始终是明文。
+pub async fn new_api_key_group(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    api_key: &str,
+    allow_private: bool,
+) -> Result<Option<String>> {
+    let mut url = probe_url(base_url, "api/token/search")?;
+    url.query_pairs_mut().append_pair("token", api_key.trim());
+    url_guard::assert_resolvable(&url, allow_private).await?;
+    // 报错里**只带路径**，不带查询串：`?token=` 后面就是这把 Key 的明文，而
+    // 这条错误会经 sanitize 落进 multiplier_snapshot.last_error 并显示在后台。
+    // 脱敏不能当唯一防线——它对全角标点结尾的串判不出来（§23.4）。
+    let endpoint = probe_url(base_url, "api/token/search")?.to_string();
+
+    let response = new_api_get(client, url, access_token, user_id, allow_private).await?;
+    let body = read_json_body(&endpoint, response).await?;
+    let payload: NewApiEnvelope = serde_json::from_slice(&body)
+        .map_err(|error| anyhow::Error::new(error).context("New API 令牌查询响应结构不符合预期"))?;
+    if !payload.success {
+        bail!(
+            "New API 令牌查询失败：{}",
+            payload.reason("访问令牌或用户 ID 可能不正确")
+        );
+    }
+
+    // 分页信封里的 items；兼容直接把数组放在 data 上的老形状。
+    let items = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| payload.data.as_ref().and_then(serde_json::Value::as_array));
+    let Some(items) = items else {
+        bail!("New API 令牌查询响应里没有令牌列表");
+    };
+
+    // 服务端是按 Key 值精确匹配的，所以命中多条只可能是同名 Key 的极端情况；
+    // 取第一条即可，并且**只认真正绑了分组的那条**，避免被空 group 抢先。
+    let mut seen_without_group = false;
+    for item in items {
+        match item.get("group").and_then(serde_json::Value::as_str) {
+            Some(group) if !group.trim().is_empty() => return Ok(Some(group.to_string())),
+            _ => seen_without_group = true,
+        }
+    }
+    if seen_without_group {
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+/// 查用户的默认分组（`GET /api/user/self` 的 `data.group`）。
+///
+/// 令牌没绑分组时，relay 用的就是它。拿不到就返回 `None`，交给保守兜底。
+pub async fn new_api_user_group(
+    client: &UpstreamClient,
+    base_url: &str,
+    access_token: &str,
+    user_id: &str,
+    allow_private: bool,
+) -> Result<Option<String>> {
+    let url = probe_url(base_url, "api/user/self")?;
+    url_guard::assert_resolvable(&url, allow_private).await?;
+    let endpoint = url.to_string();
+
+    let response = new_api_get(client, url, access_token, user_id, allow_private).await?;
+    let body = read_json_body(&endpoint, response).await?;
+    let payload: NewApiEnvelope = serde_json::from_slice(&body)
+        .map_err(|error| anyhow::Error::new(error).context("New API 用户信息响应结构不符合预期"))?;
+    if !payload.success {
+        bail!(
+            "New API 用户信息查询失败：{}",
+            payload.reason("访问令牌或用户 ID 可能不正确")
+        );
+    }
+    Ok(payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("group"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|group| !group.trim().is_empty()))
+}
+
+/// 发一次带 New API 双凭据的 GET。
+///
+/// New API 的访问令牌直接放在 `Authorization` 里，**不带 `Bearer` 前缀**；
+/// `New-Api-User` 必须与令牌所属用户一致，否则上游直接 401。
+async fn new_api_get(
+    client: &UpstreamClient,
+    url: reqwest::Url,
+    access_token: &str,
+    user_id: &str,
+    allow_private: bool,
+) -> Result<reqwest::Response> {
+    client
+        .http_for(allow_private)
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, access_token)
+        .header("New-Api-User", user_id)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        // 就地脱敏：reqwest 的错误文本里带完整 URL，而令牌查询的 URL 查询串里
+        // 就是 Key 的明文。这里脱一次，调用方无论是落库、回后台还是写日志都不会
+        // 泄漏——不能指望每个调用点都记得再过一遍（§23.4）。
+        .map_err(|error| anyhow::anyhow!("{}", crate::security::redact::text(&error.to_string())))
+        .context("New API 请求失败")
+}
+
+/// New API 统一的 `{success, message, data}` 信封。
+#[derive(Debug, Deserialize)]
+struct NewApiEnvelope {
+    success: bool,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+impl NewApiEnvelope {
+    fn reason(&self, fallback: &str) -> String {
+        if self.message.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            self.message.clone()
+        }
+    }
 }
 
 /// 分组条目既可能是 `{"ratio": 0.5, "desc": "..."}`，也可能直接是数字。
@@ -708,6 +1009,52 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 令牌查询的分页信封里带 group，且**只认真正绑了分组的那条**。
+    #[test]
+    fn the_token_search_envelope_exposes_the_bound_group() {
+        let envelope: NewApiEnvelope = serde_json::from_value(json!({
+            "success": true,
+            "message": "",
+            "data": {"items": [{"id": 7, "group": "ccmax"}]}
+        }))
+        .unwrap();
+        assert!(envelope.success);
+        let items = envelope
+            .data
+            .as_ref()
+            .and_then(|data| data.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .expect("items");
+        assert_eq!(items[0]["group"], "ccmax");
+    }
+
+    /// 失败信封要能给出原因，便于把 401/限流如实报给管理员。
+    #[test]
+    fn a_failed_envelope_reports_its_reason() {
+        let envelope: NewApiEnvelope = serde_json::from_value(json!({
+            "success": false,
+            "message": "无权进行此操作，New-Api-User 与登录用户不匹配"
+        }))
+        .unwrap();
+        assert!(!envelope.success);
+        assert!(envelope.reason("兜底").contains("New-Api-User"));
+
+        // 没有 message 时用兜底文案，而不是回一句空话。
+        let bare: NewApiEnvelope = serde_json::from_value(json!({"success": false})).unwrap();
+        assert_eq!(bare.reason("兜底"), "兜底");
+    }
+
+    /// 分组来源的文案要能直接进后台提示语。
+    #[test]
+    fn group_sources_have_stable_wire_names() {
+        assert_eq!(GroupSource::Configured.as_str(), "configured");
+        assert_eq!(GroupSource::Token.as_str(), "token");
+        assert_eq!(GroupSource::User.as_str(), "user");
+        assert_eq!(GroupSource::HighestFallback.as_str(), "highest_fallback");
+        // 兜底那一档必须自己说清"这是估算"，否则后台会把估高的数当成真值。
+        assert!(GroupSource::HighestFallback.label().contains("保守"));
+    }
+
     fn multiplier(raw: &str) -> Multiplier {
         Multiplier::parse(raw).unwrap()
     }
@@ -818,6 +1165,8 @@ mod tests {
         let reading = Reading {
             multiplier: multiplier("0.5"),
             observed_at: Some(0),
+            group: None,
+            group_source: None,
             peak: Some(
                 PeakSchedule::new(
                     multiplier("1.5"),

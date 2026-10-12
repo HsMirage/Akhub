@@ -45,7 +45,12 @@ const KEY_PREFIXES: &[&str] = &["sk-", "sk_", "akh-"];
 /// 没有前缀但足够长的连续 Token 字符也按密钥处理。
 const OPAQUE_LEN: usize = 32;
 /// 词两侧允许剥掉的标点。
-const PUNCTUATION: &str = "\"'`,;()[]{}<>";
+///
+/// 必须包含中文标点：日志与后台提示都是中文写的，一句
+/// `（GET https://…?token=sk-xxx）` 里的 Key 后面紧跟的就是全角括号。少了它，
+/// 这个词整体会被判成“不是密钥”——密钥就这么原样落进 `last_error` 并显示在
+/// 后台（§23.4）。
+const PUNCTUATION: &str = "\"'`,;()[]{}<>（）【】「」《》、。，；：！？…—";
 
 /// 只有经过当前账号上下文脱敏的原因，才允许覆盖通用客户提示。
 #[derive(Debug, Clone)]
@@ -328,6 +333,21 @@ mod tests {
         let header = text("Authorization:sk-live-0123456789 已拒绝");
         assert!(!header.contains("0123456789"), "{header}");
         assert!(header.starts_with("Authorization:sk-liv"), "{header}");
+    }
+
+    #[test]
+    fn a_key_followed_by_chinese_punctuation_is_still_redacted() {
+        // 后台提示与日志都是中文写的，密钥后面紧跟的常常是全角标点。少了这些
+        // 标点，整个词会被判成"不是密钥"——密钥原样落进 last_error 并显示在
+        // 后台（§23.4）。
+        let key = "445566778899aabbccddeeff00112233445566778899aabb";
+        for suffix in [")", "）", "。", "：", "，", "；", "、", "」", "…", ""] {
+            let masked = text(&format!(
+                "探针返回 HTTP 401（GET https://x?token={key}{suffix}）"
+            ));
+            assert!(!masked.contains(key), "后缀 {suffix:?} 没脱敏：{masked}");
+            assert!(masked.contains("探针返回 HTTP 401"), "正文要保留：{masked}");
+        }
     }
 
     #[test]

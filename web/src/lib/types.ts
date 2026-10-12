@@ -91,6 +91,10 @@ export interface Account {
   new_api_group: string | null;
   /** 是否已保存 New API 访问令牌。令牌本身绝不回吐。 */
   has_new_api_token: boolean;
+  /** 倍率取自哪个分组（Sub2API 恒为 null）。 */
+  multiplier_group: string | null;
+  /** 分组是怎么定下来的：configured / token / user / highest_fallback。 */
+  multiplier_group_source: string | null;
   /** 账号自己没填凭据、但该 Base URL 配了站点级凭据（§6.4）。 */
   uses_site_credentials: boolean;
   limits: Limits;
@@ -507,6 +511,26 @@ export interface NewApiGroupOption {
   name: string;
   ratio: string;
   description: string | null;
+}
+
+/** 保存前的 New API 分组预览入参（凭据只用于这一次请求，不落库）。 */
+export interface NewApiPreviewInput {
+  base_url: string;
+  access_token?: string;
+  user_id?: string;
+  /** Key 池的第一把或表单里现填的 Key，用于反查它绑定的分组。 */
+  api_key?: string;
+  allow_private_network?: boolean;
+}
+
+/** 保存前的 New API 分组预览结果。 */
+export interface NewApiPreviewResult {
+  groups: NewApiGroupOption[];
+  /** 自动解析出的分组归属；解析不出来时为 null，需要管理员手选。 */
+  resolved_group: string | null;
+  resolved_ratio: string | null;
+  /** `token`（Key 自己绑的分组）/ `user`（默认分组）。 */
+  resolved_source: string | null;
 }
 
 /** 站点级 New API 凭据：一个 Base URL 配一次，账号自动继承（§6.4）。 */

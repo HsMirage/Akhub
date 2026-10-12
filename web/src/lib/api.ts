@@ -21,6 +21,8 @@ import type {
   SettingsPatch,
   SetupStatus,
   NewApiGroupOption,
+  NewApiPreviewInput,
+  NewApiPreviewResult,
   NewApiSite,
   TestResult,
   DetectMultiplierResult,
@@ -330,6 +332,14 @@ export const api = {
   /** 拉取该账号可用的 New API 分组（只读，不落库）。 */
   multiplierGroups: (id: string) =>
     request<{ groups: NewApiGroupOption[] }>(`/accounts/${id}/multiplier-groups`),
+  /**
+   * 保存**之前**按表单里的凭据预览 New API 分组（只读，不落库）。
+   *
+   * 新建账号时还没有账号 ID，账号级的 `multiplierGroups` 用不了；这个无状态
+   * 接口让表单当场就能验证凭据、把分组和倍率一起带回来，不必"先存再点开"。
+   */
+  previewNewApiGroups: (input: NewApiPreviewInput) =>
+    post<NewApiPreviewResult>("/new-api/preview-groups", input),
   /** 一键独立复制：停用状态的「名称 - 副本」，Key 重新加密（§6.4）。 */
   copyAccount: (id: string) => post<Account>(`/accounts/${id}/copy`),
   /** 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。 */

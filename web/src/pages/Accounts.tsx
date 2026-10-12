@@ -7,6 +7,7 @@ import type {
   BatchMultiplierRefreshResult,
   Limits,
   MultiplierMode,
+  NewApiPreviewResult,
   Protocol,
   TestResult,
 } from "../lib/types";
@@ -871,18 +872,66 @@ function AccountDrawer({
     [],
   );
   const [groupsLoading, setGroupsLoading] = useState(false);
+  /** 上一次拉取时自动解析出的分组归属，用于在表单里说清"凭什么选中它"。 */
+  const [resolvedGroup, setResolvedGroup] = useState<{
+    name: string;
+    ratio: string | null;
+    source: string | null;
+  } | null>(null);
+
+  /**
+   * 拉取可用分组，并自动选中这把 Key 实际落在的那一档。
+   *
+   * 保存前后走的是两条路，但**结果口径完全一致**：
+   *
+   * * 已保存的账号走账号级接口（凭据在后端，浏览器不接触）；
+   * * 新建账号走无状态预览接口，把表单里现填的凭据发过去验一次。
+   *
+   * 旧版只有第一条路，且按钮在新建态是禁用的——于是新建时 `new_api_group`
+   * 必然为空，后台只能退回"可用分组最高档"的保守估算，界面上就显示成 1X
+   * 而真实档位是 0.85x。
+   */
   const loadGroups = async () => {
-    if (!account) return;
     setGroupsLoading(true);
     try {
-      const result = await api.multiplierGroups(account.id);
+      const keyDraft = keyDrafts.find((draft) => draft.api_key.trim())?.api_key.trim();
+      const result = account
+        ? await api.multiplierGroups(account.id)
+        : await api.previewNewApiGroups({
+            base_url: form.base_url.trim(),
+            access_token: form.new_api_token.trim() || undefined,
+            user_id: form.new_api_user_id.trim() || undefined,
+            api_key: keyDraft || undefined,
+            allow_private_network: form.allow_private_network,
+          });
       setGroups(result.groups);
-      const [only] = result.groups;
-      if (!only) {
+      // 账号级接口只回分组表；无状态预览还会回"这把 Key 落在哪一档"。
+      const resolved: NewApiPreviewResult | null =
+        "resolved_group" in result ? (result as NewApiPreviewResult) : null;
+      setResolvedGroup(
+        resolved?.resolved_group
+          ? {
+              name: resolved.resolved_group,
+              ratio: resolved.resolved_ratio,
+              source: resolved.resolved_source,
+            }
+          : null,
+      );
+
+      if (result.groups.length === 0) {
         toast.error("这个账号下没有可用分组");
-      } else if (!form.new_api_group && result.groups.length === 1) {
-        // 只有一个分组时直接选中，不必再点一次。
-        set("new_api_group", only.name);
+        return;
+      }
+      // 已经选过分组就不覆盖管理员的选择；只在空着的时候自动填。
+      const auto: string | null =
+        resolved?.resolved_group ?? (result.groups.length === 1 ? result.groups[0]!.name : null);
+      if (!form.new_api_group && auto) {
+        set("new_api_group", auto);
+        const ratio =
+          resolved?.resolved_ratio ?? result.groups.find((group) => group.name === auto)?.ratio;
+        toast.success(`已识别这把 Key 的分组为「${auto}」${ratio ? `（倍率 ${ratio}）` : ""}，已自动选中`);
+      } else if (resolved?.resolved_group) {
+        toast.success(`拉到 ${result.groups.length} 个分组；这把 Key 实际落在「${resolved.resolved_group}」`);
       } else {
         toast.success(`拉到 ${result.groups.length} 个分组，从下拉框里选一个`);
       }
@@ -1398,7 +1447,7 @@ function AccountDrawer({
             </div>
             <Field
               label="分组名"
-              hint="去「拉取分组」里挑；留空就按最高倍率保守估算。"
+              hint="留空时后台会自己问出这把 Key 的分组（先看 Key 绑定的分组，再看默认分组）；问不出来才按最高档保守估算。点「拉取分组」可以当场确认。"
             >
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
@@ -1409,7 +1458,7 @@ function AccountDrawer({
                       value={form.new_api_group}
                       onChange={(e) => set("new_api_group", e.target.value)}
                     >
-                      <option value="">（留空：按最高档估算）</option>
+                      <option value="">（留空：自动识别这把 Key 的分组）</option>
                       {groups.map((group) => (
                         <option key={group.name} value={group.name}>
                           {group.name} · {group.ratio}
@@ -1430,7 +1479,9 @@ function AccountDrawer({
                     variant="ghost"
                     type="button"
                     onClick={() => void loadGroups()}
-                    disabled={groupsLoading || (!form.new_api_user_id.trim() && !siteCredential) || !account}
+                    // 新建时也能拉：走无状态预览接口，不再要求"先保存再点开"。
+                    // 只要求"要么填了用户 ID、要么这个站点已配站点凭据"。
+                    disabled={groupsLoading || (!form.new_api_user_id.trim() && !siteCredential)}
                   >
                     {groupsLoading && <span className="spinner" aria-hidden="true" />}
                     {groupsLoading ? "拉取中…" : "拉取分组"}
@@ -1438,6 +1489,20 @@ function AccountDrawer({
                 </div>
               )}
             </Field>
+            {resolvedGroup && (
+              // 把"凭什么自动选中它"说清楚：分组名 + 来源 + 倍率。管理员据此判断
+              // 该不该信这个数，而不是只能看到一个来路不明的下拉框默认值。
+              <p className="text-faint" style={{ margin: "0 0 10px", fontSize: 12.5 }}>
+                已识别：这把 Key 实际落在「{resolvedGroup.name}」
+                {resolvedGroup.ratio ? `，倍率 ${resolvedGroup.ratio}` : ""}
+                {resolvedGroup.source === "token"
+                  ? "（来自 Key 自身绑定的分组）"
+                  : resolvedGroup.source === "user"
+                    ? "（Key 未绑定分组，取自默认分组）"
+                    : ""}
+                。保存后后台按同一口径取倍率。
+              </p>
+            )}
           </>
         )}
 

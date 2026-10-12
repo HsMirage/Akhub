@@ -201,6 +201,8 @@ async fn refresh_one(
                 stale_since: None,
                 last_error: None,
                 peak: reading.peak.clone(),
+                group: reading.group.clone(),
+                group_source: reading.group_source,
             };
             persist(context, account, &entry, Status::Known).await;
             context.registry.put(&account.id, entry);
@@ -224,7 +226,11 @@ async fn refresh_one(
                     .and_then(|entry| entry.stale_since)
                     .or(Some(now_unix)),
                 last_error: Some(sanitize(&error)),
-                peak: previous.and_then(|entry| entry.peak),
+                peak: previous.as_ref().and_then(|entry| entry.peak.clone()),
+                // 失败时保留上一次判定出的分组：它是"这个旧倍率取自哪一档"的
+                // 解释，清掉会让后台在故障期间说不清这个数是怎么来的。
+                group: previous.as_ref().and_then(|entry| entry.group.clone()),
+                group_source: previous.as_ref().and_then(|entry| entry.group_source),
             };
             persist(context, account, &entry, Status::Stale).await;
             context.registry.put(&account.id, entry);
@@ -252,9 +258,11 @@ pub async fn refresh_account_now(
 
 /// 按账号配置的来源发起探测。
 async fn probe_account(context: &Context, account: &Account) -> Result<probe::Reading> {
+    // Key 池的第一把。Sub2API 用它做 Key 级计费查询；New API 用它反查这把 Key
+    // 绑定的分组——所以两种来源都需要它，报错文案不能再只提 Sub2API。
     let api_key = account_api_key(context, account)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("账号缺少 Sub2API 探针所需的 API Key"))?;
+        .ok_or_else(|| anyhow::anyhow!("账号缺少 API Key，无法探测倍率"))?;
     match account.multiplier_mode {
         MultiplierMode::Manual => anyhow::bail!("手动倍率不需要探测"),
         MultiplierMode::Sub2Api => {
@@ -279,6 +287,8 @@ async fn probe_account(context: &Context, account: &Account) -> Result<probe::Re
                 &token,
                 &user_id,
                 account.new_api_group.as_deref(),
+                // 这把 Key 自己绑的分组才是 relay 计费真正用的分组，必须带上。
+                Some(api_key.as_str()),
                 account.allow_private_network,
             )
             .await
@@ -513,6 +523,8 @@ mod tests {
             stale_since: Some(100),
             last_error: Some("超时".into()),
             peak: None,
+            group: None,
+            group_source: None,
         };
         let second_failure_at = 500;
         let carried = first.stale_since.or(Some(second_failure_at));

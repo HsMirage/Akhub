@@ -75,6 +75,12 @@ pub struct Entry {
     pub last_error: Option<String>,
     /// 峰值时段。存在时由本地换算当前倍率（§11.3）。
     pub peak: Option<probe::PeakSchedule>,
+    /// 这个倍率取自哪个分组，以及那个分组是怎么定下来的。
+    ///
+    /// 只在内存里保留、供后台解释"这个数凭什么可信"，不落库：分组随时可能被
+    /// 上游改掉，重启后按新的一轮刷新结果重新判定即可。
+    pub group: Option<String>,
+    pub group_source: Option<probe::GroupSource>,
 }
 
 impl Entry {
@@ -88,6 +94,8 @@ impl Entry {
             stale_since: None,
             last_error: None,
             peak: None,
+            group: None,
+            group_source: None,
         }
     }
 
@@ -101,6 +109,8 @@ impl Entry {
             stale_since: Some(now),
             last_error: Some("尚未完成首次自动刷新".into()),
             peak: None,
+            group: None,
+            group_source: None,
         }
     }
 
@@ -269,6 +279,9 @@ impl Registry {
                         }),
                         last_error: row.last_error.clone(),
                         peak: None,
+                        // 分组不在快照里：重启后由下一轮刷新重新判定。
+                        group: None,
+                        group_source: None,
                     },
                     _ => Entry::pending(account, now),
                 }
@@ -355,6 +368,8 @@ mod tests {
             stale_since: Some(since),
             last_error: Some("上游超时".into()),
             peak: None,
+            group: None,
+            group_source: None,
         }
     }
 

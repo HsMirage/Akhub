@@ -252,6 +252,11 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/multiplier-groups",
             get(r::account_multiplier_groups),
         )
+        // 无状态预览：新建账号时也能在保存前拉分组、看清这把 Key 的档位。
+        .route(
+            "/admin/api/new-api/preview-groups",
+            post(r::preview_new_api_groups),
+        )
         .route("/admin/api/accounts/{id}/copy", post(r::copy_account))
         .route("/admin/api/accounts/{id}/test", post(r::test_account))
         // 手动放行一把被误判的 Key（§12.3）：面板上"Key 失效"必须配有出口。
