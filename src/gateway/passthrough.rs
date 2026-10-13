@@ -1201,6 +1201,8 @@ impl Walk<'_> {
             admission.cancel_before_upstream();
             self.last = Some((code, message));
             self.last_public = None;
+            // 同 `run_attempt`：这次根本没发出去，"最后一次失败"已被改写。
+            self.last_opaque = None;
             return Flow::Continue;
         }
         // 粘性/钉住命中的那把要跨重试保留：换 Key 只发生在凭据真的被拒绝之后。
@@ -1597,6 +1599,10 @@ impl Walk<'_> {
                     "目标尝试失败，切换到下一个候选"
                 );
                 self.last = Some((code, message));
+                // 后面又发生了**别的**失败：之前那个无法归因的 400 不再是本次
+                // 请求的最终原因，留着会在候选耗尽时把它当成结论报出去，把
+                // 真正的原因（限流、超时……）吞掉，客户端的重试行为也跟着错。
+                self.last_opaque = None;
                 Attempted::Done(Flow::Continue)
             }
         }
@@ -2029,6 +2035,9 @@ impl Walk<'_> {
 
     fn note_unavailable(&mut self, candidate: &routing::Candidate, reason: health::Unavailable) {
         self.last_public = None;
+        // 同 `run_attempt` 里那条注释：这个目标根本没能发出去，"最后一次失败"
+        // 已经被改写，之前那个无法归因的 400 不能再当结论（§13.7）。
+        self.last_opaque = None;
         self.last = Some((
             unavailable_code(reason),
             format!(

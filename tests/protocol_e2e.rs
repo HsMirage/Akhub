@@ -1511,3 +1511,52 @@ async fn repeated_unattributable_400s_stop_after_a_bounded_number_of_channels() 
         "有界：首次 + MAX_OPAQUE_REJECTION_RETRIES 次"
     );
 }
+
+#[tokio::test]
+async fn a_later_unrelated_failure_is_not_masked_by_an_earlier_opaque_400() {
+    // 复审发现的缺陷：last_opaque 一旦写下就不再清除，于是"先撞一次无法归因的
+    // 400、后面又因为别的原因全失败"时，客户端会拿到那个早已过期的 400，
+    // 而真正的失败原因（这里是 429 限流）被吞掉——错误码错了，客户端的重试
+    // 行为也跟着错。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    for name in ["A", "B", "C"] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                50,
+            ),
+        )
+        .await;
+    }
+
+    let opaque = json!({"error": {
+        "message": "The request could not be processed. Please check the request parameters.",
+        "type": "invalid_request_error"
+    }});
+    // 第一个目标：无法归因的 400（会触发换渠道）。之后的全部 429。
+    upstream.script([Behavior::Json(400, opaque)]);
+    upstream.fallback(Behavior::Status(429, None));
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    // 最后的失败是限流，不是那个 400。
+    assert_eq!(
+        response.status(),
+        429,
+        "应当报告最后一次真实的失败原因，而不是早已过期的 400"
+    );
+}
