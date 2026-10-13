@@ -1344,3 +1344,170 @@ async fn what_one_account_learns_about_a_level_never_leaks_to_another() {
         akhub::upstream::evidence::EffortPlan::Send(effort)
     );
 }
+
+#[tokio::test]
+async fn an_unattributable_400_moves_to_another_channel_instead_of_failing_the_client() {
+    // 现场：上游回 "The request could not be processed. Please check the request
+    // parameters."——没说是哪个参数。400 发生在开始生成之前、**一个 token 都没
+    // 消耗**，所以换渠道重试几乎免费；直接透给客户端则把上游的瞬时抖动变成
+    // 用户可见的失败（§13.7）。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    // 三个同优先级目标：前两个拒，第三个放行。
+    for name in ["会拒的1", "会拒的2", "正常的"] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                50,
+            ),
+        )
+        .await;
+    }
+
+    // 前两个目标都拒，第三个放行。
+    let opaque = json!({"error": {
+        "message": "The request could not be processed. Please check the request parameters.",
+        "type": "invalid_request_error"
+    }});
+    upstream.script([
+        Behavior::Json(400, opaque.clone()),
+        Behavior::Json(400, opaque),
+    ]);
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "换渠道之后应当成功，而不是把上游的 400 透给客户端"
+    );
+    // 请求体确实重传了（这就是这条路唯一的代价）。
+    assert!(
+        upstream.requests() >= 3,
+        "应当在别的目标上真的重试过：{}",
+        upstream.requests()
+    );
+}
+
+#[tokio::test]
+async fn an_attributable_400_is_reported_immediately_without_retrying() {
+    // "prompt is too long" 明确归因到请求本身：换哪个目标都是同一个结果，
+    // 重试只会白传一遍请求体。必须立刻如实返回（§13.7）。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "A",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        ),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "B",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        ),
+    )
+    .await;
+
+    let too_long = json!({"error": {
+        "message": "prompt is too long: 1520629 tokens > 1000000 maximum",
+        "type": "invalid_request_error"
+    }});
+    upstream.fallback(Behavior::Json(400, too_long));
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let text = response.text().await.unwrap_or_default();
+    assert!(
+        text.contains("prompt is too long"),
+        "原因要如实转达：{text}"
+    );
+    assert_eq!(
+        upstream.requests(),
+        1,
+        "可归因的 400 只打一次上游，不换渠道重试"
+    );
+}
+
+#[tokio::test]
+async fn repeated_unattributable_400s_stop_after_a_bounded_number_of_channels() {
+    // 全都拒：换有限个目标之后收手，把上游原话交回客户端，不做无界重试。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    for name in ["A", "B", "C", "D"] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                50,
+            ),
+        )
+        .await;
+    }
+
+    let opaque = json!({"error": {
+        "message": "The request could not be processed. Please check the request parameters.",
+        "type": "invalid_request_error"
+    }});
+    upstream.fallback(Behavior::Json(400, opaque));
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let text = response.text().await.unwrap_or_default();
+    assert!(
+        text.contains("could not be processed"),
+        "要把上游原话交回客户端：{text}"
+    );
+    // 首次 + 最多 2 次换渠道。
+    assert_eq!(
+        upstream.requests(),
+        3,
+        "有界：首次 + MAX_OPAQUE_REJECTION_RETRIES 次"
+    );
+}

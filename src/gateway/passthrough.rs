@@ -71,6 +71,14 @@ const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
 /// 有界是硬要求：没有界就是拿上游当重试靶子。
 const MAX_EFFORT_RETRIES: u8 = 6;
 
+/// 上游返回"无法归因的 400"时，最多再换几个目标重试（§13.7）。
+///
+/// 400 意味着上游在**开始生成之前**就拒了这次请求，一个 token 都没消耗——这是
+/// 唯一一种"重试不花钱"的失败，所以值得换个渠道再试。但请求体要重传一次（现场
+/// 是 1.6 MB），仍然要有上限：2 个额外目标足以跨过某个域名的瞬时抖动，又不至于
+/// 把一份大请求在每个目标上各传一遍。
+const MAX_OPAQUE_REJECTION_RETRIES: u8 = 2;
+
 /// 一次请求针对**同一个目标**最多换几把 Key（§4.2.1）。
 ///
 /// 换 Key 属于 §13.1 的廉价失败（连凭据都没被接受），但它必须设上限：一个
@@ -224,6 +232,25 @@ enum AttemptFailure {
     /// 本次请求可尝试其他端点。404/405 不证明整个账号缺少接口，
     /// 保留真实错误，转换不可行时仍能解释失败原因。
     EndpointRejected { status: StatusCode, body: Vec<u8> },
+    /// 上游返回了一个**无法归因**的 400（§13.7）。
+    ///
+    /// 现场形态：`The request could not be processed. Please check the request
+    /// parameters.`——它既没说是哪个参数，也没说是形状问题。这种 400 有两种
+    /// 来源：客户端的请求真的有问题，或者上游此刻自己抽了。区分不了，但**代价
+    /// 不对称**：400 意味着上游在开始生成之前就拒了，一个 token 都没消耗，
+    /// 换一个渠道重试几乎免费；而直接把 400 透给客户端，真实故障就变成用户可见
+    /// 的失败。所以换目标再试有限次，全都不行才把最后一次的原样报出去。
+    ///
+    /// 与 `Terminal` 的区别就在这里：`Terminal` 是"已经能归因到请求本身"
+    /// （如 `prompt is too long`、`ReasoningEffort invalid`），换谁都是同样结果。
+    ///
+    /// 带原料而不是 `Response`：`Response` 的 body 不是 `Sync`，放进
+    /// `AttemptFailure` 会让 `Walk` 失去 `Sync`，而后台任务要求它跨线程。
+    OpaqueRejection {
+        status: StatusCode,
+        message: String,
+        public: Option<crate::security::redact::PublicMessage>,
+    },
 }
 
 impl AttemptFailure {
@@ -319,6 +346,19 @@ struct Walk<'a> {
     /// 存原文而不是解析结果：换 Key 重试时要用**同一份**上游恢复时间给额度熔断
     /// 定时，而 `Duration` 在解析失败时与"没有恢复时间"无法区分。
     last_retry_after: Option<Duration>,
+    /// 已经为"不归因的 400"换过几个目标（§13.7）。
+    opaque_rejection_retries: u8,
+    /// 最后一次"不归因的 400"的原料：(状态码, 上游原文, 已脱敏的公开说法)。
+    ///
+    /// 存原料而不是 `Response`：`Response` 的 body 不是 `Sync`，放进 `Walk`
+    /// 会让整个结构失去 `Sync`，而后台任务要求它跨线程（§13.7）。
+    /// 候选全部用尽时用这三样重建响应——上游那句才是真实原因，比网关自己拼一句
+    /// "目标都失败了"有用得多。
+    last_opaque: Option<(
+        StatusCode,
+        String,
+        Option<crate::security::redact::PublicMessage>,
+    )>,
     /// 最后一次凭据级失败的**最终健康判定**，由 `run()` 结算到那把 Key 上。
     ///
     /// 判定只做一次：换 Key 重试时若重新推导，就会丢掉"到底是 401 还是 403"
@@ -474,6 +514,8 @@ async fn forward_inner<'a>(
         last: None,
         last_public: None,
         last_retry_after: None,
+        opaque_rejection_retries: 0,
+        last_opaque: None,
         last_credential_outcome: None,
         usage_parts: (None, None),
         usage_detail: None,
@@ -720,7 +762,14 @@ async fn forward_inner<'a>(
         }
     }
 
-    // 候选全部用尽。用最后一次失败的性质决定错误码，让客户端的重试行为正确。
+    // 候选全部用尽。换过渠道仍是"无法归因的 400"时，把上游那句原样交回——
+    // 它才是真实原因，比网关拼一句"目标都失败了"有用（§13.7）。
+    if walk.last_opaque.is_some() {
+        let response = walk.opaque_response();
+        let status = response.status();
+        return walk.finish(None, status, None, None, response);
+    }
+    // 否则用最后一次失败的性质决定错误码，让客户端的重试行为正确。
     let (code, message) = walk.last.clone().unwrap_or((
         ErrorCode::NoEligibleTarget,
         format!("逻辑模型 {} 当前没有可用的调度目标", forward.logical_model),
@@ -1393,6 +1442,48 @@ impl Walk<'_> {
                     *response,
                 )))
             }
+            // 无法归因的 400：上游没开始生成、没消耗 token，换一个目标再试
+            // （§13.7）。`attempted` 里已经记下这个目标，所以外层不会重复选它。
+            //
+            // 健康判定用 `Neutral`：这种 400 分不清是客户端请求真的有问题还是
+            // 上游此刻抽了，**不能**把账算到目标头上——若是客户端的问题，连累
+            // 三个健康目标一起降分正是 §12.3 要避免的那类误判。
+            Err(AttemptFailure::OpaqueRejection {
+                status,
+                message,
+                public,
+            }) => {
+                admission.settle(health::Outcome::Neutral, None);
+                self.note_attempt(candidate, started, "opaque_rejection", None, true);
+                // 无论还有没有重试预算，都先记下这一次：它是候选耗尽时的兜底说法。
+                self.last = Some((
+                    ErrorCode::UnsupportedParameter,
+                    format!(
+                        "账号「{}」返回 {}：{}",
+                        candidate.target.account.name,
+                        status.as_u16(),
+                        message
+                    ),
+                ));
+                self.last_opaque = Some((status, message, public));
+                if self.opaque_rejection_retries >= MAX_OPAQUE_REJECTION_RETRIES {
+                    tracing::warn!(
+                        request_id = self.forward.request_id,
+                        account = candidate.target.account.name,
+                        retries = self.opaque_rejection_retries,
+                        "换渠道重试后仍是无法归因的 400，如实返回"
+                    );
+                    return Attempted::Done(Flow::Done(self.opaque_response()));
+                }
+                self.opaque_rejection_retries += 1;
+                tracing::info!(
+                    request_id = self.forward.request_id,
+                    account = candidate.target.account.name,
+                    attempt = self.opaque_rejection_retries,
+                    "上游 400 未消耗 token，换渠道重试"
+                );
+                Attempted::Done(Flow::Continue)
+            }
             // 防御性分支：`walk_endpoints` 目前把所有"升无可升、试无可试"的
             // 情况都翻译成了 `Terminal`，所以这里走不到。留着是因为它把
             // `EffortRejected` 与普通参数错误一视同仁——将来若有人让这个变体
@@ -1988,6 +2079,26 @@ impl Walk<'_> {
     }
 
     /// 生成网关错误响应并记录元数据。
+    /// 把最后一次"无法归因的 400"重建成响应（§13.7）。
+    ///
+    /// 上游那句原文才是真实原因；网关只补上协议与 request id，不做二次解释。
+    fn opaque_response(&self) -> Response {
+        let (status, message, public) = self.last_opaque.clone().unwrap_or((
+            StatusCode::BAD_REQUEST,
+            "上游返回 400".into(),
+            None,
+        ));
+        let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
+            .with_protocol(self.forward.endpoint.protocol())
+            .with_request_id(self.forward.request_id);
+        if let Some(public) = public {
+            error = error.with_public_message(public);
+        }
+        let mut response = error.into_response();
+        *response.status_mut() = status;
+        response
+    }
+
     fn fail(&self, code: ErrorCode, message: String) -> Response {
         let mut error = GatewayError::new(code, message)
             .with_protocol(self.forward.endpoint.protocol())
@@ -3136,6 +3247,30 @@ async fn classify_upstream_error(
             response: Box::new(response),
         });
     }
+    // 无法归因的 400：上游在开始生成之前就拒了，**没有消耗任何 token**。
+    // 换一个渠道重试几乎免费，而直接透给客户端就把"上游此刻抽了"变成了用户可见
+    // 的失败（§13.7）。归因得到请求本身的 400 不走这条路。
+    if is_opaque_rejection(status, &message) {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            detail = %message,
+            "上游返回无法归因的 400，换渠道重试"
+        );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        return Err(AttemptFailure::OpaqueRejection {
+            status,
+            message,
+            public: Some(public),
+        });
+    }
     tracing::warn!(request_id = forward.request_id, account = target.account.name,
         upstream_status = status.as_u16(), detail = %message, "上游拒绝请求");
     let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
@@ -3171,6 +3306,65 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
             .take(400)
             .collect(),
     )
+}
+
+/// 上游这个 400 是不是**无法归因**到请求本身（§13.7）。
+///
+/// 判据是"消息里指不出任何具体东西"：没有参数名、没有字段名、没有模型名，只有
+/// 一句泛泛的"请求无法处理"。这类 400 分不清是客户端请求真的有问题，还是上游
+/// 此刻自己抽了——而 400 发生在开始生成之前、**不消耗 token**，所以换渠道重试
+/// 的代价只有一次请求体重传，比把真实故障当参数错误报出去小得多。
+///
+/// 反过来，只要能归因到请求本身，就绝不重试：`prompt is too long`、
+/// `field ReasoningEffort invalid`、`max_tokens must be greater than` 这些
+/// 换到哪个目标都是同一个结果，重试只会白传一遍请求体。
+fn is_opaque_rejection(status: StatusCode, message: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    // 指名道姓的字段/参数：上游已经告诉客户端该改什么了，这不是它的抖动。
+    const ATTRIBUTABLE: &[&str] = &[
+        "prompt is too long",
+        "too long",
+        "too many tokens",
+        "context length",
+        "maximum context",
+        "invalid",
+        "must be",
+        "cannot be",
+        "unsupported",
+        "not supported",
+        "exceeds",
+        "exceed",
+        "required",
+        "missing",
+        "unknown",
+        "unexpected",
+        "reasoningeffort",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "budget_tokens",
+        "output_config",
+        "thinking",
+        "tool",
+        "image",
+        "message",
+    ];
+    if ATTRIBUTABLE.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    // 还要求它确实是"泛泛的拒绝"，而不是某个我们没见过的具体说法。
+    // 现场那句是唯一已知的形态；放宽到"任意短消息"会把未知的参数错误也卷进来。
+    const OPAQUE: &[&str] = &[
+        "could not be processed",
+        "could not process",
+        "check the request parameters",
+        "bad request",
+    ];
+    OPAQUE.iter().any(|needle| lower.contains(needle))
 }
 
 /// 上游这句 400 是不是"自适应思考的档位/形状不被这个账号接受"（§14.6）。
@@ -3810,6 +4004,74 @@ fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_unattributable_400_is_worth_retrying_on_another_channel() {
+        // 现场那句：上游没说是哪个参数，也没说是形状问题。400 发生在开始生成
+        // 之前、不消耗 token，所以换渠道重试几乎免费（§13.7）。
+        for message in [
+            "The request could not be processed. Please check the request parameters.",
+            "The request could not be processed",
+            "Bad request",
+        ] {
+            assert!(
+                is_opaque_rejection(StatusCode::BAD_REQUEST, message),
+                "应当判为可重试：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attributable_400_is_never_retried() {
+        // 能归因到请求本身的 400，换到哪个目标都是同一个结果：重试只会白传一遍
+        // 请求体，还会把明确的参数错误变成"时好时坏"。
+        for message in [
+            "prompt is too long: 1520629 tokens > 1000000 maximum",
+            "field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none",
+            "max_tokens: must be greater than thinking.budget_tokens",
+            "temperature: must be between 0 and 1",
+            "invalid x-api-key",
+            "messages: at least one message is required",
+            "unsupported content type",
+            "thinking.type: unknown variant",
+            "request exceeds the maximum context length",
+        ] {
+            assert!(
+                !is_opaque_rejection(StatusCode::BAD_REQUEST, message),
+                "不该重试：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_400_can_be_an_opaque_rejection() {
+        // 别的状态码各有自己的处置：429 有 Retry-After，5xx 是可切换失败，
+        // 401/403 走凭据判定。只有 400 需要这条"分不清就换一个试试"的规则。
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(
+                !is_opaque_rejection(
+                    status,
+                    "The request could not be processed. Please check the request parameters."
+                ),
+                "{status} 不该走这条路"
+            );
+        }
+    }
+
+    #[test]
+    fn the_effort_rejection_message_is_not_treated_as_opaque() {
+        // 这两句都带 "thinking"，属于可归因（我们知道自己该改什么），必须先被
+        // 档位分支接住，不能落进"换渠道重试"——换个渠道并不会让档位被接受。
+        let message = "claude-opus-5-5 requires adaptive thinking; omit thinking or use \
+                       thinking.type=adaptive and output_config.effort";
+        assert!(!is_opaque_rejection(StatusCode::BAD_REQUEST, message));
+    }
 
     #[test]
     fn only_a_correctly_shaped_adaptive_request_counts_as_an_effort_rejection() {
