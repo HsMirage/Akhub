@@ -328,8 +328,52 @@ jobs:
           sha256sum "${targets[@]}" > checksums.txt
           cat checksums.txt
 
+      # Release 说明取自**发布提交**的正文，而不是 GitHub 的自动生成。
+      #
+      # 自动生成只列 PR 与贡献者，而本仓库的发布是直接提交到 master 的：结果是
+      # 每个 Release 只剩一行 "Full Changelog" 链接，这一版改了什么、为什么改，
+      # 用户点进去一个字都看不到。发布提交的正文本来就是按"给用户看"写的
+      # （现场证据、判据、影响面），直接拿它当说明最省事也最不会掉队。
+      - name: 从发布提交生成 Release 说明
+        id: notes
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # 找形如「发布 v1.1.30：…」的那条提交。找不到就退回被 tag 的提交本身，
+          # 宁可说明短一点，也不能让 Release 空着。
+          commit="$(git log --format=%H --grep="^发布 v${version}" -1)"
+          if [[ -z "$commit" ]]; then
+            echo "::warning::没找到「发布 v${version}」提交，退回被 tag 的提交"
+            commit="$(git rev-parse HEAD)"
+          fi
+          subject="$(git log --format=%s -1 "$commit")"
+          body="$(git log --format=%b -1 "$commit")"
+          echo "commit=$commit"
+          echo "subject=$subject"
+          # 标题去掉「发布 」前缀，版本号已经在 Release 名里了。
+          echo "title=${subject#发布 }" >> "$GITHUB_OUTPUT"
+          prev="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
+          {
+            if [[ -n "${body// /}" ]]; then
+              printf '%s\n' "$body"
+            else
+              # 正文为空的旧式发布提交（如 v1.1.28）：至少给出标题，不留白板。
+              echo "$subject"
+            fi
+            echo
+            echo "---"
+            if [[ -n "$prev" ]]; then
+              echo "**完整改动**：https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+          echo "--- 生成的 Release 说明 ---"
+          cat "$RUNNER_TEMP/notes.md"
+
       - uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.notes.outputs.title }}
+          body_path: ${{ runner.temp }}/notes.md
           files: |
             dist/akhub-v*-linux-x86_64.tar.gz
             dist/akhub-v*-linux-aarch64.tar.gz
@@ -337,7 +381,6 @@ jobs:
             dist/akhub-desktop-*-macos-x86_64.dmg
             dist/akhub-desktop-*-windows-x86_64-setup.exe
             dist/checksums.txt
-          generate_release_notes: true
   # ---------------------------------------------------------------- 容器镜像
   # 每个架构在自己的原生 runner 上构建，再合成 manifest list。
   # 用 QEMU 模拟 arm64 跑 Rust + aws-lc-sys 的 C 编译会慢一个数量级，还容易超时。

@@ -4,6 +4,8 @@
 web/node_modules
 web/dist
 web/tsconfig.tsbuildinfo
+# 本机 cargo 缓存重定向（~/.cargo 不可写时的临时办法，约 1.3 GB）。
+/.cargo-home
 
 # ---------------------------------------------------------- 运行时数据目录
 # SQLite、主密钥与临时文件都在这里。
