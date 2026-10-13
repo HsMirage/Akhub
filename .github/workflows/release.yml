@@ -340,9 +340,13 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
-          # 找形如「发布 v1.1.30：…」的那条提交。找不到就退回被 tag 的提交本身，
-          # 宁可说明短一点，也不能让 Release 空着。
-          commit="$(git log --format=%H --grep="^发布 v${version}" -1)"
+          # 找形如「发布 v1.1.30：…」的那条提交。
+          #
+          # 版本号后面必须紧跟「：」或行尾：只写 `^发布 v${version}` 时，v1.1.3
+          # 会匹配到 "发布 v1.1.30：…"——Release 说明会张冠李戴成另一个版本。
+          # 找不到就退回被 tag 的提交，宁可说明短一点，也不能让 Release 空着。
+          commit="$(git log --format=%H \
+            --grep="^发布 v${version}：\|^发布 v${version}$" -1)"
           if [[ -z "$commit" ]]; then
             echo "::warning::没找到「发布 v${version}」提交，退回被 tag 的提交"
             commit="$(git rev-parse HEAD)"
