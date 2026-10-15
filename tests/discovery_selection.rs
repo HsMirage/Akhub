@@ -678,6 +678,7 @@ async fn unselecting_a_traffic_heavy_model_requires_confirmation() {
             selected_layer: None,
             key_id: None,
             key_label: None,
+            effort_retries: 0,
             attempts_detail: Vec::new(),
         }])
         .await
@@ -723,6 +724,26 @@ async fn apply_changes(
         )
         .header("x-akhub-csrf", "1")
         .json(&json!({ "changes": changes, "force": force }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 一键清掉"上游已消失"的目录行（连同它们的调度目标）。
+async fn remove_missing(
+    client: &reqwest::Client,
+    akhub: &Akhub,
+    account_id: &str,
+) -> reqwest::Response {
+    client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/remove-missing",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
         .send()
         .await
         .unwrap()
@@ -879,6 +900,7 @@ async fn a_batch_unselect_of_a_traffic_heavy_model_needs_confirmation() {
             selected_layer: None,
             key_id: None,
             key_label: None,
+            effort_retries: 0,
             attempts_detail: Vec::new(),
         }])
         .await
@@ -1074,7 +1096,9 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
     for name in ["m1", "m2", "m3"] {
         assert_eq!(models.get(name).map(Vec::len), Some(1), "{name} 应被托管");
     }
-    // 选择集没有被托管污染：仍是只有 m1 被勾选（§16.2）。
+    // 界面读到的是"有效状态"（§16.2，2026-10-15 修订）：托管下上游有什么就
+    // 调度什么，所以三行都显示已启用；但存储里的手动选择集没被污染，仍是只有
+    // m1 —— 关掉托管后要能原样回到 m1。
     let catalog: Vec<Value> = client
         .get(format!(
             "{}/admin/api/accounts/{account_id}/models",
@@ -1099,9 +1123,33 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
         flags,
         HashMap::from([
             ("m1".into(), true),
-            ("m2".into(), false),
-            ("m3".into(), false)
-        ])
+            ("m2".into(), true),
+            ("m3".into(), true)
+        ]),
+        "托管下界面必须显示有效状态，而不是陈旧的选择集"
+    );
+    assert!(
+        catalog.iter().all(|e| e["managed"] == true),
+        "托管行要标记 managed，界面据此渲染只读徽标"
+    );
+    assert!(
+        catalog.iter().all(|e| e["excluded"] == false),
+        "托管下不该出现「你停用过」"
+    );
+    let stored = akhub
+        .state
+        .store
+        .list_account_models(&account_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|row| row.selected)
+            .map(|row| row.upstream_model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["m1"],
+        "存储里的手动选择集不能被托管改写"
     );
 
     // 同步时间已记录。
@@ -1204,6 +1252,235 @@ async fn managed_sync_drops_orphans_and_disables_vanished_models() {
         logical_models(&akhub).await.get("m3").map(Vec::len),
         Some(1)
     );
+}
+
+#[tokio::test]
+async fn managed_rename_is_allowed_but_toggling_is_not() {
+    // 别名是管理员的本地意图，不因托管失效（2026-10-15 修订）：托管下改名放行，
+    // 启用 / 停用与删除照旧拒绝。
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [{"id": "m1"}, {"id": "m2"}]
+    })));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account_id).await;
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"auto_sync": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // 批量接口只带别名 → 200，且目标立刻指向新的下游名。
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account_id,
+        json!([{"upstream_model": "m1", "alias": "m1-alias"}]),
+        false,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "托管下改名应放行：{}",
+        response.text().await.unwrap()
+    );
+    assert!(
+        logical_models(&akhub).await.contains_key("m1-alias"),
+        "改名后目标要指向新的下游名"
+    );
+
+    // 启用 / 停用（带 selected）→ 409。
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account_id,
+        json!([{"upstream_model": "m2", "selected": true}]),
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), 409, "托管下勾选仍应被拒绝");
+
+    // 删除 → 409。
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account_id,
+        json!([{"upstream_model": "m2", "delete": true}]),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), 409, "托管下删除仍应被拒绝");
+
+    // 逐行接口（旧前端 / 脚本）同样只放行改名。
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/update",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"upstream_model": "m2", "alias": "m2-alias"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "逐行接口的改名也要放行：{}",
+        response.text().await.unwrap()
+    );
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/update",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"upstream_model": "m2", "selected": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409, "逐行接口的停用仍应被拒绝");
+}
+
+#[tokio::test]
+async fn one_click_removes_vanished_models_and_their_targets() {
+    // §16.5（2026-10-15 修订）：上游下架的模型会以"上游已消失"长期占位，它们的
+    // 调度目标虽然停用、名字却仍然留在下游 /v1/models 里。一键清理把目录行与
+    // 目标一起收走，托管账号同样可用。
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
+    })));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+    // 先手动勾上三个（"上游已消失"的标记只留给曾经启用过的行），再开托管。
+    refresh(&client, &akhub, &account_id).await;
+    let response = select(&client, &akhub, &account_id, &["m1", "m2", "m3"], false).await;
+    assert_eq!(response.status(), 200);
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"auto_sync": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(logical_models(&akhub).await.len(), 3);
+
+    // 上游下架 m2 / m3：目录里保留 missing 标记，目标停用。
+    upstream.set_models(Some(json!({"data": [{"id": "m1"}]})));
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/sync",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let catalog: Vec<Value> = client
+        .get(format!(
+            "{}/admin/api/accounts/{account_id}/models",
+            akhub.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let missing: Vec<&str> = catalog
+        .iter()
+        .filter(|e| e["missing"] == true)
+        .map(|e| e["upstream_model"].as_str().unwrap())
+        .collect();
+    assert_eq!(missing, vec!["m2", "m3"], "下架的模型保留 missing 标记");
+    // 目标停用、名字却还在下游列表里——正是一键清理要解决的脏状态（§16.5）。
+    let listed: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["data"].as_array().map(Vec::len),
+        Some(3),
+        "停用的目标仍然把名字留在下游列表里：{listed}"
+    );
+
+    // 一键移除。
+    let response = remove_missing(&client, &akhub, &account_id).await;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "一键移除失败：{body}");
+    assert_eq!(body["removed"], 2, "两个消失模型一起清掉：{body}");
+
+    let catalog: Vec<Value> = client
+        .get(format!(
+            "{}/admin/api/accounts/{account_id}/models",
+            akhub.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        catalog
+            .iter()
+            .all(|e| e["upstream_model"] != "m2" && e["upstream_model"] != "m3"),
+        "消失模型的目录行要清掉：{catalog:?}"
+    );
+    let models = logical_models(&akhub).await;
+    assert_eq!(models.len(), 1, "只剩 m1：{models:?}");
+    assert_eq!(models.get("m1").map(Vec::len), Some(1));
+    let listed: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["data"].as_array().map(Vec::len),
+        Some(1),
+        "下游只剩在售模型：{listed}"
+    );
+
+    // 再点一次是空操作，不能误伤在售模型。
+    let body: Value = remove_missing(&client, &akhub, &account_id)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["removed"], 0, "没有消失模型时是空操作：{body}");
+    assert_eq!(logical_models(&akhub).await.len(), 1);
 }
 
 #[tokio::test]

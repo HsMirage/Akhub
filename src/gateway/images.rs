@@ -619,6 +619,7 @@ fn record_poll(
         selected_layer: None,
         key_id: credential.map(|key| key.id.clone()),
         key_label: credential.map(|key| key.label.clone()),
+        effort_retries: 0,
         attempts_detail: Vec::new(),
     });
 }

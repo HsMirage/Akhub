@@ -128,12 +128,20 @@ const LEVELS: [Effort; 6] = [
 ];
 
 impl EffortFacts {
+    /// 记下「这一档被上游接受过」。
+    ///
+    /// 两张位图**互斥**：最近的观测说了算。历史成功不能给一个后来被拒的档位
+    /// 免死金牌——否则 plan() 会反复选中「已确认可用」的它，在同一档位上打转
+    /// （2026-10-15 现场：high → xhigh → max → xhigh，最后把上游的 400 透传）。
     fn accept(&mut self, level: Effort) {
         self.accepted |= level_bit(level);
+        self.rejected &= !level_bit(level);
     }
 
+    /// 记下「这一档被上游拒过」。互斥口径见 accept()。
     fn reject(&mut self, level: Effort) {
         self.rejected |= level_bit(level);
+        self.accepted &= !level_bit(level);
     }
 
     fn is_rejected(&self, level: Effort) -> bool {
@@ -336,6 +344,32 @@ mod tests {
         assert_eq!(
             plan(&evidence, Effort::Minimal, now),
             EffortPlan::Send(Effort::Minimal)
+        );
+    }
+
+    #[test]
+    fn a_level_accepted_then_rejected_is_no_longer_treated_as_known_good() {
+        let evidence = Evidence::new();
+        let now = Instant::now();
+        // 先成功过一次，后来又被拒：最近的观测说了算，它不再是「已确认可用」。
+        // 2026-10-15 现场：并发的那条 200 把 xhigh 写成 accepted，正在重试的这条
+        // 立刻把 xhigh 又发了一遍——而 xhigh 上一秒刚被拒。
+        evidence.note_effort_rejected("a", "m", Effort::High, now);
+        evidence.note_effort_accepted("a", "m", Effort::XHigh, now);
+        evidence.note_effort_rejected("a", "m", Effort::XHigh, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::Max),
+            "被拒过的档位不能再以「已确认可用」的身份被发出去"
+        );
+        // 反过来：先拒后成，最近一次是成功，就回到「可用」。
+        let evidence = Evidence::new();
+        evidence.note_effort_rejected("a", "m", Effort::High, now);
+        evidence.note_effort_rejected("a", "m", Effort::XHigh, now);
+        evidence.note_effort_accepted("a", "m", Effort::XHigh, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::XHigh)
         );
     }
 

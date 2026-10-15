@@ -290,7 +290,11 @@ CREATE TABLE IF NOT EXISTS request_records (
     -- 哪个账号、哪项能力、哪个端点，但聚合口径仍按摘要算。
     filter_summary   TEXT,
     filter_details   TEXT,
-    selected_layer   INTEGER
+    selected_layer   INTEGER,
+    -- 档位重发次数：因为「上游不接受这个思考档位」而在**同一个目标上**重发了
+    -- 几次（§14.6）。`attempts` 数的是目标，数不到同一目标内的重发；没有这一列
+    -- 就看不出"一次请求打了 4 次上游"（2026-10-15 现场：attempts=1，实际 4 次）。
+    effort_retries   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_started ON request_records(started_at DESC);
@@ -316,9 +320,16 @@ CREATE TABLE IF NOT EXISTS request_attempts (
     endpoint    TEXT,
     started_at  INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
-    -- ok / failed / missing_endpoint；error_code 是网关错误码（失败时）。
+    -- ok / failed / missing_endpoint / opaque_rejection / effort_exhausted；
+    -- error_code 是网关错误码（失败时）。
     outcome     TEXT NOT NULL,
     error_code  TEXT,
+    -- 这一次尝试真正从上游拿到的状态码。网关自己判定的失败（翻译不了、
+    -- multipart 改不了名）没有上游状态码，是 NULL——两者必须能分开，
+    -- 否则"上游拒绝"与"网关拒绝"在事后长得一模一样（2026-10-15 现场）。
+    upstream_status INTEGER,
+    -- 这一次尝试实际发出去的思考档位；NULL = 不指定档位（§14.6）。
+    effort      TEXT,
     counts_against_budget INTEGER NOT NULL,
     PRIMARY KEY (request_id, seq)
 );

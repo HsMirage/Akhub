@@ -1560,3 +1560,190 @@ async fn a_later_unrelated_failure_is_not_masked_by_an_earlier_opaque_400() {
         "应当报告最后一次真实的失败原因，而不是早已过期的 400"
     );
 }
+
+#[tokio::test]
+async fn a_shape_this_round_already_sent_is_not_sent_again() {
+    // A→B→A 的往复：档位阶梯的每一跳都与上一次不同，"和上一次不同"这条
+    // 判据挡不住它。2026-10-15 现场：high → xhigh → max → xhigh，第三次
+    // 重发回到一个刚被拒的档位，白撞一次上游（§14.6）。
+    //
+    // 编排：第三跳（max）先挂住，测试在中途把 xhigh 写成"同账号另一条并发
+    // 请求证明可用"——事实库是（账号，上游模型）粒度的，这会把 xhigh 重新
+    // 放回候选。收手的地方就是"本轮已经发过的形状不再发"。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "refuse",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    upstream.script([
+        Behavior::Json(400, rejected.clone()),
+        Behavior::Json(400, rejected.clone()),
+        Behavior::HangThenJson(400, rejected.clone()),
+    ]);
+    upstream.fallback(Behavior::Json(400, rejected.clone()));
+
+    let pending = tokio::spawn(messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384}
+        }),
+    ));
+    upstream.wait_for_requests(3).await;
+    // 同账号上另一条请求用 xhigh 成功了（§14.6 的事实按账号共享）。
+    akhub.state.runtime.evidence.note_effort_accepted(
+        &wired.account_id,
+        "claude-opus-5-5",
+        akhub::protocol::canonical::Effort::XHigh,
+        std::time::Instant::now(),
+    );
+    upstream.release();
+
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), 400);
+    let text = response.text().await.unwrap_or_default();
+    assert!(text.contains("adaptive thinking"), "原因要如实转达：{text}");
+    let levels = {
+        let seen = upstream.seen.lock().unwrap();
+        seen.iter()
+            .map(|s| {
+                s.body["output_config"]["effort"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        levels,
+        vec![
+            Some("high".to_string()),
+            Some("xhigh".to_string()),
+            Some("max".to_string()),
+        ],
+        "xhigh 本轮已经发过，就不再发第二次：A→B→A 的往复在这里收手"
+    );
+    assert_eq!(upstream.requests(), 3, "不重发本轮已经发过的形状");
+}
+
+#[tokio::test]
+async fn an_exhausted_effort_ladder_switches_target() {
+    // 阶梯在一个目标上走完仍被拒——连"不指定档位"也拒——就不该把上游的 400
+    // 直接丢给客户端：同一个模型名下还有别的账号/渠道（§14.6）。
+    // 2026-10-15 现场：4 条 400 全部落在同一个 target 上，同分组另外两个账号
+    // 在同一时刻大量 200。
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "refuse",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            60,
+        ),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "healthy",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        ),
+    )
+    .await;
+
+    let rejected = json!({"error": {
+        "message": "claude-opus-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort",
+        "type": "invalid_request_error"
+    }});
+    // 只有第一个账号拒：按凭据决定行为（§4.2.1）。
+    let mut by_key = std::collections::HashMap::new();
+    by_key.insert("key-refuse".to_string(), Behavior::Json(400, rejected));
+    upstream.fallback(Behavior::PerKey(by_key));
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16_384}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "换到实现正常的那个渠道");
+    assert_eq!(
+        upstream.requests_with_key("key-refuse"),
+        4,
+        "先在自己身上把阶梯走完：high → xhigh → max → 不指定"
+    );
+    assert_eq!(
+        upstream.requests_with_key("key-healthy"),
+        1,
+        "换渠道之后一次就成"
+    );
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if !records.is_empty() {
+            break;
+        }
+    }
+    let record = &records[0];
+    // 档位阶梯走完的这次失败要留下明细：否则"一次请求打了几次上游"完全不可见。
+    // 除了两个目标各一条，档位重发的那三跳也各留一条（§14.6）：不换目标，
+    // `attempts` 永远看不见它们。
+    assert_eq!(
+        record.attempts_detail.len(),
+        5,
+        "两个目标 + 档位重发的三跳：{:#?}",
+        record.attempts_detail
+    );
+    assert_eq!(record.attempts_detail[0].outcome, "effort_retry");
+    assert_eq!(record.attempts_detail[1].outcome, "effort_retry");
+    assert_eq!(record.attempts_detail[2].outcome, "effort_retry");
+    assert_eq!(record.attempts_detail[3].outcome, "effort_exhausted");
+    assert_eq!(record.attempts_detail[4].outcome, "ok");
+    // 每一跳发出的是哪个档位：这正是现场"high → xhigh → max → 不指定"的阶梯。
+    let levels: Vec<Option<&str>> = record
+        .attempts_detail
+        .iter()
+        .map(|attempt| attempt.effort.as_deref())
+        .collect();
+    assert_eq!(
+        levels,
+        vec![Some("high"), Some("xhigh"), Some("max"), None, Some("high")],
+        "前四跳是本目标上的阶梯，最后一跳是换渠道后的第一次发送"
+    );
+    // 重发次数必须自报家门：`attempts` 是 2（两个目标），重发是 3。
+    assert_eq!(record.effort_retries, 3, "同一目标内的档位重发要单独计数");
+    // 失败尝试也带上了上游状态码：不再"上游拒绝"与"网关拒绝"分不清。
+    assert_eq!(record.attempts_detail[0].upstream_status, Some(400));
+    assert_eq!(record.attempts_detail[3].upstream_status, Some(400));
+    assert_eq!(record.attempts_detail[4].upstream_status, Some(200));
+}

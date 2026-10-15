@@ -29,6 +29,16 @@ pub struct Settings {
     pub request_timeout: Duration,
     /// 推理流提交后连续无数据的等待上限；收到数据后重新计时。
     pub stream_idle_timeout: Duration,
+    /// 首个语义事件到达前，最多为"保留切换机会"攥着响应头多久（§13.4 修订）。
+    ///
+    /// 超时后立刻交出响应头并改用带心跳的转发：继续零字节会让 CDN 把"源站
+    /// 不响应"判成事实（Cloudflare 约 100 秒后回 524）。代价是这次尝试不再可切换。
+    pub first_content_grace: Duration,
+    /// 首字之前向下游发 SSE 注释心跳的间隔（§13.4 修订）。
+    ///
+    /// 必须明显小于最窄的那一层 CDN 超时。Cloudflare 的源站响应超时约 100 秒，
+    /// 5 秒的心跳留了两个数量级的余量，同时对 SSE 流量可以忽略不计。
+    pub keep_alive_interval: Duration,
     /// 单请求体上限，超过返回 `413 request_too_large`（§17.3）。
     pub max_request_bytes: usize,
     /// 请求元数据保留天数；0 表示不新增历史明细（§24.2）。
@@ -49,6 +59,8 @@ impl Default for Settings {
         Self {
             request_timeout: Duration::from_secs(600),
             stream_idle_timeout: Duration::from_secs(180),
+            first_content_grace: Duration::from_secs(15),
+            keep_alive_interval: Duration::from_secs(5),
             max_request_bytes: 64 * 1024 * 1024,
             retention_days: 30,
             response_state_days: 30,
@@ -67,6 +79,8 @@ impl Default for Settings {
 pub struct PersistedSettings {
     pub request_timeout_secs: Option<u64>,
     pub stream_idle_timeout_secs: Option<u64>,
+    pub first_content_grace_secs: Option<u64>,
+    pub keep_alive_interval_secs: Option<u64>,
     pub max_request_bytes: Option<usize>,
     pub retention_days: Option<u32>,
     pub response_state_days: Option<u32>,
@@ -87,6 +101,14 @@ impl PersistedSettings {
                 .stream_idle_timeout_secs
                 .map(Duration::from_secs)
                 .unwrap_or(base.stream_idle_timeout),
+            first_content_grace: self
+                .first_content_grace_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.first_content_grace),
+            keep_alive_interval: self
+                .keep_alive_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.keep_alive_interval),
             max_request_bytes: self.max_request_bytes.unwrap_or(base.max_request_bytes),
             retention_days: self.retention_days.unwrap_or(base.retention_days),
             response_state_days: self.response_state_days.unwrap_or(base.response_state_days),
@@ -109,6 +131,8 @@ impl PersistedSettings {
         Self {
             request_timeout_secs: Some(settings.request_timeout.as_secs()),
             stream_idle_timeout_secs: Some(settings.stream_idle_timeout.as_secs()),
+            first_content_grace_secs: Some(settings.first_content_grace.as_secs()),
+            keep_alive_interval_secs: Some(settings.keep_alive_interval.as_secs()),
             max_request_bytes: Some(settings.max_request_bytes),
             retention_days: Some(settings.retention_days),
             response_state_days: Some(settings.response_state_days),
@@ -135,6 +159,13 @@ impl PersistedSettings {
             86_400,
         )?;
         range("流式空闲超时（秒）", self.stream_idle_timeout_secs, 5, 3600)?;
+        range(
+            "首字前心跳宽限期（秒）",
+            self.first_content_grace_secs,
+            1,
+            300,
+        )?;
+        range("首字前心跳间隔（秒）", self.keep_alive_interval_secs, 1, 60)?;
         range("关闭宽限期（秒）", self.shutdown_grace_secs, 5, 3600)?;
         range(
             "自动倍率刷新间隔（秒）",

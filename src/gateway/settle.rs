@@ -49,6 +49,11 @@ pub struct StreamSettlement {
     pub request_started: Instant,
     /// 首个语义块时间（首字延迟）。
     pub first_token: Option<Duration>,
+    /// 心跳路径下首个语义事件的时钟（§13.4 修订）。
+    ///
+    /// 走心跳的尝试里 `first_byte` 量到的是第一个注释帧，不能当首字延迟。
+    /// 响应体看到真正的语义内容时把时刻写进来，结算优先用它。
+    pub first_content: Option<crate::gateway::stream::FirstContentClock>,
     /// 客户端体感的首字节时间：排队 + 上游响应头 + 首个语义块（§6.6、§9.3）。
     ///
     /// 一个字节都没送出去（客户端在首个事件前就断开）时为空——那种情况下
@@ -104,6 +109,29 @@ impl Ending {
             Self::Aborted => Some(crate::gateway::error::CLIENT_GONE),
         }
     }
+}
+
+/// 这次请求"用户真正等到内容"用了多久（§6.6、§9.3）。
+///
+/// 两条口径：
+///
+/// - **普通路径**：用 `first_byte`（排队 + 上游响应头 + 首个语义块），
+///   它能如实反映"排了 20 秒队"这类等待，而 `first_token` 只有 1 毫秒。
+/// - **心跳路径**：`first_byte` 量到的是第一个注释帧——那是网关自己发的，
+///   不是上游的内容。此时优先用响应体记下的首个**语义**事件时刻；
+///   那个时刻还没出现（客户端在真内容之前就断了）时留空，
+///   不把心跳的时间冒充首字。
+fn observed_first_content(settlement: &StreamSettlement) -> Option<Duration> {
+    if let Some(clock) = settlement.first_content.as_ref()
+        && let Some(observed) = crate::gateway::stream::first_content(clock)
+    {
+        return Some(observed);
+    }
+    if settlement.first_content.is_some() {
+        // 心跳路径但真内容一直没来：不知道就是不知道。
+        return None;
+    }
+    settlement.first_byte
 }
 
 /// 把结算绑定到响应体的完整生命周期。
@@ -212,6 +240,8 @@ impl Drop for SettlementGuard {
 }
 
 fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamAccounting) {
+    // 先把"用户等到内容"的时刻取出来：后面 settlement 会被部分移动，借不到字段。
+    let observed = observed_first_content(&settlement);
     let usage = accounting.usage_tokens();
     let outcome = match ending {
         Ending::Completed => health::Outcome::Success,
@@ -257,7 +287,8 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
             // 成功率 EWMA（见 `SampleKind`）。
             success: kind != score::SampleKind::Rated || ending == Ending::Completed,
             // 样本用首字节而不是首字：评分要反映用户实际等了多久（§9.3）。
-            first_token: settlement.first_byte,
+            // 走心跳的尝试例外——那里的首字节是第一个注释帧，用真实首字。
+            first_token: observed,
             // 现在才是真正的"流结束时间"，不是首段提交时间。
             total: settlement.started.elapsed(),
             output_tokens: accounting.output_tokens(),
@@ -273,7 +304,7 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     //
     // 一个字节都没发出去时留空：不把"没等到"写成 0 毫秒（§6.6 的口径
     // 与用量一致——不知道就是不知道，绝不编造）。
-    record.first_token_ms = settlement.first_byte.map(|value| value.as_millis() as i64);
+    record.first_token_ms = observed.map(|value| value.as_millis() as i64);
     record.input_tokens = accounting.input_tokens().map(|value| value as i64);
     record.output_tokens = accounting.output_tokens().map(|value| value as i64);
     // Token 细分同样只有流结束才拿得到（§11.6）。

@@ -35,6 +35,13 @@ pub enum Behavior {
     Status(u16, Option<u64>),
     /// 返回固定状态码与自定义 JSON 体：模拟上游显式拒绝某能力的错误形状。
     Json(u16, Value),
+    /// 挂起到 [`FakeUpstream::release`] 被调用，再返回固定状态码与自定义 JSON 体。
+    ///
+    /// 用来在网关**正在重试**的途中注入外部事实：例如同一账号上另一条并发请求
+    /// 把某个档位写成"可用"（§14.6 的事实库是账号级的）。测试先
+    /// [`FakeUpstream::wait_for_requests`] 确认这一跳已经发出，写好事实后再
+    /// [`FakeUpstream::release`] 放行。
+    HangThenJson(u16, Value),
     /// 挂起到 [`FakeUpstream::release`] 被调用，模拟慢请求或满载。
     Hang,
     /// 流式：先送一个有语义的增量，然后连接中断。
@@ -308,6 +315,15 @@ async fn inference(
             response
         }
         Behavior::Json(code, body) => {
+            (StatusCode::from_u16(code).unwrap(), axum::Json(body)).into_response()
+        }
+        Behavior::HangThenJson(code, body) => {
+            let mut released = upstream.release.subscribe();
+            while !*released.borrow() {
+                if released.changed().await.is_err() {
+                    break;
+                }
+            }
             (StatusCode::from_u16(code).unwrap(), axum::Json(body)).into_response()
         }
         Behavior::Hang => {

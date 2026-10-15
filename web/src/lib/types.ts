@@ -188,6 +188,14 @@ export interface AccountModel {
   is_new: boolean;
   /** 管理员明确停用过的模型（§16.2）。与"从没出现过"分开。 */
   excluded: boolean;
+  /**
+   * 账号是否处于"模型自动同步"（托管）状态（§16.2）。
+   *
+   * 托管时上游全部模型由后台接管：界面不能再用库里那份手动选择集标记来说明
+   * "在不在调度"，此时 selected 已经是折算后的有效状态（= 没有消失），
+   * excluded 恒为 false（2026-10-15 修订）。
+   */
+  managed: boolean;
 }
 
 /** 分组下游账号目录里可直接选择的模型。 */
@@ -359,6 +367,8 @@ export interface RequestRecord {
   filter_details: string | null;
   /** 最终选中的层（优先级数字）（§24.1）。 */
   selected_layer: number | null;
+  /** 因为"上游不接受这个思考档位"而在同一目标内重发的次数（§14.6）。 */
+  effort_retries: number;
   /** 每次上游尝试的明细（§6.6）。 */
   attempts_detail: AttemptRecord[];
 }
@@ -395,9 +405,13 @@ export interface AttemptRecord {
   endpoint: string | null;
   started_at: number;
   duration_ms: number;
-  /** ok / failed / missing_endpoint。 */
+  /** ok / failed / missing_endpoint / opaque_rejection / effort_exhausted / effort_retry。 */
   outcome: string;
   error_code: string | null;
+  /** 这一次尝试真正从上游拿到的状态码；网关自己判定的失败是 null（§6.6）。 */
+  upstream_status: number | null;
+  /** 这一次尝试实际发出去的思考档位；null = 不指定（§14.6）。 */
+  effort: string | null;
   /** 这次失败是否计入尝试预算；廉价失败不计（§13.1）。 */
   counts_against_budget: boolean;
 }

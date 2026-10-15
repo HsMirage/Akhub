@@ -116,12 +116,19 @@ function formatFirstToken(ms: number | null, streaming: boolean): string {
   return ms === null ? "未到达" : `${(ms / 1000).toFixed(1)}s`;
 }
 
-function attemptOutcomeTone(outcome: string): "success" | "danger" | "neutral" {
+function attemptOutcomeTone(
+  outcome: string,
+): "success" | "danger" | "warn" | "neutral" {
   switch (outcome) {
     case "ok":
       return "success";
     case "failed":
       return "danger";
+    // 上游拒了但责任不在请求上：这不是"网关失败"，用 warn 区分（§13.7）。
+    case "opaque_rejection":
+    case "effort_exhausted":
+    case "effort_retry":
+      return "warn";
     default:
       return "neutral";
   }
@@ -832,6 +839,11 @@ export function Requests({
                           {record.attempts > 1 && (
                             <Badge tone="warn">切换 {record.attempts - 1} 次</Badge>
                           )}
+                          {/* 档位重发不换目标，attempts 看不见它：一次请求打了几次
+                              上游要能自己说话（§14.6）。 */}
+                          {record.effort_retries > 0 && (
+                            <Badge tone="warn">档位重发 {record.effort_retries} 次</Badge>
+                          )}
                           {record.queued_ms > 0 && (
                             <span title="容量排队等待">排队 {formatDuration(record.queued_ms)}</span>
                           )}
@@ -955,6 +967,8 @@ export function Requests({
                                       <th>端点</th>
                                       <th>耗时(ms)</th>
                                       <th>结果</th>
+                                      <th>发出的档位</th>
+                                      <th>上游状态码</th>
                                       <th>错误码</th>
                                       <th>是否计入预算</th>
                                     </tr>
@@ -1000,6 +1014,12 @@ export function Requests({
                                           <Badge tone={attemptOutcomeTone(attempt.outcome)}>
                                             {formatAttemptOutcome(attempt.outcome)}
                                           </Badge>
+                                        </td>
+                                        <td className="mono cell-dim">
+                                          {attempt.effort ?? "默认"}
+                                        </td>
+                                        <td className="mono cell-dim">
+                                          {attempt.upstream_status ?? "—"}
                                         </td>
                                         <td className="mono text-faint">
                                           {attempt.error_code ?? "—"}

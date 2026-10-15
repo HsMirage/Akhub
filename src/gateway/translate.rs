@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 
 use crate::domain::Protocol;
 use crate::gateway::error::ErrorCode;
+use crate::gateway::stream;
 use crate::protocol::{self, sse};
 
 /// 放弃嗅探前最多缓冲多少字节。
@@ -345,6 +346,191 @@ pub fn passthrough_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => yield Ok(chunk),
+                Err(_) => {
+                    // 流已经开始，稳定错误码与请求 ID 只能写进事件体（§18.2）。
+                    yield Ok(protocol::stream_error(
+                        downstream,
+                        ErrorCode::UpstreamExhausted,
+                        "上游流式响应中断",
+                        Some(&request_id),
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+    Body::from_stream(stream)
+}
+
+/// 心跳转发的三个时间参数（凑成一个结构，免得函数签名长到读不懂）。
+pub struct KeepAlive {
+    /// 首字时钟：响应体看到真正的语义内容时写入（§6.6）。
+    pub clock: stream::FirstContentClock,
+    /// 首字之前发注释帧的间隔。
+    pub interval: Duration,
+    /// 上游响应头到达之前已经等掉的时间。首字延迟要从**请求发出**起算，
+    /// 不是从响应体开始转发起算（§6.6、§9.3）。
+    pub elapsed_before: Duration,
+}
+
+/// 首个语义事件到达前的带心跳转发（§13.4 修订）。
+///
+/// **解决什么问题。** 网关在嗅探到语义事件之前不构造响应头，下游这段时间
+/// 收到的是零字节。上游首字延迟动辄几十秒到几分钟，中间的 CDN 会把它判成
+/// 源站无响应：Cloudflare 约 100 秒后回 524；EdgeOne 虽不超时，但长挂连接
+/// 会推高回源建连压力，放大 522。
+///
+/// **怎么做。** 边等上游边每隔 `KeepAlive::interval` 发一个 SSE 注释帧，
+/// 同时**继续嗅探**：
+///
+/// - 等到语义事件 → 照常转发，此后不再发心跳（真内容已经在跑，不需要替身）；
+/// - 等到明确错误 → 心跳已经让响应头发出去了，只能按流内错误收尾，
+///   不能再换目标；
+/// - 上游断流 → 同样按流内错误收尾。
+///
+/// **代价。** 一旦心跳下发，这次尝试就不能再切换目标了。绝大多数可切换失败
+/// （连接失败、明确的 4xx/5xx、立即到达的错误帧）都发生在心跳之前，不受影响。
+///
+/// **帧边界。** 心跳是独立的 SSE 注释帧，只能落在帧边界上：调用方交进来的
+/// `prefix` 只含**收全的帧**，被切开的尾帧走 `carry` 留在嗅探器里当上下文。
+/// 否则心跳会插进半个帧的中间，把它的 `data` 行截断成坏 JSON。
+///
+/// 注释帧是 SSE 规范的一部分，三个协议的客户端都会忽略它；网关自己的嗅探器
+/// 也把注释行归入 `Verdict::Pending`，所以切换边界不受影响。
+pub fn passthrough_stream_with_keepalive(
+    // 已经收全、可以立刻交给下游的帧。
+    prefix: Bytes,
+    // 被切开、还没收全的尾帧：先不发，喂进嗅探器当上下文，等后半段到齐。
+    carry: Bytes,
+    response: reqwest::Response,
+    downstream: Protocol,
+    request_id: &str,
+    keep_alive: KeepAlive,
+) -> Body {
+    let request_id = request_id.to_string();
+    let KeepAlive {
+        clock,
+        interval,
+        elapsed_before,
+    } = keep_alive;
+    let stream = async_stream::stream! {
+        let mut upstream = response.bytes_stream();
+        // 尾帧喂回嗅探器，把**帧边界上下文**接上：上游按 TCP 分片，切在哪
+        // 由不得我们。丢掉它，那个帧的尾巴就永远拼不回来，语义内容会被当成
+        // 噪声，最后还补一个假的"上游在产生内容前就结束"。
+        let mut sniffer = stream::Sniffer::new(downstream);
+        let seeded = if carry.is_empty() {
+            stream::Verdict::Pending
+        } else {
+            sniffer.push(&carry)
+        };
+        let started = Instant::now();
+        // 已经交给下游的字节数：前缀（完整帧）马上要发，尾帧还没发，
+        // 所以游标从 0 起算，flush_* 负责把尾帧及其后续补发出去。
+        let mut emitted = 0usize;
+        let mut committed = false;
+        // 完整帧先发，再按嗅探结论决定怎么接。
+        yield Ok::<Bytes, std::io::Error>(prefix);
+        match seeded {
+            // 尾帧里就已经出现语义内容（上游几乎不会这么切，但不能不认）：
+            // 把它补发出去，然后进入纯透传，别再扣在缓冲区里。
+            stream::Verdict::Semantic => {
+                stream::mark_first_content(&clock, elapsed_before);
+                let buffered = sniffer.flush_unemitted(&mut emitted);
+                if !buffered.is_empty() {
+                    yield Ok(buffered);
+                }
+                committed = true;
+            }
+            // 前缀里就是一个错误事件：如实转达，不必再等心跳。
+            stream::Verdict::Error(message) => {
+                yield Ok(protocol::stream_error(
+                    downstream,
+                    ErrorCode::UpstreamProtocolError,
+                    &format!("上游流式响应报错：{message}"),
+                    Some(&request_id),
+                ));
+                return;
+            }
+            stream::Verdict::Pending => {}
+        }
+        loop {
+            let next = if committed {
+                upstream.next().await
+            } else {
+                match tokio::time::timeout(interval, upstream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // 还没等到语义内容：先把**已经收全的帧**交给下游
+                        // （如 message_start 与 ping），再补一个注释帧。
+                        // 顺序很重要：心跳只能落在帧边界上，插进一个没收全的
+                        // 帧里会把它的 data 行截断，客户端拿到的 JSON 就是坏的。
+                        let ready = sniffer.flush_complete_frames(&mut emitted);
+                        if !ready.is_empty() {
+                            yield Ok(ready);
+                        }
+                        yield Ok(stream::keep_alive_frame());
+                        continue;
+                    }
+                }
+            };
+            let Some(item) = next else {
+                if committed {
+                    return;
+                }
+                // 语义内容出现前就断流：这是损坏响应（§13.2）。
+                yield Ok(protocol::stream_error(
+                    downstream,
+                    ErrorCode::UpstreamProtocolError,
+                    "上游流式响应在产生内容前就结束",
+                    Some(&request_id),
+                ));
+                return;
+            };
+            match item {
+                Ok(chunk) => {
+                    if committed {
+                        yield Ok(chunk);
+                        continue;
+                    }
+                    // 心跳已经发出，嗅探必须继续：语义事件到了就记时并停止心跳。
+                    match sniffer.push(&chunk) {
+                        stream::Verdict::Pending => {
+                            // 收全的帧立刻往下送（心跳路径下"还没有语义内容"
+                            // 不等于"什么都不该发"：message_start 这类开场
+                            // 本来就在首字之前）。
+                            let ready = sniffer.flush_complete_frames(&mut emitted);
+                            if !ready.is_empty() {
+                                yield Ok(ready);
+                            }
+                            continue;
+                        }
+                        stream::Verdict::Semantic => {
+                            stream::mark_first_content(
+                                &clock,
+                                elapsed_before + started.elapsed(),
+                            );
+                            // push 已经把这块并进缓冲区了：flush_unemitted 补发
+                            // 的就是"还没交给下游的字节"，不能再单独发一次。
+                            // 这里改用全量版本：语义内容到了，不再发心跳，
+                            // 不完整的尾帧可以原样往下送、由客户端侧拼回。
+                            let buffered = sniffer.flush_unemitted(&mut emitted);
+                            if !buffered.is_empty() {
+                                yield Ok(buffered);
+                            }
+                            committed = true;
+                        }
+                        stream::Verdict::Error(message) => {
+                            yield Ok(protocol::stream_error(
+                                downstream,
+                                ErrorCode::UpstreamProtocolError,
+                                &format!("上游流式响应报错：{message}"),
+                                Some(&request_id),
+                            ));
+                            return;
+                        }
+                    }
+                }
                 Err(_) => {
                     // 流已经开始，稳定错误码与请求 ID 只能写进事件体（§18.2）。
                     yield Ok(protocol::stream_error(

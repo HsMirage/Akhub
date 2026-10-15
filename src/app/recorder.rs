@@ -153,6 +153,7 @@ mod tests {
             selected_layer: None,
             key_id: None,
             key_label: None,
+            effort_retries: 0,
             attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,

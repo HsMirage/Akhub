@@ -1547,8 +1547,8 @@ impl Store {
                     sticky_wait_ms, sticky_freshness, sticky_origin, output_tps, multiplier_source,
                     quota_status, filter_summary, filter_details, selected_layer,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    key_id, key_label)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    key_id, key_label, effort_retries)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -1590,6 +1590,7 @@ impl Store {
             .bind(record.reasoning_tokens)
             .bind(&record.key_id)
             .bind(&record.key_label)
+            .bind(record.effort_retries)
             .execute(&mut *tx)
             .await?;
 
@@ -1602,8 +1603,9 @@ impl Store {
                 sqlx::query(
                     "INSERT INTO request_attempts (request_id, seq, target_id, account_id,
                         upstream_model, endpoint, started_at, duration_ms, outcome,
-                        error_code, counts_against_budget, key_id, key_label)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        error_code, upstream_status, effort, counts_against_budget,
+                        key_id, key_label)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&record.request_id)
                 .bind(attempt.seq)
@@ -1615,6 +1617,8 @@ impl Store {
                 .bind(attempt.duration_ms)
                 .bind(&attempt.outcome)
                 .bind(&attempt.error_code)
+                .bind(attempt.upstream_status)
+                .bind(&attempt.effort)
                 .bind(attempt.counts_against_budget)
                 .bind(&attempt.key_id)
                 .bind(&attempt.key_label)
@@ -1826,6 +1830,8 @@ impl Store {
                     duration_ms: row.try_get("duration_ms")?,
                     outcome: row.try_get("outcome")?,
                     error_code: row.try_get("error_code")?,
+                    upstream_status: row.try_get("upstream_status")?,
+                    effort: row.try_get("effort")?,
                     counts_against_budget: row.try_get("counts_against_budget")?,
                     key_id: row.try_get("key_id")?,
                     key_label: row.try_get("key_label")?,
@@ -2848,6 +2854,11 @@ pub struct RequestRecord {
     /// 未命中到底是因为换了账号还是换了 Key。
     pub key_id: Option<String>,
     pub key_label: Option<String>,
+    /// 因为「上游不接受这个思考档位」而在同一个目标上重发了几次（§14.6）。
+    ///
+    /// `attempts` 数的是目标个数，数不到同一目标内的重发。2026-10-15 现场一次
+    /// 请求打了 4 次上游，记录里却是 `attempts=1`——重发白烧的延迟必须自己可见。
+    pub effort_retries: i64,
     /// 每次上游尝试的明细（§6.6）。写入时与主记录同一事务。
     pub attempts_detail: Vec<AttemptRecord>,
 }
@@ -2862,9 +2873,13 @@ pub struct AttemptRecord {
     pub endpoint: Option<String>,
     pub started_at: i64,
     pub duration_ms: i64,
-    /// `ok` / `failed` / `missing_endpoint`。
+    /// `ok` / `failed` / `missing_endpoint` / `opaque_rejection` / `effort_exhausted`。
     pub outcome: String,
     pub error_code: Option<String>,
+    /// 这一次尝试真正从上游拿到的状态码；网关自己判定的失败是 `None`。
+    pub upstream_status: Option<i64>,
+    /// 这一次尝试实际发出去的思考档位；`None` 是"不指定档位"（§14.6）。
+    pub effort: Option<String>,
     /// 这次失败是否计入尝试预算：廉价的连接失败不计（§13.1）。
     pub counts_against_budget: bool,
     /// 这一次尝试用的是哪把 Key（§4.2.1）。
@@ -3407,6 +3422,7 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         selected_layer: row.try_get("selected_layer")?,
         key_id: row.try_get("key_id")?,
         key_label: row.try_get("key_label")?,
+        effort_retries: row.try_get("effort_retries")?,
         // 尝试明细由 `attach_attempts` 单独填充。
         attempts_detail: Vec::new(),
     })
@@ -3669,6 +3685,7 @@ mod tests {
                 selected_layer: None,
                 key_id: None,
                 key_label: None,
+                effort_retries: 0,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
@@ -3745,6 +3762,7 @@ mod tests {
                 selected_layer: None,
                 key_id: None,
                 key_label: None,
+                effort_retries: 0,
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
@@ -3962,6 +3980,7 @@ mod tests {
             selected_layer: None,
             key_id: None,
             key_label: None,
+            effort_retries: 0,
             attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,

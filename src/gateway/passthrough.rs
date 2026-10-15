@@ -64,11 +64,15 @@ const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
 /// 同一个端点最多为"思考档位被上游拒绝"重发几次（§14.6）。
 ///
 /// 6 次是这条阶梯的全部长度：从最低的 minimal 出发，逐档往上试到 max，最后
-/// 再试一次"不指定"，正好 6 步。实际几乎走不满——循环真正的刹车是"这次要发的
-/// 形状和上次一样就不再重发"，而试探结果会被记住，所以这条阶梯在
+/// 再试一次"不指定"，正好 6 步。实际几乎走不满——循环真正的刹车是"这个形状
+/// 本轮已经发过就不再发"，而试探结果会被记住，所以这条阶梯在
 /// （账号，上游模型，档位）上**只会走一次**，之后直接跳到结论。
 ///
 /// 有界是硬要求：没有界就是拿上游当重试靶子。
+///
+/// 走完仍被拒不再直接失败，而是交给外层换渠道（`AttemptFailure::EffortExhausted`）：
+/// 上游那句 400 有可能来自中转站内部一条实现不同的渠道，换一个目标就不复现
+/// （2026-10-15 现场）。
 const MAX_EFFORT_RETRIES: u8 = 6;
 
 /// 上游返回"无法归因的 400"时，最多再换几个目标重试（§13.7）。
@@ -216,18 +220,26 @@ enum AttemptFailure {
     /// 明确属于下游请求本身的问题，切换到别的目标也是同样结果。
     /// 装箱是因为 `Response` 比其余变体大一个数量级，而这是**失败**分支：
     /// 让成功路径为它多搬 128 字节不划算。
-    Terminal(Box<Response>),
+    ///
+    /// 第二个字段是**上游**给出的状态码（网关自己判定的参数错误是 `None`）：
+    /// 请求记录靠它区分"上游拒绝"与"网关拒绝"，否则失败记录里这一列恒为空
+    /// （2026-10-15 生产库：821 条 400 全部没有上游状态码）。
+    Terminal(Box<Response>, Option<StatusCode>),
     /// 已接单的异步图片任务失败：不得换号或再次下单，但必须记为失败。
     AcceptedJob(GatewayError),
     /// 上游拒绝了自适应思考的档位，但形状是对的（§14.6）。
     ///
     /// 这是**同一个目标**上的一次廉价失败：上游没有开始生成，而我们知道该改成
     /// 什么——换一个这个账号能接受的档位再发一次，客户端不该为"这个中转站少
-    /// 实现了两档"看见 400。升无可升、试无可试时退回 `response`，与普通参数
-    /// 错误同形。
+    /// 实现了两档"看见 400。
+    ///
+    /// 带原料而不是 `Response`：升无可升时这个变体被翻译成 `EffortExhausted`
+    /// 交给外层换渠道，最终响应到那时才组装（与 `OpaqueRejection` 同理）。
     EffortRejected {
         rejected: crate::protocol::canonical::Effort,
-        response: Box<Response>,
+        status: StatusCode,
+        message: String,
+        public: Option<crate::security::redact::PublicMessage>,
     },
     /// 本次请求可尝试其他端点。404/405 不证明整个账号缺少接口，
     /// 保留真实错误，转换不可行时仍能解释失败原因。
@@ -247,6 +259,20 @@ enum AttemptFailure {
     /// 带原料而不是 `Response`：`Response` 的 body 不是 `Sync`，放进
     /// `AttemptFailure` 会让 `Walk` 失去 `Sync`，而后台任务要求它跨线程。
     OpaqueRejection {
+        status: StatusCode,
+        message: String,
+        public: Option<crate::security::redact::PublicMessage>,
+    },
+    /// 思考档位阶梯在本目标上走完仍被上游拒绝（§14.6）。
+    ///
+    /// 现场形态（2026-10-15）：同一个中转站在 `claude-opus-5-5` 这个模型名下接了
+    /// 多条上游渠道，其中一条把 `thinking` 改写成旧的 `type:enabled` 形状——
+    /// 无论 Akhub 发哪个档位、甚至完全不指定档位，它都回同一句
+    /// `requires adaptive thinking`。这句话与请求本身无关，是那条渠道自己的问题。
+    ///
+    /// 处置与 `OpaqueRejection` 完全一致：上游没开始生成、没消耗 token，换一个
+    /// 渠道再试几乎免费；全都不行才把上游那句原样报出去（§13.7）。
+    EffortExhausted {
         status: StatusCode,
         message: String,
         public: Option<crate::security::redact::PublicMessage>,
@@ -314,6 +340,19 @@ struct Telemetry {
     selected_layer: Option<i64>,
     /// 这次实际发出去的思考档位；成功后用它记下"这一档在这个账号上可用"（§14.6）。
     sent_effort: Option<crate::protocol::canonical::Effort>,
+    /// 这一次尝试真正从上游拿到的状态码（§6.6）。网关自己判定的失败保持 None。
+    upstream_status: Option<StatusCode>,
+    /// 这一次尝试实际发出去的思考档位（`None` = 不指定）（§14.6）。
+    ///
+    /// 与 `sent_effort` 分开：那个字段是"最后一次发出去的是什么"，成功后拿它
+    /// 记"这一档可用"；这个字段跟着尝试明细走，重发的那几跳各记各的。
+    attempt_effort: Option<Effort>,
+    /// 因为"上游不接受这个思考档位"而在**同一个目标上**重发了几次（§14.6）。
+    ///
+    /// `attempts` 数的是目标个数，数不到同一目标内的重发：现场一次请求打了
+    /// 4 次上游，记录里却是 `attempts=1`。重发不是免费的——每一次都是一轮完整
+    /// 的上游往返延迟。
+    effort_retries: i64,
     /// 本次请求实际使用的 Key 的内部 ID 与标签（§4.2.1）。
     ///
     /// **只记 ID 与标签，绝不记凭据本身**：请求记录要能回答"这次走的哪把
@@ -348,6 +387,11 @@ struct Walk<'a> {
     last_retry_after: Option<Duration>,
     /// 已经为"不归因的 400"换过几个目标（§13.7）。
     opaque_rejection_retries: u8,
+    /// 思考档位阶梯走完仍被拒后，已经换过几个目标（§14.6）。
+    ///
+    /// 与 `opaque_rejection_retries` 分开计：两者的上游代价一样（都没开始生成），
+    /// 但合成一个预算会让"档位被拒"和"无法归因的 400"互相挤掉名额。
+    effort_exhausted_retries: u8,
     /// 最后一次"不归因的 400"的原料：(状态码, 上游原文, 已脱敏的公开说法)。
     ///
     /// 存原料而不是 `Response`：`Response` 的 body 不是 `Sync`，放进 `Walk`
@@ -515,6 +559,7 @@ async fn forward_inner<'a>(
         last_public: None,
         last_retry_after: None,
         opaque_rejection_retries: 0,
+        effort_exhausted_retries: 0,
         last_opaque: None,
         last_credential_outcome: None,
         usage_parts: (None, None),
@@ -767,7 +812,9 @@ async fn forward_inner<'a>(
     if walk.last_opaque.is_some() {
         let response = walk.opaque_response();
         let status = response.status();
-        return walk.finish(None, status, None, None, response);
+        // 兜底响应里的状态码就是上游给的那个（`opaque_response` 用它重建响应），
+        // 记下来才不会让这条失败在库里看起来像"网关自己拒绝了请求"。
+        return walk.finish(None, status, None, Some(status), response);
     }
     // 否则用最后一次失败的性质决定错误码，让客户端的重试行为正确。
     let (code, message) = walk.last.clone().unwrap_or((
@@ -1293,6 +1340,11 @@ impl Walk<'_> {
         self.telemetry.effective = Some(candidate.multiplier);
         self.telemetry.key_id = credential.as_ref().map(|key| key.id.clone());
         self.telemetry.key_label = credential.as_ref().map(|key| key.label.clone());
+        // 这一次尝试的上游状态码由 walk_endpoints 内部逐次填写：一个目标可能打
+        // 好几次上游（档位重发），每次的拒绝码都不同，最后一次才算这次尝试的。
+        // 必须在这里清零，否则上一次尝试的码会粘到下一次的明细上（§6.6）。
+        self.telemetry.upstream_status = None;
+        self.telemetry.attempt_effort = None;
 
         let started = Instant::now();
         let result = self.walk_endpoints(candidate, credential.as_ref()).await;
@@ -1326,6 +1378,7 @@ impl Walk<'_> {
                     // 流式：TPM 回补、性能 EWMA、熔断结果、请求记录与 Responses
                     // 状态链全都等流真正结束再结算（§26.3）。提交时记的那份
                     // 只是"首字延迟"，用它冒充总耗时会系统性高估吞吐。
+                    self.telemetry.upstream_status = Some(success.status);
                     self.note_attempt(candidate, started, "ok", None, false);
                     let record = self.record_for(
                         Some(candidate),
@@ -1370,6 +1423,8 @@ impl Walk<'_> {
                             started,
                             request_started: self.forward.started_at,
                             first_token: success.first_token,
+                            // 心跳路径下由响应体记时（§13.4 修订）；其余路径为空。
+                            first_content: success.first_content.clone(),
                             // 首字节：排队的 20 秒也会体现在评分里，而不是只记
                             // 上游吐第一个事件用掉的那 1 毫秒（§9.3）。
                             // 一个字节都没送出去时留空，让记录如实显示"流中断"
@@ -1385,6 +1440,7 @@ impl Walk<'_> {
                 } else {
                     self.usage_parts = success.usage_parts;
                     self.usage_detail = success.usage_detail;
+                    self.telemetry.upstream_status = Some(success.status);
                     self.note_attempt(candidate, started, "ok", None, false);
                     admission.settle(health::Outcome::Success, success.usage_tokens);
                     self.forward.state.runtime.perf.observe(
@@ -1423,6 +1479,7 @@ impl Walk<'_> {
                     },
                     None,
                 );
+                self.telemetry.upstream_status = Some(StatusCode::ACCEPTED);
                 self.note_attempt(candidate, started, "failed", Some(code), true);
                 Attempted::Done(Flow::Done(self.finish(
                     Some(candidate),
@@ -1432,15 +1489,16 @@ impl Walk<'_> {
                     error.into_response(),
                 )))
             }
-            Err(AttemptFailure::Terminal(response)) => {
+            Err(AttemptFailure::Terminal(response, upstream_status)) => {
                 admission.settle(health::Outcome::Neutral, None);
                 let status = response.status();
+                self.telemetry.upstream_status = upstream_status;
                 self.note_attempt(candidate, started, "failed", None, true);
                 Attempted::Done(Flow::Done(self.finish(
                     Some(candidate),
                     status,
                     None,
-                    None,
+                    upstream_status,
                     *response,
                 )))
             }
@@ -1456,6 +1514,7 @@ impl Walk<'_> {
                 public,
             }) => {
                 admission.settle(health::Outcome::Neutral, None);
+                self.telemetry.upstream_status = Some(status);
                 self.note_attempt(candidate, started, "opaque_rejection", None, true);
                 // 无论还有没有重试预算，都先记下这一次：它是候选耗尽时的兜底说法。
                 self.last = Some((
@@ -1486,22 +1545,60 @@ impl Walk<'_> {
                 );
                 Attempted::Done(Flow::Continue)
             }
-            // 防御性分支：`walk_endpoints` 目前把所有"升无可升、试无可试"的
-            // 情况都翻译成了 `Terminal`，所以这里走不到。留着是因为它把
-            // `EffortRejected` 与普通参数错误一视同仁——将来若有人让这个变体
-            // 逃出内层循环，行为仍然是"如实报上游的 400"，而不是掉进某个
-            // 会换账号重试的分支（§14.6）。
-            Err(AttemptFailure::EffortRejected { response, .. }) => {
-                admission.settle(health::Outcome::Neutral, None);
-                let status = response.status();
-                self.note_attempt(candidate, started, "failed", None, true);
-                Attempted::Done(Flow::Done(self.finish(
-                    Some(candidate),
+            // 档位阶梯在本目标上走完仍被拒：与无法归因的 400 同处置——上游没
+            // 开始生成，换一个渠道再试几乎免费（§14.6、§13.7）。
+            //
+            // `EffortRejected` 一并接住是防御性的：`walk_endpoints` 现在把
+            // 所有"升无可升、试无可试"都翻译成了 `EffortExhausted`，但将来若有人
+            // 让这个变体逃出内层循环，行为仍然是"换渠道重试"而不是直接失败。
+            Err(
+                AttemptFailure::EffortExhausted {
                     status,
-                    None,
-                    None,
-                    *response,
-                )))
+                    message,
+                    public,
+                }
+                | AttemptFailure::EffortRejected {
+                    status,
+                    message,
+                    public,
+                    ..
+                },
+            ) => {
+                admission.settle(health::Outcome::Neutral, None);
+                self.telemetry.upstream_status = Some(status);
+                self.note_attempt(candidate, started, "effort_exhausted", None, true);
+                // 无论还有没有重试预算，都先记下这一次：它是候选耗尽时的兜底说法。
+                self.last = Some((
+                    ErrorCode::UnsupportedParameter,
+                    format!(
+                        "账号「{}」返回 {}：{}",
+                        candidate.target.account.name,
+                        status.as_u16(),
+                        message
+                    ),
+                ));
+                self.last_opaque = Some((status, message.clone(), public));
+                if self.effort_exhausted_retries >= MAX_OPAQUE_REJECTION_RETRIES {
+                    tracing::warn!(
+                        request_id = self.forward.request_id,
+                        account = candidate.target.account.name,
+                        retries = self.effort_exhausted_retries,
+                        upstream_status = status.as_u16(),
+                        detail = %message,
+                        "换渠道重试后仍是这个思考档位错误，如实返回"
+                    );
+                    return Attempted::Done(Flow::Done(self.opaque_response()));
+                }
+                self.effort_exhausted_retries += 1;
+                tracing::info!(
+                    request_id = self.forward.request_id,
+                    account = candidate.target.account.name,
+                    model = candidate.target.target.upstream_model,
+                    attempt = self.effort_exhausted_retries,
+                    upstream_status = status.as_u16(),
+                    "上游 400 未消耗 token，换渠道重试"
+                );
+                Attempted::Done(Flow::Continue)
             }
             // `walk_endpoints` 已经把端点耗尽翻译成了可切换失败。
             Err(AttemptFailure::EndpointRejected { .. }) => {
@@ -1569,6 +1666,7 @@ impl Walk<'_> {
                 // 连接都没建立、上游没给状态码的 exhausted 属于廉价失败，
                 // 不计入尝试预算（§13.1）。
                 let cheap = upstream_status.is_none() && code == ErrorCode::UpstreamExhausted;
+                self.telemetry.upstream_status = upstream_status;
                 self.note_attempt(candidate, started, "failed", Some(code), !cheap);
                 // 慢到超时不熔断，但可靠性得分必须反映它（§12.1）。
                 let counts_for_perf = !matches!(outcome, health::Outcome::Neutral)
@@ -1627,11 +1725,19 @@ impl Walk<'_> {
             };
             let mut prepared = self.prepare(candidate, &choice).await?;
             let mut effort_retries = MAX_EFFORT_RETRIES;
+            // 本轮已经发出去过的形状。只比「和上一次不同」挡不住 A→B→A 的往复
+            // （2026-10-15 现场：high → xhigh → max → xhigh，第三次重发回到一个
+            // 已经被拒的档位，白撞一次上游）。
+            let mut sent_shapes = vec![adaptive_shape(&prepared.body)];
             loop {
                 let timeout = self.deadline.saturating_duration_since(Instant::now());
+                // 这一跳的起点：档位重发时用它给被拒的那一次上游调用留一条
+                // 明细（§14.6），不然重发的延迟在库里查不到。
+                let hop_started = Instant::now();
                 self.telemetry.endpoint = Some(prepared.endpoint);
                 self.telemetry.degraded = prepared.degraded.clone();
                 self.telemetry.sent_effort = adaptive_shape(&prepared.body).effort;
+                self.telemetry.attempt_effort = self.telemetry.sent_effort;
 
                 match attempt(
                     self.forward,
@@ -1643,15 +1749,26 @@ impl Walk<'_> {
                 )
                 .await
                 {
-                    Err(AttemptFailure::EffortRejected { rejected, response }) => {
+                    Err(AttemptFailure::EffortRejected {
+                        rejected,
+                        status,
+                        message,
+                        public,
+                    }) => {
                         // 记下这一档被拒，再按新的事实重发**一次**。
                         //
                         // 重发的内容一定与上一次不同：被拒的那一档在解析器里
                         // 已经变成"升到已确认可用的更高档"或"不指定"。若换算
                         // 结果还是原来那一档（说明没有任何新事实可用），就没有
-                        // 理由再打一次上游，直接把上游的拒绝报出去（§14.6）。
+                        // 理由再打一次上游——但也不该直接失败：同一个模型名下
+                        // 可能还有实现不同的渠道（§14.6）。
+                        let exhausted = AttemptFailure::EffortExhausted {
+                            status,
+                            message,
+                            public,
+                        };
                         if effort_retries == 0 || Instant::now() >= self.deadline {
-                            return Err(AttemptFailure::Terminal(response));
+                            return Err(exhausted);
                         }
                         effort_retries -= 1;
                         // 重新准备失败时**报上游这次的拒绝**，而不是把准备阶段的
@@ -1661,13 +1778,25 @@ impl Walk<'_> {
                             .prepare_with_reject(candidate, &choice, Some(rejected))
                             .await
                         else {
-                            return Err(AttemptFailure::Terminal(response));
+                            return Err(exhausted);
                         };
-                        // 形状没变就不重发：拿同一个请求再撞一次是白费上游。
-                        if adaptive_shape(&next.body) == adaptive_shape(&prepared.body) {
-                            return Err(AttemptFailure::Terminal(response));
+                        // 这个形状本轮已经发过就不重发：拿同一个请求再撞一次是
+                        // 白费上游。比的是**本轮全部**已发形状，不是相邻两次——
+                        // A→B→A 的往复每一跳都与上一次不同，旧写法放它过去。
+                        let next_shape = adaptive_shape(&next.body);
+                        if sent_shapes.contains(&next_shape) {
+                            return Err(exhausted);
                         }
+                        sent_shapes.push(next_shape);
                         prepared = next;
+                        // 这一次重发是**白烧的一轮上游往返**：记下来，请求记录与
+                        // 请求页才看得出"一次请求打了 4 次上游"（§14.6）。
+                        self.telemetry.effort_retries += 1;
+                        // 被拒的那一次上游调用也要在尝试明细里留痕：只记最终
+                        // 那次的话，重发的延迟与上游状态码在库里就查不到了。
+                        self.telemetry.upstream_status = Some(status);
+                        self.note_attempt(candidate, hop_started, "effort_retry", None, false);
+                        self.telemetry.upstream_status = None;
                         tracing::info!(
                             request_id = self.forward.request_id,
                             account = candidate.target.account.name,
@@ -1695,18 +1824,31 @@ impl Walk<'_> {
                         // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
                         // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
                         if self.forward.endpoint.is_native_only() {
-                            return Err(AttemptFailure::Terminal(Box::new(
-                                GatewayError::new(
-                                    ErrorCode::UnsupportedParameter,
-                                    format!(
-                                        "当前模型不支持 /{} 端点",
-                                        self.forward.endpoint.path()
-                                    ),
-                                )
-                                .with_protocol(self.forward.endpoint.protocol())
-                                .with_request_id(self.forward.request_id)
-                                .into_response(),
-                            )));
+                            // 端点走错了是**本次尝试**的失败，不是请求本身的：
+                            // 但辅助端点没有转换备胎，只能如实告诉客户端。
+                            tracing::warn!(
+                                request_id = self.forward.request_id,
+                                account = candidate.target.account.name,
+                                model = candidate.target.target.upstream_model,
+                                endpoint = self.forward.endpoint.path(),
+                                upstream_status = status.as_u16(),
+                                "辅助端点在当前目标上不存在，且没有可转换的备胎"
+                            );
+                            return Err(AttemptFailure::Terminal(
+                                Box::new(
+                                    GatewayError::new(
+                                        ErrorCode::UnsupportedParameter,
+                                        format!(
+                                            "当前模型不支持 /{} 端点",
+                                            self.forward.endpoint.path()
+                                        ),
+                                    )
+                                    .with_protocol(self.forward.endpoint.protocol())
+                                    .with_request_id(self.forward.request_id)
+                                    .into_response(),
+                                ),
+                                Some(status),
+                            ));
                         }
                         let detail = upstream_error_message(&body)
                             .map(|message| format!("：{message}"))
@@ -1823,12 +1965,21 @@ impl Walk<'_> {
                                 "上游模型名包含 multipart 不安全字符"
                             }
                         };
-                        AttemptFailure::Terminal(Box::new(
-                            GatewayError::new(ErrorCode::UnsupportedParameter, message)
-                                .with_protocol(self.forward.endpoint.protocol())
-                                .with_request_id(self.forward.request_id)
-                                .into_response(),
-                        ))
+                        tracing::warn!(
+                            request_id = self.forward.request_id,
+                            model = candidate.target.target.upstream_model,
+                            detail = message,
+                            "multipart 请求体无法改写上游模型名"
+                        );
+                        AttemptFailure::Terminal(
+                            Box::new(
+                                GatewayError::new(ErrorCode::UnsupportedParameter, message)
+                                    .with_protocol(self.forward.endpoint.protocol())
+                                    .with_request_id(self.forward.request_id)
+                                    .into_response(),
+                            ),
+                            None,
+                        )
                     })?;
             return Ok(Prepared {
                 endpoint: choice.endpoint,
@@ -1863,12 +2014,23 @@ impl Walk<'_> {
         } else {
             let emitted = self.translation.emit(target_protocol).map_err(|reason| {
                 // 资格过滤已经排除过这种情况；真走到这里说明请求本身表达不了。
-                AttemptFailure::Terminal(Box::new(
-                    GatewayError::new(ErrorCode::UnsupportedParameter, reason.to_string())
-                        .with_protocol(self.forward.endpoint.protocol())
-                        .with_request_id(self.forward.request_id)
-                        .into_response(),
-                ))
+                tracing::warn!(
+                    request_id = self.forward.request_id,
+                    model = candidate.target.target.upstream_model,
+                    downstream = ?self.forward.endpoint.protocol(),
+                    upstream = ?target_protocol,
+                    detail = %reason,
+                    "请求无法转换成目标协议的表达"
+                );
+                AttemptFailure::Terminal(
+                    Box::new(
+                        GatewayError::new(ErrorCode::UnsupportedParameter, reason.to_string())
+                            .with_protocol(self.forward.endpoint.protocol())
+                            .with_request_id(self.forward.request_id)
+                            .into_response(),
+                    ),
+                    None,
+                )
             })?;
             degraded = emitted.degraded.clone();
             emitted.body.clone()
@@ -2201,6 +2363,7 @@ impl Walk<'_> {
             filter_summary: self.telemetry.filter_summary.clone(),
             filter_details: self.telemetry.filter_details.clone(),
             selected_layer: self.telemetry.selected_layer,
+            effort_retries: self.telemetry.effort_retries,
             // 这次请求最终落在哪把 Key 上（§3.3）。诊断字段，绝不含凭据本身。
             key_id: self.telemetry.key_id.clone(),
             key_label: self.telemetry.key_label.clone(),
@@ -2248,6 +2411,10 @@ impl Walk<'_> {
     }
 
     /// 记一次上游尝试的明细（§6.6）。`endpoint` 取当前尝试真正用到的端点。
+    ///
+    /// `upstream_status` 是这一次尝试真正从上游拿到的状态码；网关自己判定的失败
+    /// （翻译不了、multipart 改不了名）传 `None`。没有它，"上游 400"与"网关 400"
+    /// 在请求记录里长得一模一样，事后只能靠日志猜（2026-10-15 现场）。
     fn note_attempt(
         &mut self,
         candidate: &routing::Candidate,
@@ -2256,6 +2423,11 @@ impl Walk<'_> {
         error_code: Option<ErrorCode>,
         counts_against_budget: bool,
     ) {
+        let upstream_status = self.telemetry.upstream_status.map(|s| s.as_u16() as i64);
+        let effort = self
+            .telemetry
+            .attempt_effort
+            .map(|e| e.as_str().to_string());
         self.attempt_log.push(AttemptRecord {
             seq: self.attempt_log.len() as i64 + 1,
             target_id: Some(candidate.target.target.id.clone()),
@@ -2266,6 +2438,8 @@ impl Walk<'_> {
             duration_ms: started.elapsed().as_millis() as i64,
             outcome: outcome.to_string(),
             error_code: error_code.map(|code| code.as_str().to_string()),
+            upstream_status,
+            effort,
             counts_against_budget,
             // 这一次尝试用的是哪把 Key：换 Key 重试时同一条请求会留下多条
             // 不同 Key 的明细（§7.3）。
@@ -2319,6 +2493,11 @@ struct Success {
     /// 体感，因此性能样本改用这一项；记录里两项都保留，诊断时能分清"上游慢"
     /// 与"网关排队慢"。
     first_byte: Option<Duration>,
+    /// 心跳路径下"首个语义事件"的时钟（§13.4 修订）。
+    ///
+    /// 只有走心跳的尝试才有：那时 `first_byte` 量到的是第一个注释帧，
+    /// 不能当首字延迟用。结算优先读这个时钟，读不到才退回 `first_byte`。
+    first_content: Option<stream::FirstContentClock>,
     output_tokens: Option<u64>,
     usage_tokens: Option<u64>,
     /// (输入, 输出) Token；流式在结算时才拿得到，这里为 None（§6.6）。
@@ -2570,6 +2749,7 @@ async fn attempt_inner(
             ),
             first_token: Some(sent_at.elapsed()),
             first_byte: None,
+            first_content: None,
             output_tokens: stream::output_tokens(&parsed),
             usage_tokens: stream::usage_tokens(&parsed),
             usage_parts: stream::usage_parts(&parsed),
@@ -2712,6 +2892,7 @@ async fn commit_stream(
                 ),
                 first_token: Some(committed.first_token),
                 first_byte: Some(headers_wait + committed.first_token),
+                first_content: None,
                 output_tokens: None,
                 usage_tokens: None,
                 usage_parts: (None, None),
@@ -2783,6 +2964,7 @@ async fn commit_stream(
                                 response: build_response(forward, status, &headers, prepared, body),
                                 first_token: first_token_of(started.elapsed()),
                                 first_byte: Some(headers_wait + started.elapsed()),
+                                first_content: None,
                                 output_tokens: None,
                                 usage_tokens: None,
                                 usage_parts: (None, None),
@@ -2837,50 +3019,16 @@ async fn commit_stream(
     let started = Instant::now();
     let mut response = response;
     let mut sniffer = stream::Sniffer::new(downstream);
+    // 首个语义事件的宽限期（§13.4 修订）：期内维持"可切换"，超时则交出响应头、
+    // 改用带心跳的转发。上游首字动辄几十秒到几分钟，继续攥着响应头不放会让
+    // CDN 把"零字节"判成源站无响应（Cloudflare 约 100 秒后回 524）。
+    let grace = tokio::time::Instant::now() + forward.state.settings.get().first_content_grace;
 
     loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => match sniffer.push(&chunk) {
-                stream::Verdict::Pending => continue,
-                stream::Verdict::Semantic => {
-                    let prefix = sniffer.take_buffer();
-                    let body = translate::passthrough_stream(
-                        prefix,
-                        response,
-                        downstream,
-                        forward.request_id,
-                    );
-                    let body = crate::gateway::error::private_stream(
-                        body,
-                        downstream,
-                        forward.request_id,
-                        redactor.clone(),
-                    );
-                    return Ok(Success {
-                        status,
-                        streamed: true,
-                        response: build_response(forward, status, &headers, prepared, body),
-                        first_token: first_token_of(started.elapsed()),
-                        first_byte: Some(headers_wait + started.elapsed()),
-                        output_tokens: None,
-                        usage_tokens: None,
-                        usage_parts: (None, None),
-                        usage_detail: None,
-                        stream_state: None,
-                        degraded: None,
-                    });
-                }
-                // 语义内容出现前的明确错误事件：还没花钱，可以换号。
-                stream::Verdict::Error(message) => {
-                    return Err(AttemptFailure::switchable(
-                        ErrorCode::UpstreamProtocolError,
-                        format!("账号「{}」的流式响应报错：{message}", target.account.name),
-                    )
-                    .with_status(status));
-                }
-            },
-            Ok(None) => {
-                // 流在产生任何语义内容前就结束：这是损坏响应（§13.2）。
+        let chunk = match tokio::time::timeout_at(grace, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            // 流在产生任何语义内容前就结束：这是损坏响应（§13.2）。
+            Ok(Ok(None)) => {
                 return Err(AttemptFailure::switchable(
                     ErrorCode::UpstreamProtocolError,
                     format!(
@@ -2890,7 +3038,7 @@ async fn commit_stream(
                 )
                 .with_status(status));
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 return Err(AttemptFailure::switchable(
                     if error.is_timeout() {
                         ErrorCode::UpstreamTimeout
@@ -2902,6 +3050,94 @@ async fn commit_stream(
                         target.account.name,
                         safe_reason(&error)
                     ),
+                )
+                .with_status(status));
+            }
+            // 宽限期用完还没等到语义事件：已经不能再换目标，但也绝不能继续
+            // 零字节——那正是 524/522 的直接来源。
+            Err(_elapsed) => {
+                let mut emitted = 0usize;
+                // 先只交出**收全的帧**：心跳是独立的 SSE 注释帧，只能落在帧
+                // 边界上。把一个没收全的帧先发出去，紧随其后的心跳会插进它的
+                // data 行里，客户端解析出坏 JSON。
+                let prefix = sniffer.flush_complete_frames(&mut emitted);
+                // 尾帧（没收全的那个）随响应体一起交给下游继续嗅探：
+                // 它的后半段还在上游手里，必须留着上下文才拼得回来。
+                // 用 flush_unemitted 而不是 take_buffer：后者会把**已经发过的**
+                // 完整帧再取出来一次，交给响应体就是重复下发。
+                let carry = sniffer.flush_unemitted(&mut emitted);
+                // 时钟从**上游响应头到达之前**起算：走心跳的尝试里，
+                // "用户等到内容"= 等响应头 + 等首字 + 等语义事件，
+                // 只量最后一段会把前面几十秒的等待整段丢掉（§6.6、§9.3）。
+                let clock = stream::first_content_clock();
+                let body = translate::passthrough_stream_with_keepalive(
+                    prefix,
+                    carry,
+                    response,
+                    downstream,
+                    forward.request_id,
+                    translate::KeepAlive {
+                        clock: clock.clone(),
+                        interval: forward.state.settings.get().keep_alive_interval,
+                        elapsed_before: headers_wait + started.elapsed(),
+                    },
+                );
+                let body = crate::gateway::error::private_stream(
+                    body,
+                    downstream,
+                    forward.request_id,
+                    redactor.clone(),
+                );
+                return Ok(Success {
+                    status,
+                    streamed: true,
+                    response: build_response(forward, status, &headers, prepared, body),
+                    // 首个语义事件此刻还没到：不用心跳的时间冒充首字，
+                    // 由响应体在真的看到语义内容时记时（§6.6）。
+                    first_token: None,
+                    first_byte: Some(headers_wait + started.elapsed()),
+                    first_content: Some(clock),
+                    output_tokens: None,
+                    usage_tokens: None,
+                    usage_parts: (None, None),
+                    usage_detail: None,
+                    stream_state: None,
+                    degraded: None,
+                });
+            }
+        };
+        match sniffer.push(&chunk) {
+            stream::Verdict::Pending => continue,
+            stream::Verdict::Semantic => {
+                let prefix = sniffer.take_buffer();
+                let body =
+                    translate::passthrough_stream(prefix, response, downstream, forward.request_id);
+                let body = crate::gateway::error::private_stream(
+                    body,
+                    downstream,
+                    forward.request_id,
+                    redactor.clone(),
+                );
+                return Ok(Success {
+                    status,
+                    streamed: true,
+                    response: build_response(forward, status, &headers, prepared, body),
+                    first_token: first_token_of(started.elapsed()),
+                    first_byte: Some(headers_wait + started.elapsed()),
+                    first_content: None,
+                    output_tokens: None,
+                    usage_tokens: None,
+                    usage_parts: (None, None),
+                    usage_detail: None,
+                    stream_state: None,
+                    degraded: None,
+                });
+            }
+            // 语义内容出现前的明确错误事件：还没花钱，可以换号。
+            stream::Verdict::Error(message) => {
+                return Err(AttemptFailure::switchable(
+                    ErrorCode::UpstreamProtocolError,
+                    format!("账号「{}」的流式响应报错：{message}", target.account.name),
                 )
                 .with_status(status));
             }
@@ -3053,6 +3289,7 @@ async fn commit_body(
         // 排队（排队另有 queued_ms 记录），两个维度才可比（§6.6）。
         first_token: Some(sent_at.elapsed()),
         first_byte: None,
+        first_content: None,
         output_tokens: stream::output_tokens(&parsed),
         usage_tokens: stream::usage_tokens(&parsed),
         usage_parts: stream::usage_parts(&parsed),
@@ -3246,14 +3483,52 @@ async fn classify_upstream_error(
             effort,
             Instant::now(),
         );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
         let mut response = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
+            .with_public_message(public.clone())
             .with_protocol(forward.endpoint.protocol())
             .with_request_id(forward.request_id)
             .into_response();
         *response.status_mut() = status;
         return Err(AttemptFailure::EffortRejected {
             rejected: effort,
-            response: Box::new(response),
+            status,
+            message,
+            public: Some(public),
+        });
+    }
+    // 形状已经对了、档位已经降到"不指定"，上游还是回同一句：这句话就与请求
+    // 无关了——是这条渠道自己的实现问题（现场：同一个中转站的一条渠道把
+    // thinking 改写成旧的 enabled 形状，无论 Akhub 发什么档位都回这句话）。
+    // 换一个目标再试几乎免费（§13.7）。
+    if status == StatusCode::BAD_REQUEST
+        && shape.adaptive
+        && shape.effort.is_none()
+        && message.contains("adaptive thinking")
+    {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            detail = %message,
+            "上游连不指定档位的自适应思考也拒绝，换渠道重试"
+        );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        return Err(AttemptFailure::EffortExhausted {
+            status,
+            message,
+            public: Some(public),
         });
     }
     // 无法归因的 400：上游在开始生成之前就拒了，**没有消耗任何 token**。
@@ -3298,7 +3573,7 @@ async fn classify_upstream_error(
     }
     let mut response = error.into_response();
     *response.status_mut() = status;
-    Err(AttemptFailure::Terminal(Box::new(response)))
+    Err(AttemptFailure::Terminal(Box::new(response), Some(status)))
 }
 
 /// 从上游错误体里取出可以安全转达的文本。绝不返回完整 URL、Key 或堆栈。

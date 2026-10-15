@@ -614,6 +614,8 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         "cache_read_tokens",
         "cache_write_tokens",
         "reasoning_tokens",
+        // v22：档位重发次数（§14.6）。
+        "effort_retries",
     ] {
         assert!(columns.contains(column), "迁移后缺少列 {column}");
     }
@@ -622,6 +624,21 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .await
         .unwrap();
     assert_eq!(attempts, 0, "迁移应建好空的尝试明细表");
+    // v22 给尝试明细补的两列同样要建好（§6.6、§14.6）。
+    let attempt_columns: std::collections::HashSet<String> =
+        sqlx::query("PRAGMA table_info(request_attempts)")
+            .fetch_all(reopened.store.pool())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+            .collect();
+    for column in ["upstream_status", "effort"] {
+        assert!(
+            attempt_columns.contains(column),
+            "迁移后尝试明细缺少列 {column}"
+        );
+    }
     let group_columns: std::collections::HashSet<String> = sqlx::query("PRAGMA table_info(groups)")
         .fetch_all(reopened.store.pool())
         .await

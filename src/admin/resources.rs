@@ -282,6 +282,8 @@ fn percentile(sorted: &[i64], quantile: f64) -> Option<i64> {
 const SETTINGS_LIMITS: &str = r#"{
     "request_timeout_secs": {"min": 5, "max": 86400},
     "stream_idle_timeout_secs": {"min": 5, "max": 3600},
+    "first_content_grace_secs": {"min": 1, "max": 300},
+    "keep_alive_interval_secs": {"min": 1, "max": 60},
     "max_request_bytes": {"min": 1024, "max": 268435456},
     "retention_days": {"min": 0, "max": 3650},
     "response_state_days": {"min": 0, "max": 3650},
@@ -294,6 +296,8 @@ fn settings_json(settings: &crate::app::Settings) -> Value {
     json!({
         "request_timeout_secs": settings.request_timeout.as_secs(),
         "stream_idle_timeout_secs": settings.stream_idle_timeout.as_secs(),
+        "first_content_grace_secs": settings.first_content_grace.as_secs(),
+        "keep_alive_interval_secs": settings.keep_alive_interval.as_secs(),
         "max_request_bytes": settings.max_request_bytes,
         "retention_days": settings.retention_days,
         "response_state_days": settings.response_state_days,
@@ -3228,6 +3232,13 @@ pub struct AccountModelDto {
     pub is_new: bool,
     /// 管理员明确停用过的模型。与"从没出现过"分开。
     pub excluded: bool,
+    /// 该账号是否处于"模型自动同步"（托管）状态（§16.2）。
+    ///
+    /// 托管时上游全部模型由后台接管，界面**不能**再用陈旧的 \`selected\` 标记
+    /// 说明"这个模型到底在不在调度"——那会把已经生效的模型显示成"已停用"。
+    /// 所以托管下 \`selected\` 返回的是**有效状态**（= 没有消失），而库里那份
+    /// 手动选择集标记原封不动，关闭托管后立即恢复（2026-10-15 修订）。
+    pub managed: bool,
 }
 
 /// 计算一行模型在账号级隐藏开关下的“下游可用名称”。
@@ -3248,9 +3259,18 @@ fn exposed_names(upstream: &str, public_name: &str, hide_original: bool) -> Vec<
     }
 }
 
+/// 一行模型"此刻到底在不在调度"（§16.2，2026-10-15 修订）。
+///
+/// 托管模式下选择集标记被后台忽略，全部未消失的模型都在调度；这里把它折算成
+/// 界面能直接显示的有效状态。非托管模式原样返回选择集标记。
+fn effective_selected(selected: bool, missing: bool, managed: bool) -> bool {
+    if managed { !missing } else { selected }
+}
+
 fn row_account_model_dto(
     row: &crate::storage::store::AccountModelRow,
     hide_original: bool,
+    managed: bool,
 ) -> AccountModelDto {
     AccountModelDto {
         upstream_model: row.upstream_model.clone(),
@@ -3258,25 +3278,32 @@ fn row_account_model_dto(
         hide_original,
         logical_model_name: row.public_name.clone(),
         exposed_names: exposed_names(&row.upstream_model, &row.public_name, hide_original),
-        selected: row.selected,
+        selected: effective_selected(row.selected, row.missing, managed),
         missing: row.missing,
         is_new: false,
         // 这个接口不带"本次新增"的上下文，但"排除过"是持久状态，照样给。
-        excluded: !row.selected && !row.missing,
+        // 托管下没有"排除"这回事：所有模型都在调度。
+        excluded: !managed && !row.selected && !row.missing,
+        managed,
     }
 }
 
-fn catalog_entry_dto(entry: &discovery::CatalogEntry, hide_original: bool) -> AccountModelDto {
+fn catalog_entry_dto(
+    entry: &discovery::CatalogEntry,
+    hide_original: bool,
+    managed: bool,
+) -> AccountModelDto {
     AccountModelDto {
         upstream_model: entry.upstream_model.clone(),
         public_name: entry.public_name.clone(),
         hide_original,
         logical_model_name: entry.public_name.clone(),
         exposed_names: exposed_names(&entry.upstream_model, &entry.public_name, hide_original),
-        selected: entry.selected,
+        selected: effective_selected(entry.selected, entry.missing, managed),
         missing: entry.missing,
         is_new: entry.is_new,
-        excluded: entry.excluded,
+        excluded: !managed && entry.excluded,
+        managed,
     }
 }
 
@@ -3292,7 +3319,7 @@ async fn account_models_json(
         .map_err(AdminError::internal)?;
     Ok(Json(
         rows.iter()
-            .map(|row| row_account_model_dto(row, account.hide_original))
+            .map(|row| row_account_model_dto(row, account.hide_original, account.auto_sync))
             .collect(),
     ))
 }
@@ -3329,7 +3356,7 @@ pub async fn refresh_account_models(
     Ok(Json(
         entries
             .iter()
-            .map(|entry| catalog_entry_dto(entry, account.hide_original))
+            .map(|entry| catalog_entry_dto(entry, account.hide_original, account.auto_sync))
             .collect(),
     ))
 }
@@ -3383,6 +3410,14 @@ pub async fn update_account_model(
     Json(payload): Json<UpdateAccountModelPayload>,
 ) -> AdminResult<Json<Vec<AccountModelDto>>> {
     let account = find_account(&state, &id).await?;
+    // 托管下启用 / 停用由后台接管：写进去只会造成"库里标记改了、实际调度没变"
+    // 的错觉。改名照旧放行——别名是管理员的本地意图，不因托管失效
+    // （2026-10-15 修订）。
+    if account.auto_sync && payload.selected.is_some() {
+        return Err(AdminError::conflict(
+            "该账号已开启模型自动同步，启用 / 停用由后台托管；如需手动选择请先关闭自动同步",
+        ));
+    }
     let outcome = discovery::apply_changes(
         &state,
         &account,
@@ -3424,11 +3459,6 @@ pub async fn apply_account_models(
     Json(payload): Json<ApplyAccountModelsPayload>,
 ) -> AdminResult<Response> {
     let account = find_account(&state, &id).await?;
-    if account.auto_sync {
-        return Err(AdminError::conflict(
-            "该账号已开启模型自动同步，模型目录由后台托管；如需手动修改请先关闭自动同步",
-        ));
-    }
     let changes: Vec<discovery::ModelChange> = payload
         .changes
         .into_iter()
@@ -3439,6 +3469,23 @@ pub async fn apply_account_models(
             delete: change.delete,
         })
         .collect();
+    // 托管下"上游有什么就调度什么"是后台的职责（§16.2）：改名照旧放行（别名是
+    // 管理员意图，不因托管失效），但勾选与删除必须拒绝——库里改了标记、实际
+    // 调度不会变，只会误导管理员（2026-10-15 修订）。
+    if account.auto_sync
+        && let Some(change) = changes
+            .iter()
+            .find(|change| change.delete || change.selected.is_some())
+    {
+        let action = if change.delete {
+            "删除"
+        } else {
+            "启用 / 停用"
+        };
+        return Err(AdminError::conflict(format!(
+            "该账号已开启模型自动同步，模型的{action}由后台托管；如需手动修改请先关闭自动同步"
+        )));
+    }
     match discovery::apply_changes(&state, &account, &changes, payload.force)
         .await
         .map_err(|error| AdminError::bad_request(format!("{error:#}")))?
@@ -3487,6 +3534,24 @@ pub async fn delete_account_model(
     }
     audit(&state, &admin, "delete_account_model", &id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 一键移除目录里所有"上游已消失"的模型（§16.5，2026-10-15 修订）。
+///
+/// 消失的行只是为了留住状态而保留：目标已停用，上游重新提供时自动恢复。确认
+/// 它们不会再回来时，用这个把它们连同调度目标一起清掉，省得一行一行删。
+/// 托管与非托管都能用——托管下这些行本来就不参与调度，清掉只是把列表收拾干净。
+pub async fn remove_missing_account_models(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path(id): Path<String>,
+) -> AdminResult<Json<serde_json::Value>> {
+    let account = find_account(&state, &id).await?;
+    let removed = discovery::remove_missing(&state, &account)
+        .await
+        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    audit(&state, &admin, "remove_missing_account_models", &id).await;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 #[derive(Deserialize)]
@@ -4777,6 +4842,11 @@ pub async fn list_requests(
                         "duration_ms": attempt.duration_ms,
                         "outcome": attempt.outcome,
                         "error_code": attempt.error_code,
+                        // 这一次尝试真正发给上游的状态码；网关自己判定的失败是
+                        // null，与"上游拒绝"分得开（§6.6）。
+                        "upstream_status": attempt.upstream_status,
+                        // 这一次尝试实际发出去的思考档位；null = 不指定（§14.6）。
+                        "effort": attempt.effort,
                         "counts_against_budget": attempt.counts_against_budget,
                     })
                 })
@@ -4824,6 +4894,8 @@ pub async fn list_requests(
                     "filter_summary": record.filter_summary,
                 "filter_details": record.filter_details,
                     "selected_layer": record.selected_layer,
+                    // 档位重发次数：同一个目标内因为思考档位被拒重发了几次（§14.6）。
+                    "effort_retries": record.effort_retries,
                     // 每次尝试的明细：目标、端点、耗时、失败原因与是否计入预算。
                     "attempts_detail": attempts_detail,
                 })

@@ -309,6 +309,11 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/sync",
             post(r::sync_account_models),
         )
+        // 一键清掉"上游已消失"的目录行（连同它们的调度目标）。
+        .route(
+            "/admin/api/accounts/{id}/models/remove-missing",
+            post(r::remove_missing_account_models),
+        )
         .route(
             "/admin/api/accounts/{id}/aliases",
             get(r::list_aliases).put(r::update_aliases),

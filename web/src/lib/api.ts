@@ -478,6 +478,13 @@ export const api = {
   /** 立即执行一轮托管同步（§16.2）。 */
   syncAccountModels: (id: string) =>
     post<{ managed_models: number }>(`/accounts/${id}/models/sync`),
+  /**
+   * 一键移除目录里所有"上游已消失"的模型，连同它们的调度目标（§16.5）。
+   *
+   * 返回被清掉的行数。托管与非托管都可用：托管下这些行本来就不参与调度。
+   */
+  removeMissingAccountModels: (id: string) =>
+    post<{ removed: number }>(`/accounts/${id}/models/remove-missing`),
 
   aliases: (id: string) => request<Alias[]>(`/accounts/${id}/aliases`),
   updateAliases: (id: string, aliases: Alias[]) =>

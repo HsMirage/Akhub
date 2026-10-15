@@ -328,6 +328,57 @@ pub async fn delete_model(
     Ok(true)
 }
 
+/// 一键移除目录里所有"上游已消失"的行（§16.5，2026-10-15 修订）。
+///
+/// 消失的行留在目录里只是为了留住状态：目标已经停用，上游重新提供时自动恢复。
+/// 如果确认它们不会再回来，用这个把它们连同调度目标一次清掉——省得在表格里
+/// 一行一行点删除。目录行与目标一次事务落库，最后只调和一遍目标、只重载一遍配置。
+///
+/// 不逐行做 `validate_model_id` 校验：这个方法存在的意义就是**把清理做完**，
+/// 目录里一条历史遗留的非法名字不该让整批清理失败（它本来就是待清理的对象）。
+pub async fn remove_missing(state: &SharedState, account: &Account) -> Result<usize> {
+    let missing: Vec<String> = state
+        .store
+        .list_account_models(&account.id)
+        .await?
+        .into_iter()
+        .filter(|row| row.missing)
+        .map(|row| row.upstream_model)
+        .collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let targets = state.store.list_targets().await?;
+    let mut removed_targets: Vec<String> = Vec::new();
+    for upstream in &missing {
+        state
+            .store
+            .delete_account_model(&account.id, upstream)
+            .await?;
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.account_id == account.id && &target.upstream_model == upstream)
+        {
+            removed_targets.push(target.id.clone());
+        }
+    }
+    if !removed_targets.is_empty() {
+        state
+            .store
+            .apply_config_delta(&[], &[], &removed_targets, &[])
+            .await?;
+    }
+
+    // 目标摘掉后，零目标的自动逻辑模型由调和收走；调和没发现别的变化时，
+    // 上面直接写库的那批目标删除也要让配置快照跟上。
+    let reconciled = reconcile_account(state, account, account.auto_sync).await?;
+    if !reconciled && !removed_targets.is_empty() {
+        state.reload_config().await?;
+    }
+    Ok(missing.len())
+}
+
 /// 把多个上游模型快速归并到同一个对外名（§16.4）。
 ///
 /// 这是"同一模型在不同站点叫不同名字"的最短路径：选中几个目录行，

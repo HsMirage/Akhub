@@ -7,6 +7,8 @@
 //!
 //! 这里只做**浅解析**：逐帧看事件名和少数几个字段，绝不重建整个 JSON（§19.4）。
 
+use std::time::Duration;
+
 use axum::body::Bytes;
 use futures::{Stream, StreamExt as _};
 
@@ -18,6 +20,58 @@ use crate::domain::Protocol;
 /// 代理送来无穷无尽的注释行把内存吃光。触顶后直接放行，宁可失去切换机会也
 /// 不能失去响应。
 const MAX_SNIFF_BYTES: usize = 64 * 1024;
+
+/// 首字之前的心跳：为什么必须有，以及为什么它不改变切换边界（§13.4 修订）。
+///
+/// **为什么必须有心跳。** 网关在嗅探到语义事件之前不构造响应头，这段时间里
+/// 下游收不到任何字节。上游的首字延迟动辄几十秒到几分钟（长上下文 + 思考），
+/// 中间任何一层 CDN 都会把"零字节"判成源站无响应：
+///
+/// - Cloudflare 的源站响应超时约 100 秒，超时即回 **524**；
+/// - EdgeOne 对响应慢极有耐心，但长挂连接会推高回源建连压力，间接放大 **522**。
+///
+/// 实测：同一份 6.8 MB 请求体，EdgeOne 侧 76 秒后放行 200，Cloudflare 侧
+/// 129.9 秒后返回 524；TCP/TLS 都在 0.2 秒内完成，随后是全程零字节。
+///
+/// 心跳用 SSE 注释帧（`: keep-alive`）。它是 SSE 规范的一部分，三个协议的
+/// 客户端都忽略它，网关自己的嗅探器也把它归入 `Verdict::Pending`
+/// （见本文件 `classify` 对注释行的处理），因此**不影响切换边界**：
+/// 注释帧到达不改变"下游还没看到语义内容"这一事实。
+///
+/// 间隔与宽限期都是可配的（`Settings::keep_alive_interval` 与
+/// `Settings::first_content_grace`），因为最窄的那层 CDN 超时因部署而异。
+///
+/// 一帧 SSE 注释心跳。三个协议共用同一种写法。
+pub fn keep_alive_frame() -> axum::body::Bytes {
+    axum::body::Bytes::from_static(b": keep-alive\n\n")
+}
+
+/// 首个**语义**事件真正到达的时刻，由响应体写入、结算时读取。
+///
+/// 心跳把"客户端收到第一个字节"提前到了语义内容之前，因此不能再拿
+/// `Success.first_byte` 当首字延迟：那个数字会变成"第一个注释帧"的时间，
+/// 而用户真正等的是回答的第一句话。预算耗尽后由响应体自己记时，
+/// 结算优先用它；拿不到就退回原来的口径（§6.6：不知道就是不知道）。
+pub type FirstContentClock = std::sync::Arc<std::sync::Mutex<Option<Duration>>>;
+
+/// 新建一个首字时钟。
+pub fn first_content_clock() -> FirstContentClock {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+/// 记下首个语义事件的到达时刻；只记第一次。
+pub fn mark_first_content(clock: &FirstContentClock, at: Duration) {
+    if let Ok(mut slot) = clock.lock()
+        && slot.is_none()
+    {
+        *slot = Some(at);
+    }
+}
+
+/// 读出首个语义事件的到达时刻。
+pub fn first_content(clock: &FirstContentClock) -> Option<Duration> {
+    clock.lock().ok().and_then(|slot| *slot)
+}
 
 /// 嗅探结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +121,48 @@ impl Sniffer {
     }
 
     /// 取走已缓冲的字节，交给下游作为响应体的前缀。
+    ///
+    /// 只在**放弃这个嗅探器**时使用：扫描位置不归零，继续喂新块会漏掉帧边界。
+    /// 提交之后还要接着嗅探的路径用 [`Self::flush_unemitted`]。
     pub fn take_buffer(&mut self) -> Bytes {
         Bytes::from(std::mem::take(&mut self.buffer))
+    }
+
+    /// 取走缓冲区里"还没交给下游"的字节，供"提交后继续嗅探"使用。
+    ///
+    /// 与 [`Self::take_buffer`] 的关键差别：**缓冲区不清空**，扫描位置也不归零。
+    /// 心跳提交（§13.4 修订）会先把已经收到的非语义字节交给下游，然后继续用
+    /// 同一个嗅探器判断后面来的块是不是语义内容——而一个语义帧完全可能正好被
+    /// 切在两次读取之间。把已发出的字节留在缓冲区里当上下文，那个帧的尾巴才能
+    /// 和后面的块拼成完整帧；清空缓冲区会让它永远认不出来，整条流被当成噪声，
+    /// 最后还会补一个"上游在产生内容前就结束"的假错误帧。
+    ///
+    /// `emitted` 是调用方记住的"已经交给下游的字节数"，返回后推进到当前长度。
+    /// 缓冲区的增长由 `push` 的上限兜住（触顶即判 `Semantic`）。
+    /// 取走缓冲区里**完整帧**的字节，可能被切开的尾帧留在缓冲区里。
+    ///
+    /// 心跳提交时用它决定"先发什么"：心跳是**独立的 SSE 注释帧**，只有落在
+    /// 帧边界上才是合法的——若把一个还没收全的帧的前半段先发出去，紧跟其后的
+    /// 心跳会插进这个帧的中间（注释行把 data 行截断），客户端拿到的 JSON
+    /// 就是坏的。所以先发到最后一个完整帧为止，尾帧留着等后续字节补齐。
+    pub fn flush_complete_frames(&mut self, emitted: &mut usize) -> Bytes {
+        let end = last_complete_frame_end(&self.buffer);
+        let start = (*emitted).min(end);
+        // 游标只前进，绝不倒退：调用方可能在 flush_unemitted 之后又回到这里，
+        // 让游标退回 end 会把已经发过的字节再发一遍。
+        *emitted = (*emitted).max(end);
+        Bytes::copy_from_slice(&self.buffer[start..end])
+    }
+
+    /// 取走缓冲区里所有还没交给下游的字节（含不完整的尾帧）。
+    ///
+    /// 只在**确认要提交**时使用：那一刻起不再发心跳，字节可以原样往下送，
+    /// 不完整的尾帧会和后续块在客户端侧自然拼回。
+    pub fn flush_unemitted(&mut self, emitted: &mut usize) -> Bytes {
+        let start = (*emitted).min(self.buffer.len());
+        let pending = Bytes::copy_from_slice(&self.buffer[start..]);
+        *emitted = self.buffer.len();
+        pending
     }
 
     fn classify(&self, frame: &str) -> Verdict {
@@ -106,6 +200,17 @@ impl Sniffer {
             Protocol::OpenAiResponses => openai_responses(event.as_deref(), payload.as_ref()),
         }
     }
+}
+
+/// 缓冲区里最后一个**完整** SSE 帧的结束位置（一个都没有时是 0）。
+///
+/// 心跳只能落在帧边界上：注释帧插进一个没收全的帧里会把它的 data 行截断。
+fn last_complete_frame_end(buffer: &[u8]) -> usize {
+    let mut end = 0;
+    while let Some(next) = find_frame_end(buffer, end) {
+        end = next;
+    }
+    end
 }
 
 /// 找到从 `from` 开始的第一个完整 SSE 帧的结束位置。
@@ -885,6 +990,79 @@ mod tests {
         }
         assert_eq!(verdict, Verdict::Semantic, "宁可失去切换机会也不能吃光内存");
         assert!(sniffer.buffer.len() <= MAX_SNIFF_BYTES + chunk.len());
+    }
+
+    #[test]
+    fn keep_alive_frames_are_comments_so_they_never_commit() {
+        // 心跳必须落在"还没语义内容"这一侧：否则网关会把自己的注释帧
+        // 当成下游已看到内容，切换边界被自己堵死。
+        let frame = keep_alive_frame();
+        assert_eq!(frame.as_ref(), b": keep-alive\n\n");
+        for protocol in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+        ] {
+            let mut sniffer = Sniffer::new(protocol);
+            assert_eq!(sniffer.push(&frame), Verdict::Pending);
+        }
+    }
+
+    #[test]
+    fn complete_frames_are_released_while_a_partial_tail_stays_buffered() {
+        // 心跳提交时的分工：收全的帧立刻交给下游，没收全的尾帧留在缓冲区里
+        // 等后半段——心跳只能落在帧边界上，插进半个帧里会截断它的 data 行。
+        let mut sniffer = Sniffer::new(Protocol::AnthropicMessages);
+        assert_eq!(
+            sniffer.push(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"),
+            Verdict::Pending
+        );
+        // 第二个帧只来一半：它还没结束，不能发。
+        assert_eq!(
+            sniffer.push(b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"x\""),
+            Verdict::Pending
+        );
+        let mut emitted = 0;
+        let ready = sniffer.flush_complete_frames(&mut emitted);
+        assert!(
+            ready.starts_with(b"event: message_start"),
+            "完整帧要发出去：{ready:?}"
+        );
+        assert!(
+            !ready.windows(9).any(|w| w == b"content_b"),
+            "没收全的尾帧不能发：{ready:?}"
+        );
+        // 后半段到齐：这个帧终于完整了，嗅探器这才认出它是语义内容。
+        assert_eq!(
+            sniffer.push(b"}}\n\n"),
+            Verdict::Semantic,
+            "补上后半段之后，这个帧必须被认成语义内容"
+        );
+    }
+
+    #[test]
+    fn the_emitted_cursor_only_moves_forward() {
+        // flush_unemitted（提交）之后又回到 flush_complete_frames（心跳）时，
+        // 游标不能倒退，否则同一段字节会被发第二遍。
+        let mut sniffer = Sniffer::new(Protocol::AnthropicMessages);
+        sniffer.push(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n");
+        let mut emitted = 0;
+        let _ = sniffer.flush_complete_frames(&mut emitted);
+        assert_eq!(emitted, sniffer.buffer.len());
+        let _ = sniffer.flush_unemitted(&mut emitted);
+        assert_eq!(emitted, sniffer.buffer.len());
+        let again = sniffer.flush_complete_frames(&mut emitted);
+        assert!(again.is_empty(), "已经发过的字节不能再发一遍：{again:?}");
+        assert_eq!(emitted, sniffer.buffer.len(), "游标不能倒退");
+    }
+
+    #[test]
+    fn the_first_content_clock_keeps_only_the_first_mark() {
+        let clock = first_content_clock();
+        assert_eq!(first_content(&clock), None);
+        mark_first_content(&clock, Duration::from_secs(30));
+        mark_first_content(&clock, Duration::from_secs(99));
+        assert_eq!(first_content(&clock), Some(Duration::from_secs(30)));
     }
 
     #[test]

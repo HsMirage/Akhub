@@ -113,6 +113,8 @@ export function ModelSelectionDialog({
   const [query, setQuery] = useState("");
   const [onlyEnabled, setOnlyEnabled] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 「移除消失模型」的二次确认：唯一会连带撤下调度目标的批量清理。 */
+  const [confirmRemoveMissing, setConfirmRemoveMissing] = useState(false);
 
   const [editing, setEditing] = useState<string | null>(null);
   const [editAlias, setEditAlias] = useState("");
@@ -403,6 +405,8 @@ export function ModelSelectionDialog({
   }, [editing, rows, existingNames]);
 
   const enabledCount = rows.filter((row) => row.selected).length;
+  /** 上游已消失、留在目录里等它回来的行数：提示条与一键清理按钮都看它。 */
+  const missingCount = rows.filter((row) => row.missing).length;
   const renamedCount = rows.filter(hasDownstreamName).length;
   const blockedCount = hideOriginal ? rows.filter((row) => !hasDownstreamName(row)).length : 0;
   /** 被移除的行数：底部状态行与「撤销移除」都看它。 */
@@ -635,6 +639,31 @@ export function ModelSelectionDialog({
     }
   };
 
+  /**
+   * 一键移除目录里所有"上游已消失"的模型（§16.5）。
+   *
+   * 这是唯一一个会连带撤下调度目标的批量动作，所以走二次确认。托管与非托管
+   * 都能用：托管下这些行本来就不参与调度，清掉只是把列表收拾干净。
+   */
+  const removeMissing = async () => {
+    if (!account) return;
+    setConfirmRemoveMissing(false);
+    setBusy("missing");
+    try {
+      // 这次清理会重写服务端目录，草稿必须先落库，否则回来的新目录会把用户
+      // 还没保存的改动整体覆盖（与「获取上游模型」同一条规矩）。
+      if (!(await commitDraft())) return;
+      const result = await api.removeMissingAccountModels(account.id);
+      await load();
+      toast.success(`已移除 ${result.removed} 个上游已消失的模型`);
+      await onChanged();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "移除失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const syncManaged = async () => {
     if (!account) return;
     setBusy("sync");
@@ -686,10 +715,10 @@ export function ModelSelectionDialog({
             <Button
               variant="primary"
               onClick={() => void commitDraft()}
-              // managed 时服务端一律拒绝（自动同步接管了目录），按钮可以点
-              // 只是让用户白撞一次 409——账号可能在弹窗开着的这段时间里被
-              // 另一处打开自动同步，所以这个判断必须放在渲染里而不是打开时。
-              disabled={draftCount === 0 || rowBusy || managed}
+              // 托管账号下「保存」只可能承载改名（启用 / 停用 / 删除在托管下
+              // 不可用，服务端也会照样拒绝），所以这里不能按托管禁掉——那正是
+              // "改名与自动同步冲突"的旧行为（2026-10-15 修订）。
+              disabled={draftCount === 0 || rowBusy}
               title={draftCount === 0 ? "没有未保存的改动" : "保存本次改动"}
             >
               {saving ? "保存中…" : "保存"}
@@ -707,8 +736,14 @@ export function ModelSelectionDialog({
           )}
           {managed && (
             <div className="callout callout-info">
-              该账号已开启模型自动同步：上游全部模型由后台托管，删除 / 停用 /
-              改名暂不可用。关闭自动同步后可回到手动选择集。
+              该账号已开启模型自动同步：上游有哪些模型就调度哪些，新增 / 启用 /
+              停用 / 删除由后台接管。下游模型名（改名）不受影响，照旧可以修改。
+            </div>
+          )}
+          {missingCount > 0 && (
+            <div className="callout callout-warn">
+              有 {missingCount} 个模型已从上游消失：它们的调度目标已停用，上游重新
+              提供时会自动恢复。确认不会再回来时，用工具栏的「移除消失模型」一次清掉。
             </div>
           )}
 
@@ -783,6 +818,17 @@ export function ModelSelectionDialog({
             >
               {fetching ? "拉取中…" : "获取上游模型"}
             </Button>
+            {missingCount > 0 && (
+              <Button
+                variant="danger"
+                icon={<IconTrash size={13} />}
+                onClick={() => setConfirmRemoveMissing(true)}
+                disabled={rowBusy}
+                title={`把 ${missingCount} 个上游已消失的模型连同调度目标一起从目录移除`}
+              >
+                移除消失模型（{missingCount}）
+              </Button>
+            )}
             {managed && (
               <Button
                 variant="primary"
@@ -912,7 +958,7 @@ export function ModelSelectionDialog({
                     <th>上游模型名</th>
                     <th>下游模型名</th>
                     <th>下游可用名称</th>
-                    <th>状态（点击切换）</th>
+                    <th>{managed ? "状态（后台托管）" : "状态（点击切换）"}</th>
                     <th />
                   </tr>
                 </thead>
@@ -981,6 +1027,30 @@ export function ModelSelectionDialog({
           void load();
         }}
         onConfirm={() => void commitDraft(true)}
+      />
+
+      <ConfirmDialog
+        open={confirmRemoveMissing}
+        title="移除上游已消失的模型"
+        danger
+        confirmLabel={`移除 ${missingCount} 个模型`}
+        message={
+          <>
+            {rows
+              .filter((row) => row.missing)
+              .slice(0, 8)
+              .map((row) => (
+                <span key={row.upstream_model} className="mono" style={{ display: "block" }}>
+                  {row.upstream_model}
+                </span>
+              ))}
+            {missingCount > 8 && <span style={{ display: "block" }}>…等共 {missingCount} 个</span>}
+            这些模型已经不在上游的列表里，目标处于停用状态。移除后目录里不再保留它们，
+            上游重新提供时会作为新模型重新出现。
+          </>
+        }
+        onClose={() => setConfirmRemoveMissing(false)}
+        onConfirm={() => void removeMissing()}
       />
     </>
   );
@@ -1098,6 +1168,15 @@ const ModelRow = memo(function ModelRow({
               <Badge tone="danger" dot>
                 上游已消失
               </Badge>
+            ) : row.managed ? (
+              // 托管下"在不在调度"由后台决定：这里显示的是**有效状态**，不是
+              // 库里那份手动选择集标记（否则已经生效的模型会被显示成"已停用"）。
+              // 做成不可点的徽标：点它没有任何东西可改。
+              <span title="该账号已开启模型自动同步：上游有哪些模型就调度哪些，不需要在这里启用 / 停用">
+                <Badge tone="info" dot>
+                  托管启用
+                </Badge>
+              </span>
             ) : (
               <button
                 type="button"
@@ -1124,7 +1203,8 @@ const ModelRow = memo(function ModelRow({
               size="sm"
               icon={<IconEdit size={13} />}
               onClick={() => onEdit(row.upstream_model)}
-              disabled={managed || locked}
+              // 改名（下游模型名）是管理员的本地意图，与自动同步不冲突。
+              disabled={locked}
             >
               改名
             </Button>
