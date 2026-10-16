@@ -59,6 +59,46 @@ pub async fn run_update(State(state): State<SharedState>, _: Admin) -> AdminResu
     }
 }
 
+/// `POST /admin/api/system/upgrade`：**一键升级**——下载、替换、重启一次完成。
+///
+/// 与 `POST /system/update` 的分工：那条只把二进制写到磁盘，管理员还要再点一次
+/// "重启服务"。现场反馈是"有新版本后能不能点一下就完事"（参考 sub2api 的
+/// 后台在线升级），所以这里把三步合成一步：
+///
+/// - **原生二进制**：下载 → 校验 sha256 → 原子替换 → 自己触发优雅关闭，
+///   由 systemd 拉起新进程；
+/// - **容器**：替换容器内正在运行的那份二进制（入口脚本已把它放进可写的数据卷），
+///   再退出，由 `restart` 策略拉起同一个容器。与二进制路径共用同一段实现。
+///
+/// 放到独立任务里跑，与 `run_update` 同一个理由：拉镜像 + 重建容器要几分钟，
+/// 管理员关掉页面、反代掐断连接都不该中断它。进度留在 `Registry` 里，重新打开
+/// 面板就能看到那一次进行到哪一步。
+pub async fn run_upgrade(State(state): State<SharedState>, _: Admin) -> AdminResult<Json<Value>> {
+    // 立刻回执而不是 await 到升级结束：容器路径要几分钟，浏览器与反向代理都
+    // 不会等这么久。调用方改为轮询 GET /system/update 的 progress 字段。
+    let updater = Arc::clone(&state);
+    let runtime = Arc::clone(&state);
+    tokio::spawn(async move {
+        let target = crate::update::exe_path();
+        // restart 钩子：真到那一步时触发优雅关闭。
+        let restart = move || runtime.runtime.begin_shutdown();
+        let outcome = updater.runtime.update.upgrade(&target, Some(restart)).await;
+        match outcome {
+            Ok(progress) => tracing::info!(
+                to = progress.to.as_deref().unwrap_or("?"),
+                step = progress.step.as_deref().unwrap_or(""),
+                "一键升级已完成"
+            ),
+            Err(error) => tracing::warn!(%error, "一键升级失败"),
+        }
+    });
+
+    Ok(Json(json!({
+        "started": true,
+        "notice": "升级已开始：下载、校验、替换与重启会自动完成，请稍候。",
+    })))
+}
+
 /// `POST /admin/api/system/restart`：优雅关闭自己，交给监督进程拉起新版本。
 ///
 /// 没有监督进程时会真的把服务停掉，所以这里必须先确认 systemd（或运维显式

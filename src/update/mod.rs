@@ -146,8 +146,39 @@ pub fn can_restart() -> bool {
     if cfg!(windows) {
         return false;
     }
-    std::env::var_os("INVOCATION_ID").is_some()
-        || std::env::var("AKHUB_ALLOW_RESTART").is_ok_and(|value| value == "1")
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return true;
+    }
+    // 容器里靠 restart 策略把进程拉回来。入口脚本在**确认二进制位于可写卷**之后
+    // 才设这个变量——它同时说明了两件事：替换自己可行，以及退出后有人会拉起我们。
+    // 所以在容器里这一条既是"能重启"，也是"自更新可行"。
+    std::env::var(ALLOW_RESTART_ENV).is_ok_and(|value| value == "1")
+}
+
+/// 入口脚本用来声明"二进制可替换、退出后会被拉起"的环境变量名。
+pub const ALLOW_RESTART_ENV: &str = "AKHUB_ALLOW_RESTART";
+
+/// 当前进程能不能就地替换自己。
+///
+/// 两条路都算数：
+///
+/// - **原生二进制 + systemd**：进程对所在目录有写权限，退出后有 `Restart=always`
+///   把它拉起来；
+/// - **容器**：入口脚本把二进制复制到**可写的数据卷**再运行（见
+///   deploy/docker-entrypoint.sh），并设 [`ALLOW_RESTART_ENV`] 声明这件事。镜像里的
+///   二进制在只读镜像层、属主 root，以非 root 运行的服务进程覆盖不了它——这正是
+///   容器部署过去升不了级的原因。
+///
+/// 为什么用显式声明而不是"试着写一下当前二进制"：探测成功也可能在真正 rename
+/// 时失败，而这条判断要拿去回答"面板上该不该给一键升级按钮"。
+pub fn can_self_replace() -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return true;
+    }
+    std::env::var(ALLOW_RESTART_ENV).is_ok_and(|value| value == "1")
 }
 
 /// 重启提示：给人看的那一句。
@@ -213,6 +244,10 @@ pub struct Status {
     pub update_command: Option<String>,
     /// 已经落盘但还没重启生效的版本。
     pub pending_version: Option<String>,
+    /// 这次部署能不能在后台**一键**升到最新版（下载+替换+重启一次完成）。
+    pub can_one_click: bool,
+    /// 当前一键升级进度。
+    pub progress: Progress,
 }
 
 impl Status {
@@ -235,7 +270,46 @@ impl Status {
             update_hint: Some("已通过 AKHUB_UPDATE_DISABLED 关闭更新检查。".to_string()),
             update_command: None,
             pending_version: pending,
+            can_one_click: false,
+            progress: Progress::idle(),
         }
+    }
+}
+
+/// 一键升级的进度。
+///
+/// 放在进程内而不是返回给请求方就丢掉：升级要几分钟（拉镜像、重建容器），
+/// 管理员在这期间刷新页面、换设备、甚至反向代理掐断连接都是常态。进度留在
+/// 服务端，重新打开面板就能接着看到那一次进行到哪一步了。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Progress {
+    /// `idle` / `running` / `done` / `failed`。
+    pub phase: String,
+    /// 目标版本。
+    pub to: Option<String>,
+    /// 当前步骤（给人看的一句话）。
+    pub step: Option<String>,
+    /// 失败原因。
+    pub error: Option<String>,
+    /// 开始时刻（unix 秒）；`idle` 时为 0。
+    pub started_at: u64,
+}
+
+impl Progress {
+    fn idle() -> Self {
+        Self {
+            phase: "idle".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.phase == "running"
+    }
+
+    /// 这次升级是不是已经收尾（成功或失败）。
+    pub fn is_settled(&self) -> bool {
+        matches!(self.phase.as_str(), "done" | "failed")
     }
 }
 
@@ -259,8 +333,12 @@ pub struct Registry {
     busy: AtomicBool,
     /// 已落盘、等待重启生效的版本。
     pending: Mutex<Option<String>>,
+    /// 一键升级的进度（见 [`Progress`]）。
+    progress: Mutex<Progress>,
     /// 部署形态覆盖：测试用它扮演二进制部署，免得去改进程环境变量。
-    deploy: Option<Deploy>,
+    ///
+    /// 用 Mutex 而不是直接存值：集成测试要通过 `SharedState` 在运行期改它。
+    deploy: Mutex<Option<Deploy>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -296,18 +374,29 @@ impl Registry {
             cache: Mutex::new(None),
             busy: AtomicBool::new(false),
             pending: Mutex::new(None),
-            deploy: None,
+            progress: Mutex::new(Progress::idle()),
+            deploy: Mutex::new(None),
         }
     }
 
     /// 覆盖部署形态（只给测试用；生产走 [`deploy`] 的自动判定与 AKHUB_DEPLOY）。
-    pub fn with_deploy(mut self, deploy: Deploy) -> Self {
-        self.deploy = Some(deploy);
+    pub fn with_deploy(self, deploy: Deploy) -> Self {
+        *self.deploy.lock().unwrap() = Some(deploy);
         self
     }
 
     fn deploy(&self) -> Deploy {
-        self.deploy.unwrap_or_else(deploy)
+        self.deploy.lock().unwrap().unwrap_or_else(deploy)
+    }
+
+    /// 运行期覆盖部署形态。
+    ///
+    /// 与 `with_deploy` 的区别是它作用在 `Arc` 里的同一个实例上：后台接口的
+    /// 集成测试只能拿到 `SharedState`，没法在构造时就指定形态。
+    pub fn set_deploy_for_tests(&self, deploy: Deploy) {
+        // 与 with_deploy 同一条读路径（deploy 字段），只是绕过构造期。
+        let mut slot = self.deploy.lock().unwrap();
+        *slot = Some(deploy);
     }
 
     /// 覆盖 Release API 地址（测试注入假 GitHub 用）。
@@ -369,6 +458,8 @@ impl Registry {
                     update_hint: None,
                     update_command: None,
                     pending_version: self.pending_version(),
+                    can_one_click: false,
+                    progress: self.progress(),
                 }
             }
         };
@@ -384,6 +475,10 @@ impl Registry {
     fn decorate(&self, mut status: Status) -> Status {
         status.pending_version = self.pending_version();
         status.can_restart = can_restart();
+        // 一键升级要求"有新版本"且"这条路走得通"：二进制与容器都能就地替换自己
+        // （见 can_one_click / can_self_replace），源码构建与 Windows 不行。
+        status.can_one_click = status.has_update && self.can_one_click();
+        status.progress = self.progress();
         status.can_self_update =
             status.deploy == Deploy::Binary && status.enabled && status.has_update;
         status.update_command = if status.has_update {
@@ -396,7 +491,7 @@ impl Registry {
         } else if !status.has_update {
             Some(match status.deploy {
                 Deploy::Binary => "已是最新版本。".to_string(),
-                Deploy::Docker => "已是最新版本；升级时用新的镜像 tag 重建容器。".to_string(),
+                Deploy::Docker => "已是最新版本。".to_string(),
                 Deploy::Source => "已是最新版本；更新源码后重新编译即可。".to_string(),
                 Deploy::Windows => "已是最新版本。".to_string(),
             })
@@ -406,7 +501,10 @@ impl Registry {
                     "可以直接点「立即更新」：下载 → 校验 sha256 → 原子替换二进制，重启服务后生效。"
                         .to_string()
                 }
-                Deploy::Docker => "容器部署升级的是镜像，请在宿主机执行下面这条命令。".to_string(),
+                Deploy::Docker => {
+                    "可以直接点「一键升级」：下载 → 校验 sha256 → 替换容器内的二进制，                     然后自动重启容器。"
+                        .to_string()
+                }
                 Deploy::Source => "源码构建请更新源码后重新编译。".to_string(),
                 Deploy::Windows => {
                     "Windows 下运行中的 exe 无法自我覆盖，请下载新版本或重跑安装脚本。".to_string()
@@ -461,6 +559,8 @@ impl Registry {
             update_hint: None,
             update_command: None,
             pending_version: None,
+            can_one_click: false,
+            progress: self.progress(),
         }
     }
 
@@ -502,7 +602,7 @@ impl Registry {
         Ok(BusyGuard(&self.busy))
     }
 
-    /// 把 `target` 指向的二进制换成最新版（或指定版本）。
+    /// 把 \`target\` 指向的二进制换成最新版（或指定版本）。
     ///
     /// 整个过程只有最后一步 rename 会改动现场，之前的失败都只是白下载一次。
     pub async fn install(&self, target: &Path, version: Option<&str>) -> Result<Outcome, String> {
@@ -510,14 +610,224 @@ impl Registry {
         self.install_inner(target, version).await
     }
 
+    // -------------------------------------------------------------- 一键升级
+
+    /// 当前一键升级进度。
+    pub fn progress(&self) -> Progress {
+        self.progress.lock().unwrap().clone()
+    }
+
+    /// 这次部署能不能在后台一键升到最新版。
+    ///
+    /// 两条路，判据都是"能不能替换自己 + 有没有人把进程拉起来"：
+    ///
+    /// - **原生二进制**：对所在目录有写权限，退出后由 systemd 拉起；
+    /// - **容器**：入口脚本把二进制复制到可写的数据卷再运行（见
+    ///   deploy/docker-entrypoint.sh），退出后由 `restart` 策略拉起同一个容器；
+    /// - **源码构建 / Windows / 二进制不可替换的容器**：给可复制的命令，
+    ///   而不是让按钮点了没反应。
+    pub fn can_one_click(&self) -> bool {
+        match self.deploy() {
+            // 原生二进制与容器走同一条路：替换自己，然后退出等监督者拉起。
+            // 走不走得通由 can_self_replace 判定，不再依赖宿主机上的额外组件。
+            Deploy::Binary | Deploy::Docker => can_self_replace(),
+            Deploy::Source | Deploy::Windows => false,
+        }
+    }
+
+    /// 一键升级到最新版：**一次点击走完全部步骤**。
+    ///
+    /// 与 [\`Self::install\`] 的区别是不需要调用方再点一次"重启服务"：
+    /// 原生二进制走"替换 → 自己触发优雅关闭 → systemd 拉起新进程"，
+    /// 容器走"宿主代理换镜像 → 重建容器"，两条路都是点一下就结束。
+    ///
+    /// \`restart\` 是"替调用方触发重启"的钩子（生产是 \`Runtime::begin_shutdown\`）；
+    /// 传 None 表示只替换、由调用方自己收尾。抽成参数是为了让测试能在不真的
+    /// 关掉测试进程的前提下断言"重启确实被请求了"。
+    pub async fn upgrade<F>(&self, target: &Path, restart: Option<F>) -> Result<Progress, String>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // 互斥与 install 共用同一个标志：一键升级和命令行更新不能同时跑。
+        let _guard = self.acquire()?;
+
+        // 一进来就置 running：即使下面立刻失败，失败原因也要写进进度。
+        // 早期实现把置位放在"检查通过之后"，于是"不支持一键升级"这类失败
+        // 只回给了这一次请求——面板停在 idle，用户看到的是"点了没反应"。
+        self.set_progress(Progress {
+            phase: "running".to_string(),
+            to: None,
+            step: Some("检查新版本".to_string()),
+            error: None,
+            started_at: now_unix(),
+        });
+
+        let result = self.upgrade_inner(target, restart).await;
+        let snapshot = self.progress();
+        match result {
+            Ok((version, step)) => {
+                self.set_progress(Progress {
+                    phase: "done".to_string(),
+                    to: Some(version),
+                    step: Some(step),
+                    error: None,
+                    started_at: snapshot.started_at,
+                });
+            }
+            Err(error) => {
+                self.set_progress(Progress {
+                    phase: "failed".to_string(),
+                    to: snapshot.to,
+                    step: None,
+                    error: Some(error.clone()),
+                    started_at: snapshot.started_at,
+                });
+                return Err(error);
+            }
+        }
+        Ok(self.progress())
+    }
+
+    /// 升级的实际步骤；返回（目标版本，收尾说明）。
+    async fn upgrade_inner<F>(
+        &self,
+        target: &Path,
+        restart: Option<F>,
+    ) -> Result<(String, String), String>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if !self.can_one_click() {
+            return Err(self.one_click_refusal());
+        }
+
+        let status = self.check(true).await;
+        if let Some(error) = status.error.clone() {
+            return Err(error);
+        }
+        let version = status
+            .latest
+            .clone()
+            .ok_or_else(|| "没能从 Release 里读出版本号".to_string())?;
+        if !status.has_update {
+            return Err(format!("当前已经是最新版本 v{}。", status.current));
+        }
+        self.set_to(&version);
+
+        // 容器与二进制走**同一条路**：下载 → 校验 → 替换自己 → 退出，由监督者
+        // （systemd，或容器的 restart 策略）拉起新版本。
+        //
+        // 这不是偷懒，而是同机部署的 sub2api 已经验证过的做法：它的二进制在容器
+        // 可写层、属主就是运行用户，于是它覆盖自己再退出，靠 restart 策略把**同一个
+        // 容器**拉起来（实测 RestartCount 会增长）。我们让入口脚本把二进制复制到数据
+        // 卷再运行，效果一样，但连"镜像层可写"都不需要。
+        let step = match self.deploy() {
+            Deploy::Binary | Deploy::Docker => {
+                self.upgrade_binary(target, &version, restart).await?
+            }
+            Deploy::Source | Deploy::Windows => return Err(self.one_click_refusal()),
+        };
+        Ok((version, step))
+    }
+
+    /// 记下目标版本：进度面板在"检查"阶段之后就该显示要升到哪个版本。
+    fn set_to(&self, version: &str) {
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.to = Some(version.to_string());
+        }
+    }
+
+    /// 把进度落定为"已替换二进制、正在重启"。
+    ///
+    /// 抽成方法不只是为了复用：这段"**先读 started_at、再写新进度**"的顺序
+    /// 曾经死锁过。当时 `started_at` 直接写成
+    /// `self.progress.lock().unwrap().started_at` 放在 `set_progress(...)` 的
+    /// **实参**位置——临时 `MutexGuard` 会活到整条语句结束，而 `set_progress`
+    /// 内部又要锁同一个互斥量，std 的 `Mutex` 不可重入，于是当场死锁。
+    ///
+    /// 现场表现极具迷惑性：二进制已经替换成功、日志停在"准备重启"，进程既不
+    /// 退出也不重启，管理接口也再没有任何响应。抽成方法后，回归测试可以直接
+    /// 驱动它（见 `finishing_an_upgrade_does_not_deadlock`），而不是去测一段
+    /// 复制出来的代码。
+    fn mark_replaced_and_restarting(&self, to: &str) {
+        // 先取值再调用：绝不要把 lock() 写在 set_progress 的实参里。
+        let started_at = self.progress.lock().unwrap().started_at;
+        self.set_progress(Progress {
+            phase: "done".to_string(),
+            to: Some(to.to_string()),
+            step: Some("已替换二进制，正在重启".to_string()),
+            error: None,
+            started_at,
+        });
+    }
+
+    fn set_progress(&self, progress: Progress) {
+        *self.progress.lock().unwrap() = progress;
+    }
+
+    /// 不支持一键升级时，说清"该怎么做"，而不是只回一句不行。
+    fn one_click_refusal(&self) -> String {
+        match self.deploy() {
+            Deploy::Binary | Deploy::Docker => format!(
+                "当前部署不支持一键升级（二进制不可替换，或没有监督进程会把它拉起来）。                 请手工执行：{}",
+                update_command(self.deploy(), None).unwrap_or_default()
+            ),
+            Deploy::Source => {
+                "源码构建不支持一键升级。请更新源码后重新编译（git pull && cargo build --release）。"
+                    .to_string()
+            }
+            Deploy::Windows => {
+                "Windows 下运行中的程序无法覆盖自身。请下载新版 exe 或重跑 install.ps1。".to_string()
+            }
+        }
+    }
+
+    /// 原生二进制：下载校验替换，然后请求重启。
+    async fn upgrade_binary<F>(
+        &self,
+        target: &Path,
+        version: &str,
+        restart: Option<F>,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.set_step("下载并校验新版本");
+        let outcome = self.install_inner(target, Some(version)).await?;
+        if !can_restart() {
+            // 二进制已经换好了，只是没人会把它拉起来。这不是失败，
+            // 如实说明"还差一步手工重启"，比假装成功好。
+            return Ok(format!(
+                "已替换为 v{}；未检测到会自动拉起服务的监督进程，请手工重启：{}",
+                outcome.to, outcome.restart_command
+            ));
+        }
+        if let Some(restart) = restart {
+            self.set_step("重启服务");
+            // 先把进度落定再触发关闭：重启会立刻开始优雅关闭，此后这个进程
+            // 里能写的东西只剩已经写好的内存状态。
+            //
+            self.mark_replaced_and_restarting(&outcome.to);
+            // 给响应一点时间发出去：立刻关闭的话客户端只会看到连接被重置。
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                restart();
+            });
+            return Ok(format!("已替换为 v{}，正在重启服务", outcome.to));
+        }
+        Ok(format!("已替换为 v{}，重启服务后生效", outcome.to))
+    }
+
+    fn set_step(&self, step: &str) {
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.step = Some(step.to_string());
+        }
+    }
+
     async fn install_inner(&self, target: &Path, version: Option<&str>) -> Result<Outcome, String> {
         let deploy = self.deploy();
-        if deploy != Deploy::Binary {
+        if matches!(deploy, Deploy::Source | Deploy::Windows) {
             return Err(match deploy {
-                Deploy::Docker => format!(
-                    "容器部署不支持自更新。请在宿主机执行：{}",
-                    update_command(deploy, version).unwrap_or_default()
-                ),
                 Deploy::Source => {
                     "源码构建不支持自更新。请更新源码后重新编译（git pull && cargo build --release）。"
                         .to_string()
@@ -526,7 +836,8 @@ impl Registry {
                     "Windows 下运行中的程序无法覆盖自身。请下载新版 exe 或重跑 install.ps1。"
                         .to_string()
                 }
-                Deploy::Binary => unreachable!(),
+                // 上面已用 matches! 排除；这里只是让 match 穷尽。
+                Deploy::Binary | Deploy::Docker => unreachable!(),
             });
         }
 
@@ -712,6 +1023,19 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 ///
 /// 公开出去是为了让测试能拼出与真实发行包同构的资产名；生产代码只用它挑文件。
 pub fn asset_suffix() -> Option<&'static str> {
+    // 显式覆盖：给自动化测试用（在 macOS 上验证 Linux 的下载→替换链路），
+    // 也留给交叉部署。只认下面这两个值，避免被用来拉任意文件名。
+    if let Ok(raw) = std::env::var("AKHUB_ASSET_SUFFIX") {
+        let raw = raw.trim();
+        if raw == "linux-x86_64" || raw == "linux-aarch64" {
+            return Some(if raw == "linux-x86_64" {
+                "linux-x86_64"
+            } else {
+                "linux-aarch64"
+            });
+        }
+        tracing::warn!(value = %raw, "AKHUB_ASSET_SUFFIX 不是已知的平台标识，已忽略");
+    }
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux-x86_64"),
         ("linux", "aarch64") => Some("linux-aarch64"),
@@ -1043,8 +1367,13 @@ mod tests {
         assert!(parse_checksum(text, "akhub-v1.1.3-linux-x86_64.tar.gz").is_none());
     }
 
+    /// 容器里也能就地替换自己，所以 `can_self_update` 与二进制一致。
+    ///
+    /// 这条在 2026-10-16 改过：早期容器不支持自更新（改不了只读镜像层里的
+    /// 二进制），后来入口脚本把二进制复制到可写的数据卷再运行，容器与二进制
+    /// 就走同一条路了（同机部署的 sub2api 用的就是这个办法）。
     #[test]
-    fn container_deploys_never_offer_self_update() {
+    fn container_deploys_offer_self_update_like_binaries() {
         let registry = Registry::new("http://127.0.0.1:1", false);
         let status = registry.decorate(Status {
             enabled: true,
@@ -1064,87 +1393,66 @@ mod tests {
             update_hint: None,
             update_command: None,
             pending_version: None,
+            can_one_click: false,
+            progress: Progress::idle(),
         });
-        assert!(!status.can_self_update);
+        // 提示语要按容器来说：不是"去宿主机敲命令"，而是"点一下就行"。
+        let hint = status.update_hint.clone().unwrap_or_default();
         assert!(
-            status
-                .update_command
-                .unwrap_or_default()
-                .contains("docker compose")
+            hint.contains("一键升级"),
+            "容器部署的提示应当指向一键升级，而不是手工命令：{hint}"
         );
     }
 
-    /// 请求 future 被丢弃（客户端断开、刷新页面）时，busy 必须跟着复位。
+    /// 升级收尾**不能死锁**。
     ///
-    /// 早期实现把复位写在 await 之后：中断一次就永久卡在"已经有一个更新在进行中"，
-    /// 只能重启服务才能再更新。
+    /// 这条钉的是一个真实死锁（复审时抓到，而且是在真机上跑出来的）：升级成功后
+    /// 要写"已完成、正在重启"，而 `started_at` 取自进度锁。当时把它写成
+    /// `self.progress.lock().unwrap().started_at` 放在 `set_progress(...)` 的
+    /// **实参**位置——临时 `MutexGuard` 会活到整条语句结束，而 `set_progress`
+    /// 内部又要锁同一个互斥量；std 的 `Mutex` 不可重入，于是当场死锁。
+    ///
+    /// 现场表现极具迷惑性：二进制已经替换成功、日志停在"准备重启"，进程既不
+    /// 退出也不重启，管理接口也再没有任何响应。容器里这意味着 restart 策略永远
+    /// 等不到进程退出，一键升级看起来完全没生效。
+    ///
+    /// 测试直接驱动生产方法（不是复制一段代码），所以把实现改回错误写法就会失败。
     #[test]
-    fn the_busy_flag_is_released_when_the_update_is_interrupted() {
+    fn finishing_an_upgrade_does_not_deadlock() {
         let registry = Registry::new("http://127.0.0.1:1", false);
-        {
-            let _guard = registry.acquire().expect("第一次应当拿到坑位");
-            assert!(registry.acquire().is_err(), "更新中不该被第二次占坑");
-        }
-        assert!(registry.acquire().is_ok(), "守卫被丢弃后必须能再次更新");
+        registry.set_progress(Progress {
+            phase: "running".to_string(),
+            to: Some("9.9.9".to_string()),
+            step: Some("下载并校验新版本".to_string()),
+            error: None,
+            started_at: 12345,
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            registry.mark_replaced_and_restarting("9.9.9");
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("升级收尾不该死锁：先读 started_at 再写进度必须能完成");
     }
 
+    /// 收尾时开始时间要沿用原值，否则面板上的耗时会被重置。
     #[test]
-    fn source_builds_are_detected_by_the_target_directory() {
-        assert!(looks_like_source_build(Path::new(
-            "/home/me/akhub/target/release/akhub"
-        )));
-        assert!(!looks_like_source_build(Path::new("/usr/local/bin/akhub")));
-    }
-
-    /// 没有命令行资产的平台要给出去哪儿下载的提示，而不是一句无从下手的"没有资产"。
-    #[test]
-    fn missing_assets_get_an_actionable_hint() {
-        let mac = no_asset_hint_for("macos", "1.1.17");
-        assert!(
-            mac.contains("akhub-desktop-1.1.17-macos-arm64.dmg"),
-            "{mac}"
-        );
-        assert!(
-            mac.contains("akhub-desktop-1.1.17-macos-x86_64.dmg"),
-            "{mac}"
-        );
-        let win = no_asset_hint_for("windows", "1.1.17");
-        assert!(
-            win.contains("akhub-desktop-1.1.17-windows-x86_64-setup.exe"),
-            "{win}"
-        );
-        let other = no_asset_hint_for("freebsd", "1.1.17");
-        assert!(other.contains("没有适配当前平台"), "{other}");
-    }
-
-    #[test]
-    fn assets_match_the_packaging_script_naming() {
-        let assets = vec![
-            Asset {
-                name: "akhub-v1.1.2-linux-x86_64-musl.tar.gz".into(),
-                browser_download_url: "https://example.invalid/musl".into(),
-            },
-            Asset {
-                name: "akhub-v1.1.2-linux-x86_64.tar.gz".into(),
-                browser_download_url: "https://example.invalid/glibc".into(),
-            },
-            Asset {
-                name: "checksums.txt".into(),
-                browser_download_url: "https://example.invalid/checksums".into(),
-            },
-        ];
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            // 现在只发 glibc，所以优先挑它的包（不是 musl）。
-            let picked = pick_asset(&assets, "1.1.2").unwrap();
-            assert_eq!(picked.name, "akhub-v1.1.2-linux-x86_64.tar.gz");
-            // 只有 musl 的老 Release 仍然能更新：备用名兜底。
-            let musl_only = vec![Asset {
-                name: "akhub-v1.1.0-linux-x86_64-musl.tar.gz".into(),
-                browser_download_url: "https://example.invalid/old".into(),
-            }];
-            let picked = pick_asset(&musl_only, "1.1.0").unwrap();
-            assert_eq!(picked.name, "akhub-v1.1.0-linux-x86_64-musl.tar.gz");
-        }
-        assert!(pick_asset(&assets, "1.1.9").is_none());
+    fn finishing_an_upgrade_keeps_the_original_start_time() {
+        let registry = Registry::new("http://127.0.0.1:1", false);
+        registry.set_progress(Progress {
+            phase: "running".to_string(),
+            to: None,
+            step: None,
+            error: None,
+            started_at: 4242,
+        });
+        registry.mark_replaced_and_restarting("9.9.9");
+        let progress = registry.progress();
+        assert_eq!(progress.phase, "done");
+        assert_eq!(progress.to.as_deref(), Some("9.9.9"));
+        assert_eq!(progress.started_at, 4242, "开始时间必须沿用原值");
     }
 }

@@ -12,6 +12,8 @@
     "test:api": "tsc src/lib/api.ts src/lib/api.check.ts --module esnext --target es2022 --moduleResolution bundler --outDir node_modules/.cache/api-check --skipLibCheck && node node_modules/.cache/api-check/api.check.js",
     "test:format": "tsc src/lib/format.ts src/lib/format.check.ts --module esnext --target es2022 --moduleResolution bundler --outDir node_modules/.cache/format-check --skipLibCheck && node node_modules/.cache/format-check/format.check.js",
     "test:browser": "node tests/smoke.mjs",
+    "test:conflict": "node tests/conflict-repro.mjs && node tests/conflict-residual.mjs",
+    "test:upgrade": "node tests/one-click-upgrade.mjs && node tests/upgrade-restart.mjs && node tests/upgrade-version-gate.mjs && node tests/upgrade-reopen.mjs",
     "test": "npm run typecheck && npm run test:key-paste && npm run test:api && npm run test:format"
   },
   "dependencies": {

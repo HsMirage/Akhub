@@ -38,6 +38,10 @@ services:
       #（例如 `./data:/data`），宿主目录必须先 `chown 10001:10001`，
       # 否则启动会以「创建主密钥文件失败：Permission denied」退出。
       - akhub-data:/data
+      # 容器内一键升级不需要额外挂载：入口脚本把二进制复制到本卷的 runtime/ 下运行，
+      # 服务进程于是能替换自己，退出后由 restart: unless-stopped 把同一个容器拉起来。
+      # 同机部署的 sub2api 用的就是这个办法（它的二进制在容器可写层）。
+      # 只读挂载本卷（:ro）时会自动退回镜像里那份二进制，面板如实提示一键升级不可用。
 
     environment:
       AKHUB_LISTEN: 0.0.0.0:8080

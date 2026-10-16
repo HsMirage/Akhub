@@ -339,12 +339,24 @@ export const api = {
    * 接口让表单当场就能验证凭据、把分组和倍率一起带回来，不必"先存再点开"。
    */
   previewNewApiGroups: (input: NewApiPreviewInput) =>
-    post<NewApiPreviewResult>("/new-api/preview-groups", input),
+    post<NewApiPreviewResult>("/new-api/preview-groups", input, {
+      skipConfigVersion: true,
+    }),
   /** 一键独立复制：停用状态的「名称 - 副本」，Key 重新加密（§6.4）。 */
   copyAccount: (id: string) => post<Account>(`/accounts/${id}/copy`),
-  /** 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。 */
+  /**
+   * 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。
+   *
+   * 不携带配置版本号：它不修改配置，带上只会被并发的配置写入（比如后台托管
+   * 同步刚发现了新模型）判成 409，让用户看到一条与"测试连接"毫无关系的
+   * "配置已被其他会话修改"（见 `RequestOptions.skipConfigVersion`）。
+   */
   testAccount: (id: string, model?: string) =>
-    post<TestResult>(`/accounts/${id}/test`, { model: model || undefined }),
+    post<TestResult>(
+      `/accounts/${id}/test`,
+      { model: model || undefined },
+      { skipConfigVersion: true },
+    ),
   /**
    * 清除某一把 Key 的失效标记与熔断（§12.3）。
    *
@@ -536,6 +548,17 @@ export const api = {
     request<UpdateStatus>(`/system/update${refresh ? "?refresh=1" : ""}`),
   /** 立即更新：下载 → 校验 sha256 → 原子替换二进制，重启后生效。 */
   runUpdate: () => post<{ outcome: UpdateOutcome }>("/system/update"),
+  /**
+   * 一键升级：下载 / 替换 / 重启一次完成（容器则交给宿主机代理换镜像重建）。
+   *
+   * 立即回执而不是等到升级结束：容器路径要几分钟（拉镜像 + 重建容器），
+   * 浏览器与反向代理都不会等这么久。进度改由 `updateStatus` 的 progress 字段轮询。
+   */
+  runUpgrade: () =>
+    post<{ started: boolean; notice: string }>("/system/upgrade", undefined, {
+      // 升级不改配置，带上乐观锁只会被并发的配置写入判成 409。
+      skipConfigVersion: true,
+    }),
   /** 重启服务：优雅关闭自己，交给 systemd 拉起新版本。 */
   restartService: () => post<{ restarting: boolean }>("/system/restart"),
 

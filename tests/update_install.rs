@@ -147,23 +147,57 @@ async fn an_explicit_version_can_be_installed_even_without_asking_the_latest() {
     assert_eq!(github.hits(), 0, "指定版本不该再去查 latest");
 }
 
+/// 走不通的部署要给出**可照做**的替代路径，而不是一句"不行"。
+///
+/// 2026-10-16 修订：容器从这条里**移出去**了。入口脚本把二进制复制到可写的数据卷
+/// 再运行（见 deploy/docker-entrypoint.sh），容器与原生二进制于是走同一条"替换
+/// 自己"的路，不再需要宿主机上跑代理。剩下源码构建与 Windows 仍然走不通。
 #[tokio::test]
-async fn container_and_source_deploys_are_refused_with_a_usable_command() {
+async fn source_and_windows_deploys_are_refused_with_a_usable_command() {
     let dir = tempfile::tempdir().unwrap();
     let target = write_old_binary(dir.path());
-
-    let docker = Registry::new("http://127.0.0.1:1", false).with_deploy(Deploy::Docker);
-    let error = docker.install(&target, Some("9.9.9")).await.unwrap_err();
-    assert!(error.contains("docker compose"), "{error}");
-    assert_eq!(std::fs::read(&target).unwrap(), b"old-binary");
 
     let source = Registry::new("http://127.0.0.1:1", false).with_deploy(Deploy::Source);
     let error = source.install(&target, Some("9.9.9")).await.unwrap_err();
     assert!(error.contains("cargo build"), "{error}");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"old-binary",
+        "被拒绝时不该动目标二进制"
+    );
 
     let windows = Registry::new("http://127.0.0.1:1", false).with_deploy(Deploy::Windows);
     let error = windows.install(&target, Some("9.9.9")).await.unwrap_err();
     assert!(error.contains("install.ps1"), "{error}");
+}
+
+/// 容器部署**不再**被拒绝：它和二进制一样能就地替换自己。
+///
+/// 这条钉住本次修复的主诉——容器部署过去升不了级，是因为镜像里的二进制在只读层、
+/// 属主 root，以非 root 运行的服务进程覆盖不了它。现在入口脚本把二进制放进可写卷，
+/// 于是 `can_self_replace()` 成立，安装路径必须真的去替换而不是直接报错。
+#[tokio::test]
+async fn a_container_deploy_replaces_the_binary_like_a_native_one() {
+    if !common::cli_updates_supported() {
+        eprintln!("跳过：当前平台没有命令行发行资产（macOS / Windows 只发桌面端安装包）");
+        return;
+    }
+    let archive = make_release_archive("9.9.9", NEW_BINARY);
+    let github = FakeGithub::spawn("v9.9.9", archive).await;
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_old_binary(dir.path());
+
+    let registry = Registry::new(github.base_url.clone(), false).with_deploy(Deploy::Docker);
+    let outcome = registry
+        .install(&target, Some("v9.9.9"))
+        .await
+        .expect("容器部署应当能就地替换二进制");
+    assert_eq!(outcome.to, "9.9.9");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        NEW_BINARY,
+        "容器里的二进制必须被真的替换掉"
+    );
 }
 
 #[tokio::test]

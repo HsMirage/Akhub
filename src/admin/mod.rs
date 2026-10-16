@@ -341,6 +341,8 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/system/update",
             get(system::update_status).post(system::run_update),
         )
+        // 一键升级：下载/替换/重启（或换镜像重建容器）一次完成。
+        .route("/admin/api/system/upgrade", post(system::run_upgrade))
         .route("/admin/api/system/restart", post(system::restart))
         .route(
             "/admin/api/settings",

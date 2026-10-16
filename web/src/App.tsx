@@ -490,11 +490,18 @@ function Console({
       />
       <ConfirmDialog
         open={conflictOpen}
-        title="配置已被其他会话修改"
-        confirmLabel="重新加载"
-        message="另一个标签页或管理员刚刚修改了配置。继续在当前页面保存可能覆盖对方的修改。请重新加载后重试；重新加载会放弃本页尚未保存的修改。"
+        title="这份配置已经变了"
+        confirmLabel="取回最新配置"
+        message="服务端上的配置在你这轮编辑期间被改过了。你填写的内容不会丢——点「取回最新配置」只刷新后台数据、不重载页面，弹窗和表单都保持原样；确认无误后再点一次保存即可。"
         onClose={() => setConflictOpen(false)}
-        onConfirm={() => window.location.reload()}
+        // 刻意**不用** `window.location.reload()`：整页重载会把管理员正在填的
+        // 表单连同弹窗一起丢掉，"又得重新输入一遍"就是这么来的。这里只重新
+        // 拉一次后台数据——它同时刷新了客户端手上的配置版本号，下一次保存就能
+        // 带上正确的版本；而表单、弹窗、已输入的内容全都原地不动。
+        onConfirm={() => {
+          void refresh();
+          setConflictOpen(false);
+        }}
       />
     </div>
   );

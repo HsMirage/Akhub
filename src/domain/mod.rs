@@ -180,7 +180,10 @@ impl Default for SchedulingWeights {
 }
 
 /// 分组：完全独立的调用空间，也是调度的硬边界（§4.1）。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` 供配置版本判定使用（见 `config::ConfigService::reload`）：
+/// 它比较的是"配置内容有没有变"，不是"数据库行有没有被写过"。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     pub id: String,
     pub name: String,
@@ -199,7 +202,10 @@ pub struct Group {
 }
 
 /// 上游账号：一套独立凭据与连接配置（§4.2）。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` 供配置版本判定使用；`model_synced_at` 这类后台高频字段由
+/// 调用方归一化后再比（见 `config::same_account`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
     /// 所属分组；`None` 表示**未分配**（§4.2.3）。
@@ -250,7 +256,7 @@ impl Account {
 }
 
 /// 逻辑模型：下游看到的名称（§4.4）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalModel {
     pub id: String,
     pub group_id: String,
@@ -261,7 +267,7 @@ pub struct LogicalModel {
 }
 
 /// 调度目标：`分组 + 上游账号 + 具体上游模型`（§4.5）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchTarget {
     pub id: String,
     pub logical_model_id: String,

@@ -37,6 +37,15 @@ globalThis.fetch = async (_url, init) => {
 await Promise.all([api.updateGroup("test", { name: "a" }), api.updateGroup("test", { name: "b" })]);
 check(sentVersions.join(",") === "2,3", "并发保存必须串行携带上次成功响应的版本");
 
+// 与配置无关的写操作（测试连接）不能带上乐观锁：它会被并发的配置写入
+// 判成 409，让用户看到一条与当前操作毫无关系的"配置已被其他会话修改"。
+globalThis.fetch = async (_url, init) => {
+  const sent = new Headers(init?.headers).get("x-akhub-config-version");
+  check(sent === null, "测试连接不该携带配置版本号，实际带了 " + sent);
+  return response(4, JSON.stringify({ ok: true, message: "通了", keys: [] }));
+};
+await api.testAccount("acc", "glm-4.6");
+
 globalThis.fetch = async () => response(99, JSON.stringify({ error: "保存失败" }), 500);
 try { await api.updateGroup("test", { name: "failed" }); } catch { /* 失败不能污染版本。 */ }
 check(knownConfigVersion() === 4, "失败响应不能推进配置版本");
@@ -46,4 +55,4 @@ globalThis.fetch = async () => { throw new TypeError("network"); };
 let network: unknown;
 try { await api.overview(); } catch (error) { network = error; }
 check(network instanceof ApiError && network.status === 0, "网络异常必须转为可读错误");
-console.log("通过：响应乱序、重启、无效数据、串行写入、失败版本保护、204、网络异常");
+console.log("通过：响应乱序、重启、无效数据、串行写入、失败版本保护、204、网络异常、与配置无关的写不带乐观锁");

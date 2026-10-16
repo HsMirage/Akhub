@@ -133,6 +133,32 @@ impl RuntimeConfig {
             .find(|target| target.account.id == account_id)
     }
 
+    /// 两份快照是不是**同一份配置**（§7.4 的乐观锁版本语义）。
+    ///
+    /// 判据是"下游调度能看到的东西有没有变"，而不是结构体的逐字节相等：
+    ///
+    /// * 分组：ID 与全部调度相关字段（倍率上限、权重、队列、降级开关）；
+    /// * 逻辑模型：ID、对外名、启用、来源；
+    /// * 目标：ID、所属模型、账号、上游模型名、启用、隐藏原始名、限制；
+    /// * 账号：ID、所属分组、启用、优先级、倍率配置、限制、隐藏原始名。
+    ///
+    /// 刻意**不**比较的字段是那些"与调度无关、却会被后台任务高频改写"的：
+    /// `Account::model_synced_at`（每次托管同步都会 touch）、`created_at`、
+    /// Key 池与凭据密文（凭据是热路径状态，不进配置版本）。把它们算进来，
+    /// 后台同步就又会推进版本，误报原样复现——这正是本函数存在的理由。
+    ///
+    /// 顺序敏感：`build` 对分组、模型、目标都按固定顺序装配，两边都来自同一
+    /// 段代码，所以直接逐项比较即可，不必排序。
+    pub fn same_config(&self, other: &RuntimeConfig) -> bool {
+        if self.groups.len() != other.groups.len() {
+            return false;
+        }
+        self.groups
+            .iter()
+            .zip(other.groups.iter())
+            .all(|(a, b)| same_group(a, b))
+    }
+
     /// 当前配置中全部账号与目标的 ID，供动态状态表清理已消失的条目。
     pub fn live_ids(&self) -> (Vec<String>, Vec<String>) {
         let mut accounts = Vec::new();
@@ -151,6 +177,66 @@ impl RuntimeConfig {
     }
 }
 
+/// 两份分组视图是不是同一份配置（见 `RuntimeConfig::same_config`）。
+fn same_group(a: &GroupView, b: &GroupView) -> bool {
+    same_group_row(&a.group, &b.group)
+        && a.models.len() == b.models.len()
+        && a.models.iter().all(|(name, left)| {
+            b.models
+                .get(name)
+                .is_some_and(|right| same_model(left, right))
+        })
+}
+
+/// 分组是不是同一份配置。
+///
+/// 用领域类型的派生 `PartialEq` **整体**比较，而不是手写字段清单。手写清单
+/// 曾经漏掉 `key_digest_hex`，于是"重新生成下游 Key"不推进版本、也不替换
+/// 快照，旧 Key 继续可用——全量回归里 `regenerating_a_key_invalidates_the_previous_one`
+/// 正是这么抓到的。结构性比较没有这个失败模式：领域类型新增字段时它自动覆盖。
+///
+/// `created_at` 参与比较是安全的：它只在插入时写一次，之后不会变。
+fn same_group_row(a: &Group, b: &Group) -> bool {
+    a == b
+}
+
+fn same_model(a: &LogicalModelView, b: &LogicalModelView) -> bool {
+    a.model == b.model
+        && a.exposed == b.exposed
+        && a.aliases == b.aliases
+        && a.targets.len() == b.targets.len()
+        && a.targets
+            .iter()
+            .zip(b.targets.iter())
+            .all(|(left, right)| same_target(left, right))
+}
+
+fn same_target(a: &TargetView, b: &TargetView) -> bool {
+    a.target == b.target && a.priority == b.priority && same_account(&a.account, &b.account)
+}
+
+/// 账号是不是同一份配置。
+///
+/// 唯一被刻意忽略的字段是 `model_synced_at`：后台托管同步每轮都会 touch 它
+/// （`sync_managed` 结尾的 `touch_model_sync`），而它与"下游能看到什么、
+/// 请求会被调度到哪"毫无关系。把它算进配置版本，管理员每次保存都会撞上
+/// 与自己的编辑无关的冲突提示——这正是要修的那个误报。
+///
+/// 其余字段一律整体比较（凭据与 Key 池不在 `Account` 里，它们是
+/// `CredentialPool`，本来就不参与配置版本）。
+fn same_account(a: &Account, b: &Account) -> bool {
+    if a.model_synced_at == b.model_synced_at {
+        return a == b;
+    }
+    // 只差这个时间戳时才有必要克隆一次；账号数量是个位数到几十个，
+    // 这点开销远小于上面四次数据库查询。
+    let mut left = a.clone();
+    let mut right = b.clone();
+    left.model_synced_at = None;
+    right.model_synced_at = None;
+    left == right
+}
+
 /// 持有当前配置快照，并负责从数据库整体重建。
 pub struct ConfigService {
     store: Store,
@@ -160,11 +246,18 @@ pub struct ConfigService {
 
 impl ConfigService {
     /// 从数据库加载首个快照。
+    ///
+    /// 计数器从 **1** 起步，于是首个快照的版本就是 1，而不是 0。
+    ///
+    /// 这不是审美问题：客户端把 0 当作"还没读到过版本"，因而**不带**乐观锁头
+    /// （见 web/src/lib/api.ts 的 `configVersion`，以及 §7.4 的兼容模式约定）。
+    /// 若首启停在 0，管理员在第一次配置变更之前保存时，锁是静默关闭的。
+    /// 从 1 起步还顺带对上客户端注释里"服务重启会将版本重置为 1"那条既有约定。
     pub async fn load(store: Store) -> Result<Self> {
         let service = Self {
             store,
             current: ArcSwap::from_pointee(RuntimeConfig::default()),
-            version: AtomicU64::new(0),
+            version: AtomicU64::new(1),
         };
         service.reload().await?;
         Ok(service)
@@ -180,14 +273,63 @@ impl ConfigService {
     }
 
     /// 重新读取全部配置并原子替换当前快照。
+    ///
+    /// **版本号只在配置内容真的变了时才前进**（2026-10-15 修订）。
+    ///
+    /// 旧实现无条件 `fetch_add`：任何一次 `reload_config` 都会推进版本，而
+    /// `reload_config` 的调用点远不止"管理员改配置"——后台的托管模型同步
+    /// （`tasks::model_sync`，默认 30 分钟一轮、每轮都会 reconcile 一次）、
+    /// 账号变更后的目录兜底调和都会走到这里。于是管理员在表单里刚填完内容，
+    /// 一次与他的编辑毫无关系的后台同步就把他手上的版本号顶掉了，点保存必
+    /// 409，弹出"配置已被其他会话修改，另一个标签页或管理员刚刚修改了配置"。
+    /// 现场从来没有第二个人在操作——这是纯粹的误报。
+    ///
+    /// 乐观锁要防的是"两个会话各改一半、后保存的覆盖先保存的"，所以版本号
+    /// 的语义必须是**配置内容的世代**，而不是"服务端重建快照的次数"。内容
+    /// 没变时保留旧版本号，客户端手上的版本就仍然有效，保存不再无谓地失败。
     pub async fn reload(&self) -> Result<Arc<RuntimeConfig>> {
         let groups = self.store.list_groups().await?;
         let accounts = self.store.list_accounts().await?;
         let models = self.store.list_logical_models().await?;
         let targets = self.store.list_targets().await?;
 
+        // 先按"当前世代"装配一份候选快照，再与在用的那一份比内容。比的是
+        // 装配结果（分组、模型、目标、账号），不是数据库行的写入次数：只有
+        // 真正影响调度的差异才配得上一个新版本号。
+        let current = self.current.load();
+        let candidate = build(current.version, groups, accounts, models, targets);
+        // 首个快照：在用的那份还是 `RuntimeConfig::default()`（version 0），
+        // 而计数器的起点是 1。直接采纳 1，而不是把它当成一次"内容变化"再 +1——
+        // 装载不该消耗一个版本号。
+        if current.version == 0 {
+            let version = self.version.load(Ordering::Acquire);
+            let config = Arc::new(RuntimeConfig {
+                version,
+                groups: candidate.groups,
+            });
+            self.current.store(Arc::clone(&config));
+            return Ok(config);
+        }
+        if current.same_config(&candidate) {
+            // 内容一致：保留旧快照与旧版本号，也不 store——在途请求手上那份
+            // Arc 继续有效，客户端手上的版本号也仍然对得上。
+            let snapshot: Arc<RuntimeConfig> = Arc::clone(&current);
+            drop(current);
+            return Ok(snapshot);
+        }
+        drop(current);
+
+        // 内容真的变了才推进版本。候选快照的 groups 直接搬过来复用，不重装配。
+        //
+        // `fetch_add` 从 1 起步而不是从 0：客户端把 0 当作"还没读到过版本"
+        // （见 web/src/lib/api.ts 的 configVersion），于是它**不会**带乐观锁头。
+        // 空库首启时如果停在 0，管理员第一次保存前锁都是关着的——那是静默失效。
+        // 从 1 起步还顺带对上"重启后版本从 1 开始"这条既有约定。
         let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
-        let config = Arc::new(build(version, groups, accounts, models, targets));
+        let config = Arc::new(RuntimeConfig {
+            version,
+            groups: candidate.groups,
+        });
         self.current.store(Arc::clone(&config));
         Ok(config)
     }
@@ -387,6 +529,95 @@ mod tests {
             enabled: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    /// 配置内容没变时，`same_config` 必须为真——这是"版本号只在内容真变时前进"
+    /// 的判据，也是"配置已被其他会话修改"不再误报的根。
+    #[test]
+    fn identical_content_counts_as_the_same_config() {
+        let build_once = || {
+            build(
+                1,
+                vec![group("g1", "d1")],
+                vec![account("a1", "g1", 50)],
+                vec![model("m1", "g1", "glm-4.6")],
+                vec![target("t1", "m1", "a1", None)],
+            )
+        };
+        assert!(build_once().same_config(&build_once()));
+    }
+
+    /// 后台托管同步每轮都会 `touch_model_sync`。它改的是 `model_synced_at`，
+    /// 与调度无关——把它算进配置版本，管理员保存时就会收到与自己的编辑毫无
+    /// 关系的"配置已被其他会话修改"（现场症状就是这个）。
+    #[test]
+    fn touching_the_sync_timestamp_is_not_a_config_change() {
+        let before = build(
+            1,
+            vec![group("g1", "d1")],
+            vec![account("a1", "g1", 50)],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![target("t1", "m1", "a1", None)],
+        );
+        let mut synced_account = account("a1", "g1", 50);
+        synced_account.model_synced_at = Some(1_700_000_000);
+        let after = build(
+            1,
+            vec![group("g1", "d1")],
+            vec![synced_account],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![target("t1", "m1", "a1", None)],
+        );
+        assert!(
+            before.same_config(&after),
+            "托管同步只是记了一次时间戳，不该让客户端手上的版本号失效"
+        );
+    }
+
+    /// 真正影响调度的改动必须被认出来，否则乐观锁就形同虚设。
+    #[test]
+    fn real_dispatch_changes_are_detected() {
+        let base = build(
+            1,
+            vec![group("g1", "d1")],
+            vec![account("a1", "g1", 50)],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![target("t1", "m1", "a1", None)],
+        );
+
+        // 账号停用。
+        let mut disabled = account("a1", "g1", 50);
+        disabled.enabled = false;
+        let disabled = build(
+            1,
+            vec![group("g1", "d1")],
+            vec![disabled],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![target("t1", "m1", "a1", None)],
+        );
+        assert!(!base.same_config(&disabled), "账号停用必须算配置变化");
+
+        // 目标被撤下。
+        let without_target = build(
+            1,
+            vec![group("g1", "d1")],
+            vec![account("a1", "g1", 50)],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![],
+        );
+        assert!(!base.same_config(&without_target), "目标消失必须算配置变化");
+
+        // 分组倍率上限变了。
+        let mut tighter = group("g1", "d1");
+        tighter.multiplier_limit = Multiplier::from_raw(500_000);
+        let tighter = build(
+            1,
+            vec![tighter],
+            vec![account("a1", "g1", 50)],
+            vec![model("m1", "g1", "glm-4.6")],
+            vec![target("t1", "m1", "a1", None)],
+        );
+        assert!(!base.same_config(&tighter), "分组上限变了必须算配置变化");
     }
 
     #[test]

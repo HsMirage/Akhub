@@ -1634,3 +1634,163 @@ async fn a_manual_logical_model_keeps_its_last_target_removed_but_stays_hidden()
         "零目标的手工模型从 /v1/models 消失：{listed}"
     );
 }
+
+/// 乐观锁的误报回归（§7.4，2026-10-15 修订）。
+///
+/// 现场症状：管理员在表单里刚填完内容，点保存却收到"配置已被其他会话修改，
+/// 另一个标签页或管理员刚刚修改了配置"——可现场从来没有第二个人在操作。
+///
+/// 根因是版本号曾经按"服务端重建快照的次数"前进：后台托管模型同步
+/// （`tasks::model_sync`，默认 30 分钟一轮）每轮都会 `reconcile_account`，
+/// 于是哪怕目录一个字都没改，它也会把管理员手上的版本号顶掉。
+///
+/// 这条用例钉住修好之后的行为：**一轮什么都没改的托管同步，不能让客户端
+/// 手上的版本号失效**——它带着那个版本号保存，必须照常成功。
+#[tokio::test]
+async fn a_no_op_managed_sync_does_not_invalidate_the_clients_version() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [{"id": "m1"}, {"id": "m2"}]
+    })));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+
+    // 打开托管并同步一轮，把目录与目标都收敛好。
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"auto_sync": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let account = find_account(&akhub, &account_id).await;
+    akhub::discovery::sync_managed(&akhub.state, &account)
+        .await
+        .unwrap();
+
+    // 管理员此刻读到的版本号（表单打开时的那一次 GET 就会带上它）。
+    let version: u64 = client
+        .get(format!("{}/admin/api/accounts", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .expect("每个响应都要回带配置版本")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // 后台又跑了一轮托管同步：上游目录没变，什么都不该被改动。
+    let account = find_account(&akhub, &account_id).await;
+    akhub::discovery::sync_managed(&akhub.state, &account)
+        .await
+        .unwrap();
+
+    // 版本号本身必须原地不动。这一条是根因的直接断言：旧实现里
+    // `sync_managed` 结尾那次 `reload_config()` 会无条件 `fetch_add`，
+    // 哪怕配置一个字都没改。
+    let after_sync: u64 = client
+        .get(format!("{}/admin/api/accounts", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        after_sync, version,
+        "一轮什么都没改的托管同步不该推进配置版本（否则客户端手上的版本立刻过期）"
+    );
+
+    // 管理员现在点保存：带着刚才那个版本号，必须成功——而不是 409。
+    let saved = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", version.to_string())
+        .json(&json!({"default_priority": 42}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.status(),
+        200,
+        "后台跑了一轮什么都没改的托管同步，不该让管理员的保存变成冲突：{}",
+        saved.text().await.unwrap()
+    );
+    assert_eq!(
+        find_account(&akhub, &account_id).await.default_priority,
+        42,
+        "保存的内容必须真的落库"
+    );
+}
+
+/// 反过来：真有别人改了配置时，乐观锁必须照常拦下（§7.4 不能修坏）。
+#[tokio::test]
+async fn a_real_concurrent_change_still_conflicts() {
+    let (akhub, client) = spawn_admin().await;
+
+    // 管理员 A 手上的版本号。
+    let stale: u64 = client
+        .get(format!("{}/admin/api/groups", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // 另一个会话真的改了配置：新建一个分组。
+    let created = client
+        .request(
+            reqwest::Method::POST,
+            format!("{}/admin/api/groups", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .json(&json!({"name": "别人建的分组", "multiplier_limit": "1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // A 拿着旧版本号保存：必须 409，且错误里点明是版本冲突。
+    let conflict = client
+        .request(
+            reqwest::Method::POST,
+            format!("{}/admin/api/groups", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", stale.to_string())
+        .json(&json!({"name": "A 要建的分组", "multiplier_limit": "1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        conflict.status(),
+        409,
+        "别人真的改过配置时必须拦下，否则乐观锁就失效了"
+    );
+    let body: Value = conflict.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("config_conflict")),
+        "错误里要能认出是版本冲突：{body}"
+    );
+}

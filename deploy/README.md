@@ -361,16 +361,47 @@ AKHUB_IMAGE=ghcr.io/hsmirage/akhub:1.1.17 docker compose up -d
 
 回滚就是换回旧 tag。数据卷不动，SQLite 结构会在需要时自动迁移。
 
-### 4.4 后台一键升级与 `akhub --update`
+### 4.4 后台一键升级
 
 后台左上角的版本号点开就是「版本与更新」面板：它比对 GitHub Release，显示当前版本、
 最新版本与这台机器的部署方式，并在有新版本时给出升级入口。
 
-- **原生二进制部署**点「立即更新」：服务端下载对应平台的资产 → 用 `checksums.txt` 校验
-  sha256 → 把旧二进制备份成 `akhub.bak-<时间戳>` → 原子替换；随后点「重启服务」生效
-  （重启按钮只在检测到 systemd 之类的监督进程时出现）。
-- **systemd 加固部署**（单元里有 `ProtectSystem=strict`）通常没有写 `/usr/local/bin` 的权限，
-  面板会给出等价的命令行版本：
+**一键升级**：点一下就走完下载 → 校验 sha256 → 替换 → 重启，不需要再点第二次。
+
+| 部署 | 一键升级做了什么 |
+| --- | --- |
+| 原生二进制 | 下载对应平台资产、用 `checksums.txt` 校验、把旧二进制备份成
+`akhub.bak-<时间戳>`、原子替换，然后自己触发优雅关闭，由 systemd 拉起新进程 |
+| Docker / Compose | **同一条路**：替换容器里正在运行的那份二进制，然后退出，
+由 `restart: unless-stopped` 把同一个容器拉起来 |
+
+面板会实时显示进度（当前步骤、目标版本、失败原因）。进度存在服务端，所以中途
+刷新页面、换设备都能接着看到那一次进行到哪一步。走不通一键升级的部署（源码构建、
+Windows、数据卷只读的容器）会退回给一条**可复制**的命令，而不是让按钮点了没反应。
+
+#### 容器里为什么能替换自己
+
+镜像里的 `/usr/local/bin/akhub` 属于 root 且在**只读镜像层**，以非 root 运行的服务
+进程覆盖不了它——容器部署过去正是卡在这里。
+
+同机部署的 sub2api 能一键升级，靠的是它的二进制 `/app/sub2api` 在**容器可写层**、
+属主就是运行用户：它下载新版覆盖自己、退出，由 restart 策略把同一个容器拉起来。
+（可以 `docker diff sub2api` 看到 `C /app/sub2api` 与 `A /app/sub2api.backup`。）
+
+Akhub 用同样的思路，但不要求镜像层可写：**入口脚本把二进制复制到数据卷的
+`runtime/` 下再运行那一份**。数据卷持久、属主就是运行用户，所以：
+
+- 服务进程能替换 `$AKHUB_DATA_DIR/runtime/akhub`；
+- 替换后退出，`restart: unless-stopped` 拉起同一个容器，入口脚本仍然运行那一份，
+  升级得以保留；
+- 运维执行 `docker compose pull && up -d` 换镜像时，入口脚本会发现镜像版本变了，
+  用镜像里的二进制刷新卷里那一份（所以**回滚也照常有效**）；
+- 数据卷以 `:ro` 挂载时自动退回镜像里那份，面板如实提示一键升级不可用。
+
+这一切都是自动的，**不需要在宿主机上额外装任何东西**，也不需要挂 docker socket。
+
+**systemd 加固部署**（单元里有 `ProtectSystem=strict`）通常没有写 `/usr/local/bin` 的权限，
+一键升级会失败并说明原因；此时用面板给出的命令行版本：
 
 ```bash
 sudo akhub --update                    # 升到最新 Release
@@ -382,8 +413,8 @@ sudo systemctl restart akhub
 `install.sh` 的机器。校验不过（sha256 不匹配、Release 里没有对应平台的资产）时它会
 明确报错并保持原二进制不动。
 
-容器部署请在宿主机换镜像 tag；Windows 下运行中的 exe 无法自我覆盖，请下载新版或重跑
-`install.ps1`。不想让服务端访问 GitHub 时，设 `AKHUB_UPDATE_DISABLED=1` 关闭检查。
+Windows 下运行中的 exe 无法自我覆盖，请下载新版或重跑 `install.ps1`。
+不想让服务端访问 GitHub 时，设 `AKHUB_UPDATE_DISABLED=1` 关闭检查。
 
 ---
 
@@ -445,6 +476,9 @@ Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 6
 | `AKHUB_RETENTION_DAYS` | `30` | 请求元数据保留天数，0 表示不新增历史明细 |
 | `AKHUB_RESPONSE_STATE_DAYS` | `30` | Responses 可重放状态保留天数，0 表示只存最小定位映射 |
 | `AKHUB_MODEL_SYNC_SECS` | `1800` | 模型自动同步间隔，各账号叠加 ±10% 抖动 |
+| `AKHUB_DEPLOY` | 自动判定 | 强制部署形态：`binary` / `docker` / `source`（判断不出来时以运维为准） |
+| `AKHUB_UPDATE_DISABLED` | 无 | 设 `1` 关闭版本检查，服务端不再访问 GitHub |
+| `AKHUB_UPDATE_API` | GitHub API | 覆盖 Release 接口地址（内网镜像或测试用） |
 | `RUST_LOG` | `akhub=info,warn` | 日志级别 |
 
 命令行参数（`akhub --help`）：
@@ -454,6 +488,7 @@ Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 6
 | 无 | 启动服务 |
 | `--healthcheck` | 探测本机 `/health/ready`，就绪退出码 0，否则非 0 |
 | `--version` / `-V` | 打印版本号 |
+| `--update` | 从 GitHub Release 下载并替换本二进制（需要写权限） |
 | `--help` / `-h` | 显示帮助 |
 
 ---
@@ -472,6 +507,18 @@ Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 6
 `curl -s http://127.0.0.1:8080/health/version` 确认实际在跑的是哪个二进制。
 常见的坑是装了新二进制但服务指向了另一份（systemd 的 `ExecStart` 路径、
 容器里挂载覆盖了 `/usr/local/bin/akhub`）。
+
+容器里还要看数据卷：一键升级替换的是 `$AKHUB_DATA_DIR/runtime/akhub`，重启后
+入口脚本会优先运行那一份。可以这样确认：
+
+```bash
+docker exec akhub ls -la /data/runtime/       # akhub 与 .image-version
+docker exec akhub cat /data/runtime/.image-version
+docker exec akhub sh -c 'tr \"\0\" \" \" < /proc/1/cmdline'   # 应当指向 /data/runtime/akhub
+```
+
+如果面板说一键升级不可用，多半是数据卷以 `:ro` 挂载（入口脚本会退回镜像里那份，
+并在日志里说明）。
 
 **流式响应被掐断**
 停止宽限期没配够。systemd 的 `TimeoutStopSec`、Docker 的

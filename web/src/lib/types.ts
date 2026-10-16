@@ -760,45 +760,28 @@ export interface UpdateStatus {
   update_command: string | null;
   /** 已落盘但还没重启生效的版本。 */
   pending_version: string | null;
+  /** 这次部署能不能在后台一键升到最新版（下载+替换+重启一次完成）。 */
+  can_one_click: boolean;
+  /** 当前一键升级进度。 */
+  progress: UpdateProgress;
 }
 
-/** 自更新成功后的结果（POST /admin/api/system/update）。 */
-export interface UpdateOutcome {
-  from: string;
-  to: string;
-  path: string;
-  /** 旧二进制的备份路径。 */
-  backup: string | null;
-  need_restart: boolean;
-  can_restart: boolean;
-  restart_command: string;
-}
-
-export interface UpdateStatus {
-  /** 是否启用了更新检查（服务端可用 AKHUB_UPDATE_DISABLED 关闭）。 */
-  enabled: boolean;
-  /** 当前进程的版本。 */
-  current: string;
-  /** 上游最新版本；查询失败时为 null。 */
-  latest: string | null;
-  has_update: boolean;
-  release_url: string | null;
-  release_name: string | null;
-  published_at: string | null;
-  /** Release 说明的摘要。 */
-  notes: string | null;
-  checked_at: number;
-  /** 这次结果是否来自服务端缓存。 */
-  cached: boolean;
-  /** 查询失败的原因：拿不到 GitHub 时明确说，而不是假装已是最新。 */
+/** 一键升级的进度（GET /admin/api/system/update 的 progress 字段）。
+ *
+ * 升级要几分钟（容器路径还要拉镜像、重建容器），进度留在服务端而不是只回给
+ * 请求方：这期间刷新页面、换设备都能接着看到那一次进行到哪一步。
+ */
+export interface UpdateProgress {
+  /** idle / running / done / failed。 */
+  phase: "idle" | "running" | "done" | "failed";
+  /** 目标版本。 */
+  to: string | null;
+  /** 当前步骤（给人看的一句话）。 */
+  step: string | null;
+  /** 失败原因。 */
   error: string | null;
-  deploy: DeployKind;
-  can_self_update: boolean;
-  can_restart: boolean;
-  update_hint: string | null;
-  update_command: string | null;
-  /** 已落盘但还没重启生效的版本。 */
-  pending_version: string | null;
+  /** 开始时刻（unix 秒）；idle 时为 0。 */
+  started_at: number;
 }
 
 /** 自更新成功后的结果（POST /admin/api/system/update）。 */

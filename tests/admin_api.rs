@@ -1354,6 +1354,34 @@ async fn writes_carry_config_version_and_conflict_is_reported() {
     assert_eq!(malformed.status(), 400, "非法版本号要明确拒绝");
 }
 
+/// 空库首启时版本必须是 1，不能是 0。
+///
+/// 客户端把 0 当作"还没读到过版本"，因而**不带**乐观锁头（§7.4 的兼容模式）。
+/// 若首启停在 0，管理员在第一次配置变更之前保存时，锁是静默关闭的——
+/// 这正是复审时发现并修掉的一个回归。
+#[tokio::test]
+async fn a_fresh_install_starts_at_version_one_not_zero() {
+    let (base, client, _dir) = spawn().await;
+    setup_admin(&base, &client).await;
+
+    let version: u64 = client
+        .get(format!("{base}/admin/api/groups"))
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-akhub-config-version")
+        .expect("响应必须回带配置版本")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        version, 1,
+        "空库首启的版本必须是 1：0 会让客户端认为「还没读到过」而关掉乐观锁"
+    );
+}
+
 /// 版本冲突后必须重新加载才能再写：同一份陈旧版本重试仍然 409（§7.4）。
 ///
 /// 这条钉住的是"提示重新加载"到底有没有约束力——如果冲突响应把新版本号
