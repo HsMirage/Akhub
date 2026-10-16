@@ -17,6 +17,13 @@
 # 保留。
 set -eu
 
+# 信息性输出一律走 **stderr**。
+#
+# 理由：`docker run <镜像> --version` 会走到下面的 exec、把参数透传给 akhub，
+# 而 stdout 必须是**纯版本号**——用户脚本与 CI 都在解析它（CI 的断言是
+# `[[ "$got" == akhub\ * ]]`）。入口脚本往 stdout 多打一行，这条解析就坏了。
+# 诊断信息仍然看得到：docker logs 同时收集 stdout 与 stderr。
+
 DATA_DIR="${AKHUB_DATA_DIR:-/data}"
 IMAGE_BIN="/usr/local/bin/akhub"
 RUNTIME_DIR="$DATA_DIR/runtime"
@@ -43,7 +50,7 @@ if [ "$(id -u)" = "0" ]; then
     # 收紧权限。递归 chown 在大目录上会拖慢每次启动。
     owner="$(stat -c '%u:%g' "$DATA_DIR" 2>/dev/null || echo '?')"
     if [ "$owner" != "10001:10001" ]; then
-        echo "akhub-entrypoint: 修正 $DATA_DIR 属主 $owner -> 10001:10001"
+        echo "akhub-entrypoint: 修正 $DATA_DIR 属主 $owner -> 10001:10001" >&2
         chown 10001:10001 "$DATA_DIR" || {
             echo "akhub-entrypoint: 无法修改 $DATA_DIR 属主，将以 10001 继续；若启动失败请检查宿主目录权限" >&2
         }
@@ -74,9 +81,9 @@ if [ "$use_runtime" = yes ]; then
         # 运维显式回滚到旧 tag 时也该以镜像为准。自更新过的二进制不会改动这个
         # 标记，所以重启后它仍然是"数据卷里那份更新"，不会被镜像顶回去。
         if [ -f "$RUNTIME_BIN" ] && [ "$image_version" != "$recorded" ]; then
-            echo "akhub-entrypoint: 镜像版本 $recorded -> $image_version，改用镜像里的二进制"
+            echo "akhub-entrypoint: 镜像版本 $recorded -> $image_version，改用镜像里的二进制" >&2
         else
-            echo "akhub-entrypoint: 准备可自更新的二进制副本（v$image_version）"
+            echo "akhub-entrypoint: 准备可自更新的二进制副本（v$image_version）" >&2
         fi
         tmp="$RUNTIME_DIR/.akhub-incoming-$$"
         if cp "$IMAGE_BIN" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$RUNTIME_BIN"; then
