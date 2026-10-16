@@ -127,8 +127,12 @@ async fn one_click_is_refused_with_a_usable_alternative() {
 
 /// 容器里二进制可替换时，一键升级必须**可用**——这正是本次修复的主诉。
 ///
-/// 判据是入口脚本设的 AKHUB_ALLOW_RESTART：它只在"二进制已复制到可写卷"时出现
-/// （见 deploy/docker-entrypoint.sh）。子进程里设置它，再断言面板会给按钮。
+/// 判据是入口脚本设的 `AKHUB_ALLOW_RESTART`：它只在"二进制已复制到可写卷"时
+/// 出现（见 deploy/docker-entrypoint.sh）。
+///
+/// 这里用 `set_can_self_replace_for_tests` 而不是去 set 那个环境变量：
+/// 环境变量是**进程全局**的，而 cargo 默认并行跑测试——一个用例 set 了它，
+/// 另一个用例就会看到。CI 上正是这么挂的（"不可替换"那条断言拿到 true）。
 #[tokio::test]
 async fn a_container_with_a_writable_binary_can_one_click() {
     if !common::cli_updates_supported() {
@@ -141,7 +145,8 @@ async fn a_container_with_a_writable_binary_can_one_click() {
     state.runtime.update.set_deploy_for_tests(Deploy::Docker);
     setup_admin(&base, &client).await;
 
-    // 没有这个变量时容器不该出现一键入口（二进制在只读镜像层，替换不了）。
+    // 二进制不可替换（镜像里那份在只读层）：不该出现一键入口。
+    state.runtime.update.set_can_self_replace_for_tests(false);
     let status = status_of(&base, &client).await;
     assert_eq!(status["has_update"], true, "{status}");
     assert_eq!(
@@ -150,13 +155,12 @@ async fn a_container_with_a_writable_binary_can_one_click() {
     );
 
     // 入口脚本声明"二进制在可写卷里"之后，一键入口必须出现。
-    unsafe { std::env::set_var("AKHUB_ALLOW_RESTART", "1") };
+    state.runtime.update.set_can_self_replace_for_tests(true);
     let status = status_of(&base, &client).await;
     assert_eq!(
         status["can_one_click"], true,
         "容器里二进制可替换时必须能一键升级：{status}"
     );
-    unsafe { std::env::remove_var("AKHUB_ALLOW_RESTART") };
 }
 
 /// 有新版本、且部署支持时，一键入口必须出现。

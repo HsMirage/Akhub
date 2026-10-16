@@ -339,6 +339,14 @@ pub struct Registry {
     ///
     /// 用 Mutex 而不是直接存值：集成测试要通过 `SharedState` 在运行期改它。
     deploy: Mutex<Option<Deploy>>,
+    /// "能否就地替换自己"的覆盖，同样只给测试用。
+    ///
+    /// **为什么要有这个缝**：生产里这条判断读环境变量（入口脚本设的
+    /// `AKHUB_ALLOW_RESTART`），而环境变量是**进程全局**的——测试并行跑在同一个
+    /// 进程里，一个用例 set 了它，另一个用例就会看到。CI 上就是这么挂的：
+    /// "容器不可替换"那条断言拿到 true，因为并行的另一个用例刚把它设成 1。
+    /// 用显式覆盖就不存在这个竞态。
+    self_replace: Mutex<Option<bool>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -376,6 +384,7 @@ impl Registry {
             pending: Mutex::new(None),
             progress: Mutex::new(Progress::idle()),
             deploy: Mutex::new(None),
+            self_replace: Mutex::new(None),
         }
     }
 
@@ -397,6 +406,22 @@ impl Registry {
         // 与 with_deploy 同一条读路径（deploy 字段），只是绕过构造期。
         let mut slot = self.deploy.lock().unwrap();
         *slot = Some(deploy);
+    }
+
+    /// 覆盖"能否就地替换自己"（只给测试用）。
+    ///
+    /// 见 `self_replace` 字段上的说明：生产读环境变量，但那是进程全局的，
+    /// 测试并行时会互相干扰。
+    pub fn set_can_self_replace_for_tests(&self, value: bool) {
+        *self.self_replace.lock().unwrap() = Some(value);
+    }
+
+    /// 当前部署能不能就地替换自己：先看测试覆盖，再看环境变量。
+    fn self_replace_capable(&self) -> bool {
+        self.self_replace
+            .lock()
+            .unwrap()
+            .unwrap_or_else(can_self_replace)
     }
 
     /// 覆盖 Release API 地址（测试注入假 GitHub 用）。
@@ -629,8 +654,8 @@ impl Registry {
     pub fn can_one_click(&self) -> bool {
         match self.deploy() {
             // 原生二进制与容器走同一条路：替换自己，然后退出等监督者拉起。
-            // 走不走得通由 can_self_replace 判定，不再依赖宿主机上的额外组件。
-            Deploy::Binary | Deploy::Docker => can_self_replace(),
+            // 走不走得通由 self_replace_capable 判定，不再依赖宿主机上的额外组件。
+            Deploy::Binary | Deploy::Docker => self.self_replace_capable(),
             Deploy::Source | Deploy::Windows => false,
         }
     }
