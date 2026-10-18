@@ -353,9 +353,12 @@ function Console({
             <p className="topbar-sub">{meta.subtitle}</p>
           </div>
           <div className="topbar-actions">
+            <span className="freshness tabular hide-md" title="数据的最近成功更新时间">
+              {formatUpdatedAgo(lastUpdated, now)}
+            </span>
             <Button
               size="sm"
-              variant="secondary"
+              variant="ghost"
               icon={<IconSearch size={14} />}
               onClick={() => setPaletteOpen(true)}
               title="搜索与跳转（Ctrl / ⌘ + K）"
@@ -364,24 +367,22 @@ function Console({
               <span className="hide-sm">搜索</span>
               <kbd className="kbd hide-sm">⌘K</kbd>
             </Button>
-            <span className="freshness tabular hide-md" title="数据的最近成功更新时间">
-              {formatUpdatedAgo(lastUpdated, now)}
-            </span>
-            <label className="topbar-refresh-select">
-              <span className="hide-sm">自动刷新</span>
+            <label className="topbar-refresh-select" title="自动刷新间隔">
               <select
                 className="select select-sm"
                 value={autoRefreshSecs}
                 aria-label="自动刷新间隔"
                 onChange={(event) => setAutoRefreshSecs(Number(event.target.value))}
               >
-                <option value={0}>关</option>
-                <option value={30}>30 秒</option>
-                <option value={60}>1 分钟</option>
-                <option value={300}>5 分钟</option>
+                <option value={0}>不自动刷新</option>
+                <option value={30}>每 30 秒</option>
+                <option value={60}>每 1 分钟</option>
+                <option value={300}>每 5 分钟</option>
               </select>
             </label>
             <Button
+              size="sm"
+              variant="ghost"
               icon={
                 refreshing ? (
                   <span className="spinner spinner-sm" aria-hidden="true" />
@@ -393,7 +394,6 @@ function Console({
               disabled={refreshing}
               title="刷新数据"
               aria-label="刷新数据"
-              size="sm"
             >
               <span className="hide-sm">{refreshing ? "刷新中…" : "刷新"}</span>
             </Button>
@@ -401,7 +401,9 @@ function Console({
         </header>
 
         <div className="content">
-          <div className="content-inner">
+          {/* key=route：切页时换一个挂载点，页面内容才能播一次进场动画，
+              而不是静默替换。数据刷新不会改变 key，所以刷新不闪。 */}
+          <div className="content-inner" key={route}>
             {loading && !data && <Skeleton rows={4} />}
             {error && (
               <div className="callout callout-warn" role="alert">
@@ -492,7 +494,7 @@ function Console({
         open={conflictOpen}
         title="这份配置已经变了"
         confirmLabel="取回最新配置"
-        message="服务端上的配置在你这轮编辑期间被改过了。你填写的内容不会丢——点「取回最新配置」只刷新后台数据、不重载页面，弹窗和表单都保持原样；确认无误后再点一次保存即可。"
+        message="配置在你这轮编辑期间被改过。点「取回最新配置」只刷新后台数据，不重载页面，已填内容与弹窗都保留；确认后再点一次保存即可。"
         onClose={() => setConflictOpen(false)}
         // 刻意**不用** `window.location.reload()`：整页重载会把管理员正在填的
         // 表单连同弹窗一起丢掉，"又得重新输入一遍"就是这么来的。这里只重新

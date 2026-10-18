@@ -11,7 +11,7 @@ import { api } from "../lib/api";
 import type { Data } from "../lib/store";
 import type { RequestRecord } from "../lib/types";
 import type { Route } from "../routes";
-import { Badge, Button, Card, CopyButton, EmptyState, InfoTip } from "../components/ui";
+import { Badge, Button, CopyButton, EmptyState, InfoTip } from "../components/ui";
 import { TrendChart } from "../components/TrendChart";
 import {
   IconAlert,
@@ -121,15 +121,13 @@ export function Overview({
         </div>
       )}
 
-      <div className="stat-sections">
-        <section className="stat-section">
-          <div className="stat-section-head">
-            <h2 className="stat-section-title">配置规模</h2>
-            <span className="stat-section-desc">
-              这条链路缺任何一环，请求都会以 503 失败
-            </span>
-          </div>
-          <div className="stat-grid">
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">配置规模</h2>
+          <span className="section-desc">这条链路缺任何一环，请求都会以 503 失败</span>
+        </header>
+        <div className="section-body">
+          <div className="metrics">
             <Stat
               icon={<IconKey size={13} />}
               label="分组"
@@ -176,14 +174,16 @@ export function Overview({
               onClick={() => navigate("targets")}
             />
           </div>
-        </section>
+        </div>
+      </section>
 
-        <section className="stat-section">
-          <div className="stat-section-head">
-            <h2 className="stat-section-title">流量健康</h2>
-            <span className="stat-section-desc">{windowLabel}窗口 · 按开始时间统计</span>
-          </div>
-          <div className="stat-grid">
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">流量健康</h2>
+          <span className="section-desc">{windowLabel}窗口 · 按开始时间统计</span>
+        </header>
+        <div className="section-body">
+          <div className="metrics">
             <Stat
               icon={<IconInbox size={13} />}
               label="窗口内请求数"
@@ -215,14 +215,16 @@ export function Overview({
               hint={`${windowLabel}窗口尾部延迟`}
             />
           </div>
-        </section>
+        </div>
+      </section>
 
-        <section className="stat-section">
-          <div className="stat-section-head">
-            <h2 className="stat-section-title">队列与并发</h2>
-            <span className="stat-section-desc">实时值，随调度变化即时更新</span>
-          </div>
-          <div className="stat-grid">
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">队列与并发</h2>
+          <span className="section-desc">实时值，随调度变化即时更新</span>
+        </header>
+        <div className="section-body">
+          <div className="metrics">
             <Stat
               icon={<IconRoute size={13} />}
               label="当前在途"
@@ -243,23 +245,25 @@ export function Overview({
               tone={overview.queue_timeouts > 0 ? "warn" : undefined}
             />
           </div>
-        </section>
-      </div>
+        </div>
+      </section>
 
-      <Card
-        title="请求趋势"
-        description={`${windowLabel}窗口，按小时聚合；柱子深色部分为成功请求。`}
-      >
-        <div className="card-body">
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">请求趋势</h2>
+          <span className="section-desc">{windowLabel}窗口 · 按小时聚合</span>
+        </header>
+        <div className="section-body">
           <TrendChart points={overview.trend} />
         </div>
-      </Card>
+      </section>
 
       {!ready && (
-        <Card
-          title="配置进度"
-          description="完成这四步后，下游客户端即可开始调用。"
-        >
+        <section className="section">
+          <header className="section-head">
+            <h2 className="section-title">配置进度</h2>
+            <span className="section-desc">完成后下游即可调用</span>
+          </header>
           <div className="steps">
             {steps.map((step, index) => (
               <div
@@ -305,23 +309,26 @@ export function Overview({
               </div>
             ))}
           </div>
-        </Card>
+        </section>
       )}
 
       {ready && <ReadyPanel data={data} navigate={navigate} />}
 
       <div className="overview-list-grid">
-        <Card
-          title="最近错误"
-          description={`${windowLabel}窗口内最近 5 条失败请求。点击行可查看调度明细。`}
-          actions={
-            overview.recent_errors.length > 0 && (
-              <Button size="sm" onClick={() => navigate("requests", { status: "error" })}>
-                查看全部失败
-              </Button>
-            )
-          }
-        >
+        <section className="section">
+          <header className="section-head">
+            <h2 className="section-title">最近错误</h2>
+            <span className="section-desc">
+              {windowLabel}窗口内最近 5 条失败请求
+            </span>
+            {overview.recent_errors.length > 0 && (
+              <div className="section-actions">
+                <Button size="sm" onClick={() => navigate("requests", { status: "error" })}>
+                  查看全部
+                </Button>
+              </div>
+            )}
+          </header>
           {overview.recent_errors.length === 0 ? (
             <div className="table-empty">窗口内没有失败请求</div>
           ) : (
@@ -391,12 +398,13 @@ export function Overview({
               </table>
             </div>
           )}
-        </Card>
+        </section>
 
-        <Card
-          title="最近配置变化"
-          description={`最近 5 条管理操作，时间范围为 ${windowLabel}。`}
-        >
+        <section className="section">
+          <header className="section-head">
+            <h2 className="section-title">最近配置变化</h2>
+            <span className="section-desc">最近 5 条管理操作</span>
+          </header>
           {overview.recent_changes.length === 0 ? (
             <div className="table-empty">窗口内没有配置变化</div>
           ) : (
@@ -438,20 +446,21 @@ export function Overview({
               </table>
             </div>
           )}
-        </Card>
+        </section>
       </div>
 
-      <Card
-        title="最近请求"
-        description="只记录元数据，不保存消息正文、图片、工具参数或思考内容。"
-        actions={
-          requests.length > 0 && (
-            <Button size="sm" onClick={() => navigate("requests")}>
-              查看全部
-            </Button>
-          )
-        }
-      >
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">最近请求</h2>
+          <span className="section-desc">只记元数据，不保存正文、图片、工具参数与思考内容</span>
+          {requests.length > 0 && (
+            <div className="section-actions">
+              <Button size="sm" onClick={() => navigate("requests")}>
+                查看全部
+              </Button>
+            </div>
+          )}
+        </header>
         {requests.length === 0 ? (
           <EmptyState
             icon={<IconInbox size={19} />}
@@ -495,7 +504,7 @@ export function Overview({
             </table>
           </div>
         )}
-      </Card>
+      </section>
     </>
   );
 }
@@ -519,7 +528,7 @@ function Alerts({
   if (overview.probe_systemic_failure) {
     items.push({
       tone: "danger",
-      text: "超过半数账号在同一轮倍率刷新中失败，判定为探针侧系统性故障。所有账号的宽限期已统一延长到 60 分钟；请检查 Akhub 的出站网络。",
+      text: "超过半数账号在同一轮倍率刷新中失败，判定为探针侧系统性故障；所有账号宽限期已延长到 60 分钟。请检查出站网络。",
       route: "accounts",
     });
   }
@@ -592,12 +601,12 @@ function ReadyPanel({
   ].join("\n");
 
   return (
-    <Card
-      title="接入方式"
-      description="配置已就绪。下游只需要分组 Key 与逻辑模型名。"
-      padded
-    >
-      <div className="stack">
+    <section className="section">
+      <header className="section-head">
+        <h2 className="section-title">接入方式</h2>
+        <span className="section-desc">下游只需要分组 Key 与逻辑模型名</span>
+      </header>
+      <div className="section-body">
         <div className="callout callout-info">
           <span>
             分组 Key 同时接受 <code>Authorization: Bearer</code> 与{" "}
@@ -650,7 +659,7 @@ function ReadyPanel({
           </div>
         )}
       </div>
-    </Card>
+    </section>
   );
 }
 

@@ -7,7 +7,6 @@ import type { Data } from "../lib/store";
 import {
   Badge,
   Button,
-  Card,
   ConfirmDialog,
   CopyButton,
   Drawer,
@@ -111,20 +110,22 @@ export function Groups({
 
   return (
     <>
-      <Card
-        title="分组"
-        description="分组之间不共享账号、Key、状态与调度。跨分组调度不存在。"
-        actions={
-          <Button variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
-            新建分组
-          </Button>
-        }
-      >
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">分组</h2>
+          <span className="section-desc">分组之间不共享账号、Key 与调度</span>
+          <div className="section-actions">
+            <Button size="sm" variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
+              新建分组
+            </Button>
+          </div>
+        </header>
+        <div className="section-body">
         {data.groups.length === 0 ? (
           <EmptyState
             icon={<IconKey size={19} />}
             title="还没有分组"
-            description="分组是一切配置的起点：它持有下游 API Key、倍率上限与调度权重。一个人用一个分组就够。"
+            description="分组持有下游 Key、倍率上限与调度权重。一个人用一个分组就够。"
             action={
               <Button variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
                 新建分组
@@ -133,8 +134,8 @@ export function Groups({
           />
         ) : (
           <>
-            <div className="list-toolbar">
-              <div className="input-with-icon list-search">
+            <div className="toolbar">
+              <div className="input-with-icon toolbar-search">
                 <IconSearch size={14} />
                 <input
                   className="input"
@@ -150,14 +151,14 @@ export function Groups({
                   checked={onlyAlerts}
                   onChange={(event) => setOnlyAlerts(event.target.checked)}
                 />
-                仅看有告警的分组
+                只看有告警
               </label>
-              <span className="spacer" />
-              <span className="table-filter-summary tabular">
-                共 {data.groups.length} 个（筛选后 {filteredGroups.length} 个）
+              <span className="toolbar-spacer" />
+              <span className="toolbar-count tabular">
+                {filteredGroups.length}/{data.groups.length} 个分组
               </span>
             </div>
-            <div className="table-wrap">
+            <div className="table-wrap" style={{ marginTop: "var(--space-2)" }}>
               <table className="data">
                 <thead>
                   <tr>
@@ -257,7 +258,8 @@ export function Groups({
             </div>
           </>
         )}
-      </Card>
+        </div>
+      </section>
 
       <GroupDrawer
         key={editing === "new" ? "new" : (editing?.id ?? "closed")}
@@ -494,11 +496,12 @@ function GroupDrawer({
       }
     >
       <div className="stack">
-        <div className="callout callout-info">
-          <span>{impactSummary}。</span>
-        </div>
+        <p className="impact-line">
+          <span className="micro">影响</span>
+          {impactSummary}
+        </p>
 
-        <FormSection title="基本设置" description="分组名与调度硬边界。">
+        <FormSection title="基本设置">
           <Field
             label="名称"
             error={duplicateName ? "同一实例内已存在同名分组" : undefined}
@@ -520,9 +523,9 @@ function GroupDrawer({
             error={limitError ?? undefined}
             hint={
               <span>
-                绝对红线：有效倍率高于它的目标会被暂停，等于它仍然允许调用。想「便宜优先」请用优先级表达，不要压低这个值。
+                硬红线：有效倍率高于它的目标会被暂停。想「便宜优先」用优先级表达。
                 <InfoTip label="什么是倍率上限">
-                  倍率是上游的计费折扣系数；有效倍率 = 上游倍率 × 校准系数。
+                  倍率是上游计费折扣；有效倍率 = 上游倍率 × 校准系数。
                 </InfoTip>
               </span>
             }
@@ -541,7 +544,7 @@ function GroupDrawer({
 
         <FormSection
           title="调度权重"
-          description="只决定同一层内怎么分流量，永远不会让低优先级层越过高优先级层。"
+          description="只影响同层内的流量分配，低优先级层永远不会被越过"
         >
           <Field label="四个维度的相对权重" error={weightsError ?? undefined}>
             {() => (
@@ -638,7 +641,7 @@ function GroupDrawer({
 
           <Field
             label="能力降级"
-            hint="只对白名单内的能力生效，且只在故障切换时发生：thinking 块与协议独有采样参数。工具、图片与结构化输出永远不会被丢弃，表达不了就直接报错。"
+            hint="只在故障切换时丢弃 thinking 块与协议独有采样参数；工具、图片与结构化输出永不丢弃，表达不了就直接报错。"
           >
             {(id) => (
               <select

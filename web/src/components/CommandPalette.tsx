@@ -155,11 +155,11 @@ export function CommandPalette({
                 onMouseEnter={() => setActive(index)}
                 onClick={() => choose(item)}
               >
-                <span className="command-item-label">{item.label}</span>
-                <span className="command-item-hint">
-                  {item.group}
-                  {item.hint ? ` · ${item.hint}` : ""}
+                <span className="command-item-label">
+                  <span className="micro command-item-group">{item.group}</span>
+                  {item.label}
                 </span>
+                {item.hint && <span className="command-item-hint">{item.hint}</span>}
               </button>
             ))
           )}

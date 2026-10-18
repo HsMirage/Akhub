@@ -11,7 +11,6 @@ import type { CostModel, CostView } from "../lib/types";
 import {
   Badge,
   Button,
-  Card,
   EmptyState,
   InfoTip,
   Segmented,
@@ -61,11 +60,13 @@ export function Cost({
   const groupName = (id: string) => data.groups.find((group) => group.id === id)?.name ?? id;
 
   return (
-    <Card
-      title="成本视图"
-      description="倍率 × 用量只在同一个逻辑模型内部与真实花销成正比，所以这里不做跨模型加总。"
-      actions={
-        <div className="row" style={{ gap: 6 }}>
+    <section className="section">
+      <header className="section-head">
+        <h2 className="section-title">成本视图</h2>
+        <span className="section-desc">
+          倍率 × 用量只在同一个逻辑模型内部与真实花销成正比，这里不做跨模型加总。
+        </span>
+        <div className="section-actions">
           <Segmented
             value={period}
             options={PERIODS}
@@ -89,15 +90,14 @@ export function Cost({
             刷新
           </Button>
         </div>
-      }
-    >
+      </header>
       {loading ? (
         <Skeleton rows={4} />
       ) : view === null || view.models.length === 0 ? (
         <EmptyState
           icon={<IconGauge size={19} />}
           title="区间内没有成功请求"
-          description="成本页只统计成功请求：失败请求没有产生上游消耗，因此不会出现在这里。跑一些真实流量后再来看，或先到请求记录页确认请求是否成功。"
+          description="只统计成功请求——失败调用不产生上游消耗。跑一些真实流量后再回来，或先确认请求是否成功。"
           action={
             <Button variant="secondary" onClick={() => navigate("requests")}>
               查看请求记录
@@ -108,11 +108,11 @@ export function Cost({
         <div className="cost-content">
           <div className="callout callout-info">
             <span style={{ flex: 1 }}>
-              倍率是上游的计费折扣系数，不是价格；不同模型的倍率口径不同，
-              所以这里不做跨模型加总。「可再省比例」表示：如果该模型的请求全部走最便宜目标，大约还能省多少。
+              倍率是计费折扣，不是价格；口径因模型而异，所以不做跨模型加总。
             </span>
             <InfoTip label="成本口径说明">
-              加权均倍率按本逻辑模型内的请求占比计算；跨模型相加会被模型组合严重扭曲，因此全局区域只显示请求数与账号占比。
+              加权均倍率按本模型内的请求占比计算；跨模型相加会被模型组合扭曲，所以全局区域只显示请求数与账号占比。
+              「可再省比例」假设该模型全部请求走最便宜目标。
             </InfoTip>
           </div>
           {refreshing && (
@@ -139,7 +139,7 @@ export function Cost({
           </div>
         </div>
       )}
-    </Card>
+    </section>
   );
 }
 
@@ -209,7 +209,7 @@ function ModelCostCard({
           <span className="cost-model-tokens mono">Token 数 {model.tokens.toLocaleString()}</span>
           {model.single_target && (
             <span
-              title="该模型只挂在一个账号下：省不了钱也谈不上分散风险，加权均倍率就等于它的倍率。新增第二家同价或更低的上游后，这一项才会开始有意义。"
+              title="只挂在一个账号下：省不了钱，也谈不上分散风险。新增第二个同价或更低的上游后才有意义。"
             >
               <Badge tone="neutral">单目标</Badge>
             </span>
@@ -236,7 +236,7 @@ function ModelCostCard({
       </div>
 
       <p className="cost-footnote">
-        口径：加权均倍率按本逻辑模型内的请求占比计算；可再省比例是假设全部请求走最便宜目标，始终不跨模型加总。
+        加权均倍率按本模型内请求占比计算；可再省比例假设全部走最便宜目标。不跨模型加总。
       </p>
       {showTokenFallbackNote && (
         <p className="cost-footnote cost-token-note">上游未上报 Token，占比按请求数</p>

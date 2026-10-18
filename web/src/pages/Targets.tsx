@@ -24,7 +24,6 @@ import type { Route } from "../routes";
 import {
   Badge,
   Button,
-  Card,
   EmptyState,
   InfoTip,
   ScoreMeter,
@@ -254,26 +253,31 @@ export function Targets({
         </div>
       )}
 
-      <Card
-        title="调度视图"
-        description="按分组与模型查看上游账号的综合评分、可用性与速度。目标是自动生成的；人工优先级只在账号上，数字相同即同层，同层按评分加权。"
-        actions={
-          <Button
-            icon={<IconSettings size={13} />}
-            onClick={() => navigate("accounts")}
-          >
-            去账号配置模型
-          </Button>
-        }
-      >
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">调度视图</h2>
+          <span className="section-desc">
+            目标自动生成 · 人工优先级只在账号上 · 同值同层，层内按评分分配
+          </span>
+          <div className="section-actions">
+            <Button
+              size="sm"
+              icon={<IconSettings size={13} />}
+              onClick={() => navigate("accounts")}
+            >
+              去账号配置模型
+            </Button>
+          </div>
+        </header>
+        <div className="section-body">
         {targetTotal === 0 ? (
           <EmptyState
             icon={<IconRoute size={19} />}
             title="还没有可调度的模型"
             description={
               data.accounts.length === 0
-                ? "先创建上游账号，再从账号的「模型管理」里获取或添加模型。"
-                : "打开账号的「模型管理」，获取上游模型并启用，就会自动生成这里的调度目标。"
+                ? "先创建上游账号，再到「模型管理」获取模型。"
+                : "到账号的「模型管理」获取并启用模型，这里就会自动出现目标。"
             }
             action={
               <Button
@@ -287,8 +291,8 @@ export function Targets({
           />
         ) : (
           <>
-            <div className="list-toolbar">
-              <div className="input-with-icon list-search">
+            <div className="toolbar">
+              <div className="input-with-icon toolbar-search">
                 <IconSearch size={14} />
                 <input
                   className="input"
@@ -319,11 +323,11 @@ export function Targets({
                 />
                 只看异常
               </label>
-              <span className="spacer" />
+              <span className="toolbar-spacer" />
               {/* 调度视图是只读的全局视图：这里必须能看出"手上拿的是不是全量"。
                   列表在数据层已翻页取全，所以正常显示"已全部加载"；
                   万一服务端没给全，立刻退化成"已加载 N/共 M"。 */}
-              <span className="table-filter-summary tabular">
+              <span className="toolbar-count tabular">
                 {visible.length} / {entries.length} 个模型 · {targetTotal} 个目标 ·{" "}
                 {data.targets.length >= data.totals.targets
                   ? "已全部加载"
@@ -366,7 +370,8 @@ export function Targets({
             )}
           </>
         )}
-      </Card>
+        </div>
+      </section>
     </>
   );
 }
@@ -578,7 +583,7 @@ function ModelBlock({
                     <th>可用性</th>
                     <th>首字 / 速度</th>
                     <th title="当前并发 / 并发上限；下面一行是 RPM / TPM 限制">当前并发</th>
-                    <th title="层内按调度器同一把抽签权重（评分^8 + 探索口粮）归一化后的期望占比。强粘性命中的请求不参与抽签，短窗口的实际占比可能偏离。">
+                    <th title="层内按调度器同一把抽签权重（评分^8 + 探索口粮）归一化的期望占比；强粘性命中不参与抽签，短窗口实际占比可能偏离。">
                       预计分配
                     </th>
                   </tr>

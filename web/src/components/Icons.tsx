@@ -221,3 +221,12 @@ export const IconBook = (p: IconProps) => (
     <path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20" />
   </Icon>
 );
+
+/** 连接测试：插头。比警告三角形更贴合"试连一次"的语义。 */
+export const IconPlug = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M9 3v5M15 3v5" />
+    <path d="M6 8h12v3a6 6 0 0 1-12 0V8Z" />
+    <path d="M12 17v4" />
+  </Icon>
+);

@@ -5,7 +5,7 @@ import type { Data, DataPatch } from "../lib/store";
 import type { NewApiSite, Settings, SettingsNumericField, SettingsPatch } from "../lib/types";
 import { formatBytes, humanizeSeconds } from "../lib/format";
 import { MIN_PASSWORD_LENGTH, USERNAME_STORAGE_KEY } from "../lib/policy";
-import { Button, Card, ConfirmDialog, Field, InfoTip, useToast } from "../components/ui";
+import { Button, ConfirmDialog, Field, InfoTip, useToast } from "../components/ui";
 
 const SETTING_FIELDS: readonly {
   key: SettingsNumericField;
@@ -20,14 +20,14 @@ const SETTING_FIELDS: readonly {
     label: "普通请求 / 流开始超时",
     unit: "秒",
     presets: [300, 600, 1800],
-    hint: "普通请求限制总时长；推理流只限制排队到开始输出，不截断持续输出的长思考。图片任务仍受总时长限制。",
+    hint: "普通请求限总时长；推理流只限排队到开始输出，不截断长思考。",
   },
   {
     key: "stream_idle_timeout_secs",
     label: "流式空闲超时",
     unit: "秒",
     presets: [60, 180, 300],
-    hint: "推理流开始后，连续未收到数据才超时；收到数据后重新计时。超时会结束本轮，不自动换上游重放。",
+    hint: "连续未收到数据才超时；超时结束本轮，不换上游重放。",
   },
   {
     key: "max_request_bytes",
@@ -389,11 +389,11 @@ export function Settings({
         </div>
       )}
 
-      <Card
-        title="系统设置"
-        description="大多数字段保存后立即热生效；标记「需重启」的字段会在下次重启后生效。范围由服务端实时返回。"
-        actions={
-          <div className="row" style={{ gap: 8 }}>
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">系统设置</h2>
+          <span className="section-desc">大多数字段即时生效，标记「需重启」的字段下次重启后生效</span>
+          <div className="section-actions">
             {hasSettingsChanges && <span className="dirty-badge">未保存</span>}
             <Button
               size="sm"
@@ -415,9 +415,8 @@ export function Settings({
               {settingsSaving ? "保存中…" : "保存"}
             </Button>
           </div>
-        }
-      >
-        <form id="settings-form" className="card-body form-grid" onSubmit={saveSettings}>
+        </header>
+        <form id="settings-form" className="form-grid" onSubmit={saveSettings}>
           <div className="settings-grid">
             {SETTING_FIELDS.map((field) => {
               const limit = settings.limits[field.key];
@@ -491,13 +490,11 @@ export function Settings({
           {(parseSettingNumber(settingsForm.retention_days) === 0 ||
             parseSettingNumber(settingsForm.response_state_days) === 0) && (
             <div className="callout callout-warn" role="status">
-              <span>
-                保留天数填 0 会停止写入对应历史数据；保存前会再确认一次，且这个口径变化不可逆。
-              </span>
+              <span>保留天数填 0 会停止写入对应历史数据，且不可逆；保存前会再确认一次。</span>
             </div>
           )}
           <p className="settings-note">
-            请求体上限按 bytes 保存；保留天数填 0 表示关闭对应记录保留。只有发生变化的字段会提交。
+            请求体上限按 bytes 保存；只有发生变化的字段会提交。
           </p>
           <div className="row" style={{ justifyContent: "flex-end" }}>
             <Button
@@ -519,13 +516,14 @@ export function Settings({
             </Button>
           </div>
         </form>
-      </Card>
+      </section>
 
-      <Card
-        title="管理员账号"
-        description="用户名创建后不可修改；修改密码成功后当前会话会继续保持有效。"
-      >
-        <form className="card-body form-grid" onSubmit={changePassword}>
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">管理员账号</h2>
+          <span className="section-desc">用户名创建后不可修改</span>
+        </header>
+        <form className="form-grid" onSubmit={changePassword}>
           <div className="form-row-2">
             <Field label="用户名" hint="当前登录账号（创建后不可修改）">
               {(id) => (
@@ -621,13 +619,16 @@ export function Settings({
             </Button>
           </div>
         </form>
-      </Card>
+      </section>
 
-      <Card
-        title="New API 站点凭据"
-        description="一个 Base URL 只配一次访问令牌与用户 ID，该站点下的账号自动继承；账号自己填的凭据优先。"
-      >
-        <div className="card-body">
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">New API 站点凭据</h2>
+          <span className="section-desc">
+            一个 Base URL 配一次，站点下账号自动继承；账号自填的优先
+          </span>
+        </header>
+        <div className="section-body">
           <div className="table-wrap">
             <table className="data">
               <thead>
@@ -718,13 +719,15 @@ export function Settings({
             </div>
           </form>
         </div>
-      </Card>
+      </section>
 
-      <Card title="版本信息">
-        <div className="card-body">
-          <div className="table-wrap">
-            <table className="data">
-              <tbody>
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">版本信息</h2>
+        </header>
+        <div className="table-wrap">
+          <table className="data">
+            <tbody>
                 <tr>
                   <td className="text-faint" style={{ width: 200 }}>Akhub 版本</td>
                   <td className="mono">{settings.version}</td>
@@ -770,17 +773,19 @@ export function Settings({
                 </tr>
               </tbody>
             </table>
-          </div>
         </div>
-      </Card>
+      </section>
 
-      <Card
-        title="配置备份"
-        description="备份包含分组、账号（含上游 Key）、模型选择集与调度目标；不含请求记录与运行日志。备份整体用口令加密。"
-      >
-        <div className="card-body stack" style={{ gap: 16 }}>
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">配置备份</h2>
+          <span className="section-desc">
+            含分组、账号（含 Key）、模型与目标；不含请求记录，口令加密
+          </span>
+        </header>
+        <div className="stack" style={{ gap: 16 }}>
           <div className="form-row-2">
-            <Field label="导出：备份口令" hint="口令丢失 = 备份作废。Argon2id 派生密钥加密。">
+            <Field label="导出：备份口令" hint="口令丢失即备份作废（Argon2id 加密）">
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
                   <input
@@ -802,7 +807,7 @@ export function Settings({
                 </div>
               )}
             </Field>
-            <Field label="恢复：选择备份文件与口令" hint="恢复会原子替换全部配置；成功后页面会自动重新加载数据。">
+            <Field label="恢复：选择备份文件与口令" hint="会原子替换全部配置，成功后自动重新加载">
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
                   <input
@@ -834,14 +839,14 @@ export function Settings({
             </Field>
           </div>
         </div>
-      </Card>
+      </section>
 
       <ConfirmDialog
         open={confirmZero}
         title="关闭历史数据保留"
         danger
         confirmLabel="确认关闭保留"
-        message="把保留天数设为 0 会停止写入对应的历史数据，运行时指标将只覆盖当天且重启后清零。这个口径变化不可逆，确定继续保存吗？"
+        message="保留天数设为 0 会停止写入对应历史数据，运行指标只覆盖当天且重启清零。此变更不可逆，确定继续？"
         onClose={() => setConfirmZero(false)}
         onConfirm={() => void applySettingsPatch()}
       />

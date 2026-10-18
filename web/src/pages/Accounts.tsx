@@ -9,7 +9,6 @@ import type {
   MultiplierMode,
   NewApiPreviewResult,
   Protocol,
-  TestResult,
 } from "../lib/types";
 import {
   MULTIPLIER_MODE_LABELS,
@@ -27,7 +26,6 @@ import type { Data, DataPatch } from "../lib/store";
 import {
   Badge,
   Button,
-  Card,
   ConfirmDialog,
   Drawer,
   EmptyState,
@@ -69,8 +67,6 @@ export function Accounts({
   const toast = useToast();
   const [editing, setEditing] = useState<Account | "new" | null>(null);
   const [confirm, setConfirm] = useState<Account | null>(null);
-  /** 新建成功后询问是否立刻测试连接，避免"保存→回列表→找按钮"的来回。 */
-  const [createdAccount, setCreatedAccount] = useState<Account | null>(null);
   // 从请求记录跳过来时带着 account=<id>：定位并高亮该账号（§6.6）。
   const params = useRouteParams();
   const highlightId = params.get("account");
@@ -258,31 +254,29 @@ export function Accounts({
     }
   };
 
-  const test = async (account: Account) => {
-    setBusyId(account.id);
-    try {
-      const result: TestResult = await api.testAccount(account.id);
-      if (result.ok) {
-        toast.success(`「${account.name}」${result.message}`);
-      } else {
-        toast.error(`「${account.name}」${result.message}`);
-      }
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "测试失败");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
   return (
     <>
-      <Card
-        title="上游账号"
-        description="一个账号 = 一套独立凭据。同一把 Key 要同时用在两个分组，请复制成两个账号；只是换归属，在编辑里改「所属分组」，模型会一起迁过去。暂时不决定归属就先建「未分配」账号，之后再分配。"
-        actions={
-          <div className="row" style={{ gap: 8 }}>
+      <section className="section">
+        <header className="section-head">
+          <h2 className="section-title">上游账号</h2>
+          <span className="section-desc">
+            一套凭据一个账号 · 同步于{" "}
+            {(() => {
+              const latest = data.accounts.reduce<number | null>(
+                (current, account) =>
+                  account.model_synced_at !== null &&
+                  (current === null || account.model_synced_at > current)
+                    ? account.model_synced_at
+                    : current,
+                null,
+              );
+              return latest === null ? "从未" : formatRelative(latest);
+            })()}
+          </span>
+          <div className="section-actions">
             {/* 批量刷新：一次探测所有自动倍率账号（§11.3）。 */}
             <Button
+              size="sm"
               icon={<IconRefresh size={13} />}
               onClick={() => void refreshAllMultipliers()}
               disabled={refreshingAll || data.accounts.length === 0}
@@ -291,6 +285,7 @@ export function Accounts({
               {refreshingAll ? "刷新中…" : "刷新全部倍率"}
             </Button>
             <Button
+              size="sm"
               variant="primary"
               icon={<IconPlus />}
               onClick={() => setEditing("new")}
@@ -298,13 +293,13 @@ export function Accounts({
               新建账号
             </Button>
           </div>
-        }
-      >
+        </header>
+        <div className="section-body">
         {data.accounts.length === 0 ? (
           <EmptyState
             icon={<IconServer size={19} />}
             title="还没有上游账号"
-            description="填 Base URL、上游 API Key 与首选协议就行。不需要填写上下文长度、多模态、工具或思考等模型能力字段——这些由真实调用结果自动处理。"
+            description="填 Base URL 与上游 Key 即可；模型能力由真实调用自动判断。"
             action={
               <Button variant="primary" icon={<IconPlus />} onClick={() => setEditing("new")}>
                 新建账号
@@ -313,62 +308,49 @@ export function Accounts({
           />
         ) : (
           <>
-            <div className="table-filters account-filters">
-              <div className="table-filter-fields account-filters">
-              <Field label="搜索">
-                {(id) => (
-                  <div className="input-with-icon">
-                    <IconSearch size={14} />
-                    <input
-                      id={id}
-                      className="input"
-                      value={search}
-                        placeholder="按名称或 Base URL 搜索"
-                        onChange={(event) => setSearch(event.target.value)}
-                      />
-                    </div>
-                  )}
-                </Field>
-                <Field label="分组">
-                  {(id) => (
-                    <select
-                      id={id}
-                      className="select"
-                      value={groupFilter}
-                      onChange={(event) => setGroupFilter(event.target.value)}
-                    >
-                      <option value="all">全部分组</option>
-                      <option value={UNASSIGNED}>
-                        未分配（{data.accounts.filter((account) => account.group_id === null).length}）
-                      </option>
-                      {data.groups.map((group) => (
-                        <option key={group.id} value={group.id}>
-                          {group.name}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </Field>
-                <Field label="状态">
-                  {(id) => (
-                    <select
-                      id={id}
-                      className="select"
-                      value={statusFilter}
-                      onChange={(event) =>
-                        setStatusFilter(event.target.value as AccountStatusFilter)
-                      }
-                    >
-                      <option value="all">全部</option>
-                      <option value="enabled">已启用</option>
-                      <option value="disabled">已停用</option>
-                    </select>
-                  )}
-                </Field>
+            <div className="toolbar">
+              <div className="input-with-icon toolbar-search">
+                <IconSearch size={14} />
+                <input
+                  className="input"
+                  value={search}
+                  placeholder="按名称或 Base URL 搜索"
+                  aria-label="搜索账号"
+                  onChange={(event) => setSearch(event.target.value)}
+                />
               </div>
-              <div className="table-filter-summary tabular">
-                共 {data.accounts.length} 个账号（筛选后 {filteredAccounts.length} 个）
-              </div>
+              <select
+                className="select select-sm toolbar-select"
+                value={groupFilter}
+                aria-label="按分组筛选"
+                onChange={(event) => setGroupFilter(event.target.value)}
+              >
+                <option value="all">全部分组</option>
+                <option value={UNASSIGNED}>
+                  未分配（{data.accounts.filter((account) => account.group_id === null).length}）
+                </option>
+                {data.groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="select select-sm toolbar-select"
+                value={statusFilter}
+                aria-label="按状态筛选"
+                onChange={(event) =>
+                  setStatusFilter(event.target.value as AccountStatusFilter)
+                }
+              >
+                <option value="all">全部状态</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已停用</option>
+              </select>
+              <span className="toolbar-spacer" />
+              <span className="toolbar-count tabular">
+                {filteredAccounts.length}/{data.accounts.length} 个账号
+              </span>
               <Button
                 size="sm"
                 variant="ghost"
@@ -385,23 +367,6 @@ export function Accounts({
               >
                 清除筛选
               </Button>
-            </div>
-            <div className="model-sync-meta">
-              <span>上次同步：</span>
-              <strong>
-                {(() => {
-                  const latest = filteredAccounts.reduce<number | null>(
-                    (current, account) =>
-                      account.model_synced_at !== null &&
-                      (current === null || account.model_synced_at > current)
-                        ? account.model_synced_at
-                        : current,
-                    null,
-                  );
-                  return latest === null ? "从未" : formatRelative(latest);
-                })()}
-              </strong>
-              <span className="text-faint">模型目录可手动更新，也可由自动同步托管</span>
             </div>
             <div className="table-wrap">
               <table className="data">
@@ -446,7 +411,7 @@ export function Accounts({
                           {account.group_id === null ? (
                             <span
                               className="text-faint"
-                              title="未分配账号不参与调度：它没有调度目标，也不会出现在任何分组里。在「编辑」里选一个分组即可开始使用。"
+                              title="未分配：不参与调度，也不出现在任何分组里。在「编辑」里选一个分组即可开始使用。"
                             >
                               未分配
                             </span>
@@ -531,12 +496,6 @@ export function Accounts({
                                   onSelect: () => void copy(account),
                                 },
                                 {
-                                  label: "测试连接",
-                                  hint: "发送一次真实 hi 测试连接",
-                                  disabled: busyId === account.id,
-                                  onSelect: () => void test(account),
-                                },
-                                {
                                   label: "删除账号",
                                   danger: true,
                                   onSelect: () => setConfirm(account),
@@ -553,7 +512,8 @@ export function Accounts({
             </div>
           </>
         )}
-      </Card>
+        </div>
+      </section>
 
       <AccountDrawer
         key={editing === "new" ? "new" : (editing?.id ?? "closed")}
@@ -561,12 +521,11 @@ export function Accounts({
         account={editing === "new" ? null : editing}
         open={editing !== null}
         onClose={() => setEditing(null)}
-        onSaved={async (created) => {
+        onSaved={async () => {
           setEditing(null);
-          if (created) setCreatedAccount(created);
           refreshSoon();
         }}
-        // 只刷新数据、**不关闭抽屉**：测试连接与清除失效标记都发生在编辑途中，
+        // 只刷新数据、**不关闭抽屉**：清除失效标记发生在编辑途中，
         // 走 onSaved 会把抽屉关掉，连同还没保存的 Key 改动一起丢掉
         // （Drawer 的脏数据确认只在用户点关闭按钮时才走）。
         onRefreshed={refresh}
@@ -603,37 +562,6 @@ export function Accounts({
         onClose={() => setConfirm(null)}
         onConfirm={() => void remove(confirm!)}
       />
-
-      <Modal
-        open={createdAccount !== null}
-        onClose={() => setCreatedAccount(null)}
-        title="账号已创建"
-        footer={
-          <>
-            <Button onClick={() => setCreatedAccount(null)}>稍后再说</Button>
-            <Button
-              variant="primary"
-              onClick={() => {
-                const target = createdAccount;
-                setCreatedAccount(null);
-                if (target) void test(target);
-              }}
-            >
-              立即测试连接
-            </Button>
-          </>
-        }
-      >
-        <div className="stack" style={{ gap: 10 }}>
-          <p style={{ margin: 0 }}>
-            账号「{createdAccount?.name}」已保存。现在发送一次真实
-            <code> hi </code>测试请求验证连接吗？
-          </p>
-          <p className="field-hint" style={{ margin: 0 }}>
-            测试不会参与统计，也不会影响该账号的调度状态；失败时会给出具体错误原因。
-          </p>
-        </div>
-      </Modal>
 
       <Modal
         open={refreshReport !== null}
@@ -861,7 +789,7 @@ function AccountDrawer({
   open: boolean;
   onClose: () => void;
   onSaved: (created?: Account) => void | Promise<void>;
-  /** 只刷新列表数据，**不关闭抽屉**（测试连接、清除失效标记用）。 */
+  /** 只刷新列表数据、**不关闭抽屉**（清除失效标记用）。 */
   onRefreshed: () => Promise<unknown>;
 }) {
   const toast = useToast();
@@ -968,7 +896,6 @@ function AccountDrawer({
     adaptive_protocol: account?.adaptive_protocol ?? true,
   });
   const [busy, setBusy] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [detecting, setDetecting] = useState(false);
   /** 改分组待确认时暂存的提交内容（§4.2.2）。 */
   const [pendingMove, setPendingMove] = useState<AccountInput | null>(null);
@@ -986,17 +913,13 @@ function AccountDrawer({
     const limit = Number(target.multiplier_limit);
     const effective = Number(account.effective_multiplier);
     if (!Number.isFinite(limit) || !Number.isFinite(effective) || effective <= limit) return null;
-    return `注意：账号当前有效倍率 ${account.effective_multiplier} 高于「${target.name}」的上限 ${target.multiplier_limit}，迁过去后它不会被调度，除非同时降低倍率或提高该分组的上限。`;
+    return `注意：当前有效倍率 ${account.effective_multiplier} 高于「${target.name}」上限 ${target.multiplier_limit}，迁过去不会被调度，除非同时降低倍率或提高上限。`;
   })();
   // Key 池（§4.2.1）：编辑已有账号时从后台带回的元数据起手，明文一律为空。
   // 新建时是**空池**：主路径是往批量粘贴框里糊一批，而不是从一行空输入开始。
   const [keyDrafts, setKeyDrafts] = useState<KeyDraft[]>(() =>
     account ? draftsFromKeys(account.keys ?? []) : [],
   );
-  // 逐把 Key 的测试结果，按 Key 行 ID 对齐；新增行用序号兜底。
-  const [keyTestResults, setKeyTestResults] = useState<
-    Record<string, { ok: boolean; message: string }>
-  >({});
   /** 正在清除失效标记的那把 Key（§12.3）。 */
   const [clearingKeyId, setClearingKeyId] = useState<string | null>(null);
   const [initialSnapshot] = useState(() => JSON.stringify(form));
@@ -1119,42 +1042,6 @@ function AccountDrawer({
     }
   };
 
-  /** 编辑态下用已保存的凭据发一次真实请求；新建时必须先保存。 */
-  const testConnection = async () => {
-    if (!account || testing) return;
-    setTesting(true);
-    try {
-      const result = await api.testAccount(account.id);
-      // 逐把 Key 的结果按行 ID 落到编辑器上：多 Key 账号最有用的诊断动作就是
-      // "哪几把已经死了"（§4.2.1）。
-      const perKey: Record<string, { ok: boolean; message: string }> = {};
-      for (const entry of result.keys ?? []) {
-        perKey[entry.id] = { ok: entry.ok, message: entry.message };
-      }
-      setKeyTestResults(perKey);
-      const total = result.key_total ?? 0;
-      if (total > 1) {
-        const healthy = result.healthy_keys ?? 0;
-        const summary = `「${account.name}」${healthy}/${total} 把 Key 可用`;
-        if (healthy === total) toast.success(summary);
-        else toast.error(summary);
-      } else if (result.ok) {
-        toast.success(`「${account.name}」${result.message}`);
-      } else {
-        toast.error(`「${account.name}」${result.message}`);
-      }
-      // 测试通过的 Key 会在后台解除硬停（§12.3："手动测试成功后恢复"）：
-      // 不刷新的话，界面上那个"Key 失效"徽标会一直挂在一把刚刚测通的 Key 上。
-      // 走 onRefreshed 而不是 onSaved：后者会关掉抽屉，把这次测试的逐行结果
-      // 与还没保存的改动一起丢掉。
-      if (result.ok || (result.healthy_keys ?? 0) > 0) await onRefreshed();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : "测试失败");
-    } finally {
-      setTesting(false);
-    }
-  };
-
   /** 真正落库。编辑态下 keys 是整体替换：带 id 的沿用原密文、带明文的轮换、没出现的删除。 */
   const save = async (payload: AccountInput, moving: boolean) => {
     setBusy(true);
@@ -1220,7 +1107,7 @@ function AccountDrawer({
       onClose={onClose}
       dirty={dirty}
       title={editing ? `编辑「${account.name}」` : "新建上游账号"}
-      description="连接上游、Key 池与倍率来源；模型能力由自动发现决定，不用手填。"
+      description="连接上游、Key 池与倍率来源。"
       footer={
         <>
           <Button onClick={onClose}>取消</Button>
@@ -1231,15 +1118,15 @@ function AccountDrawer({
       }
     >
       <div className="stack">
-        <FormSection title="基本信息" description="账号身份、归属与上游地址。">
+        <FormSection title="基本信息">
         <Field
           label="所属分组"
           hint={
             form.group_id === ""
-              ? "未分配：账号可以正常配置凭据与模型，但不会参与调度，也不出现在任何分组里。之后在「编辑」里选一个分组即可开始使用。"
+              ? "未分配：可正常配置凭据与模型，但不参与调度。之后再选分组即可启用。"
               : editing
-                ? "改分组会把账号的模型按对外名一起迁过去：新分组缺同名逻辑模型会自动建好，旧分组里只靠它提供的自动模型会随最后一个目标消失。改成「未分配」会把它的调度目标全部撤下，模型目录保留。"
-                : "分组决定它能被哪把下游 Key 使用；先留「未分配」也可以，之后再分配。"
+                ? "改分组会把模型按对外名一起迁过去；改成「未分配」则撤下全部调度目标，目录与凭据保留。"
+                : "决定它能被哪把下游 Key 使用；先留「未分配」也可以。"
           }
         >
           {(id) => (
@@ -1291,7 +1178,7 @@ function AccountDrawer({
 
         <Field
           label="Base URL"
-          hint="填站点地址即可；以 /v1 结尾会识别为已含版本段，不会拼出 /v1/v1/messages。"
+          hint="填站点地址；已含 /v1 结尾也能识别。"
         >
           {(id) => (
             <input
@@ -1306,19 +1193,15 @@ function AccountDrawer({
 
         <KeyPoolEditor
           drafts={keyDrafts}
-          editing={!!editing}
-          testing={testing}
           clearingKeyId={clearingKeyId}
-          testResults={keyTestResults}
           onChange={setKeyDrafts}
-          onTest={() => void testConnection()}
           onClearFaults={(keyId) => void clearKeyFaults(keyId)}
         />
 
         <Field
           label="默认人工优先级"
           error={priorityError ?? undefined}
-          hint="数值越大越先被使用，默认 0；相同的数字同属一层，层内按综合评分分配。"
+          hint="越大越优先，默认 0；同值同层，层内按综合评分分配。"
         >
           {(id) => (
             <input
@@ -1335,7 +1218,7 @@ function AccountDrawer({
 
         </FormSection>
 
-        <FormSection title="倍率与校准" description="有效倍率 = 上游倍率 × 校准系数。">
+        <FormSection title="倍率与校准" description="有效倍率 = 上游倍率 × 校准系数">
         <div className="form-row-2">
         <Field
           label="倍率来源"
@@ -1415,7 +1298,7 @@ function AccountDrawer({
                   account?.has_new_api_token ? "访问令牌（留空则不变）" : "访问令牌"
                 }
                 error={needsNewApiToken ? "自动倍率需要访问令牌" : undefined}
-                hint="New API 个人设置页生成，不是登录密码。"
+                hint="New API 个人设置页生成，不是登录密码"
               >
                 {(id) => (
                   <input
@@ -1432,7 +1315,7 @@ function AccountDrawer({
               <Field
                 label="用户 ID"
                 error={needsNewApiUser ? "自动倍率需要用户 ID" : undefined}
-                hint="New API 个人设置页里的数字 ID。"
+                hint="个人设置页里的数字 ID"
               >
                 {(id) => (
                   <input
@@ -1447,7 +1330,7 @@ function AccountDrawer({
             </div>
             <Field
               label="分组名"
-              hint="留空时后台会自己问出这把 Key 的分组（先看 Key 绑定的分组，再看默认分组）；问不出来才按最高档保守估算。点「拉取分组」可以当场确认。"
+              hint="留空时后台自动识别这把 Key 的分组；点「拉取分组」可当场确认。"
             >
               {(id) => (
                 <div className="row" style={{ gap: 8 }}>
@@ -1529,7 +1412,7 @@ function AccountDrawer({
           <Field
             label="校准系数"
             error={calibrationError ?? undefined}
-            hint="把不同站点的口径对齐到同一把尺子上。"
+            hint="把不同站点的口径对齐到同一把尺子"
           >
             {(id) => (
               <input
@@ -1556,13 +1439,13 @@ function AccountDrawer({
 
         <FormSection
           title="限制与运行时"
-          description="账号级默认限制与运行时适配；不确定时保持默认。"
+          description="不确定时保持默认"
           collapsible
           defaultOpen={false}
         >
         <Field
           label="限制（账号默认值）"
-          hint="留空表示不限；同一把 Key 下的所有模型共享这些限制。TPM 按请求体估算。"
+          hint="留空不限；同账号所有模型共享，TPM 按请求体估算。"
         >
           {() => (
             <div className="weights" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
@@ -1601,8 +1484,8 @@ function AccountDrawer({
           label="运行时自动适配端点"
           hint={
             form.adaptive_protocol
-              ? "在首选端点之外按端点证据依次尝试，猜错会自动回退。"
-              : "只用首选端点。上游只认一种协议，或回退有副作用时关闭。"
+              ? "在首选端点外按证据依次尝试，猜错自动回退"
+              : "只用首选端点。上游只认一种协议时关闭"
           }
         />
 
@@ -1610,7 +1493,7 @@ function AccountDrawer({
           checked={form.allow_private_network}
           onChange={(value) => set("allow_private_network", value)}
           label="允许访问内网地址"
-          hint="默认禁止环回、内网与云元数据地址；上游在局域网里时才打开。"
+          hint="默认禁止环回、内网与云元数据地址；上游在局域网时才打开"
         />
 
         <Switch
@@ -1619,8 +1502,8 @@ function AccountDrawer({
           label="模型自动同步"
           hint={
             form.auto_sync
-              ? "上游全部模型进入调度，之前的模型选择集被忽略。"
-              : "按设置页的同步间隔（默认 30 分钟）全量托管上游模型，忽略选择集。"
+              ? "上游全部模型进入调度，忽略原选择集"
+              : "按设置页间隔（默认 30 分钟）全量托管上游模型"
           }
         />
         <Switch
@@ -1629,8 +1512,8 @@ function AccountDrawer({
           label="隐藏原始模型名"
           hint={
             form.hide_original
-              ? "只暴露在「模型管理」里填了下游模型名的模型。"
-              : "下游既能用下游模型名，也能用上游原模型名。"
+              ? "只暴露填了下游模型名的模型"
+              : "下游既可用了下游名，也可用上游原名"
           }
         />
         {editing && form.auto_sync && account?.model_synced_at != null && (

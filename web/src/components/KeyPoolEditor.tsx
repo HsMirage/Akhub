@@ -149,24 +149,14 @@ function keyStatusTone(status: string): "success" | "warn" | "danger" | "neutral
 
 export function KeyPoolEditor({
   drafts,
-  editing,
-  testing,
   clearingKeyId,
-  testResults,
   onChange,
-  onTest,
   onClearFaults,
 }: {
   drafts: KeyDraft[];
-  /** 编辑已有账号时才能测试连接。 */
-  editing: boolean;
-  testing: boolean;
   /** 正在清除哪一把 Key 的失效标记；null 表示没有进行中的清除。 */
   clearingKeyId?: string | null;
-  /** 测试结果，按 Key 的明文以外的标识对齐；新增行用序号兜底。 */
-  testResults: Record<string, { ok: boolean; message: string }>;
   onChange: (next: KeyDraft[]) => void;
-  onTest: () => void;
   /** 清除某一把 Key 的失效标记与熔断（§12.3）。 */
   onClearFaults?: (keyId: string) => void;
 }) {
@@ -192,7 +182,7 @@ export function KeyPoolEditor({
     <Field
       label="API Key 池"
       error={error ?? undefined}
-      hint="一个账号可以放多把 Key：它们之间的关系与多个账号完全一致，负载均衡、粘性、熔断与限额都按每一把独立生效。"
+      hint="一个账号可放多把 Key：负载均衡、粘性、熔断与限额都按每把独立生效。"
     >
       {() => (
         <>
@@ -205,7 +195,7 @@ export function KeyPoolEditor({
               rows={3}
               spellCheck={false}
               aria-label="批量粘贴 API Key"
-              placeholder={"每行一把 Key，直接粘贴即可自动分行；也支持逗号分隔的一行。\nsk-aaaa\nsk-bbbb\nsk-cccc\n带标签也可以：站点A sk-dddd"}
+              placeholder={"每行一把，粘贴即自动分行；也支持逗号分隔。\nsk-aaaa\nsk-bbbb\n带标签：站点A sk-cccc"}
               onChange={(event) => {
                 const text = event.target.value;
                 // 粘进来自动拆成多行：只要出现了分隔符就相当于"提交这批"。
@@ -248,7 +238,6 @@ export function KeyPoolEditor({
           <div className="key-pool">
             {drafts.map((draft, index) => {
               const health = draft.health?.health;
-              const result = testResults[draft.id ?? `new-${index}`];
               const position = draft.label.trim() || `Key ${index + 1}`;
               const open = expanded[index] ?? false;
               return (
@@ -333,11 +322,6 @@ export function KeyPoolEditor({
                       >
                         {clearingKeyId === draft.id ? "清除中…" : "清除失效标记"}
                       </Button>
-                    )}
-                    {result && (
-                      <Badge tone={result.ok ? "success" : "danger"}>
-                        {result.ok ? "测试通过" : "测试失败"}
-                      </Badge>
                     )}
                     <button
                       type="button"
@@ -432,25 +416,10 @@ export function KeyPoolEditor({
             >
               添加一把 Key
             </Button>
-            {editing && (
-              <Button
-                size="sm"
-                variant="secondary"
-                disabled={testing}
-                title="逐把 Key 发送一次真实测试请求，确认哪几把已经失效"
-                onClick={onTest}
-              >
-                {testing && <span className="spinner spinner-sm" aria-hidden="true" />}
-                {testing ? "测试中…" : "测试全部 Key"}
-              </Button>
-            )}
             <InfoTip label="Key 池怎么工作">
-              <p>
-                额度按凭据计：Key 出问题只影响它自己，其他 Key 继续服务。
-              </p>
-              <p>
-                同一个会话始终落在同一把 Key 上，不会打断上游的前缀缓存。
-              </p>
+              <p>额度按凭据计：一把出问题只影响它自己。</p>
+              <p>同一会话固定落在同一把 Key 上，不打断上游前缀缓存。</p>
+              <p>想确认每把是否可用，去「模型管理」点「测试连接」。</p>
             </InfoTip>
           </div>
         </>

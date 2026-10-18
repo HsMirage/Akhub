@@ -104,7 +104,7 @@ export function CalibrationDialog({
     >
       <div className="stack" style={{ gap: 12 }}>
         <div className="form-row-2">
-          <Field label="选一个模型" hint="必须按单个模型对账，不能用账号总用量。">
+          <Field label="选一个模型" hint="按单个模型对账，不能用账号总用量">
             {(id) => (
               <select
                 id={id}
@@ -122,7 +122,7 @@ export function CalibrationDialog({
           </Field>
           <Field
             label="对账区间"
-            hint="站点改过倍率就选短一点，否则新旧两档会被混在一起，算出的系数两边都不对。"
+            hint="站点改过倍率就选短一些，否则新旧两档会混在一起"
           >
             {(id) => (
               <select
@@ -141,7 +141,7 @@ export function CalibrationDialog({
         <div className="form-row-2">
           <Field
             label="站点后台该模型扣费倍率"
-            hint="去站点后台看这个模型实际扣了多少倍率，填到这里。"
+            hint="站点后台上该模型实际扣的倍率"
           >
             {(id) => (
               <input
@@ -156,21 +156,26 @@ export function CalibrationDialog({
         </div>
 
         {result && (
-          <div
-            className="card-body"
-            style={{ border: "1px solid var(--border)", borderRadius: 10 }}
-          >
-            <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-              <span>
-                校准系数 <b className="mono" style={{ fontSize: 17 }}>{result.calibration}</b>
-              </span>
-              <span className="text-faint" style={{ fontSize: 12.5 }}>
-                站点 {result.reported} ÷ 网关加权均倍率 {result.group_avg_multiplier}
-                {" · "}
-                对账区间 {result.gateway_requests.toLocaleString()} 次请求
-              </span>
+          <div className="calibration-result">
+            <div className="metrics">
+              <div className="metric">
+                <span className="metric-label">校准系数</span>
+                <span className="metric-value">{result.calibration}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">站点报值</span>
+                <span className="metric-value">{result.reported}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">网关加权均倍率</span>
+                <span className="metric-value">{result.group_avg_multiplier}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">对账请求数</span>
+                <span className="metric-value">{result.gateway_requests.toLocaleString()}</span>
+              </div>
             </div>
-            <p className="field-hint" style={{ margin: "6px 0 10px" }}>
+            <p className="field-hint" style={{ margin: "0 0 10px" }}>
               {result.notice}
             </p>
             <Button variant="primary" onClick={() => void applyCalibration()} disabled={busy}>

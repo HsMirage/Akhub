@@ -29,11 +29,18 @@
  */
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../lib/api";
-import type { Account, AccountModel, DispatchTarget, SelectionWarning } from "../lib/types";
+import type {
+  Account,
+  AccountModel,
+  DispatchTarget,
+  SelectionWarning,
+  TestResult,
+} from "../lib/types";
 import { Badge, Button, ConfirmDialog, Modal, Switch, useToast } from "./ui";
 import {
   IconCheck,
   IconEdit,
+  IconPlug,
   IconPlus,
   IconRefresh,
   IconSearch,
@@ -127,6 +134,17 @@ export function ModelSelectionDialog({
   const [selection, setSelection] = useState<ReadonlySet<string>>(() => new Set());
   /** 本次草稿里被移除的行，供「撤销移除」用（删除不再弹二次确认）。 */
   const [removedRows, setRemovedRows] = useState<AccountModel[]>([]);
+  /**
+   * 测试连接面板（New API 式）：入口收敛到「模型管理」里。
+   *
+   * 连接测试天然是"按模型打一次真实请求"的动作——它需要的输入（用哪个上游
+   * 模型）刚好就是这张表的行，所以放在这里比放在账号列表的"更多操作"里
+   * 少一次来回，也能对着具体的模型看结果。
+   */
+  const [testOpen, setTestOpen] = useState(false);
+  const [testModel, setTestModel] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
 
   /** 本地草稿：上游模型名 → 待保存的改动。只有点「保存」时才提交。 */
   const pending = useRef<Map<string, PendingChange>>(new Map());
@@ -317,6 +335,10 @@ export function ModelSelectionDialog({
     setConfirmWarnings(null);
     conflictRetried.current = false;
     setHideOriginal(accountRef.current?.hide_original ?? false);
+    // 测试结果只属于发出它的那个账号：换账号 / 重开弹窗都清掉。
+    setTestOpen(false);
+    setTestModel("");
+    setTestResult(null);
     void load();
     void loadGroupNames();
   }, [open, accountId, forgetDraft, load, loadGroupNames]);
@@ -595,6 +617,48 @@ export function ModelSelectionDialog({
     setNotice(`已恢复 ${restored.length} 个模型。`);
   }, [removedRows]);
 
+  /** 可用于测试的上游模型：已启用、且没有被上游移除。 */
+  const testableModels = useMemo(
+    () => rows.filter((row) => row.selected && !row.missing).map((row) => row.upstream_model),
+    [rows],
+  );
+  const defaultTestModel = testableModels[0] ?? "";
+
+  /**
+   * 测试连接（New API 式）：用**已保存**的凭据发一次真实 `hi`。
+   *
+   * 不先落库草稿：测试打的是服务端手上那份配置，草稿里刚勾的模型还不存在。
+   * 逐把 Key 的结果由后台给出；通过测试的 Key 会被后台解除硬停，所以测完
+   * 顺手刷新一次全局数据，列表上的"Key 失效"徽标才不会残留在已经通了的 Key 上。
+   */
+  const runTest = async (model?: string) => {
+    if (!account || testing) return;
+    const target = (model ?? testModel ?? defaultTestModel).trim();
+    if (!target) {
+      toast.error("这个账号还没有已启用的模型：先在列表里启用一个，再测试连接");
+      return;
+    }
+    setTestOpen(true);
+    setTestModel(target);
+    setTesting(true);
+    try {
+      const result = await api.testAccount(account.id, target);
+      setTestResult(result);
+      if (result.ok) {
+        toast.success(`连接正常：${result.message}`);
+      } else {
+        toast.error(result.message);
+      }
+      if (result.ok || (result.healthy_keys ?? 0) > 0) {
+        void onChangedRef.current().catch(() => undefined);
+      }
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "测试失败");
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const refreshUpstream = async () => {
     if (!account) return;
     setFetching(true);
@@ -729,29 +793,24 @@ export function ModelSelectionDialog({
         <div className="stack model-dialog-content">
           {account?.group_id === null && (
             <div className="callout callout-info">
-              该账号还没有分配到分组：可以在这里整理模型目录、设好下游模型名，但
-              <strong>不会生成调度目标</strong>，下游暂时用不到这些模型。去「编辑」
-              里选一个分组，模型会按对外名一起迁过去并立即生效。
+              未分配分组：可以整理目录与下游名，但<strong>不会生成调度目标</strong>。到「编辑」里选分组后立即生效。
             </div>
           )}
           {managed && (
             <div className="callout callout-info">
-              该账号已开启模型自动同步：上游有哪些模型就调度哪些，新增 / 启用 /
-              停用 / 删除由后台接管。下游模型名（改名）不受影响，照旧可以修改。
+              已开启自动同步：调度哪些模型由后台接管；下游模型名仍可改。
             </div>
           )}
           {missingCount > 0 && (
             <div className="callout callout-warn">
-              有 {missingCount} 个模型已从上游消失：它们的调度目标已停用，上游重新
-              提供时会自动恢复。确认不会再回来时，用工具栏的「移除消失模型」一次清掉。
+              {missingCount} 个模型已从上游消失，目标已停用；上游重新提供会自动恢复。确认不再回来时用「移除消失模型」清理。
             </div>
           )}
 
           <div className="model-help">
-            <strong>下游模型名怎么填？</strong>
+            <strong>下游模型名</strong>
             <span>
-              留空就是使用上游原名；填写后，下游用这个名字调用。多个账号把同一个模型填成
-              同一个名字，系统会自动合并成一个模型。
+              留空用上游原名；多个账号填同一个名字会自动合并成一个模型。
             </span>
           </div>
 
@@ -795,8 +854,31 @@ export function ModelSelectionDialog({
               只看已启用
             </label>
             <span className="spacer" />
+            <Button
+              variant="ghost"
+              icon={
+                testing ? (
+                  <span className="spinner spinner-sm" aria-hidden="true" />
+                ) : (
+                  <IconPlug size={13} />
+                )
+              }
+              aria-expanded={testOpen}
+              title={
+                testableModels.length === 0
+                  ? "这个账号还没有已启用的模型：先启用一个，再测试连接"
+                  : "用已保存的凭据发一次真实请求，逐把 Key 报告结果"
+              }
+              onClick={() => {
+                if (!testOpen) setTestModel(defaultTestModel);
+                setTestOpen((current) => !current);
+              }}
+            >
+              {testing ? "测试中…" : "测试连接"}
+            </Button>
             {!managed && (
               <Button
+                variant="ghost"
                 icon={<IconPlus size={13} />}
                 onClick={() => setAdding((current) => !current)}
                 disabled={adding || busy !== null}
@@ -846,6 +928,94 @@ export function ModelSelectionDialog({
               </Button>
             )}
           </div>
+
+          {/* 测试连接：New API 式，入口在模型管理里。测试打的是服务端已保存的
+              凭据，因此不受左下角「保存」影响，也不需要先保存草稿。 */}
+          {testOpen && (
+            <div className="test-panel" role="region" aria-label="测试连接">
+              <div className="test-panel-head">
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <span className="micro">测试连接</span>
+                  {testResult ? (
+                    <Badge tone={testResult.ok ? "success" : "danger"} dot>
+                      {testResult.ok ? "通过" : "失败"}
+                      {testResult.latency_ms > 0 ? ` · ${testResult.latency_ms} ms` : ""}
+                    </Badge>
+                  ) : (
+                    <span className="text-faint" style={{ fontSize: 12 }}>
+                      发送一次真实 hi，不参与统计，也不改变调度状态。
+                    </span>
+                  )}
+                </div>
+                <div className="row" style={{ gap: 8 }}>
+                  <select
+                    className="select select-sm"
+                    value={testModel || defaultTestModel}
+                    aria-label="测试用的上游模型"
+                    onChange={(event) => setTestModel(event.target.value)}
+                    disabled={testing || testableModels.length === 0}
+                  >
+                    {testableModels.length === 0 && <option value="">没有已启用的模型</option>}
+                    {(testModel && !testableModels.includes(testModel)
+                      ? [testModel, ...testableModels]
+                      : testableModels
+                    ).map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={testing || testableModels.length === 0}
+                    onClick={() => void runTest(testModel || defaultTestModel)}
+                  >
+                    {testing ? "测试中…" : "开始测试"}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setTestOpen(false)}>
+                    收起
+                  </Button>
+                </div>
+              </div>
+              {testResult && (
+                <div className="test-panel-body">
+                  <div className="test-result">
+                    <span className={`test-result-badge ${testResult.ok ? "is-ok" : "is-fail"}`}>
+                      {testResult.ok ? <IconCheck size={13} /> : <IconX size={13} />}
+                      {testResult.ok ? "连接正常" : "连接失败"}
+                    </span>
+                    <span className="text-dim">{testResult.message}</span>
+                    {testResult.key_total ? (
+                      <span className="text-faint tabular">
+                        {testResult.healthy_keys ?? 0}/{testResult.key_total} 把 Key 可用
+                      </span>
+                    ) : null}
+                  </div>
+                  {(testResult.keys?.length ?? 0) > 0 && (
+                    <div className="test-key-list">
+                      {testResult.keys?.map((key) => (
+                        <div className="test-key-row" key={key.id}>
+                          <span className="test-key-name">
+                            <Badge tone={key.ok ? "success" : "danger"} dot>
+                              {key.ok ? "通过" : "失败"}
+                            </Badge>
+                            {key.label}
+                          </span>
+                          <span className="test-key-meta">
+                            <span className="tabular">{key.latency_ms} ms</span>
+                            <span className="cell-truncate" title={key.message}>
+                              {key.message}
+                            </span>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* 选择列的落点：勾了行之后**一定**有动作可做，这正是「全选」的意义。
               批量动作和单个动作一样只改草稿，点「保存」才提交。 */}
@@ -994,6 +1164,8 @@ export function ModelSelectionDialog({
                           selected={selectedNames.has(row.upstream_model)}
                           onSelect={toggleSelected}
                           onRemove={removeRows}
+                          onTest={(model) => void runTest(model)}
+                          testingModel={testing ? testModel : null}
                         />
                       );
                     })
@@ -1045,8 +1217,7 @@ export function ModelSelectionDialog({
                 </span>
               ))}
             {missingCount > 8 && <span style={{ display: "block" }}>…等共 {missingCount} 个</span>}
-            这些模型已经不在上游的列表里，目标处于停用状态。移除后目录里不再保留它们，
-            上游重新提供时会作为新模型重新出现。
+            这些模型已不在上游列表里，目标已停用。移除后目录不再保留，上游恢复提供时会作为新模型重新出现。
           </>
         }
         onClose={() => setConfirmRemoveMissing(false)}
@@ -1083,6 +1254,8 @@ const ModelRow = memo(function ModelRow({
   onToggle,
   onSelect,
   onRemove,
+  onTest,
+  testingModel,
 }: {
   row: AccountModel;
   renamed: boolean;
@@ -1105,6 +1278,9 @@ const ModelRow = memo(function ModelRow({
   onToggle: (upstreamModel: string, selected: boolean) => void;
   onSelect: (upstreamModel: string, on: boolean) => void;
   onRemove: (rows: AccountModel[]) => void;
+  onTest: (upstreamModel: string) => void;
+  /** 正在测试的那个上游模型名；别的行显示为禁用态。 */
+  testingModel: string | null;
 }) {
   return (
     <>
@@ -1201,6 +1377,14 @@ const ModelRow = memo(function ModelRow({
           <div className="cell-actions">
             <Button
               size="sm"
+              icon={<IconPlug size={13} />}
+              title="用已保存的凭据对这个模型发一次真实请求；结果在上方测试面板里"
+              aria-label={`测试模型 ${row.upstream_model}`}
+              onClick={() => onTest(row.upstream_model)}
+              disabled={locked || row.missing || testingModel !== null}
+            />
+            <Button
+              size="sm"
               icon={<IconEdit size={13} />}
               onClick={() => onEdit(row.upstream_model)}
               // 改名（下游模型名）是管理员的本地意图，与自动同步不冲突。
@@ -1258,7 +1442,7 @@ const ModelRow = memo(function ModelRow({
                   </select>
                 )}
                 <span className="field-hint">
-                  留空 = 使用上游原名；填写后下游用这个名字调用。多个账号填成同一个名字会自动合并。
+                  留空用上游原名；多个账号填同名会自动合并
                 </span>
               </div>
               <div className="model-edit-actions">

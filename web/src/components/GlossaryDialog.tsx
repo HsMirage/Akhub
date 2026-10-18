@@ -15,15 +15,15 @@ const GROUPS: { title: string; terms: { term: string; desc: string }[] }[] = [
       },
       {
         term: "上游账号",
-        desc: "一套真实的上游凭据（Base URL + API Key）。同一把 Key 要同时用在两个分组时，请复制成两个账号；只是改归属，直接改「所属分组」即可，模型会按对外名一起迁过去。",
+        desc: "一套上游凭据（Base URL + API Key）。同一把 Key 要用在两个分组就复制成两个账号；只改归属直接改「所属分组」，模型会一起迁过去。",
       },
       {
         term: "逻辑模型",
-        desc: "下游看到的模型名。上游模型名不同、但你填了相同“下游模型名”的模型会合并成同一个模型显示；它由账号的模型管理自动维护，不需要单独创建。",
+        desc: "下游看到的模型名。填了同一个“下游模型名”的模型会合并成一个；由账号的模型管理自动维护。",
       },
       {
         term: "调度目标",
-        desc: "「逻辑模型 + 账号 + 具体上游模型」的组合，由账号模型目录自动生成；它不单独配置，调度视图只展示评分与可用性。",
+        desc: "「逻辑模型 + 账号 + 上游模型」的组合，由模型目录自动生成，不单独配置。",
       },
       { term: "候选过滤", desc: "请求记录里展示本次调度淘汰了哪些目标、原因是什么。" },
     ],
@@ -33,7 +33,7 @@ const GROUPS: { title: string; terms: { term: string; desc: string }[] }[] = [
     terms: [
       {
         term: "账号优先级与层",
-        desc: "优先级只配置在账号上（默认 0，越大越优先）。同值的账号同属一层；层内按综合评分与可用性分配流量，跨层严格保底。",
+        desc: "优先级只配在账号上（默认 0，越大越优先）。同值同层，层内按评分分配；跨层严格保底。",
       },
       {
         term: "调度权重",
@@ -55,7 +55,7 @@ const GROUPS: { title: string; terms: { term: string; desc: string }[] }[] = [
     terms: [
       {
         term: "倍率",
-        desc: "上游对每次调用的计费折扣系数，不是价格。倍率只能在同一逻辑模型内部比较，跨模型相加会失真。",
+        desc: "上游的计费折扣系数，不是价格；只能在同一逻辑模型内比较，跨模型相加会失真。",
       },
       { term: "校准系数", desc: "编码「站 A 的 x1 约等于站 B 的 x0.7」这类跨站点差异；有效倍率 = 上游倍率 × 校准系数。" },
       { term: "分组倍率上限", desc: "绝对红线：有效倍率高于它的目标会被暂停，等于它仍然允许调用。" },
@@ -77,7 +77,7 @@ const GROUPS: { title: string; terms: { term: string; desc: string }[] }[] = [
 export function GlossaryDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
     <Modal open={open} onClose={onClose} title="术语表" size="lg">
-      <div className="glossary">
+      <div className="glossary glossary-columns">
         {GROUPS.map((group) => (
           <section key={group.title} className="glossary-group">
             <h3 className="glossary-title">{group.title}</h3>

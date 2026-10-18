@@ -24,7 +24,6 @@ import {
 import {
   Badge,
   Button,
-  Card,
   CopyButton,
   EmptyState,
   Field,
@@ -466,10 +465,11 @@ export function Requests({
       : `当前保留最近 ${data.settings.retention_days} 天；默认查询近 24 小时。`;
 
   return (
-    <Card
-      title="请求记录"
-      description={`只记录元数据，不保存消息正文、图片、工具参数或思考内容。${retentionText}`}
-    >
+    <section className="section">
+      <header className="section-head">
+        <h2 className="section-title">请求记录</h2>
+        <span className="section-desc">只记元数据，不保存正文与图片 · {retentionText}</span>
+      </header>
       <form
         className="table-filters request-filters"
         onSubmit={(event) => {
@@ -621,9 +621,9 @@ export function Requests({
       </form>
 
       {chips.length > 0 && (
-        <div className="filter-chips" aria-label="当前筛选条件">
+        <div className="chip-list" aria-label="当前筛选条件">
           {chips.map((chip) => (
-            <span key={chip.label} className="filter-chip">
+            <span key={chip.label} className="chip">
               {chip.label}
               <button
                 type="button"
@@ -1113,6 +1113,6 @@ export function Requests({
           </Button>
         </div>
       </div>
-    </Card>
+    </section>
   );
 }
