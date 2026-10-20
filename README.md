@@ -316,26 +316,21 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 管理后台是独立的 Vite 应用，构建产物在编译期嵌入 Rust 二进制。
 
 ```bash
-# 1. 构建前端（改动 web/ 后需要重跑）
+# 只在本机做这一件事：构建前端（改动 web/ 后需要重跑，秒级）
 cd web && npm install && npm run build && cd ..
-
-# 2. 构建与测试后端
-cargo test          # 单元测试 + 端到端测试
-cargo clippy --all-targets
-cargo fmt
 ```
 
-跳过第 1 步也能 `cargo build`：`build.rs` 会放一个占位页面，`/v1` 网关接口不受影响，
-只是 `/admin` 会提示你先构建前端。前端热更新开发时，先在一个终端跑 `cargo run`，
-另一个终端跑 `cd web && npm run dev`，Vite 会把 `/admin/api` 与 `/v1` 代理到 `127.0.0.1:8080`。
+**后端不要在本机编译**：`cargo build` / `cargo test` / `cargo clippy` 一律交给 CI
+（push 就编译、跑测试、跑 clippy）。本机跑一次完整 `cargo test` 会在 `target/` 里写掉
+20 GB 以上，把开发机的磁盘填满。原因、替代做法与产物位置见
+**[docs/BUILD.md](docs/BUILD.md)**。
+
+前端热更新开发时，`cd web && npm run dev` 即可，Vite 会把 `/admin/api` 与 `/v1` 代理到
+`127.0.0.1:8080`——后端跑在容器或另一台机器上时，改 `vite.config.ts` 里的代理目标即可。
+没有前端产物时 `build.rs` 会放一个占位页面，编译不会因此失败，只是 `/admin` 会提示先构建前端。
 
 端到端测试会拉起一个假上游站点和一台完整的 Akhub，覆盖鉴权、模型改写、故障切换、
-跨协议矩阵、流式结算、Responses 生命周期、后台 CRUD 与静态资源服务。
-
-**完整构建别放在开发机上跑**：`cargo test` 的中间产物实测能到 20 GB 以上，把开发机的磁盘
-填满之后连日志都写不出来。完整构建交给 CI（push 就编译、跑测试、跑 clippy）或仓库的
-`Dockerfile`；本机只做前端构建（`npm run build`，秒级）。命令、产物与平台上限的完整说明
-见 **[docs/BUILD.md](docs/BUILD.md)**。
+跨协议矩阵、流式结算、Responses 生命周期、后台 CRUD 与静态资源服务——这些都在 CI 里跑。
 
 ---
 
