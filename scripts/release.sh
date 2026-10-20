@@ -38,6 +38,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 这台机器的定位是开发机，不是构建机（见 docs/BUILD.md §2）：
+# 本脚本会跑全量测试 + 交叉编译，在开发机上执行会写掉 20 GB 量级的 target/。
+# 所以默认拒绝运行，确实在构建机上执行时显式设 AKHUB_BUILD_MACHINE=1。
+if [[ "${AKHUB_BUILD_MACHINE:-}" != "1" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "拒绝执行：这台是 macOS 开发机，不是构建机。" >&2
+        echo "  本项目只发 Linux 与 Windows；macOS 已于 2026-10-20 停止构建。" >&2
+        echo "  正式产出一律走 CI（打 tag 即触发 .github/workflows/release.yml）。" >&2
+        echo "  确实要在构建机上执行本脚本，先设 AKHUB_BUILD_MACHINE=1。" >&2
+        exit 2
+    fi
+fi
+
 # 平台名 → 目标三元组。顺序就是报告顺序，也是 --only 的取值来源。
 # 平台名必须与 .github/workflows/release.yml 的 matrix.name 完全一致：
 # 安装脚本按这个名字拼资产文件名。

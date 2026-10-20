@@ -23,10 +23,18 @@
 `x86_64-apple-darwin` 的构建步骤、也不修 macOS 专属问题。
 
 这条上限有机械门禁：[scripts/check-platforms.sh](../scripts/check-platforms.sh)。
-`ci.yml` 与 `release.yml` 都调用它（tag 发版不经过 `ci.yml`，所以两边都得卡）。
-它扫的是真正会产出苹果产物的三处——`release.yml`、`scripts/release.sh`、`install.sh`；
+`ci.yml` 与 `release.yml` 都调用它（tag 发版不经过 `ci.yml`，所以两边都得卡）。两道检查：
+
+1. **字面量**：扫构建配置（`release.yml`、`ci.yml`、`scripts/release.sh`、`install.sh`、
+   `desktop/tauri.conf.json`、`desktop/prepare-sidecar.sh`），命中 `-apple-darwin`、
+   `macos-latest`、`macos-13` 这类带版本的 runner 标签、`hdiutil` / `codesign` /
+   `xcrun` / `xcodebuild` 就失败。
+2. **结构**：用 YAML 解析所有 workflow，matrix 里任何取值含 macos / darwin 就失败——
+   这样 `os: MacOS-14` 这种大小写混写也逃不掉（字面量是大小写敏感的）。
+
 文档里写"macOS 已停止支持"不算违规，所以不扫 `*.md`。
-往这三处里加回 `macos-latest` 或 `*-apple-darwin`，CI 会直接失败。
+另见 `scripts/release.sh`：它在 Darwin 上直接以退出码 2 拒绝运行（`--help` 除外），
+确实要在构建机上跑时显式设 `AKHUB_BUILD_MACHINE=1`。
 
 ---
 
@@ -41,7 +49,8 @@
 具体红线：
 
 - ❌ 不在本机跑 `cargo build` / `cargo test` / `cargo clippy` / `cargo zigbuild`
-- ❌ 不在本机跑 `scripts/release.sh`（它本身就是交叉编译 + 全量测试）
+- ❌ 不在本机跑 `scripts/release.sh`（它本身就是交叉编译 + 全量测试；脚本在 Darwin 上
+  会直接拒绝执行，见 §1）
 - ❌ 不为了"试一下"就随手 `cargo run`
 - ✅ 前端构建（`cd web && npm run build`）可以在本机跑：秒级，只产出 `web/dist`
 
@@ -140,7 +149,8 @@ curl -fsS http://127.0.0.1:8080/health/ready
 平台表只有三项：`linux-x86_64`、`linux-aarch64`、`windows-x86_64`。它依赖
 `cargo-zigbuild` 与对应 rustup target，缺哪个就跳过哪个并给出提示。
 
-**这个脚本会跑全量测试与交叉编译，不要在开发机上执行。**
+**这个脚本会跑全量测试与交叉编译，不要在开发机上执行。** 它在 Darwin 上会直接以退出码 2
+拒绝运行；确实在 Linux 构建机上执行时设 `AKHUB_BUILD_MACHINE=1` 显式放行。
 
 ---
 
