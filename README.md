@@ -13,6 +13,8 @@
 - 单文件二进制或一个容器就能跑，不需要额外的数据库、队列或 Redis。
 - 管理后台内嵌在二进制里，打开 `/admin` 设置管理员密码即可开始用。
 - 上游凭据加密落库、日志脱敏、请求正文不落盘，默认拒绝访问内网与云元数据地址。
+- **只发布 Linux 与 Windows**：Linux 出单文件二进制，Windows 出桌面安装器。
+  **macOS 自 2026-10-20 起不再构建也不再发布**；历史 Release 上的 `.dmg` 仍可下载但不更新。
 
 ![管理后台概览](docs/images/overview.png)
 
@@ -29,6 +31,7 @@
 - [必须知道的行为](#必须知道的行为)
 - [开发](#开发)
 - [部署](#部署)
+- [桌面端（Windows）](#桌面端windows)
 - [许可与来源](#许可与来源)
 
 ---
@@ -137,16 +140,16 @@ docker compose up -d
 #   AKHUB_BIND=0.0.0.0 docker compose up -d）
 ```
 
-### 一键脚本（Linux / macOS）
+### 一键脚本（Linux）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
 ```
 
 脚本只服务 Linux：识别平台 → 下载对应资产 → 用 `checksums.txt` 校验 sha256 → 安装到
-`/usr/local/bin`；`--service` 会顺带装好 systemd 单元。**macOS 与 Windows 请装桌面端**
-（见下面的「桌面端」一节）——这两个平台从 v1.1.17 起不再发命令行二进制；要在这两个平台上
-跑命令行版，从源码构建即可。
+`/usr/local/bin`；`--service` 会顺带装好 systemd 单元。**Windows 请装桌面端**（见下面的
+「桌面端」一节）——Windows 不发命令行二进制；要跑命令行版，从源码构建即可。
+**macOS 自 2026-10-20 起不再支持**（详见 [docs/BUILD.md](docs/BUILD.md) §1）。
 
 ### 本地运行
 
@@ -238,7 +241,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   权限，这时面板会给出 `sudo akhub --update`——同一个二进制自带更新能力，不需要 curl 管道。
 - **容器部署**：升级的是镜像，面板会给出带目标版本的重建命令，形如
   `AKHUB_IMAGE=ghcr.io/hsmirage/akhub:<tag> docker compose up -d`。
-- **Windows / 源码构建**：给出去哪儿装桌面端（Windows 与 macOS 只发桌面应用，没有可自动
+- **Windows / 源码构建**：给出去哪儿装桌面端（Windows 只发桌面应用，没有可自动
   更新的命令行资产），源码构建则给出 `git pull && cargo build --release`。
 
 更新检查在服务端缓存 30 分钟，不会频繁打扰 GitHub；需要完全关闭时设
@@ -329,9 +332,10 @@ cargo fmt
 端到端测试会拉起一个假上游站点和一台完整的 Akhub，覆盖鉴权、模型改写、故障切换、
 跨协议矩阵、流式结算、Responses 生命周期、后台 CRUD 与静态资源服务。
 
-**完整构建别放在开发机上跑**：`cargo test` 的中间产物约 5 GB，把开发机的磁盘填满之后
-连日志都写不出来。完整构建交给 Linux 构建机或仓库的 `Dockerfile`；本机只做前端构建
-（`npm run build`，秒级）与 `cargo check` 这类轻量检查。
+**完整构建别放在开发机上跑**：`cargo test` 的中间产物实测能到 20 GB 以上，把开发机的磁盘
+填满之后连日志都写不出来。完整构建交给 CI（push 就编译、跑测试、跑 clippy）或仓库的
+`Dockerfile`；本机只做前端构建（`npm run build`，秒级）。命令、产物与平台上限的完整说明
+见 **[docs/BUILD.md](docs/BUILD.md)**。
 
 ---
 
@@ -346,35 +350,32 @@ curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | 
 ```
 
 每个 `v*` 标签会触发 [release.yml](.github/workflows/release.yml)：Linux 的 runner 上构建
-`linux-x86_64` / `linux-aarch64` 两个单文件二进制，macOS 与 Windows 的 runner 上构建桌面
-安装包（见「桌面端」），再合成多架构镜像推送到 GHCR，附 `checksums.txt`。Release 上只有这
-几个文件——**macOS 与 Windows 的裸二进制不再单独发布**，它们的形态是桌面应用。本地发版用
-`scripts/release.sh`，打包规则由 [scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
+`linux-x86_64` / `linux-aarch64` 两个单文件二进制，Windows 的 runner 上构建桌面安装包
+（见「桌面端」），再合成多架构镜像推送到 GHCR，附 `checksums.txt`。Release 上只有这几个
+文件——**Windows 的裸二进制不再单独发布**，它的形态是桌面应用。**macOS 自 2026-10-20 起
+不再构建**（见 [docs/BUILD.md](docs/BUILD.md) §1）。本地发版用 `scripts/release.sh`，打包规则由
+[scripts/package.sh](scripts/package.sh) 统一定义，与 CI 共用。
 
 容器侧记得给足停止宽限（compose 的 `stop_grace_period` 或 `docker run --stop-timeout` ≥ 200 秒），
 否则 Docker 默认的 10 秒会强杀在途的长流式请求。
 
 ---
 
-## 桌面端（Windows / macOS）
+## 桌面端（Windows）
 
 不想开终端、也不想操心端口的话，可以直接装桌面应用：双击打开就是同一个管理后台。
 
 - 应用在 `127.0.0.1` 上自动挑一个空闲端口拉起内置的 akhub（sidecar），数据目录固定在
-  系统应用数据目录下（macOS 是 `~/Library/Application Support/com.hsmirage.akhub/data`，
-  Windows 是 `%APPDATA%\com.hsmirage.akhub\data`），窗口打开的就是
+  系统应用数据目录下（`%APPDATA%\com.hsmirage.akhub\data`），窗口打开的就是
   `http://127.0.0.1:<port>/admin`，与管理后台的功能完全一致。
 - 关掉窗口时 sidecar 一起退出，不会留下后台进程；端口每次启动都可能不同，不需要手工配置，
   也不会和本机已有的 akhub / 其它服务抢端口。
-- Release 页面上一共五个文件：macOS 的 `akhub-desktop-<tag>-macos-arm64.dmg`（Apple
-  Silicon）与 `akhub-desktop-<tag>-macos-x86_64.dmg`（Intel）、Windows 的
-  `akhub-desktop-<tag>-windows-x86_64-setup.exe`（NSIS 安装器），加上 Linux 服务端的
-  `akhub-v<tag>-linux-x86_64.tar.gz` 与 `akhub-v<tag>-linux-aarch64.tar.gz`。
+- Release 页面上一共三个文件：Windows 的 `akhub-desktop-<tag>-windows-x86_64-setup.exe`
+  （NSIS 安装器），加上 Linux 服务端的 `akhub-v<tag>-linux-x86_64.tar.gz` 与
+  `akhub-v<tag>-linux-aarch64.tar.gz`。
 
-安装包没有做代码签名：macOS 首次打开要右键点图标选「打开」
-（或 `xattr -dr com.apple.quarantine /Applications/Akhub.app`），Windows 首次运行要在
-SmartScreen 弹窗里点「更多信息 → 仍要运行」。构建、调试与打包的完整说明见
-[desktop/README.md](desktop/README.md)。
+安装包没有做代码签名：Windows 首次运行要在 SmartScreen 弹窗里点「更多信息 → 仍要运行」。
+构建、调试与打包的完整说明见 [desktop/README.md](desktop/README.md)。
 
 ---
 

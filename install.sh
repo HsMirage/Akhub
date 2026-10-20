@@ -1,5 +1,5 @@
 #!/bin/sh
-# Akhub 一键安装 / 升级脚本（Linux 与 macOS）。
+# Akhub 一键安装 / 升级脚本（Linux）。
 #
 #   curl -fsSL https://raw.githubusercontent.com/HsMirage/Akhub/master/install.sh | sh
 #
@@ -16,6 +16,9 @@
 #   --dry-run           只打印将要做什么
 #
 # 环境变量等价物：AKHUB_VERSION / AKHUB_INSTALL_DIR / AKHUB_REPO
+#
+# 只服务 Linux：macOS 从 2026-10-20 起不再构建（本项目只保留 Linux 与 Windows），
+# Windows 请用 install.ps1 或桌面安装包。
 #
 # 退出码：0 成功；1 参数错误；2 不支持的平台；3 下载失败；4 校验失败；5 安装失败。
 
@@ -65,8 +68,10 @@ uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 
 case "$uname_s" in
-    Linux)  os_family="linux" ;;
-    Darwin) os_family="macos" ;;
+    Linux) os_family="linux" ;;
+    Darwin) die "macOS 已不再支持：本项目自 2026-10-20 起只发布 Linux 与 Windows。
+  macOS 上没有可下载的命令行资产；需要的话请从源码构建（cargo build --release）。
+  Windows 请用 install.ps1。" 2 ;;
     *) die "不支持的平台：$uname_s。Windows 请用 install.ps1，其他平台请自行编译。" 2 ;;
 esac
 
@@ -78,18 +83,13 @@ esac
 
 # 资产命名与 .github/workflows/release.yml 的 matrix.name 一一对应：
 #   linux-x86_64 / linux-aarch64
-#   macos-aarch64 / macos-x86_64
 #
 # Linux 现在只有 glibc 版（静态链接的 musl 版已停发）。--libc 保留是为了不让
 # 旧脚本直接报参数错误，但选了 musl 也只能拿到 glibc 资产，所以明确警告一句。
 if [ "$LIBC_PREF" = "musl" ]; then
     warn "--libc musl 已不再发布；本次安装 glibc 版（需要 glibc 2.34+）"
 fi
-if [ "$os_family" = "linux" ]; then
-    platform="linux-${arch}"
-else
-    platform="macos-${arch}"
-fi
+platform="linux-${arch}"
 
 # ---------------------------------------------------------------- 版本解析
 if [ -z "$VERSION" ]; then
@@ -151,15 +151,6 @@ fetch() {
 
 info "下载 ${asset}"
 if ! fetch "${base}/${asset}" "${tmp}/${asset}"; then
-    # macOS 从 v1.1.17 起只发桌面应用（.dmg），命令行版只发 Linux。
-    # 固定到旧版本（--version v1.1.16）时这里仍然下得到，所以只在失败时提示。
-    if [ "$os_family" = "macos" ]; then
-        die "下载失败：${base}/${asset}
-  macOS 从 v1.1.17 起只发桌面应用，请到 https://github.com/${REPO}/releases/latest 下载
-    akhub-desktop-<版本>-macos-arm64.dmg    （Apple Silicon）
-    akhub-desktop-<版本>-macos-x86_64.dmg   （Intel）
-  双击安装即可；要在 macOS 上跑命令行版，请从源码构建（cargo build --release）。" 3
-    fi
     die "下载失败：${base}/${asset}" 3
 fi
 

@@ -1,16 +1,18 @@
 # 公开发版：推 v* tag 时产出桌面安装包 + Linux 单文件二进制 + 多架构 Docker 镜像。
 #
-# 挂到 Release 上的只有这几个（2026-10-01 起的口径）：
-#   akhub-desktop-<tag>-macos-arm64.dmg            Apple Silicon 桌面端
-#   akhub-desktop-<tag>-macos-x86_64.dmg           Intel Mac 桌面端
+# 挂到 Release 上的只有这几个（2026-10-20 起的口径：只发 Linux 与 Windows）：
 #   akhub-desktop-<tag>-windows-x86_64-setup.exe   Windows 桌面端（NSIS 安装器）
 #   akhub-v<tag>-linux-x86_64.tar.gz               Linux 服务端
 #   akhub-v<tag>-linux-aarch64.tar.gz              Linux 服务端（arm64）
 #   checksums.txt                                  上面这些文件的 sha256
 #
-# macOS / Windows 不再发裸二进制：这两个平台的产品形态是桌面端应用。它们的二进制
-# 仍然在各自的 runner 上编出来，但只作为桌面端的 sidecar 使用，不挂到 Release。
-# Windows 的 .msi 也不再打——只留一个双击即装的 setup.exe，安装入口只有一个。
+# **macOS 不再构建、不再发布**（2026-10-20 起）：本项目只保留 Linux 与 Windows
+# 两个平台。早于该日期的 Release 上仍有 macOS 的 .dmg 历史资产，它们不会被删除，
+# 但新版本不再产出。
+#
+# Windows 不发裸二进制：它的产品形态是桌面端应用，二进制只在 windows runner 上
+# 编出来作为桌面端的 sidecar 使用，不挂到 Release。Windows 的 .msi 也不打——
+# 只留一个双击即装的 setup.exe，安装入口只有一个。
 #
 # 镜像推送到 GHCR（ghcr.io/<owner>/<repo>），配置了 Docker Hub 变量时再镜像一份过去。
 #
@@ -102,8 +104,8 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- 二进制
-  # 五个平台都要编：Linux 的两份是发布资产，macOS / Windows 的三份是桌面端 sidecar
-  # 的来源（见下面的 desktop job），编完只留在 workflow artifact 里，不上 Release。
+  # 三个平台都要编：Linux 的两份是发布资产，Windows 那份是桌面端 sidecar 的来源
+  # （见下面的 desktop job），编完只留在 workflow artifact 里，不上 Release。
   binaries:
     name: ${{ matrix.name }}
     needs: [web, verify]
@@ -118,14 +120,6 @@ jobs:
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - name: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          # macOS 的 x86_64 直接从 arm64 runner 上交叉编译（SDK 本身是三架构的），
-          # 比钉死某个即将退役的 Intel runner 标签稳。
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -174,12 +168,13 @@ jobs:
 
   # ---------------------------------------------------------------- 桌面端
   # Tauri v2 外壳：sidecar 用的 akhub 二进制直接复用 binaries job 的发行工件
-  # （macOS 的 .tar.gz / Windows 的裸 exe），不在这里重编译一遍——这样「桌面端里
-  # 跑的 akhub」与用户手工下载的那个一定是同一份产物。
+  # （Windows 的裸 exe），不在这里重编译一遍——这样「桌面端里跑的 akhub」与用户
+  # 手工下载的那个一定是同一份产物。
   #
-  # 不签名（仓库没有 Apple Developer ID / Windows 代码签名证书）：macOS 首次打开
-  # 需要右键「打开」或 xattr 放行，Windows 需要过 SmartScreen 的「仍要运行」。
-  # 具体步骤写在 desktop/README.md。
+  # 只构建 Windows：macOS 从 2026-10-20 起不再产出。
+  #
+  # 不签名（仓库没有 Windows 代码签名证书）：首次运行需要过 SmartScreen 的
+  # 「仍要运行」。具体步骤写在 desktop/README.md。
   desktop:
     name: desktop-${{ matrix.name }}
     needs: [binaries]
@@ -188,16 +183,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            binary-asset: akhub-macos-aarch64
-            bundles: app,dmg
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            binary-asset: akhub-macos-x86_64
-            bundles: app,dmg
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -237,13 +222,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p sidecar-raw
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            src="$(ls sidecar-dist/*.exe | head -n1)"
-          else
-            tar -xzf "$(ls sidecar-dist/*.tar.gz | head -n1)" -C sidecar-raw --strip-components=1
-            src="sidecar-raw/akhub"
-          fi
+          src="$(ls sidecar-dist/*.exe | head -n1)"
           echo "sidecar 来源：$src"
           ./desktop/prepare-sidecar.sh "${{ matrix.target }}" "$src"
           ls -l desktop/binaries
@@ -255,8 +234,7 @@ jobs:
         run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       # 产物统一改名成 akhub-desktop-<tag>-<platform>.<ext>：用户从 Release 页面
-      # 一眼就能看出是哪个平台、什么版本。macOS 的 arm64 用 arm64 而不是目标三元组
-      # 里的 aarch64：这是给下载者看的名字，跟构建目标名无关。
+      # 一眼就能看出是哪个平台、什么版本。
       - name: 归集产物
         shell: bash
         run: |
@@ -268,17 +246,7 @@ jobs:
           # 万一将来布局变了，退回到不带三元组的那层，避免整条发版卡在一个路径上。
           if [[ ! -d "$BUNDLE" ]]; then BUNDLE="desktop/target/release/bundle"; fi
           mkdir -p dist-desktop
-          case "${{ matrix.target }}" in
-            *windows*)
-              cp "$BUNDLE"/nsis/*-setup.exe "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}-setup.exe"
-              ;;
-            aarch64-apple-darwin)
-              cp "$BUNDLE"/dmg/*.dmg "dist-desktop/akhub-desktop-$TAG-macos-arm64.dmg"
-              ;;
-            *)
-              cp "$BUNDLE"/dmg/*.dmg "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}.dmg"
-              ;;
-          esac
+          cp "$BUNDLE"/nsis/*-setup.exe "dist-desktop/akhub-desktop-$TAG-${{ matrix.name }}-setup.exe"
           ls -l dist-desktop
 
       - uses: actions/upload-artifact@v4
@@ -304,8 +272,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # 只对真正要发布的那几个文件算：下载下来的中间产物（macOS / Windows 的裸
-      # 二进制）不挂 Release，也就不该出现在校验和里。
+      # 只对真正要发布的那几个文件算：下载下来的中间产物（Windows 的裸二进制）
+      # 不挂 Release，也就不该出现在校验和里。
       - name: 生成校验和
         run: |
           set -euo pipefail
@@ -315,8 +283,6 @@ jobs:
           targets=(
             ./akhub-v*-linux-x86_64.tar.gz
             ./akhub-v*-linux-aarch64.tar.gz
-            ./akhub-desktop-*-macos-arm64.dmg
-            ./akhub-desktop-*-macos-x86_64.dmg
             ./akhub-desktop-*-windows-x86_64-setup.exe
           )
           shopt -u nullglob
@@ -381,8 +347,6 @@ jobs:
           files: |
             dist/akhub-v*-linux-x86_64.tar.gz
             dist/akhub-v*-linux-aarch64.tar.gz
-            dist/akhub-desktop-*-macos-arm64.dmg
-            dist/akhub-desktop-*-macos-x86_64.dmg
             dist/akhub-desktop-*-windows-x86_64-setup.exe
             dist/checksums.txt
   # ---------------------------------------------------------------- 容器镜像

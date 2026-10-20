@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/release.sh                     # 全量：校验 + 全部平台 + 校验和
 #   ./scripts/release.sh --skip-tests        # 跳过 cargo test（仍然跑 fmt/clippy）
-#   ./scripts/release.sh --only linux-aarch64,macos-aarch64
+#   ./scripts/release.sh --only linux-aarch64
 #   ./scripts/release.sh --no-checksums
 #
 # 交叉编译依赖：
@@ -41,11 +41,10 @@ done
 # 平台名 → 目标三元组。顺序就是报告顺序，也是 --only 的取值来源。
 # 平台名必须与 .github/workflows/release.yml 的 matrix.name 完全一致：
 # 安装脚本按这个名字拼资产文件名。
+# 只保留 Linux 与 Windows：macOS 从 2026-10-20 起不再构建（见 docs/BUILD.md §1）。
 PLATFORMS=(
     "linux-x86_64:x86_64-unknown-linux-gnu"
     "linux-aarch64:aarch64-unknown-linux-gnu"
-        "macos-aarch64:aarch64-apple-darwin"
-    "macos-x86_64:x86_64-apple-darwin"
     "windows-x86_64:x86_64-pc-windows-gnu"
 )
 
@@ -90,9 +89,8 @@ for entry in "${PLATFORMS[@]}"; do
 
     echo "  - $platform ($target)"
     # 逐个目标检查工具链：缺哪个就跳过哪个，而不是炸掉整轮发版。
-    # rustup 的 target 是必需的——即使是 macOS 上从 arm64 交叉编译 x86_64，
-    # 也需要 rustup target add x86_64-apple-darwin；Apple SDK 多架构只解决
-    # 链接器与系统库那一半，标准库那一半仍然来自 rustup。
+    # rustup 的 target 是必需的：交叉编译时链接器与系统库由 zig/sysroot 提供，
+    # 标准库那一半仍然来自 rustup target add。
     if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
         echo "    缺少目标 $target（rustup target add $target），跳过"
         SKIPPED+=("$platform")
@@ -140,6 +138,7 @@ if [[ "$CHECKSUMS" == true ]]; then
             exit 0
         fi
         # macOS 自带 shasum，Linux 用 sha256sum。两者输出格式一致。
+        # （本脚本现在只发 Linux/Windows，但本机可能就是 macOS，保留这条分支。）
         if have sha256sum; then
             sha256sum "${targets[@]}" > checksums.txt
         elif have shasum; then
@@ -165,7 +164,7 @@ cat <<EOF
       1. 确认 Cargo.toml 的版本是 $VERSION，tag 必须打 v$VERSION
          （release.yml 里有一道校验，对不上直接失败）
       2. git tag v$VERSION && git push origin v$VERSION
-         CI 会自动构建 5 个平台并推送多架构镜像到 ghcr.io/hsmirage/akhub（镜像路径全小写）
+         CI 会自动构建 Linux/Windows 产物并推送多架构镜像到 ghcr.io/hsmirage/akhub（镜像路径全小写）
       3. 本地产物要手工上传时：
          gh release create v$VERSION dist/*.tar.gz dist/*.zip dist/checksums.txt
 

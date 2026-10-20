@@ -151,7 +151,7 @@ docker exec akhub /usr/local/bin/akhub --healthcheck        # 手动跑一次
 
 ---
 
-## 2. 一键安装脚本（Linux / macOS）
+## 2. 一键安装脚本（Linux）
 
 ### 2.1 Linux
 
@@ -187,64 +187,21 @@ sh install.sh --version v1.1.17 --service
 停发——两条 libc 线让自更新要在两个资产之间挑，而它们装出来的其实是两个不同的二进制。
 `--libc` 参数保留下来只是不让旧脚本直接报错。
 
-### 2.2 macOS
+### 2.2 macOS（已停止支持）
 
-**macOS 从 v1.1.17 起只发桌面应用**：到
-[Releases](https://github.com/HsMirage/Akhub/releases/latest) 下载
-`akhub-desktop-<tag>-macos-arm64.dmg`（Apple Silicon）或
-`akhub-desktop-<tag>-macos-x86_64.dmg`（Intel），双击安装；数据目录在
-`~/Library/Application Support/com.hsmirage.akhub/data`。
+**本项目自 2026-10-20 起只保留 Linux 与 Windows，不再构建也不再发布 macOS 版本**：
+连续集成里删掉了两个 macOS runner，Release 上不会再出现新的 `.dmg`。
+早于该日期的 Release 仍保留 macOS 历史资产（v1.1.17–v1.1.33），可以继续下载，
+但不再更新，也不再修 macOS 专属问题。
 
-想在 macOS 上跑命令行版（例如挂 launchd 当服务），从源码构建：
+`install.sh` 在 Darwin 上会直接以退出码 2 结束并说明原因。确实需要在 macOS 上跑：
 
 ```bash
+# 从源码构建（需要 Rust 工具链；完整构建别放在开发机上跑，见根 README「开发」）
 cargo build --release   # 产物在 target/release/akhub
 ```
 
-`install.sh` 只服务 Linux。想装 v1.1.16 及更早的 macOS 资产仍然可以
-（`--version v1.1.16`），新版本它会直接告诉你去下桌面端。
-
-直接跑（前台）：
-
-```bash
-AKHUB_DATA_DIR="$HOME/Library/Application Support/Akhub" akhub
-```
-
-后台常驻推荐用 launchd，写一个 plist：
-
-```bash
-cat > ~/Library/LaunchAgents/com.hsmirage.akhub.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.hsmirage.akhub</string>
-  <key>ProgramArguments</key>
-  <array><string>/usr/local/bin/akhub</string></array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>AKHUB_DATA_DIR</key><string>/Users/you/Library/Application Support/Akhub</string>
-    <!-- 默认所有网卡；只给本机用时改成 127.0.0.1:8080 -->
-    <key>AKHUB_LISTEN</key><string>0.0.0.0:8080</string>
-    <key>RUST_LOG</key><string>akhub=info,warn</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/akhub.log</string>
-  <key>StandardErrorPath</key><string>/tmp/akhub.err</string>
-  <!-- 与 §25.3 的 180 秒宽限期对齐；退出超时太短会掐断在途流式请求。 -->
-  <key>ExitTimeOut</key><integer>200</integer>
-</dict>
-</plist>
-PLIST
-
-launchctl load ~/Library/LaunchAgents/com.hsmirage.akhub.plist
-launchctl list | grep akhub
-```
-
-> Gatekeeper 提示"无法验证开发者"时，二进制没有签名。可以右键 →「打开」，
-> 或 `xattr -d com.apple.quarantine /usr/local/bin/akhub`。
+---
 
 ### 2.3 Windows
 
@@ -554,7 +511,7 @@ HTTPS 部署下没转发 `X-Forwarded-Proto`，会话 Cookie 的 `Secure` 判定
 
 | 文件 | 用途 |
 |---|---|
-| `install.sh` / `install.ps1` | 一键安装升级（Linux/macOS / Windows） |
+| `install.sh` / `install.ps1` | 一键安装升级（Linux / Windows） |
 | `docker-compose.yml` / `Dockerfile` | 容器部署 |
 | `deploy/akhub.service` | systemd 单元 |
 | `deploy/docker-entrypoint.sh` | 容器入口，处理数据目录属主后降权 |
@@ -563,4 +520,4 @@ HTTPS 部署下没转发 `X-Forwarded-Proto`，会话 Cookie 的 `Secure` 判定
 | `scripts/release.sh` | 本地发版：多平台交叉编译 + 打包 + 校验和 |
 | `scripts/package.sh` | 打包单个平台（CI 与本地共用） |
 | `scripts/docker-build.sh` | 本地多架构镜像构建 |
-| `.github/workflows/release.yml` | CI 发版：5 个平台 + 多架构镜像 |
+| `.github/workflows/release.yml` | CI 发版：Linux×2 + Windows + 多架构镜像 |
