@@ -45,18 +45,10 @@ jobs:
       - name: 全量测试
         run: cargo test --all --no-fail-fast
 
-      # 平台上限：只发 Linux 与 Windows。macOS 于 2026-10-20 停掉（见 docs/BUILD.md），
-      # 这里留一道机械门禁，免得以后有人顺手把 darwin 目标加回来。
-      - name: 不引入 macOS 目标
-        run: |
-          set -euo pipefail
-          # 只查"会产出苹果二进制"的三处：发版流水线、本地发版脚本、安装脚本。
-          # 文档里提到"macOS 已停止支持"是正常的，所以不扫 *.md。
-          if grep -rn -- '-apple-darwin\|macos-latest\|macos-' \
-               .github/workflows/release.yml scripts/release.sh install.sh; then
-            echo "::error::检测到 macOS 构建目标；本项目只支持 Linux 与 Windows（docs/BUILD.md）"
-            exit 1
-          fi
+      # 平台上限：只发 Linux 与 Windows（macOS 于 2026-10-20 停掉，见 docs/BUILD.md）。
+      # 实现只在 scripts/check-platforms.sh 里，release.yml 也调用同一份。
+      - name: 平台上限
+        run: ./scripts/check-platforms.sh
 
       # 发布脚本是运维唯一直接执行的东西，语法错误必须在这里拦下，
       # 而不是等用户在服务器上敲下去才发现。

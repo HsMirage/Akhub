@@ -58,9 +58,14 @@ jobs:
             exit 1
           fi
 
+      # 平台上限：只发 Linux 与 Windows。ci.yml 里有同一道门禁，但 tag 发版
+      # 不会经过 ci.yml，所以这里必须再卡一次——否则一条 darwin 目标就能悄悄
+      # 混进公开发版。实现只在 scripts/check-platforms.sh 里。
+      - name: 平台上限
+        run: ./scripts/check-platforms.sh
+
       # 桌面端是独立 crate（desktop/），版本号手写在它自己的 Cargo.toml 里：
-      # 一旦掉队，安装包版本与 .app 的 CFBundleShortVersionString 就会和服务端
-      # 对不上。这里提前卡住，别等用户装完才发现。
+      # 一旦掉队，安装包版本就会和服务端对不上。这里提前卡住，别等用户装完才发现。
       - name: desktop 版本必须与根 crate 一致
         run: |
           set -euo pipefail

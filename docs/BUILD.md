@@ -22,6 +22,12 @@
 不要再往这个仓库里加 macOS 目标：不补 runner、不补 `aarch64-apple-darwin` /
 `x86_64-apple-darwin` 的构建步骤、也不修 macOS 专属问题。
 
+这条上限有机械门禁：[scripts/check-platforms.sh](../scripts/check-platforms.sh)。
+`ci.yml` 与 `release.yml` 都调用它（tag 发版不经过 `ci.yml`，所以两边都得卡）。
+它扫的是真正会产出苹果产物的三处——`release.yml`、`scripts/release.sh`、`install.sh`；
+文档里写"macOS 已停止支持"不算违规，所以不扫 `*.md`。
+往这三处里加回 `macos-latest` 或 `*-apple-darwin`，CI 会直接失败。
+
 ---
 
 ## 2. 不要在本机（这台 Mac）上编译
@@ -61,7 +67,7 @@ Ubuntu runner 上完成，不占本机资源：
 
 | job | 内容 |
 |---|---|
-| `check` | 前端构建 → `cargo fmt --check` → `cargo clippy --all-targets -D warnings` → `cargo test --all` → 发布脚本语法检查 |
+| `check` | 前端构建 → `cargo fmt --check` → `cargo clippy --all-targets -D warnings` → `cargo test --all` → 平台上限门禁 → 发布脚本语法检查 |
 | `docker` | 真实构建运行镜像，在空数据目录上首次启动、真实 HTTP 调用、校验非 root 运行 |
 
 所以日常流程是：**改代码 → push → 看 CI**。CI 绿了就等于"能编译、测试通过、格式没问题"，
