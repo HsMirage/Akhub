@@ -2873,7 +2873,8 @@ pub struct AttemptRecord {
     pub endpoint: Option<String>,
     pub started_at: i64,
     pub duration_ms: i64,
-    /// `ok` / `failed` / `missing_endpoint` / `opaque_rejection` / `effort_exhausted`。
+    /// `ok` / `failed` / `missing_endpoint` / `opaque_rejection` /
+    /// `content_filtered` / `effort_exhausted` / `effort_retry`。
     pub outcome: String,
     pub error_code: Option<String>,
     /// 这一次尝试真正从上游拿到的状态码；网关自己判定的失败是 `None`。

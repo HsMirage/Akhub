@@ -125,6 +125,7 @@ function attemptOutcomeTone(
       return "danger";
     // 上游拒了但责任不在请求上：这不是"网关失败"，用 warn 区分（§13.7）。
     case "opaque_rejection":
+    case "content_filtered":
     case "effort_exhausted":
     case "effort_retry":
       return "warn";

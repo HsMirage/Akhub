@@ -405,7 +405,7 @@ export interface AttemptRecord {
   endpoint: string | null;
   started_at: number;
   duration_ms: number;
-  /** ok / failed / missing_endpoint / opaque_rejection / effort_exhausted / effort_retry。 */
+  /** ok / failed / missing_endpoint / opaque_rejection / content_filtered / effort_exhausted / effort_retry。 */
   outcome: string;
   error_code: string | null;
   /** 这一次尝试真正从上游拿到的状态码；网关自己判定的失败是 null（§6.6）。 */

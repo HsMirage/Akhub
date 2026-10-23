@@ -177,6 +177,14 @@ pub enum ErrorCode {
     ResponseStateExpired,
     RateLimited,
     UpstreamProtocolError,
+    /// 中转站的内容审核拒绝了这份输入（§13.3）。
+    ///
+    /// 现场（2026-10-23）：`Request was blocked by upstream content filtering`。
+    /// 这句话没说是哪个参数不对，也不是客户端能把请求改对的错误——它是**这个
+    /// 账号自己的**审核策略，同一份请求在别的账号上是能过的。所以它与
+    /// `unsupported_parameter` 必须分开：前者要换渠道、且要让用户知道被拦在哪，
+    /// 后者换到哪都是同一个结果。
+    ContentFiltered,
     InternalError,
 }
 
@@ -198,6 +206,9 @@ impl ErrorCode {
             Self::QueueFull => "请求队列已满，请稍后重试",
             Self::QueueTimeout => "请求排队超时，请稍后重试",
             Self::MultiplierUnknown | Self::MultiplierExceeded => "当前模型暂不可用，请联系管理员",
+            // 内容审核是唯一一种"换个账号可能就过"的拒绝：如实说，别让客户端
+            // 以为自己的参数写错了（§13.3）。
+            Self::ContentFiltered => "请求内容被上游内容审核拒绝，换用其它渠道或调整输入后重试",
             _ => detail,
         }
     }
@@ -221,6 +232,7 @@ impl ErrorCode {
         Self::ResponseStateExpired,
         Self::RateLimited,
         Self::UpstreamProtocolError,
+        Self::ContentFiltered,
         Self::InternalError,
     ];
 
@@ -259,6 +271,7 @@ impl ErrorCode {
             Self::ResponseStateExpired => "response_state_expired",
             Self::RateLimited => "rate_limited",
             Self::UpstreamProtocolError => "upstream_protocol_error",
+            Self::ContentFiltered => "content_filtered",
             Self::InternalError => "internal_error",
         }
     }
@@ -279,6 +292,7 @@ impl ErrorCode {
                 StatusCode::NOT_FOUND
             }
             Self::UnsupportedParameter => StatusCode::BAD_REQUEST,
+            Self::ContentFiltered => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
@@ -304,7 +318,9 @@ impl ErrorCode {
             StatusCode::UNAUTHORIZED => "authentication_error",
             StatusCode::NOT_FOUND => "invalid_request_error",
             StatusCode::BAD_REQUEST => "invalid_request_error",
-            StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY => {
+                "invalid_request_error"
+            }
             StatusCode::FORBIDDEN => "permission_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             _ => "api_error",
@@ -328,6 +344,7 @@ impl ErrorCode {
             StatusCode::FORBIDDEN => "permission_error",
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::BAD_REQUEST => "invalid_request_error",
+            StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
             StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             StatusCode::GATEWAY_TIMEOUT | StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
@@ -577,6 +594,7 @@ mod tests {
                 | ErrorCode::ResponseStateExpired
                 | ErrorCode::RateLimited
                 | ErrorCode::UpstreamProtocolError
+                | ErrorCode::ContentFiltered
                 | ErrorCode::InternalError => ErrorCode::ALL,
             };
             assert!(registered.contains(code), "{code:?} 未登记进 ALL");
@@ -638,6 +656,16 @@ mod tests {
         assert_eq!(
             ErrorCode::UnsupportedParameter.status(),
             StatusCode::BAD_REQUEST
+        );
+        // 内容审核不是"参数写错了"：用 422 把它与 400 分开，客户端据此可以判断
+        // "换个渠道/换个说法还有救"而不是去改参数（§18.3、§13.3）。
+        assert_eq!(
+            ErrorCode::ContentFiltered.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(
+            !ErrorCode::ContentFiltered.is_retryable(),
+            "同一份输入重试还是被拦，重试标记交给客户端按提示决定"
         );
         assert_eq!(
             ErrorCode::RequestTooLarge.status(),

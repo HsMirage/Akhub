@@ -1329,13 +1329,9 @@ fn release_platforms_agree_across_workflow_script_and_installers() {
     let install_sh = std::fs::read_to_string("install.sh").expect("install.sh");
     let install_ps1 = std::fs::read_to_string("install.ps1").expect("install.ps1");
 
-    for platform in [
-        "linux-x86_64",
-        "linux-aarch64",
-        "macos-aarch64",
-        "macos-x86_64",
-        "windows-x86_64",
-    ] {
+    // 只列真正发版的平台：macOS 自 2026-10-20 起不再构建（docs/BUILD.md §1），
+    // 留在这里只会让这条用例一直红着，反而掩盖真正的漂移。
+    for platform in ["linux-x86_64", "linux-aarch64", "windows-x86_64"] {
         assert!(
             workflow.contains(&format!("name: {platform}")),
             "release.yml 的 matrix 缺少平台 {platform}"
@@ -1348,12 +1344,10 @@ fn release_platforms_agree_across_workflow_script_and_installers() {
 
     // 安装脚本要能按本机架构拼出资产名。这里不查具体三元组，只确认那段
     // 拼装逻辑还在——它一旦被改成硬编码，多架构就废了。
-    for needle in ["linux-${arch}", "macos-${arch}"] {
-        assert!(
-            install_sh.contains(needle),
-            "install.sh 里找不到平台拼装片段 {needle}"
-        );
-    }
+    assert!(
+        install_sh.contains("linux-${arch}"),
+        "install.sh 里找不到平台拼装片段 linux-${{arch}}"
+    );
     assert!(
         install_ps1.contains("windows-x86_64"),
         "install.ps1 必须指定 windows-x86_64 资产"
@@ -1385,8 +1379,8 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
         .map(|name| name.trim().to_string())
         .collect();
     assert!(
-        declared.len() >= 5,
-        "release.yml 里应当解析出至少 5 个平台名，实际 {declared:?}"
+        declared.len() >= 3,
+        "release.yml 里应当解析出至少 3 个平台名（Linux x86_64/aarch64 + Windows），实际 {declared:?}"
     );
 
     // 伪造的 uname：只回答 -s 与 -m，值取自环境变量。
@@ -1406,11 +1400,10 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
     );
 
     // 覆盖安装脚本里每一个平台分支。
+    // macOS 分支已从 install.sh 删掉（现在会明确报错退出），只覆盖 Linux 两种架构。
     let cases = [
         ("Linux", "x86_64", "linux-x86_64"),
         ("Linux", "aarch64", "linux-aarch64"),
-        ("Darwin", "arm64", "macos-aarch64"),
-        ("Darwin", "x86_64", "macos-x86_64"),
     ];
 
     // 用 Cargo.toml 的版本构造 tag，避免测试里钉死一个会过期的版本号。
@@ -1503,11 +1496,10 @@ fn the_release_publishes_exactly_the_five_assets() {
         .next()
         .expect("发布 job 之后应有容器镜像 job");
 
+    // 2026-10-20 起只发这四个：两个 Linux 服务端 + 一个 Windows 桌面安装器 + 校验和。
     for pattern in [
         "dist/akhub-v*-linux-x86_64.tar.gz",
         "dist/akhub-v*-linux-aarch64.tar.gz",
-        "dist/akhub-desktop-*-macos-arm64.dmg",
-        "dist/akhub-desktop-*-macos-x86_64.dmg",
         "dist/akhub-desktop-*-windows-x86_64-setup.exe",
         "dist/checksums.txt",
     ] {
@@ -1520,23 +1512,13 @@ fn the_release_publishes_exactly_the_five_assets() {
         );
     }
 
-    // 三个桌面安装包必须进校验和，否则用户没法校验直接下载的安装器。
-    for installer in [
-        "macos-arm64.dmg",
-        "macos-x86_64.dmg",
-        "windows-x86_64-setup.exe",
-    ] {
-        assert!(
-            release_job.contains(installer),
-            "校验和必须覆盖 {installer}"
-        );
-    }
-
-    // arm64 是给下载者看的名字；Windows 只打 NSIS，安装入口留一个。
+    // 桌面安装器必须进校验和，否则用户没法校验直接下载的安装器。
     assert!(
-        workflow.contains("akhub-desktop-$TAG-macos-arm64.dmg"),
-        "归集产物时要把 macOS arm64 的 dmg 命名成 macos-arm64"
+        release_job.contains("windows-x86_64-setup.exe"),
+        "校验和必须覆盖 Windows 桌面安装器"
     );
+
+    // Windows 只打 NSIS，安装入口留一个。
     assert!(
         workflow.contains("bundles: nsis") && !workflow.contains("bundles: msi,nsis"),
         "Windows 桌面端只应打 NSIS 安装器"

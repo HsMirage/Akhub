@@ -1403,6 +1403,128 @@ async fn an_unattributable_400_moves_to_another_channel_instead_of_failing_the_c
 }
 
 #[tokio::test]
+async fn upstream_content_moderation_fails_over_to_another_channel() {
+    // 现场（2026-10-23，AwsClaude/ccmax）：上游中转站自己的内容审核拒了这份输入。
+    // 同一份请求在别的账号上能过，所以必须换渠道；换渠道前还要清粘性——不清的话
+    // 下一次请求又被粘回那个账号，同一段会话会被反复拒（§13.3）。
+    let refusing = FakeUpstream::spawn().await;
+    refusing.fallback(Behavior::Json(
+        400,
+        json!({"error": {
+            "message": "Request was blocked by upstream content filtering (request id: 20261023064057)",
+            "type": "invalid_request_error"
+        }}),
+    ));
+    let accepting = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    // 拒绝的那台优先级更高：同优先级是加权抽签，撞不一定先撞到它。
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "会拦内容的",
+            &refusing.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            60,
+        ),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "放行的",
+            &accepting.base_url,
+            Protocol::AnthropicMessages,
+            MODEL,
+            "claude-opus-5-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "内容审核拒绝要换渠道，而不是把 400 透给客户端"
+    );
+    assert!(
+        !response.headers().contains_key("x-akhub-degraded"),
+        "换渠道不是降级：不该带降级头"
+    );
+    assert_eq!(
+        refusing.requests(),
+        1,
+        "高优先级那台必须先被撞到（然后才有换渠道这回事）"
+    );
+    assert_eq!(accepting.requests(), 1, "换渠道：第二台真的接过这次请求");
+}
+
+#[tokio::test]
+async fn content_moderation_is_reported_as_such_when_every_channel_refuses() {
+    // 全都拦：换一次渠道之后收手，错误码必须是 content_filtered（422）而不是
+    // unsupported_parameter（400）——客户端据此知道"不是我的参数写错了"。
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::Json(
+        400,
+        json!({"error": {
+            "message": "Request was blocked by upstream content filtering",
+            "type": "invalid_request_error"
+        }}),
+    ));
+    let akhub = spawn_akhub().await;
+    for name in ["A", "B", "C"] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                50,
+            ),
+        )
+        .await;
+    }
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        422,
+        "内容审核用 422，与参数错误的 400 分开"
+    );
+    let text = response.text().await.unwrap_or_default();
+    assert!(
+        text.contains("content_filtered"),
+        "要带上稳定的网关错误码：{text}"
+    );
+    assert_eq!(
+        upstream.requests(),
+        2,
+        "只换一次渠道：审核策略是确定的，多试只是白传请求体"
+    );
+}
+#[tokio::test]
 async fn an_attributable_400_is_reported_immediately_without_retrying() {
     // "prompt is too long" 明确归因到请求本身：换哪个目标都是同一个结果，
     // 重试只会白传一遍请求体。必须立刻如实返回（§13.7）。

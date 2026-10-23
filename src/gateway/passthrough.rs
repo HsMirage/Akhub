@@ -263,6 +263,21 @@ enum AttemptFailure {
         message: String,
         public: Option<crate::security::redact::PublicMessage>,
     },
+    /// 上游的内容审核拒绝了这份输入（§13.3）。
+    ///
+    /// 现场形态（2026-10-23）：`Request was blocked by upstream content filtering`。
+    /// 它与 `OpaqueRejection` 一样是"上游没开始生成就拒了"，但性质完全不同：
+    /// 同一份请求在别的账号上**能过**（现场 8858B 的请求体在华强北kiro 被拦、
+    /// 3 秒后在 supeai.cc-awsclaude 上 200）。
+    ///
+    /// 处置与其他可切换失败一致，只是**不计入目标故障**：账号没有被证明有问题，
+    /// 只是它不肯处理这份输入，罚分会把一个好好的账号冷却掉。
+    /// 另外要显式清掉粘性绑定——不换渠道的话下一跳还是它，同一段会话会被反复拒。
+    ContentFiltered {
+        status: StatusCode,
+        message: String,
+        public: Option<crate::security::redact::PublicMessage>,
+    },
     /// 思考档位阶梯在本目标上走完仍被上游拒绝（§14.6）。
     ///
     /// 现场形态（2026-10-15）：同一个中转站在 `claude-opus-5-5` 这个模型名下接了
@@ -387,11 +402,27 @@ struct Walk<'a> {
     last_retry_after: Option<Duration>,
     /// 已经为"不归因的 400"换过几个目标（§13.7）。
     opaque_rejection_retries: u8,
+    /// 内容审核拒绝过之后，是否已经换过渠道。
+    ///
+    /// 与 `opaque_rejection_retries` 分开计：两者的上游代价一样（都没开始生成），
+    /// 但审核拒绝是**确定会复现**的（同一份输入、同一套策略），所以只换一次渠道
+    /// 探一下别的账号，不在这条路上多花请求体；合成一个预算则会让它挤掉
+    /// "无法归因的 400"的名额。
+    content_filtered: bool,
     /// 思考档位阶梯走完仍被拒后，已经换过几个目标（§14.6）。
     ///
     /// 与 `opaque_rejection_retries` 分开计：两者的上游代价一样（都没开始生成），
     /// 但合成一个预算会让"档位被拒"和"无法归因的 400"互相挤掉名额。
     effort_exhausted_retries: u8,
+    /// 最后一次内容审核拒绝的原料：(状态码, 上游原文, 已脱敏的公开说法)。
+    ///
+    /// 与 `last_opaque` 分开存：候选全部用尽时两句话要分别报出去，混在一起会
+    /// 把"内容被拦"说成"请求无法处理"，用户就不知道该改哪一边。
+    last_filtered: Option<(
+        StatusCode,
+        String,
+        Option<crate::security::redact::PublicMessage>,
+    )>,
     /// 最后一次"不归因的 400"的原料：(状态码, 上游原文, 已脱敏的公开说法)。
     ///
     /// 存原料而不是 `Response`：`Response` 的 body 不是 `Sync`，放进 `Walk`
@@ -559,8 +590,10 @@ async fn forward_inner<'a>(
         last_public: None,
         last_retry_after: None,
         opaque_rejection_retries: 0,
+        content_filtered: false,
         effort_exhausted_retries: 0,
         last_opaque: None,
+        last_filtered: None,
         last_credential_outcome: None,
         usage_parts: (None, None),
         usage_detail: None,
@@ -807,6 +840,26 @@ async fn forward_inner<'a>(
         }
     }
 
+    // 候选全部用尽。最后一次失败是内容审核拒绝时按它报，别掉进下面那句泛化的
+    // "目标都失败了"：用户需要知道内容被拦了，而不是以为网关挂了（§13.3）。
+    // 记录里的 `upstream_status` 记上游真实给的那个（可能是 400，也可能是 403），
+    // 响应状态码则由 `content_filtered` 决定成 422。
+    if let Some((upstream, _, _)) = walk.last_filtered.clone()
+        && walk
+            .last
+            .as_ref()
+            .is_some_and(|(code, _)| *code == ErrorCode::ContentFiltered)
+    {
+        let response = walk.filtered_response();
+        let status = response.status();
+        return walk.finish(
+            None,
+            status,
+            Some(ErrorCode::ContentFiltered),
+            Some(upstream),
+            response,
+        );
+    }
     // 候选全部用尽。换过渠道仍是"无法归因的 400"时，把上游那句原样交回——
     // 它才是真实原因，比网关拼一句"目标都失败了"有用（§13.7）。
     if walk.last_opaque.is_some() {
@@ -1501,6 +1554,61 @@ impl Walk<'_> {
                     upstream_status,
                     *response,
                 )))
+            }
+            // 内容审核拒绝（§13.3）：上游没开始生成、一个 token 都没消耗，而
+            // 同一份请求在别的账号上**能过**——现场 8858B 的请求体在华强北kiro
+            // 被拦，3 秒后在 supeai.cc-awsclaude 上 200（2026-10-23）。
+            //
+            // 所以处置与无法归因的 400 一致：换渠道。三点不同：
+            // 1. **不计目标故障**（`Neutral`）：账号没坏，只是不肯处理这份输入，
+            //    按 5xx 罚分会把一个健康账号冷却掉，而且冷却了也没用——它还是会拒。
+            // 2. **清掉粘性绑定**：现场 9/17 次命中粘在同一个账号上，那段会话每次
+            //    重发都被它拒。不清的话"换渠道"只对本次请求生效，下一跳又回去。
+            // 3. 只换一次渠道：审核策略是确定的，同一份输入在别的账号上要么过要么
+            //    不过，多试几个只是把这几十万字节的请求体再传几遍。
+            Err(AttemptFailure::ContentFiltered {
+                status,
+                message,
+                public,
+            }) => {
+                admission.settle(health::Outcome::Neutral, None);
+                self.telemetry.upstream_status = Some(status);
+                self.note_attempt(candidate, started, "content_filtered", None, false);
+                self.last = Some((
+                    ErrorCode::ContentFiltered,
+                    format!(
+                        "账号「{}」返回 {}：{}",
+                        candidate.target.account.name,
+                        status.as_u16(),
+                        message
+                    ),
+                ));
+                self.last_filtered = Some((status, message, public));
+                // 只换一次渠道：审核策略是**确定**的，同一份输入换个账号要么过
+                // 要么不过，多试几个只是把几十万字节的请求体再传几遍（§13.3）。
+                if self.content_filtered {
+                    tracing::warn!(
+                        request_id = self.forward.request_id,
+                        account = candidate.target.account.name,
+                        "换渠道后仍被内容审核拒绝，如实返回"
+                    );
+                    self.last_opaque = None;
+                    return Attempted::Done(Flow::Done(self.filtered_response()));
+                }
+                self.content_filtered = true;
+                if let Some((key, _)) = sticky_key {
+                    self.forward.state.runtime.sticky.clear(key);
+                }
+                tracing::warn!(
+                    request_id = self.forward.request_id,
+                    account = candidate.target.account.name,
+                    model = candidate.target.target.upstream_model,
+                    upstream_status = status.as_u16(),
+                    "上游内容审核拒绝，清掉粘性并换渠道重试"
+                );
+                // 后面又发生了别的失败：这次审核拒绝不再是本次请求的最终原因。
+                self.last_opaque = None;
+                Attempted::Done(Flow::Continue)
             }
             // 无法归因的 400：上游没开始生成、没消耗 token，换一个目标再试
             // （§13.7）。`attempted` 里已经记下这个目标，所以外层不会重复选它。
@@ -2268,6 +2376,28 @@ impl Walk<'_> {
         let mut response = error.into_response();
         *response.status_mut() = status;
         response
+    }
+
+    /// 把最后一次内容审核拒绝重建成响应（§13.3）。
+    ///
+    /// 错误码用 `content_filtered` 而不是 `unsupported_parameter`：客户端要能看出
+    /// "这不是我的参数写错了，是这份内容被那个账号的审核策略拦了"。
+    /// 状态码用网关自己那套 422，**不**沿用上游给的那个：中途换过渠道，把
+    /// 第一家的 400 原样发出去，客户端会以为这是改参数就能解决的错误。上游
+    /// 真实状态码照样进请求记录与尝试明细（`upstream_status`）。
+    fn filtered_response(&self) -> Response {
+        let (_, message, public) = self.last_filtered.clone().unwrap_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "上游内容审核拒绝了这份请求".into(),
+            None,
+        ));
+        let mut error = GatewayError::new(ErrorCode::ContentFiltered, &message)
+            .with_protocol(self.forward.endpoint.protocol())
+            .with_request_id(self.forward.request_id);
+        if let Some(public) = public {
+            error = error.with_public_message(public);
+        }
+        error.into_response()
     }
 
     fn fail(&self, code: ErrorCode, message: String) -> Response {
@@ -3443,6 +3573,31 @@ async fn classify_upstream_error(
                 tracing::warn!(%reason, "读取上游错误响应体失败，按空体处理");
                 axum::body::Bytes::new()
             });
+        // 403 也可能是内容审核（现场：`Request was blocked by upstream content
+        // filtering`）。它必须先于下面的凭据判定：按 403 处理会把一个**没有**坏
+        // 的账号判成 Key 失效/故障，冷却之后照样拒（§12.3、§13.3）。
+        let text = upstream_error_message(&body)
+            .unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
+        if is_content_filtered(status, &text) {
+            tracing::warn!(
+                request_id = forward.request_id,
+                account = target.account.name,
+                model = target.target.upstream_model,
+                upstream_status = status.as_u16(),
+                "上游内容审核拒绝，换渠道重试"
+            );
+            let public = crate::security::redact::ErrorRedactor::new(
+                &target.account.name,
+                &target.account.base_url,
+                api_key,
+            )
+            .payload(&serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null));
+            return Err(AttemptFailure::ContentFiltered {
+                status,
+                message: text,
+                public: Some(public),
+            });
+        }
         return Err(AttemptFailure::Switchable {
             code,
             message: format!(
@@ -3531,6 +3686,30 @@ async fn classify_upstream_error(
             public: Some(public),
         });
     }
+    // 内容审核拒绝（§13.3）：上游没开始生成、没消耗 token，而这份输入在别的
+    // 账号上可能过得了。必须先于 `is_opaque_rejection` 判断——那句英文里既有
+    // "blocked"（不在可归因清单里）也不在"泛泛的拒绝"清单里，落进下面任何一条
+    // 都会被当成"客户端参数错了"或"上游抽了"。
+    if is_content_filtered(status, &message) {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            "上游内容审核拒绝，换渠道重试"
+        );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        return Err(AttemptFailure::ContentFiltered {
+            status,
+            message,
+            public: Some(public),
+        });
+    }
     // 无法归因的 400：上游在开始生成之前就拒了，**没有消耗任何 token**。
     // 换一个渠道重试几乎免费，而直接透给客户端就把"上游此刻抽了"变成了用户可见
     // 的失败（§13.7）。归因得到请求本身的 400 不走这条路。
@@ -3602,6 +3781,50 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
 /// 反过来，只要能归因到请求本身，就绝不重试：`prompt is too long`、
 /// `field ReasoningEffort invalid`、`max_tokens must be greater than` 这些
 /// 换到哪个目标都是同一个结果，重试只会白传一遍请求体。
+/// 上游这句 4xx 是不是**内容审核**拒绝了这份输入（§13.3）。
+///
+/// 判据取上游各自的原文，不看状态码：中转站有的回 400，有的回 422/403，还有的
+/// 回 200 然后在流里报错——状态码不构成判据，那句话才是。
+///
+/// 这句话的特征是"说得出是谁拦的、说不出改哪个字段"：命中 `CONTENT_FILTER` 里
+/// 任一句就是审核拒绝，同时要求它**不**指向具体参数，否则 `invalid content_type`
+/// 这类真·参数错误会被误判成审核。
+fn is_content_filtered(status: StatusCode, message: &str) -> bool {
+    if status.is_server_error() {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    const CONTENT_FILTER: &[&str] = &[
+        "content filtering",
+        "content filter",
+        "content_filter",
+        "content_policy",
+        "content policy",
+        "moderation",
+        "safety system",
+        "blocked by upstream",
+        "responsible ai",
+        // 国内中转站大多直接用中文回这句：同一个判据。
+        "内容审核",
+        "敏感词",
+        "内容安全",
+        "违规内容",
+    ];
+    if !CONTENT_FILTER.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    const ATTRIBUTABLE: &[&str] = &[
+        "content_type",
+        "invalid",
+        "must be",
+        "required",
+        "missing",
+        "unsupported",
+        "not supported",
+        "parameter",
+    ];
+    !ATTRIBUTABLE.iter().any(|needle| lower.contains(needle))
+}
 fn is_opaque_rejection(status: StatusCode, message: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
@@ -4327,6 +4550,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn upstream_content_moderation_is_recognised_as_such() {
+        // 现场那句（2026-10-23，AwsClaude/ccmax）：它既不是"参数写错了"，也不是
+        // "上游抽了"，而是这个账号自己的审核策略——必须与那两类分开处置（§13.3）。
+        for message in [
+            "Request was blocked by upstream content filtering (request id: 202610…)",
+            "Request was blocked by upstream content filtering",
+            "This request was rejected by our content policy.",
+            "Blocked by moderation",
+            "Your request was flagged by our safety system",
+            // 国内中转站常用中文回同一件事。
+            "请求内容未通过内容审核",
+            "输入包含敏感词",
+        ] {
+            assert!(
+                is_content_filtered(StatusCode::BAD_REQUEST, message),
+                "应当判为内容审核：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_rejection_is_never_mistaken_for_a_parameter_error() {
+        // 反过来也一样：指向具体参数的 4xx 不是审核拒绝，换渠道不会让它变好。
+        for message in [
+            "content_type is invalid",
+            "unsupported content_type: image/x-icon",
+            "max_tokens must be greater than 0",
+        ] {
+            assert!(
+                !is_content_filtered(StatusCode::BAD_REQUEST, message),
+                "不该判为内容审核：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_rejection_stays_out_of_the_opaque_bucket() {
+        // 两条路径的处置不同（一个清粘性、一个不清），判据重叠会让同一句 400 走错门。
+        let message = "Request was blocked by upstream content filtering";
+        assert!(!is_opaque_rejection(StatusCode::BAD_REQUEST, message));
+    }
     #[test]
     fn only_a_400_can_be_an_opaque_rejection() {
         // 别的状态码各有自己的处置：429 有 Retry-After，5xx 是可切换失败，

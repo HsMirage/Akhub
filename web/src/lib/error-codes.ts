@@ -68,6 +68,14 @@ const CODES: Record<string, ErrorCodeInfo> = {
     hint: "同一请求内所有候选目标都尝试失败。到「请求记录」展开本次尝试明细查看每个目标的原因。",
     retryable: true,
   },
+  content_filtered: {
+    label: "内容审核拒绝",
+    hint:
+      "上游中转站自己的内容审核拒了这份输入（不是参数写错，也不是 Akhub 的判断）。" +
+      "Akhub 会先换一个渠道重试一次；仍然被拒才会返回这个错误。" +
+      "换一种说法或减少被拦的内容后重试，或把该账号从分组里摘掉。",
+    retryable: false,
+  },
   upstream_protocol_error: {
     label: "上游协议错误",
     hint: "上游返回了无法解析为声明协议的响应。检查账号的首选协议与 Base URL 是否匹配。",

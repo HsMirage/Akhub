@@ -162,9 +162,10 @@ export function formatAttemptOutcome(outcome: string): string {
     ok: "成功",
     failed: "失败",
     missing_endpoint: "端点不存在",
-    // 换渠道重试的两种收手原因（§13.7）：都说明"这个目标拒绝了，但不是
-    // 请求本身的问题"，与网关自己判定的失败区分开。
+    // 换渠道重试后的三种收手原因（§13.3、§13.7）：都说明"这个目标拒绝了，
+    // 但不是请求本身的问题"，与网关自己判定的失败区分开。
     opaque_rejection: "无法归因的 400",
+    content_filtered: "内容审核拒绝",
     effort_exhausted: "思考档位被拒",
     // 同一目标内因为档位被拒而重发的那一跳：它没换来成功，也不该算失败，
     // 但用户必须看得出"这次请求打了几次上游"（§14.6）。

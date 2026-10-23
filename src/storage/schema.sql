@@ -320,7 +320,8 @@ CREATE TABLE IF NOT EXISTS request_attempts (
     endpoint    TEXT,
     started_at  INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
-    -- ok / failed / missing_endpoint / opaque_rejection / effort_exhausted；
+    -- ok / failed / missing_endpoint / opaque_rejection / content_filtered /
+    -- effort_exhausted / effort_retry；
     -- error_code 是网关错误码（失败时）。
     outcome     TEXT NOT NULL,
     error_code  TEXT,
