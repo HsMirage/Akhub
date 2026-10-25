@@ -906,3 +906,62 @@ async fn saving_uses_the_counterfactual_cheapest_target_not_the_observed_minimum
         "加权均倍率 1.0、最便宜 0.5 → 应当能省 50%，实际 {saving}"
     );
 }
+
+/// 备份恢复之后，内存里的实时汇总必须一起作废。
+///
+/// 它按 (分组, 模型, 账号) 归档，恢复之后这些键可能整个换了一批。不清的话
+/// 成本页还会按恢复前的账号显示当日用量与倍率样本——管理员看到的是
+/// 「恢复成功、数字对不上」。
+#[tokio::test]
+async fn restoring_a_backup_clears_the_in_memory_usage_summary() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "站点A",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "glm-4.6",
+            "glm-4.6",
+            50,
+        ),
+    )
+    .await;
+    // 往内存汇总里塞一条用量（保留期为 0 时成本页就靠它）。
+    let now = akhub::storage::now_unix();
+    akhub
+        .state
+        .runtime
+        .live
+        .record(&base_record(&akhub, &wired, "glm-4.6", "1.0", 100, 20));
+    assert!(
+        !akhub.state.runtime.live.usage(now).is_empty(),
+        "前置条件：内存汇总里应当有这一条"
+    );
+
+    // 导出一份只有当前配置的备份，再导回去：这会把账号与模型整体重建。
+    let backup = akhub::security::backup::export_backup(
+        &akhub.state.store,
+        &akhub.state.cipher,
+        "test-backup-password",
+    )
+    .await
+    .unwrap();
+    let response = client
+        .post(format!("{}/admin/api/backup/import", akhub.base_url))
+        .header("x-akhub-csrf", "1")
+        .json(&json!({
+            "password": "test-backup-password",
+            "content": String::from_utf8(backup).unwrap(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    assert!(
+        akhub.state.runtime.live.usage(now).is_empty(),
+        "备份恢复之后内存汇总必须清空，否则成本页会按恢复前的账号显示用量"
+    );
+}

@@ -4715,6 +4715,10 @@ pub async fn import_backup(
     // 动态状态整体作废：账号协议与模型可能都变了（§16.7）。
     state.runtime.evidence.clear();
     state.runtime.health.clear_all();
+    // 内存实时汇总同理：它按 (分组, 模型, 账号) 归档，恢复之后这些键可能整个换
+    // 了一批。不清的话成本页还会按恢复前的账号显示当日用量与倍率样本——管理员
+    // 看到的会是「恢复成功、数字对不上」。
+    state.runtime.live.clear();
     reload(&state).await?;
     // 设置是内存快照：只写库不刷新的话，运行中的进程会继续用旧设置，
     // 直到下一次重启——那正好是"看起来恢复成功、实际没生效"（§23.5）。
