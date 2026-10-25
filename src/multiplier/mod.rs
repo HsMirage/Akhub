@@ -292,12 +292,29 @@ impl Registry {
     }
 
     /// 覆盖单个账号的状态。刷新任务每探完一个账号就调用一次。
+    ///
+    /// 整表 clone-on-write：账号数量是几十的量级，5 分钟一次的复制可忽略，
+    /// 换来的是读侧完全无锁。
+    ///
+    /// **必须用比较交换**。`load_full → clone → insert → store` 是无锁读改写：
+    /// 定时轮（`app::tasks`）与后台「立即刷新」跑在不同的 tokio 任务上，两者同时
+    /// 探完各自的账号时，后 store 的那次会覆盖前一次——先写入的那个账号的新倍率
+    /// 与清掉的 `stale_since` 一起回退成旧值，宽限期重新计时，界面上冒出"倍率已
+    /// 过期"的误报，直到下一轮刷新（最长 5 分钟）才纠正。
     fn put(&self, account_id: &str, entry: Entry) {
-        // 整表 clone-on-write：账号数量是几十的量级，5 分钟一次的复制可忽略，
-        // 换来的是读侧完全无锁。
-        let mut next = (*self.current.load_full()).clone();
-        next.insert(account_id.to_string(), entry);
-        self.current.store(Arc::new(next));
+        let mut current = self.current.load_full();
+        loop {
+            let mut next = (*current).clone();
+            next.insert(account_id.to_string(), entry.clone());
+            match self.current.compare_and_swap(&current, Arc::new(next)) {
+                previous if Arc::ptr_eq(&previous, &current) => return,
+                // 别人先写了一步：拿它那份重来，只叠加自己这一个账号。
+                fresh => {
+                    let fresh: Arc<HashMap<String, Entry>> = Arc::clone(&fresh);
+                    current = fresh;
+                }
+            }
+        }
     }
 
     fn get(&self, account_id: &str) -> Option<Entry> {
@@ -370,6 +387,61 @@ mod tests {
             peak: None,
             group: None,
             group_source: None,
+        }
+    }
+
+    /// 两个刷新任务同时写不同账号时，谁都不能覆盖谁。
+    ///
+    /// `put` 以前是 `load_full → clone → insert → store`，无锁读改写：定时轮与
+    /// 后台「立即刷新」跑在不同 tokio 任务上，后 store 的那次会把前一次写的账号
+    /// 一起丢掉——那个账号的新倍率与清掉的 `stale_since` 回退成旧值，宽限期
+    /// 重新计时，界面上冒出“倍率已过期”的误报。
+    #[test]
+    fn a_write_built_on_a_stale_snapshot_does_not_drop_another_account() {
+        // 确定性复现"读到旧快照 → 对方写入 → 自己再写"这条交错：
+        // 非 CAS 实现下第二次写会基于旧快照整体覆盖，把对方刚写的账号丢掉。
+        let registry = Registry::new();
+        // 先取一份快照（模拟对方读到的那个版本）。
+        let stale = registry.current.load_full();
+        // 对方在这之后写入 b。
+        registry.put("b", stale_entry("0.6", 2));
+        // 自己基于那份旧快照写入 a：非 CAS 会整表覆盖 b。
+        let mut next = (*stale).clone();
+        next.insert("a".to_string(), stale_entry("0.5", 1));
+        match registry.current.compare_and_swap(&stale, Arc::new(next)) {
+            swapped if Arc::ptr_eq(&swapped, &stale) => {}
+            // CAS 实现下这里必须落空——说明快照已经过期，调用方会重读重试。
+            _ => {}
+        }
+        assert!(
+            registry.view().entries.get("b").is_some(),
+            "基于过期快照的写入不能吃掉别人刚写的账号"
+        );
+    }
+
+    /// 压力型：大量并发写入后每个账号都必须还在。
+    #[test]
+    fn two_refreshers_writing_different_accounts_never_lose_each_other() {
+        // 单轮里两个线程的写入窗口未必重叠，多跑几轮才能稳定暴露丢更新。
+        for _ in 0..20 {
+            let registry = Registry::new();
+            std::thread::scope(|scope| {
+                for name in ["a", "b", "c"] {
+                    let registry = &registry;
+                    scope.spawn(move || {
+                        for round in 0..400 {
+                            registry.put(name, stale_entry("0.5", round));
+                        }
+                    });
+                }
+            });
+            let view = registry.view();
+            for name in ["a", "b", "c"] {
+                assert!(
+                    view.entries.get(name).is_some(),
+                    "并发写入丢掉了账号 {name} 的状态"
+                );
+            }
         }
     }
 
