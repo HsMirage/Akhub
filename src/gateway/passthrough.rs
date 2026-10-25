@@ -278,6 +278,16 @@ enum AttemptFailure {
         message: String,
         public: Option<crate::security::redact::PublicMessage>,
     },
+    /// 上游把这个会话钉在了别的渠道上，换账号可能就过（§13.3）。
+    ///
+    /// 与 `ContentFiltered` 同为"换渠道可能解决"的失败，处置相同：不计目标故障、
+    /// 清掉粘性绑定、换一个目标重试。区别在换的**次数**——审核策略是确定的，
+    /// 所以只换一次；渠道挂载关系是随机的（下一跳可能落回原渠道），可以多试几个。
+    SessionUnroutable {
+        status: StatusCode,
+        message: String,
+        public: Option<crate::security::redact::PublicMessage>,
+    },
     /// 思考档位阶梯在本目标上走完仍被上游拒绝（§14.6）。
     ///
     /// 现场形态（2026-10-15）：同一个中转站在 `claude-opus-5-5` 这个模型名下接了
@@ -1541,6 +1551,8 @@ impl Walk<'_> {
                             first_token: success.first_byte.or(success.first_token),
                             total: started.elapsed(),
                             output_tokens: success.output_tokens,
+                            // 缓存命中率只有非流式才知道——流式在结算时补。
+                            cache_hit: success.usage_detail.and_then(stream::cache_hit_rate),
                         },
                         self.now_unix,
                     );
@@ -1640,6 +1652,53 @@ impl Walk<'_> {
                     "上游内容审核拒绝，清掉粘性并换渠道重试"
                 );
                 // 后面又发生了别的失败：这次审核拒绝不再是本次请求的最终原因。
+                self.last_opaque = None;
+                Attempted::Done(Flow::Continue)
+            }
+            // 上游把会话钉在别的渠道上（§13.3）：换账号可能就过。
+            //
+            // 与内容审核同为"换个来路可能就过"，所以处置一致：**不计目标故障**
+            // （账号没坏，罚分会冷却一个健康账号，而且冷却了也没用）、**清掉粘性
+            // 绑定**（不清的话下一跳又回到同一个账号，同一段会话被反复拒）。
+            //
+            // 与审核不同的是**换几次**：审核策略是确定的，同一份输入换个账号要么
+            // 过要么不过，试一次就够；而这里赌的是"下一条渠道恰好认得这个会话"，
+            // 是概率问题，多试几个目标才有意义。
+            Err(AttemptFailure::SessionUnroutable {
+                status,
+                message,
+                public,
+            }) => {
+                admission.settle(health::Outcome::Neutral, None);
+                self.telemetry.upstream_status = Some(status);
+                self.note_attempt(candidate, started, "session_unroutable", None, false);
+                self.last = Some((
+                    ErrorCode::SessionUnroutable,
+                    format!(
+                        "账号「{}」返回 {}：{}",
+                        candidate.target.account.name,
+                        status.as_u16(),
+                        message
+                    ),
+                ));
+                // 脱敏后的上游原文放进 `last_public`——`fail()` 会读它，
+                // 客户端因此能看到"是哪个账号、上游原话是什么"，而不是一句泛化的
+                // "目标都失败了"。
+                // **不要**写 `last_filtered`：那个字段是内容审核专用的恢复槽，
+                // 只被"最后一次失败是 ContentFiltered"的分支消费，写进来也读不到，
+                // 反而会在换渠道后残留、干扰后续判定。
+                self.last_public = public;
+                // 清掉绑定：留着只会让下一跳又回到这个账号（§10.2）。
+                if let Some((key, _)) = sticky_key {
+                    self.forward.state.runtime.sticky.clear(key);
+                }
+                tracing::warn!(
+                    request_id = self.forward.request_id,
+                    account = candidate.target.account.name,
+                    model = candidate.target.target.upstream_model,
+                    upstream_status = status.as_u16(),
+                    "上游无法把会话路由回原渠道，清掉粘性并换渠道重试"
+                );
                 self.last_opaque = None;
                 Attempted::Done(Flow::Continue)
             }
@@ -1824,6 +1883,8 @@ impl Walk<'_> {
                             first_token: None,
                             total: started.elapsed(),
                             output_tokens: None,
+                            // 失败请求没有用例可算命中率。
+                            cache_hit: None,
                         },
                         self.now_unix,
                     );
@@ -3612,6 +3673,28 @@ async fn classify_upstream_error(
         // 的账号判成 Key 失效/故障，冷却之后照样拒（§12.3、§13.3）。
         let text = upstream_error_message(&body)
             .unwrap_or_else(|| format!("上游返回 {}", status.as_u16()));
+        // 上游把会话钉在别的渠道上（§13.3）：换账号可能就过。先于凭据判定，
+        // 否则会被当成账号级故障，把一个健康账号冷却掉（冷却了也没用）。
+        if is_session_unroutable(&text) {
+            tracing::warn!(
+                request_id = forward.request_id,
+                account = target.account.name,
+                model = target.target.upstream_model,
+                upstream_status = status.as_u16(),
+                "上游无法把会话路由回原渠道，换渠道重试"
+            );
+            let public = crate::security::redact::ErrorRedactor::new(
+                &target.account.name,
+                &target.account.base_url,
+                api_key,
+            )
+            .payload(&serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null));
+            return Err(AttemptFailure::SessionUnroutable {
+                status,
+                message: text,
+                public: Some(public),
+            });
+        }
         if is_content_filtered(status, &text) {
             tracing::warn!(
                 request_id = forward.request_id,
@@ -3730,6 +3813,29 @@ async fn classify_upstream_error(
             public: Some(public),
         });
     }
+    // 会话被上游钉在别的渠道上（§13.3）：换账号可能就过，且不是账号故障。
+    // 必须同样先于 `is_opaque_rejection`：这句话里没有可归因的参数名，
+    // 落进 opaque 会被当成"上游抽了"，走不到"换渠道"这条正确路径。
+    if is_session_unroutable(&message) {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            "上游无法把会话路由回原渠道，换渠道重试"
+        );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        return Err(AttemptFailure::SessionUnroutable {
+            status,
+            message,
+            public: Some(public),
+        });
+    }
     // 内容审核拒绝（§13.3）：上游没开始生成、没消耗 token，而这份输入在别的
     // 账号上可能过得了。必须先于 `is_opaque_rejection` 判断——那句英文里既有
     // "blocked"（不在可归因清单里）也不在"泛泛的拒绝"清单里，落进下面任何一条
@@ -3833,6 +3939,25 @@ pub(crate) fn upstream_error_message(bytes: &[u8]) -> Option<String> {
 /// 这句话的特征是"说得出是谁拦的、说不出改哪个字段"：命中 `CONTENT_FILTER` 里
 /// 任一句就是审核拒绝，同时要求它**不**指向具体参数，否则 `invalid content_type`
 /// 这类真·参数错误会被误判成审核。
+/// 上游把会话钉在某个账号/渠道上了，换账号就路由不过去（§13.3）。
+///
+/// 现场（2026-10-25，ccmax / opus-5-5 / wishtoapp）：
+/// `This conversation can no longer be routed to its original account.`
+/// `Start a new Claude Code session.`
+///
+/// 这是**渠道挂载关系**的问题，不是账号坏了，也不是请求写错了：上游保存了会话
+/// 的加密上下文，只有当初接单的那条渠道解得开。换一个账面试，可能就落回它自己
+/// 的渠道上（同一账号的不同 target 也可能是不同渠道），所以值得换渠道重试。
+fn is_session_unroutable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    const UNROUTABLE: &[&str] = &[
+        "can no longer be routed",
+        "routed to its original account",
+        "start a new claude code session",
+    ];
+    UNROUTABLE.iter().any(|needle| lower.contains(needle))
+}
+
 fn is_content_filtered(status: StatusCode, message: &str) -> bool {
     if status.is_server_error() {
         return false;
@@ -4611,6 +4736,40 @@ mod tests {
             assert!(
                 is_content_filtered(StatusCode::BAD_REQUEST, message),
                 "应当判为内容审核：{message}"
+            );
+        }
+    }
+
+    /// 上游把会话钉在别的渠道上时，必须认出来并换渠道重试（§13.3）。
+    ///
+    /// 现场（2026-10-25，ccmax / opus-5-5 / wishtoapp）：这句话把 400 透传给了
+    /// 用户，而同一段会话在别的账号上是能过的。
+    #[test]
+    fn a_conversation_pinned_to_another_channel_is_recognized() {
+        for message in [
+            "This conversation can no longer be routed to its original account. Start a new Claude Code session.",
+            "conversation can no longer be routed to its original account",
+            "Please Start a new Claude Code session.",
+        ] {
+            assert!(
+                is_session_unroutable(message),
+                "应当判为会话不可路由：{message}"
+            );
+        }
+    }
+
+    /// 反过来：普通的参数错误不能被误判成"换渠道就能过"。
+    #[test]
+    fn a_parameter_error_is_never_mistaken_for_an_unroutable_session() {
+        for message in [
+            "max_tokens must be greater than 0",
+            "prompt is too long",
+            "ReasoningEffort invalid",
+            "The request could not be processed.",
+        ] {
+            assert!(
+                !is_session_unroutable(message),
+                "不该判为会话不可路由：{message}"
             );
         }
     }

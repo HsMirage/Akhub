@@ -185,6 +185,16 @@ pub enum ErrorCode {
     /// `unsupported_parameter` 必须分开：前者要换渠道、且要让用户知道被拦在哪，
     /// 后者换到哪都是同一个结果。
     ContentFiltered,
+    /// 上游已经把这个会话**钉在某个账号/渠道**上了，换账号就路由不过去（§13.3）。
+    ///
+    /// 现场（2026-10-25，ccmax / opus-5-5 / wishtoapp）：
+    /// `This conversation can no longer be routed to its original account.`
+    /// `Start a new Claude Code session.`
+    ///
+    /// 即上游保存了会话的加密上下文状态，只有当初接单的那个渠道解得开。
+    /// 与 `ContentFiltered` 一样是"换个账号可能就过"，所以也该换渠道重试；
+    /// 但它**不是**账号故障，罚分会把健康账号冷却掉，而且冷却了也没用。
+    SessionUnroutable,
     InternalError,
 }
 
@@ -209,6 +219,10 @@ impl ErrorCode {
             // 内容审核是唯一一种"换个账号可能就过"的拒绝：如实说，别让客户端
             // 以为自己的参数写错了（§13.3）。
             Self::ContentFiltered => "请求内容被上游内容审核拒绝，换用其它渠道或调整输入后重试",
+            // 上游把会话钉在某个渠道上了：换个渠道可能就过，但客户端多半要新开会话。
+            Self::SessionUnroutable => {
+                "上游无法把这个会话路由回原渠道，换用其它渠道重试或新开一个会话"
+            }
             _ => detail,
         }
     }
@@ -233,6 +247,7 @@ impl ErrorCode {
         Self::RateLimited,
         Self::UpstreamProtocolError,
         Self::ContentFiltered,
+        Self::SessionUnroutable,
         Self::InternalError,
     ];
 
@@ -272,6 +287,7 @@ impl ErrorCode {
             Self::RateLimited => "rate_limited",
             Self::UpstreamProtocolError => "upstream_protocol_error",
             Self::ContentFiltered => "content_filtered",
+            Self::SessionUnroutable => "session_unroutable",
             Self::InternalError => "internal_error",
         }
     }
@@ -292,7 +308,7 @@ impl ErrorCode {
                 StatusCode::NOT_FOUND
             }
             Self::UnsupportedParameter => StatusCode::BAD_REQUEST,
-            Self::ContentFiltered => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::ContentFiltered | Self::SessionUnroutable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
@@ -595,6 +611,7 @@ mod tests {
                 | ErrorCode::RateLimited
                 | ErrorCode::UpstreamProtocolError
                 | ErrorCode::ContentFiltered
+                | ErrorCode::SessionUnroutable
                 | ErrorCode::InternalError => ErrorCode::ALL,
             };
             assert!(registered.contains(code), "{code:?} 未登记进 ALL");
