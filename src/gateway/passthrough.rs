@@ -338,6 +338,13 @@ struct Telemetry {
     /// 记录里只差这一个字段，没有它就无法按级统计守门放行的比例。
     sticky_origin: Option<&'static str>,
     sticky_hit: bool,
+    /// 绑定里的目标是不是**真的被这次请求用上了**（§24.1）。
+    ///
+    /// `sticky_hit` 只说明"找到了一条绑定"，在软亲和路径下它会在**重新抽签之前**
+    /// 就置位——所以它长期高估粘性：现场（AwsClaude / opus-5-5）`sticky_hit` 看着
+    /// 有 82.8%，实测相邻请求却有 35% 换了账号。两个字段合起来才回答得了
+    /// "到底粘住了没有"：`hit=true, kept=false` 就是"有绑定但被抽签抽走了"。
+    sticky_kept: Option<bool>,
     cheapest: Option<Multiplier>,
     dearest: Option<Multiplier>,
     effective: Option<Multiplier>,
@@ -451,6 +458,11 @@ struct Walk<'a> {
     /// 保住 Key 才是保住缓存。目标会不会变由层内抽签决定——某个账号变慢时，
     /// 评分把它的权重压下去，流量才真的走得掉。
     soft_affinity: Option<String>,
+    /// 这次请求命中的绑定指向哪个目标（§24.1）。
+    ///
+    /// 用来回答"绑定目标有没有真的被用上"——与 `soft_affinity`（偏的是 Key）
+    /// 分开：目标是抽签决定的，Key 是绑定保住的，两者不是同一件事。
+    bound_target_id: Option<String>,
 }
 
 /// 一次请求里"用过哪把 Key"的记录（§4.2.1）。
@@ -563,6 +575,8 @@ async fn forward_inner<'a>(
         now: Instant::now(),
         // 粘性绑定的凭据在下面查到之后才知道；计划本身不需要它。
         bound_credential: None,
+        // 请求体大小参与软亲和的留存率：请求越大，换号重建缓存越贵（§10.3）。
+        request_bytes: forward.request_bytes,
     };
 
     let deadline = forward.started_at + forward.state.settings.get().request_timeout;
@@ -600,6 +614,8 @@ async fn forward_inner<'a>(
         attempt_log: Vec::new(),
         // 软亲和偏好哪把 Key 由绑定决定，填充在下面（弱身份才有）。
         soft_affinity: None,
+        // 绑定指向哪个目标同样在下面填充，用于判断"到底粘住了没有"（§24.1）。
+        bound_target_id: None,
     };
 
     // 粘性键必须在**抽签之前**推导出来：弱身份（稳定前缀）的绑定要作为抽签的
@@ -631,6 +647,8 @@ async fn forward_inner<'a>(
     let existing = sticky_key
         .as_ref()
         .and_then(|(key, _)| forward.state.runtime.sticky.get(key, now_unix));
+    // 绑定指向哪个目标：供 `run()` 判断这次到底粘住了没有（§24.1）。
+    walk.bound_target_id = existing.as_ref().map(|binding| binding.target_id.clone());
 
     // ① 缓存已凉的绑定不再钉住（§10.1 修订）。
     //
@@ -671,7 +689,14 @@ async fn forward_inner<'a>(
         &mut score::random_unit,
     ) {
         Ok(plan) => plan,
-        Err(failure) => return walk.fail(failure.code, failure.message),
+        Err(failure) => {
+            // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
+            // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
+            // 与"网关挂了"在事后看起来一模一样（§24.1）。
+            walk.telemetry.filter_summary = failure.filter_summary();
+            walk.telemetry.filter_details = failure.filter_details();
+            return walk.fail(failure.code, failure.message);
+        }
     };
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
@@ -1304,6 +1329,14 @@ impl Walk<'_> {
             // 同 `run_attempt`：这次根本没发出去，"最后一次失败"已被改写。
             self.last_opaque = None;
             return Flow::Continue;
+        }
+        // 记录"绑定目标到底有没有被用上"（§24.1）：过了倍率终检就一定会发上游，
+        // 这是判断粘性是否真的保住的唯一可靠时点。`sticky_hit` 只说明找到过绑定，
+        // 软亲和下它在抽签之前就置位，所以会高估粘性。
+        // 放在终检之后：终检失败意味着这次根本没发出去，不该记成"做了选择"。
+        if self.telemetry.sticky_hit {
+            self.telemetry.sticky_kept =
+                Some(self.bound_target_id.as_deref() == Some(candidate.target.target.id.as_str()));
         }
         // 粘性/钉住命中的那把要跨重试保留：换 Key 只发生在凭据真的被拒绝之后。
         let mut digest = credential.as_ref().map(|key| key.credential_digest.clone());
@@ -2466,6 +2499,7 @@ impl Walk<'_> {
             attempts: self.telemetry.attempts,
             queued_ms: self.telemetry.queued.as_millis() as i64,
             sticky_hit: self.telemetry.sticky_hit,
+            sticky_kept: self.telemetry.sticky_kept,
             first_token_ms: None,
             input_tokens: self.usage_parts.0.map(|value| value as i64),
             output_tokens: self.usage_parts.1.map(|value| value as i64),

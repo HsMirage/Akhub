@@ -61,7 +61,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 不带上游状态码，"上游拒绝"与"网关拒绝"在库里长得一模一样。
 /// 对测试公开：迁移用例本该断言"升到当前版本"，写死数字会在每次加版本时
 /// 无意义地红一遍（§27）。
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -794,6 +794,22 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .execute(pool)
                 .await
                 .context("迁移 request_attempts.effort 失败")?;
+        }
+    }
+    if from < 23 {
+        // v23：请求记录补"绑定目标有没有真的被用上"（§24.1）。
+        //
+        // `sticky_hit` 只说明"找到了一条绑定"：软亲和路径下它在重新抽签**之前**
+        // 就置位，于是系统性高估粘性——现场（AwsClaude / opus-5-5）该字段看着
+        // 82.8%，实测相邻请求仍有 35% 换了账号。补这一列之后，
+        // `hit=true, kept=false` 才让"有绑定但被抽签抽走了"第一次可见。
+        // 历史请求没记过它，留 NULL（不猜）。
+        let columns = table_columns(pool, "request_records").await?;
+        if !columns.contains("sticky_kept") {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN sticky_kept INTEGER")
+                .execute(pool)
+                .await
+                .context("迁移 request_records.sticky_kept 失败")?;
         }
     }
     if from < 21 {

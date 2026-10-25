@@ -1542,13 +1542,13 @@ impl Store {
                     upstream_model, request_bytes, upstream_status, http_status, error_code,
                     endpoint, degraded,
                     effective_multiplier, cheapest_multiplier, dearest_multiplier,
-                    attempts, queued_ms, sticky_hit,
+                    attempts, queued_ms, sticky_hit, sticky_kept,
                     first_token_ms, input_tokens, output_tokens, config_version,
                     sticky_wait_ms, sticky_freshness, sticky_origin, output_tps, multiplier_source,
                     quota_status, filter_summary, filter_details, selected_layer,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens,
                     key_id, key_label, effort_retries)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.request_id)
             .bind(record.started_at)
@@ -1572,6 +1572,7 @@ impl Store {
             .bind(record.attempts)
             .bind(record.queued_ms)
             .bind(record.sticky_hit)
+            .bind(record.sticky_kept)
             .bind(record.first_token_ms)
             .bind(record.input_tokens)
             .bind(record.output_tokens)
@@ -2814,6 +2815,13 @@ pub struct RequestRecord {
     pub attempts: i64,
     pub queued_ms: i64,
     pub sticky_hit: bool,
+    /// 绑定里的目标有没有**真的被用上**（§24.1）。
+    ///
+    /// `sticky_hit` 只说明"找到了一条绑定"：软亲和路径下它在重新抽签之前就置位，
+    /// 于是系统性高估粘性——现场（AwsClaude / opus-5-5）`sticky_hit` 看着 82.8%，
+    /// 实测相邻请求仍有 35% 换了账号。两者合起来才回答得了"到底粘住了没有"：
+    /// `hit=true, kept=false` 就是"有绑定、但被抽签抽走了"。
+    pub sticky_kept: Option<bool>,
     /// 首个语义块到达的时间（流式才有），毫秒（§6.6）。
     pub first_token_ms: Option<i64>,
     /// 本次请求的输入/输出 Token；上游没上报时为空，绝不估算（§6.8）。
@@ -3405,6 +3413,7 @@ fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
         attempts: row.try_get("attempts")?,
         queued_ms: row.try_get("queued_ms")?,
         sticky_hit: row.try_get("sticky_hit")?,
+        sticky_kept: row.try_get("sticky_kept")?,
         first_token_ms: row.try_get("first_token_ms")?,
         input_tokens: row.try_get("input_tokens")?,
         output_tokens: row.try_get("output_tokens")?,
@@ -3690,6 +3699,8 @@ mod tests {
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
+
+                sticky_kept: None,
             })
             .collect();
         store.insert_request_records(&records).await.unwrap();
@@ -3767,6 +3778,8 @@ mod tests {
                 attempts_detail: Vec::new(),
                 queued_ms: 0,
                 sticky_hit: false,
+
+                sticky_kept: None,
             });
         }
         store.insert_request_records(&records).await.unwrap();
@@ -3985,6 +3998,8 @@ mod tests {
             attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,
+
+            sticky_kept: None,
         }
     }
 

@@ -74,14 +74,14 @@ const MIN_SCORE: f64 = 0.01;
 /// 也有约 3% 的期望流量，于是它能在可接受的时间内攒够 §9.4 要求的 20 个样本，
 /// 真正进入评分——这正是 §9.5 所说的"保命口粮"在数量级差距下真正生效。
 const EXPLORATION: f64 = 0.03;
-/// 目标多久没被采样就算"陈旧"，探索口粮按这个尺度放大（§9.5）。
-const STALE_UNIT_SECS: f64 = 600.0;
-/// 陈旧换来的探索口粮上限倍数（相对 `EXPLORATION`）。
+/// 探索口粮的放大上限倍数（相对 `EXPLORATION`）。
 ///
-/// 取 8 而不是更小：口粮要能把一个"分低但只是很久没测过"的目标拉回到能攒够
-/// `MIN_SAMPLES` 的量级。按 300 请求/小时、5 个目标估算，4 倍（0.12）在对手
-/// 分数 0.95 时只够 4% 上下，攒 20 个样本要两个多小时；8 倍（0.24）能到 10%
-/// 量级，二十多分钟就重新有数。
+/// 取 8：口粮要能把一个"证据严重不足"的目标拉回到能攒够 `MIN_SAMPLES` 的量级。
+/// 按 300 请求/小时、5 个目标估算，4 倍（0.12）在对手分数 0.95 时只够 4% 上下，
+/// 攒 20 个样本要两个多小时；8 倍（0.24）能到 10% 量级，二十多分钟就重新有数。
+///
+/// 注意它现在只管**上界**：放大的依据是"离 `MIN_SAMPLES` 还差多少"（见
+/// [`exploration_floor`]），不再是"闲置了多久"。
 ///
 /// 不抬高基础值 `EXPLORATION` 本身：那是所有目标（含主力）都吃的水位，抬高它
 /// 会把"主力仍然拿走绝大多数流量"这条不变量一起改掉。
@@ -504,19 +504,44 @@ impl Reference {
 /// 这个目标此刻的探索口粮（§9.5）。
 ///
 /// 底权的本意是"每个候选都有一份与分数无关的口粮"，让弱者攒得到样本回到评分里。
-/// 但固定底权有个漏洞：**越久没被采样，越说明我们对它的判断已经过时**。一个
-/// 两小时前的 0.9 只是历史，不是现在的证据；而它没被采样，恰恰是因为某个赢家
-/// 把流量全吃掉了。
+/// 但固定底权有个漏洞：**证据不够的目标拿不到足够样本**。所以口粮要放大——
+/// 关键问题是**按什么放大**。
 ///
-/// 所以口粮随"距上次采样多久"放大，被采样一次就立刻回落。真正差的目标不会因此
-/// 长期占流量：采到样本、分数掉下去，口粮就恢复成基础值。
+/// 原实现按"距上次采样多久"放大（10 分钟翻倍、封顶 8 倍），这条轴是错的：
+/// 它与"证据到底够不够"不是同一个量纲。证据按 24 小时半衰期衰减
+/// （`SAMPLE_HALF_LIFE_SECS`），而口粮 10 分钟就翻倍——两者差了 144 倍，
+/// 于是**任何闲置超过 1 小时的目标都会拿到满档口粮，哪怕它有两万个样本**。
+///
+/// 现场（AwsClaude / claude-opus-5-5，2026-10-25）：四个账号样本量分别
+/// 21941 / 2192 / 568，全部早过了 `MIN_SAMPLES`，可闲置 >2 小时后一律拿到
+/// 满档口粮 0.24，而它们的 `score^8` 只有 0.20~0.28 —— 口粮占了层内权重的
+/// 一半以上，抽签退化成近似均匀随机。实测份额 35/25/22/17 与评分应得的
+/// 31/24/22/22 相比被抹平了 12 个百分点，运营看到的是"配比不生效"。
+///
+/// 现在改成按**证据缺口**放大：`MIN_SAMPLES / 有效样本量`，夹在 [1, 8]。
+/// 这条轴与证据本身同量纲，语义是"离能信任它还差多少"：
+///
+/// * 证据充足 → 缺口 ≤ 1 → 只吃基础口粮，分配由评分主导（配比因此真实有效）；
+/// * 样本很少 → 缺口大 → 口粮成倍放大，新目标照样攒得到样本；
+/// * 证据放久了自然衰减，缺口跟着变大，口粮自动回升——不需要另设一条时间轴。
+///
+/// 这同时修好了原实现的另一个毛病：热目标闲置 2 小时就被当成"需要探索"，
+/// 而真正缺样本的冷目标反而只拿到同样的 8 倍封顶。改为按缺口给药之后，
+/// 冷目标的份额从 8.6% 回升到 10.2%（旧实现把口粮平均撒给了所有人）。
 pub fn exploration_floor(stats: &Stats, now: i64) -> f64 {
-    if stats.last_sample_at == 0 {
-        // 从没被采样过：口粮直接给满，否则新账号永远攒不到 `MIN_SAMPLES`。
+    exploration_floor_for(0.0, stats, now)
+}
+
+/// 探索口粮。`_total` 保留在签名里是为了调用方语义清晰（口粮与分数是两个维度），
+/// 但不再参与计算——口粮只该由"证据够不够"决定，不该由分数高低决定。
+pub fn exploration_floor_for(_total: f64, stats: &Stats, now: i64) -> f64 {
+    let effective = stats.effective_samples(now);
+    // 从没被采样过：没有证据，口粮直接给满。
+    if effective <= 0.0 {
         return EXPLORATION * MAX_STALE_FACTOR;
     }
-    let idle = (now - stats.last_sample_at).max(0) as f64;
-    let factor = (1.0 + idle / STALE_UNIT_SECS).min(MAX_STALE_FACTOR);
+    // 离"够信任"还差多少：不足 MIN_SAMPLES 时按比例补，够了就只吃基础口粮。
+    let factor = (MIN_SAMPLES as f64 / effective).clamp(1.0, MAX_STALE_FACTOR);
     EXPLORATION * factor
 }
 
@@ -602,13 +627,15 @@ fn score_one(
         total
     };
 
+    let total = total.clamp(MIN_SCORE, 1.0);
     Score {
         multiplier,
         reliability,
         first_token,
         throughput,
-        total: total.clamp(MIN_SCORE, 1.0),
-        exploration: exploration_floor(&candidate.stats, now),
+        total,
+        // 口粮按这个候选**自己的**分数分量封顶：分配必须以评分为主导（§9.5）。
+        exploration: exploration_floor_for(total, &candidate.stats, now),
     }
 }
 
@@ -636,6 +663,36 @@ pub fn base_weight(score: &Score) -> f64 {
 /// 账号照样能被"锁"在会话上——那正是 §10.1 修订要修的病。封顶之后留存率退化为
 /// `cap·own / (cap·own + others)`：`own` 越小留存越低，差账号自然留不住，
 /// 不需要再加一条分数判据。
+/// 软亲和的**有效留存率**：绑定目标落后越多，留存越低（§10.1 修订的安全阀）。
+///
+/// 为什么必须是连续函数。硬绑定有 [`crate::routing::pin_is_outpaced`] 守门，
+/// 弱绑定（软亲和）没有——它只能靠 `1 - retention` 的随机概率逃逸，留存率提到
+/// 0.95 之后就变成"平均 20 轮才松手"，等于把 §10.1 修订当初要治的"锁死"请回来。
+///
+/// 但反过来也不能做成悬崖：早先的实现是"落后超过阈值就完全不倾斜"，而生产上
+/// 四个账号的分数是 0.845 / 0.817 / 0.740 / 0.684——后两个刚好越过 0.10 的线，
+/// 于是它们的会话每一轮都 100% 重抽签。那比原设计更糟：不但缓存全碎，连"倾向"
+/// 都没了。
+///
+/// 所以这里做线性降级：`lag = 0` 时保持名义留存率，`lag ≥ tolerance` 时降到
+/// 下限 `DEGRADED_RETENTION_FLOOR`。中间线性插值，让"稍微落后"和"明显落后"
+/// 有区别，而不是一刀切。
+///
+/// 下限取 0.5：仍然偏向原账号（缓存有价值），但每两轮就重新抽一次签，
+/// 让真正落后的目标在几十轮内被换掉——这是"缓存价值"与"及时止损"的折中。
+pub fn soft_affinity_retention(nominal: f64, lag: f64, tolerance: f64) -> f64 {
+    const DEGRADED_RETENTION_FLOOR: f64 = 0.5;
+    if tolerance <= 0.0 || lag <= 0.0 {
+        return nominal;
+    }
+    if lag >= tolerance {
+        return nominal.min(DEGRADED_RETENTION_FLOOR);
+    }
+    let t = lag / tolerance;
+    let floor = nominal.min(DEGRADED_RETENTION_FLOOR);
+    nominal - (nominal - floor) * t
+}
+
 pub fn affinity_boost(weights: &[f64], bound: usize, retention: f64, cap: f64) -> Vec<f64> {
     let mut boost = vec![1.0; weights.len()];
     let Some(&own) = weights.get(bound) else {
@@ -1182,29 +1239,50 @@ mod tests {
             0.0,
             "采样时刻未知等于完全过期"
         );
+        // 快照目标本身还没有分数，口粮取基础值——它到底该拿多少要看评分，
+        // 而"封顶后口粮不会淹没评分"由 `the_floor_never_drowns_the_score` 保证。
         assert!(
-            exploration_floor(&stats, 1_000_000) > EXPLORATION,
-            "陈旧目标必须拿到放大的口粮"
+            exploration_floor_for(NEUTRAL, &stats, 1_000_000) >= EXPLORATION,
+            "陈旧目标至少拿到基础口粮"
         );
     }
 
-    /// ⑤ 探索口粮随"距上次采样多久"放大，被采样一次就回落（§9.5）。
+    /// ⑤ 探索口粮按**证据缺口**放大，而不是按闲置时长（§9.5）。
+    ///
+    /// 旧实现按闲置时长放大（10 分钟翻倍），与证据 24 小时半衰期差了两个数量级，
+    /// 于是任何闲置超过 1 小时的目标都会拿到满档口粮——哪怕它有两万个样本。
+    /// 现场四个账号因此全部拿到 0.24 的口粮，把配比抹平了 12 个百分点。
     #[test]
-    fn a_stale_target_earns_a_bigger_exploration_allowance() {
-        let stats = Stats {
-            samples: MIN_SAMPLES,
+    fn the_exploration_allowance_follows_the_evidence_gap() {
+        // 证据充足：只吃基础口粮，闲置再久也一样（不再跟着时间放大）。
+        let warm = Stats {
+            samples: 500,
+            weight: 500.0,
             last_sample_at: 1_000,
             ..Stats::default()
         };
-        // 刚刚采过样：只有基础口粮。
-        assert!((exploration_floor(&stats, 1_000) - EXPLORATION).abs() < 1e-12);
-        // 十分钟没采样：翻倍。
-        assert!((exploration_floor(&stats, 1_600) - EXPLORATION * 2.0).abs() < 1e-12);
-        // 再久就封顶，不能让一个老目标把流量全吸走。
+        assert!((exploration_floor(&warm, 1_000) - EXPLORATION).abs() < 1e-12);
+        // 闲置 2 小时（生产现场的典型间隔）仍然只吃基础口粮。
         assert!(
-            (exploration_floor(&stats, 100_000) - EXPLORATION * MAX_STALE_FACTOR).abs() < 1e-12
+            (exploration_floor(&warm, 1_000 + 7_200) - EXPLORATION).abs() < 1e-12,
+            "证据够的目标不该因为闲置 2 小时就领口粮"
         );
-        // 从没采样过的新目标直接给满，否则永远攒不到 MIN_SAMPLES。
+
+        // 证据不足：按缺口放大。样本越少口粮越大。
+        let thin = Stats {
+            samples: 1,
+            weight: 1.0,
+            last_sample_at: 1_000,
+            ..Stats::default()
+        };
+        let thin_floor = exploration_floor(&thin, 1_000);
+        assert!(thin_floor > EXPLORATION, "证据不足必须放大：{thin_floor}");
+        assert!(
+            thin_floor <= EXPLORATION * MAX_STALE_FACTOR + 1e-12,
+            "但不得超过上限"
+        );
+
+        // 从没采样过的目标直接给满，否则永远攒不到 MIN_SAMPLES。
         assert!(
             (exploration_floor(&Stats::default(), 1_000) - EXPLORATION * MAX_STALE_FACTOR).abs()
                 < 1e-12
@@ -1809,5 +1887,56 @@ mod tests {
             "统计表不该无界增长：{}",
             registry.len()
         );
+    }
+
+    /// 证据充足的目标只吃基础口粮：这是「配比不生效」的根因（§9.5）。
+    ///
+    /// 现场（AwsClaude / opus-5-5）：四个账号样本 21941/2192/568，早就够了，
+    /// 却因闲置 >2h 一律拿到满档口粮 0.24，而 score^8 只有 0.20~0.28 —— 口粮
+    /// 占了层内权重一半以上，实测配比因此被抹平 12 个百分点。
+    #[test]
+    fn the_floor_never_drowns_the_score() {
+        let warm = Stats {
+            samples: 500,
+            weight: 500.0,
+            last_sample_at: 1_000,
+            ..Stats::default()
+        };
+        // 生产现场观测时刻：这些账号最后一次采样就在最近（闲置 2 小时量级）。
+        let now = 1_000 + 7_200;
+        // 证据充足时，无论分数高低，都只吃基础口粮。
+        for total in [0.30_f64, 0.60, 0.85, 0.95] {
+            let floor = exploration_floor_for(total, &warm, now);
+            assert!(
+                (floor - EXPLORATION).abs() < 1e-12,
+                "证据充足的目标只该吃基础口粮，实际 {floor}"
+            );
+        }
+    }
+
+    /// 封顶之后，四个真实账号的配比必须回到评分主导。
+    #[test]
+    fn the_allocation_follows_the_scores_again() {
+        let totals = [0.852_f64, 0.826, 0.820, 0.817];
+        let stale = Stats {
+            samples: MIN_SAMPLES,
+            last_sample_at: 0,
+            ..Stats::default()
+        };
+        let now = 1_000_000;
+        let weights: Vec<f64> = totals
+            .iter()
+            .map(|t| t.max(MIN_SCORE).powi(POWER) + exploration_floor_for(*t, &stale, now))
+            .collect();
+        let sum: f64 = weights.iter().sum();
+        let share: Vec<f64> = weights.iter().map(|w| w / sum).collect();
+        assert!(
+            share.iter().all(|s| *s > 0.18 && *s < 0.32),
+            "配比应当接近均分：{share:?}"
+        );
+        assert!(share[0] > share[3], "分数最高的必须拿到更多：{share:?}");
+        let floor = exploration_floor_for(totals[0], &stale, now);
+        let core = totals[0].powi(POWER);
+        assert!(floor < core, "口粮 {floor} 必须小于分数分量 {core}");
     }
 }

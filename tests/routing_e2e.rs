@@ -1721,6 +1721,69 @@ async fn sticky_bindings_and_perf_snapshots_survive_a_restart() {
     assert_eq!(stale.runtime.sticky.len(), 0);
 }
 
+/// 全部目标都不合格时，请求记录里必须留下**每个目标为什么不合格**（§24.1）。
+///
+/// 现场（2026-10-24，ccmax）：组内只有两个账号启用，两个被上游 502 同时打进冷却，
+/// 75 条 503 全部 `attempts=0`、`filter_summary`/`filter_details` 皆 NULL。事后
+/// 只能靠一条挤进过计划的 200 记录反推原因——这正是"记录里没有原因"的代价。
+#[tokio::test]
+async fn a_rejected_request_records_why_every_target_was_filtered() {
+    let x = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let wired = wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50)
+            .multiplier(MultiplierMode::Manual, "0.5"),
+    )
+    .await;
+    // 把唯一的账号停用：一个目标都不合格，请求在 plan() 里就失败，绝不发往上游。
+    let account = akhub
+        .state
+        .store
+        .list_accounts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == wired.account_id)
+        .unwrap();
+    akhub
+        .state
+        .store
+        .update_account(
+            &akhub::domain::Account {
+                enabled: false,
+                ..account
+            },
+            &akhub::storage::store::AccountSecrets::default(),
+        )
+        .await
+        .unwrap();
+    akhub.state.reload_config().await.unwrap();
+
+    let response = chat(&akhub, small_body("s", "u")).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(x.requests(), 0, "没有合格目标时绝不该把请求打到上游");
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if !records.is_empty() {
+            break;
+        }
+    }
+    let record = records.first().expect("失败也要留一条请求记录");
+    assert_eq!(record.error_code.as_deref(), Some("no_eligible_target"));
+    assert_eq!(record.attempts, 0);
+    assert_eq!(
+        record.filter_summary.as_deref(),
+        Some("已停用×1"),
+        "计划直接失败时，过滤原因也必须入库：{record:?}"
+    );
+    let details = record.filter_details.as_deref().unwrap_or_default();
+    assert!(details.contains("已停用"), "要有具体说明：{details}");
+}
+
 #[tokio::test]
 async fn request_records_capture_scheduling_telemetry() {
     let x = FakeUpstream::spawn().await;
@@ -1822,4 +1885,57 @@ async fn admissions_settle_correctly_through_the_public_api() {
             )
             .is_ok()
     );
+}
+
+/// 软亲和下 `sticky_hit` 会高估粘性：必须在记录里补一个"到底粘住了没有"
+/// 的字段（§24.1）。
+///
+/// 现场（AwsClaude / opus-5-5，2026-10-25）：`sticky_hit` 看着 82.8%，可实测
+/// 相邻请求仍有 35% 换了账号。原因是软亲和路径在**重新抽签之前**就把
+/// `sticky_hit` 置位了——它只说明"找到了一条绑定"，不说明"用上了它"。
+///
+/// 现场（AwsClaude / opus-5-5，2026-10-25）：`sticky_hit` 看着 82.8%，可实测
+/// 相邻请求仍有 35% 换了账号。补上 `sticky_kept` 之后，
+/// `hit=true, kept=false` 才让"有绑定但被抽签抽走了"第一次可见。
+#[tokio::test]
+async fn a_soft_affinity_hit_records_whether_the_binding_was_actually_kept() {
+    let x = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50)
+            .multiplier(MultiplierMode::Manual, "0.5"),
+    )
+    .await;
+
+    // 同一个稳定前缀连发两次：第一次建绑定，第二次命中软亲和。
+    let body = small_body("s", "hi");
+    for _ in 0..2 {
+        let response = chat(&akhub, body.clone()).await;
+        assert_eq!(response.status(), 200);
+    }
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if records.len() >= 2 {
+            break;
+        }
+    }
+    assert!(
+        records.len() >= 2,
+        "两次请求都要留下记录：{}",
+        records.len()
+    );
+    // 记录按时间倒序：latest 是第二次。
+    let latest = &records[0];
+    assert!(latest.sticky_hit, "同一前缀第二次应当命中软亲和");
+    assert_eq!(
+        latest.sticky_kept,
+        Some(true),
+        "只有一个候选时，绑定目标必然被用上：{latest:?}"
+    );
+    // 第一次请求还没有绑定，不该记 kept。
+    assert_eq!(records[1].sticky_kept, None, "首次请求没有绑定可谈");
 }

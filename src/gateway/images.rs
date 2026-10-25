@@ -601,6 +601,7 @@ fn record_poll(
         attempts: 1,
         queued_ms: 0,
         sticky_hit: false,
+        sticky_kept: None,
         first_token_ms: None,
         input_tokens: None,
         output_tokens: None,

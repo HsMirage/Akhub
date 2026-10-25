@@ -262,6 +262,9 @@ CREATE TABLE IF NOT EXISTS request_records (
     attempts         INTEGER NOT NULL,
     queued_ms        INTEGER NOT NULL,
     sticky_hit       INTEGER NOT NULL,
+    -- 绑定目标有没有真的被用上（§24.1）：sticky_hit 只说明"找到过绑定"，
+    -- 软亲和下它在重抽签之前就置位，会高估粘性。NULL = 没有绑定可谈。
+    sticky_kept      INTEGER,
     -- 诊断用的用量与时机：首字延迟、输入/输出 token、当时的配置版本（§6.6）。
     first_token_ms   INTEGER,
     input_tokens     INTEGER,

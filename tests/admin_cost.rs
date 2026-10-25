@@ -78,6 +78,8 @@ async fn record_tokens(
             attempts: 1,
             queued_ms: 0,
             sticky_hit: false,
+
+            sticky_kept: None,
             first_token_ms: None,
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),

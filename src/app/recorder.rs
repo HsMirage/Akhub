@@ -157,6 +157,8 @@ mod tests {
             attempts_detail: Vec::new(),
             queued_ms: 0,
             sticky_hit: false,
+
+            sticky_kept: None,
         }
     }
 

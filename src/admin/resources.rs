@@ -4874,6 +4874,9 @@ pub async fn list_requests(
                     "attempts": record.attempts,
                     "queued_ms": record.queued_ms,
                     "sticky_hit": record.sticky_hit,
+                    // 绑定目标有没有真的被用上（§24.1）：hit=true 且 kept=false
+                    // 就是"有绑定、但被抽签抽走了"——sticky_hit 单独看不出这件事。
+                    "sticky_kept": record.sticky_kept,
                     // 用量与时机（§6.6）；上游没上报时是 null，不估算。
                     "first_token_ms": record.first_token_ms,
                     "input_tokens": record.input_tokens,

@@ -127,6 +127,24 @@ fn short_digest(digest: &str) -> &str {
 pub struct SelectionFailure {
     pub code: ErrorCode,
     pub message: String,
+    /// 每个目标被过滤掉的原因；写进请求记录，事后不必再猜（§24.1）。
+    ///
+    /// 这里**必须**带上：`plan()` 直接失败时根本没有 `Plan` 可读，而失败的原因
+    /// （全在冷却、全停用、倍率超限）恰恰是管理员唯一需要的信息。缺了它，库里
+    /// 只剩一句"没有可用的调度目标"，与"网关挂了"看起来一模一样。
+    pub filtered: Vec<FilteredReason>,
+}
+
+impl SelectionFailure {
+    /// 候选过滤原因摘要（§24.1），与 [`Plan::filter_summary`] 同口径。
+    pub fn filter_summary(&self) -> Option<String> {
+        summarize(&self.filtered)
+    }
+
+    /// 候选过滤原因的具体说明（§24.1），与 [`Plan::filter_details`] 同口径。
+    pub fn filter_details(&self) -> Option<String> {
+        detailize(&self.filtered)
+    }
 }
 
 /// 一个候选目标及其此刻的倍率、评分与端点尝试顺序。
@@ -201,6 +219,66 @@ pub struct FilteredReason {
     pub count: usize,
 }
 
+/// 过滤原因摘要：`倍率超限×2,能力不支持×1`（§24.1）。
+///
+/// 抽成自由函数是因为 [`SelectionFailure`] 也要写同一对字段：`plan()` 成功时
+/// 原因来自 `Plan::filtered`，失败时来自 `SelectionFailure::filtered`，两边口径
+/// 必须一致，否则后台按 `filter_summary` 聚合就会把同一件事算成两类。
+fn summarize(filtered: &[FilteredReason]) -> Option<String> {
+    if filtered.is_empty() {
+        return None;
+    }
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for entry in filtered {
+        match grouped.iter_mut().find(|(label, _)| *label == entry.label) {
+            Some((_, count)) => *count += entry.count,
+            None => grouped.push((entry.label.clone(), entry.count)),
+        }
+    }
+    Some(
+        grouped
+            .into_iter()
+            .map(|(label, count)| format!("{label}×{count}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// 过滤原因的具体说明：哪个账号、哪项能力、哪个端点（§24.1）。
+fn detailize(filtered: &[FilteredReason]) -> Option<String> {
+    if filtered.is_empty() {
+        return None;
+    }
+    Some(
+        filtered
+            .iter()
+            .map(|entry| format!("{}×{}", entry.detail, entry.count))
+            .collect::<Vec<_>>()
+            .join("；"),
+    )
+}
+
+/// 把逐个目标的失败原因合并成"类别 + 具体说明 + 计数"（§24.1）。
+fn merge_reasons(reasons: &[Ineligible]) -> Vec<FilteredReason> {
+    let mut filtered: Vec<FilteredReason> = Vec::new();
+    for reason in reasons {
+        let label = reason.describe();
+        let detail = reason.describe_detailed();
+        match filtered
+            .iter_mut()
+            .find(|entry| entry.label == label && entry.detail == detail)
+        {
+            Some(entry) => entry.count += 1,
+            None => filtered.push(FilteredReason {
+                label,
+                detail,
+                count: 1,
+            }),
+        }
+    }
+    filtered
+}
+
 impl Plan {
     /// 按尝试顺序展开全部候选，并施加 8 个目标的失控保护上限。
     pub fn attempts(&self) -> Vec<&Candidate> {
@@ -228,21 +306,7 @@ impl Plan {
     /// 形如 `倍率超限×2,能力不支持×1`；没有过滤掉任何目标时返回 `无`。
     /// 只用于诊断，不参与调度。
     pub fn filter_summary(&self) -> String {
-        if self.filtered.is_empty() {
-            return "无".to_string();
-        }
-        let mut grouped: Vec<(String, usize)> = Vec::new();
-        for entry in &self.filtered {
-            match grouped.iter_mut().find(|(label, _)| *label == entry.label) {
-                Some((_, count)) => *count += entry.count,
-                None => grouped.push((entry.label.clone(), entry.count)),
-            }
-        }
-        grouped
-            .into_iter()
-            .map(|(label, count)| format!("{label}×{count}"))
-            .collect::<Vec<_>>()
-            .join(",")
+        summarize(&self.filtered).unwrap_or_else(|| "无".to_string())
     }
 
     /// 候选过滤原因的**具体**说法（§24.1）。
@@ -251,16 +315,7 @@ impl Plan {
     /// 给事后复盘用的"到底是谁、因为什么"。没有它，一条"能力不支持"要等到
     /// 现场复现才能定位到具体账号与能力。
     pub fn filter_details(&self) -> Option<String> {
-        if self.filtered.is_empty() {
-            return None;
-        }
-        Some(
-            self.filtered
-                .iter()
-                .map(|entry| format!("{}×{}", entry.detail, entry.count))
-                .collect::<Vec<_>>()
-                .join("；"),
-        )
+        detailize(&self.filtered)
     }
 
     /// 在计划里找出某个目标，供粘性命中时复用已算好的倍率与评分。
@@ -297,6 +352,12 @@ pub struct Context<'a> {
     /// 而不是"换一把 Key 继续用同一个目标"——后者会让绑定失去意义，
     /// 每次请求都在 Key 之间漂移（§4.2.1 的不变量 B）。
     pub bound_credential: Option<String>,
+    /// 本次请求体字节数（§10.3）。
+    ///
+    /// 用于让"缓存重建代价"进入调度决策：请求越大，换一次号重建前缀缓存越贵，
+    /// 软亲和的留存率就越高（见 shuffle 的 affinity_retention）。字节数在 §8
+    /// 第 2 步缓冲请求体时就已经知道，零额外开销。
+    pub request_bytes: usize,
 }
 
 impl Context<'_> {
@@ -319,6 +380,7 @@ impl Context<'_> {
             now_unix: self.now_unix,
             now: self.now,
             bound_credential: digest,
+            request_bytes: self.request_bytes,
         }
     }
 }
@@ -473,12 +535,14 @@ pub fn plan(
         return Err(SelectionFailure {
             code: ErrorCode::ModelNotFound,
             message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
+            filtered: Vec::new(),
         });
     };
     if !model.model.enabled {
         return Err(SelectionFailure {
             code: ErrorCode::ModelNotFound,
             message: format!("逻辑模型 {model_name} 已被停用"),
+            filtered: Vec::new(),
         });
     }
     // 账号级"隐藏原始模型"可能让一个没有任何下游模型名的目标整体不可达；
@@ -487,6 +551,7 @@ pub fn plan(
         return Err(SelectionFailure {
             code: ErrorCode::ModelNotFound,
             message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
+            filtered: Vec::new(),
         });
     }
 
@@ -523,8 +588,13 @@ pub fn plan(
         }
     }
 
+    // 过滤原因在这里就合并好：`failure()` 的每一个分支都要带着它返回（§24.1）。
+    // 早先只在成功路径上合并，于是"全部目标都不合格"这种最需要诊断的请求，
+    // 记录里反而一个原因都没有。
+    let filtered = merge_reasons(&reasons);
+
     if eligible.is_empty() {
-        return Err(failure(model_name, group, &reasons));
+        return Err(failure(model_name, group, &reasons, filtered));
     }
 
     // 归一化参照系：倍率是账号级属性，用整个分组作参照系，同一个账号在不同
@@ -595,26 +665,8 @@ pub fn plan(
 
     let cheapest = candidates.iter().map(|c| c.multiplier).min();
     let dearest = candidates.iter().map(|c| c.multiplier).max();
-    // 过滤原因按"类别 + 具体说明"合并计数，写进请求记录供诊断（§24.1）。
-    // 两层都要：类别词用于聚合与告警，具体说明用于事后定位到账号与能力。
-    let mut filtered: Vec<FilteredReason> = Vec::new();
-    for reason in &reasons {
-        let label = reason.describe();
-        let detail = reason.describe_detailed();
-        match filtered
-            .iter_mut()
-            .find(|entry| entry.label == label && entry.detail == detail)
-        {
-            Some(entry) => entry.count += 1,
-            None => filtered.push(FilteredReason {
-                label,
-                detail,
-                count: 1,
-            }),
-        }
-    }
     Ok(Plan {
-        layers: into_layers(candidates, affinity, random),
+        layers: into_layers(candidates, affinity, context.request_bytes, random),
         cheapest,
         dearest,
         filtered,
@@ -638,6 +690,7 @@ fn catalog_discouraged(target: &TargetView, requested: &[&'static str]) -> bool 
 fn into_layers(
     mut candidates: Vec<Candidate>,
     affinity: Option<&str>,
+    request_bytes: usize,
     random: &mut impl FnMut() -> f64,
 ) -> Vec<Layer> {
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.target.priority));
@@ -663,7 +716,7 @@ fn into_layers(
         }
         layer.candidates = buckets
             .into_iter()
-            .flat_map(|bucket| shuffle(bucket, affinity, random))
+            .flat_map(|bucket| shuffle(bucket, affinity, request_bytes, random))
             .collect();
     }
     layers
@@ -671,13 +724,44 @@ fn into_layers(
 
 /// 软粘性命中时，绑定目标在层内抽签里应有的**留存率**（§10.1 修订）。
 ///
-/// 八成而不是"必中"：前缀缓存的价值基本保住，但每五次里总有一次重新分配，
+/// 不做"必中"：前缀缓存的价值基本保住，但总留一次重新分配的机会，
 /// 免得某个账号一旦被抽中就把整条会话锁死——那正是 §10.1 修订要修的病。
 ///
 /// 注意它是**留存率**，不是权重倍数。两者只有在**恰好两个**候选时才等价：
 /// 固定 4 倍在 5 个候选下只剩 50% 留存，而现场国模分组正是 5 个同优先级目标。
 /// 倍数由 [`score::affinity_boost`] 按当前候选集合反解。
-const AFFINITY_RETENTION: f64 = 0.8;
+///
+/// **它必须随上下文大小变化，不能是一个常量。** 换一次号的代价是整份前缀缓存
+/// 重建，而这个代价与上下文体量成正比——§10.3 的等待预算、`sticky::migrate_margin`
+/// 的迁移门槛都已经按请求字节数分档了，唯独留存率写死 0.8，这是设计内部的不一致。
+///
+/// 现场的代价：AwsClaude / opus-5-5 有 88.5% 的请求大于 64 KB，中位输入 16 万 token。
+/// 在 0.8 留存下，一条 20 轮的会话留在同一账号的概率只有 1.2%（`0.8^20`）——也就是
+/// 几乎必然换号、必然重建缓存。实测同账号留存率 80.3%、缓存写/读比 0.41，而对照组
+/// ccmax 是 96.9% / 0.12。
+///
+/// 所以按请求体分档，与 `migrate_margin` 用**同一组分档边界**（同一种代价，同一把尺子）：
+/// 小请求缓存重建便宜，保持 0.8 让负载均衡生效；大请求重建昂贵，提到 0.95 以上。
+pub fn affinity_retention(request_bytes: usize) -> f64 {
+    match request_bytes {
+        bytes if bytes < 32 * 1024 => 0.80,
+        bytes if bytes < 160 * 1024 => 0.90,
+        bytes if bytes < 640 * 1024 => 0.95,
+        _ => 0.97,
+    }
+}
+
+/// 软亲和允许绑定目标落后的**最大分数差**（§10.1 修订的安全阀）。
+///
+/// 高留存率本身有风险：绑定目标后来变慢、变差，如果仍然粘着它，用户体验会下降。
+/// 硬绑定有 [`pin_is_outpaced`] 守门，弱绑定（软亲和）以前没有——它只能靠
+/// `1 - retention` 的随机概率逃逸，留存率提到 0.95 之后就变成"平均 20 轮才松手"，
+/// 等于把 §10.1 修订当初要治的"锁死"又请了回来。
+///
+/// 所以这里补一道同样的闸门：绑定目标的总分比同层最优低出这个幅度时，本次不给
+/// 它权重倾斜，让评分自己决定。阈值取 0.10：正常波动（现场四个账号分布在
+/// 0.68~0.85）不会触发，真正的退化才会。
+const SOFT_AFFINITY_MAX_LAG: f64 = 0.10;
 
 /// 反解出的倍数上限（§10.1 修订）。
 ///
@@ -689,11 +773,12 @@ const AFFINITY_BOOST_CAP: f64 = 64.0;
 
 /// 按综合评分加权随机排出一组候选的尝试顺序。
 ///
-/// `affinity` 命中时把那个候选的**权重**按 [`AFFINITY_RETENTION`] 反解出的倍数
+/// `affinity` 命中时把那个候选的**权重**按 [`affinity_retention`] 反解出的倍数
 /// 放大（§10.1 修订的软粘性）。它只影响**层内**顺序，不跨层。
 fn shuffle(
     candidates: Vec<Candidate>,
     affinity: Option<&str>,
+    request_bytes: usize,
     random: &mut impl FnMut() -> f64,
 ) -> Vec<Candidate> {
     let scores: Vec<score::Score> = candidates.iter().map(|c| c.score).collect();
@@ -705,7 +790,20 @@ fn shuffle(
                 .position(|candidate| candidate.target.target.id == id)
             {
                 Some(bound) => {
-                    score::affinity_boost(&weights, bound, AFFINITY_RETENTION, AFFINITY_BOOST_CAP)
+                    // 安全阀：绑定目标落后越多，留存率越低（§10.1 修订）。
+                    //
+                    // 这里必须是**连续**降级，不能是一道悬崖。早先写成
+                    // "落后超过阈值就完全不倾斜"，而生产上四个账号的分数是
+                    // 0.845/0.817/0.740/0.684——后两个刚好越过 0.10 的线，
+                    // 于是它们的会话每一轮都 100% 重抽签，比原设计还糟。
+                    let best = scores.iter().map(|s| s.total).fold(f64::MIN, f64::max);
+                    let lag = (best - scores[bound].total).max(0.0);
+                    let retention = score::soft_affinity_retention(
+                        affinity_retention(request_bytes),
+                        lag,
+                        SOFT_AFFINITY_MAX_LAG,
+                    );
+                    score::affinity_boost(&weights, bound, retention, AFFINITY_BOOST_CAP)
                 }
                 None => Vec::new(),
             }
@@ -725,7 +823,12 @@ fn shuffle(
 /// 状态码与文案必须来自**同一个**原因。早先的实现分开取：状态码挑"第一个非能力
 /// 原因"、文案取"第一个原因"，于是出现了"503 + 已停用"这种把管理员完全带偏的
 /// 组合——真正的拦路者其实是另一个目标上的能力封禁。
-fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> SelectionFailure {
+fn failure(
+    model_name: &str,
+    group: &GroupView,
+    reasons: &[Ineligible],
+    filtered: Vec<FilteredReason>,
+) -> SelectionFailure {
     let all =
         |predicate: fn(&Ineligible) -> bool| !reasons.is_empty() && reasons.iter().all(predicate);
 
@@ -742,6 +845,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
                 Some(detail) => format!("逻辑模型 {model_name} 无法表达本次请求：{detail}"),
                 None => format!("逻辑模型 {model_name} 无法表达本次请求"),
             },
+            filtered,
         };
     }
     // 倍率相关的原因最值得单独报出——它是"你的钱包在拦你"，客户端重试没有
@@ -753,6 +857,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
                 "逻辑模型 {model_name} 的所有目标有效倍率都高于分组上限 {}",
                 group.group.multiplier_limit
             ),
+            filtered,
         };
     }
     if all(|r| {
@@ -764,6 +869,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
         return SelectionFailure {
             code: ErrorCode::MultiplierUnknown,
             message: format!("逻辑模型 {model_name} 的所有目标倍率未知且已超过宽限期"),
+            filtered,
         };
     }
 
@@ -774,6 +880,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
         return SelectionFailure {
             code: ErrorCode::NoEligibleTarget,
             message: format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
+            filtered: Vec::new(),
         };
     };
     // 状态码：静态表达问题只有在"无一例外"时才是不可重试的 400（上面已返回）。
@@ -789,6 +896,7 @@ fn failure(model_name: &str, group: &GroupView, reasons: &[Ineligible]) -> Selec
             "逻辑模型 {model_name} 当前没有可用的调度目标：{}",
             chosen.describe_detailed()
         ),
+        filtered,
     }
 }
 
@@ -1067,6 +1175,7 @@ mod tests {
                 protocol: Protocol::OpenAiChat,
                 streaming: false,
                 bound_credential: None,
+                request_bytes: 0,
                 now_unix: 0,
                 now: std::time::Instant::now(),
             }
@@ -1266,6 +1375,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             streaming: false,
             bound_credential: None,
+            request_bytes: 0,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1310,6 +1420,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             streaming: false,
             bound_credential: None,
+            request_bytes: 0,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1359,6 +1470,7 @@ mod tests {
             protocol: Protocol::AnthropicMessages,
             streaming: false,
             bound_credential: None,
+            request_bytes: 0,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1414,6 +1526,84 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.code, ErrorCode::NoEligibleTarget);
+    }
+
+    /// 全部目标都不合格时，**失败**也要带出过滤原因（§24.1）。
+    ///
+    /// 现场（2026-10-24，ccmax）：两个账号被上游 502 打进冷却，75 条 503 的
+    /// `attempts=0`，而 `filter_summary` / `filter_details` 全是 NULL——事后分不清
+    /// 是"全在冷却"还是"全部停用"。原因就来自这条路径：`plan()` 直接失败时没有
+    /// `Plan` 可读，而过滤原因只在成功路径上合并。
+    #[test]
+    fn a_failed_plan_still_carries_the_filter_reasons() {
+        let fixture = Fixture::new();
+        let (view, _) = fixture.context();
+        let translation = fixture.translation();
+        // 一个停用的账号 + 一个不在本次请求端点能力内的账号：两种原因混在一起。
+        let group = group_with(
+            "1",
+            vec![
+                target("off", account("a1", "0.5", Protocol::OpenAiChat, false), 50),
+                target("ok", account("a2", "0.5", Protocol::OpenAiChat, true), 50),
+            ],
+        );
+        // 让 a2 熔断，于是两个目标都不合格。
+        for _ in 0..5 {
+            fixture
+                .health
+                .try_admit(
+                    health::Caller {
+                        account_id: "a2",
+                        key_id: None,
+                        target_id: "ok",
+                    },
+                    Limits::default(),
+                    0,
+                )
+                .unwrap()
+                .settle(health::Outcome::Fault, None);
+        }
+
+        let failure = plan(
+            &group,
+            "glm-4.6",
+            &context!(fixture, view, translation),
+            None,
+            &mut fixed(0.5),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, ErrorCode::NoEligibleTarget);
+        let summary = failure.filter_summary().expect("失败也要有过滤摘要");
+        assert!(summary.contains("已停用×1"), "{summary}");
+        assert!(summary.contains("冷却中"), "{summary}");
+        let details = failure.filter_details().expect("要有具体说明");
+        assert!(details.contains("已停用"), "{details}");
+        assert!(details.contains("冷却中"), "{details}");
+    }
+
+    /// 成功路径与失败路径的摘要口径必须一致，否则后台按它聚合会把同一件事算成两类。
+    #[test]
+    fn plan_and_failure_share_one_filter_summary_vocabulary() {
+        let fixture = Fixture::new();
+        let (view, _) = fixture.context();
+        let translation = fixture.translation();
+        let group = group_with(
+            "1",
+            vec![
+                target("a", account("a1", "0.5", Protocol::OpenAiChat, true), 50),
+                target("off", account("a2", "0.5", Protocol::OpenAiChat, false), 50),
+            ],
+        );
+        let plan = plan(
+            &group,
+            "glm-4.6",
+            &context!(fixture, view, translation),
+            None,
+            &mut fixed(0.5),
+        )
+        .unwrap();
+        assert_eq!(plan.filter_summary(), "已停用×1");
+        assert!(plan.filter_details().unwrap().contains("已停用"));
     }
 
     #[test]
@@ -1518,6 +1708,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             streaming: false,
             bound_credential: None,
+            request_bytes: 0,
             now_unix: 1,
             now: std::time::Instant::now(),
         };
@@ -1698,6 +1889,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             streaming: false,
             bound_credential: None,
+            request_bytes: 0,
             now_unix: 0,
             now: std::time::Instant::now(),
         };
@@ -1716,5 +1908,92 @@ mod tests {
             !layer.candidates[0].catalog_discouraged && layer.candidates[1].catalog_discouraged,
             "档位应当反映目录的意见"
         );
+    }
+
+    /// 软亲和留存率必须随请求体增加：小请求让位给均衡，大请求优先保缓存（§10.1）。
+    ///
+    /// 现场（AwsClaude / opus-5-5，2026-10-25）：88.5% 的请求大于 64KB、中位输入
+    /// 16 万 token。留存率写死 0.8 时，一条 20 轮会话留在同一账号的概率只有 1.2%
+    /// —— 几乎必然换号、必然重建前缀缓存。实测留存 80.3%、缓存写/读 0.41，
+    /// 对照组 ccmax 是 96.9% / 0.12。
+    #[test]
+    fn affinity_retention_grows_with_the_cached_prefix() {
+        let small = affinity_retention(4 * 1024);
+        let medium = affinity_retention(100 * 1024);
+        let large = affinity_retention(400 * 1024);
+        let huge = affinity_retention(2 * 1024 * 1024);
+        assert!(
+            small < medium && medium < large && large < huge,
+            "必须单调递增"
+        );
+        // 小请求保持原来的 0.8：重建便宜，负载均衡优先。
+        assert!((small - 0.80).abs() < 1e-12);
+        // 大上下文必须明显更粘，但绝不能钉死。
+        assert!(large >= 0.95, "大上下文必须明显更粘：{large}");
+        assert!(huge <= 0.98, "但不能钉死，仍要留重抽签的机会：{huge}");
+    }
+
+    /// 安全阀：绑定目标明显落后时不再倾斜权重（§10.1 修订）。
+    ///
+    /// 没有这道闸门，留存率提到 0.95 就等于把"差账号锁死"请回来——那正是
+    /// §10.1 修订当初要治的病。这里注入真实性能样本，让 a1 明显比 a2 慢，
+    /// 再验证绑定 a1 时抽签不会把它硬推上来。
+    #[test]
+    fn a_degraded_binding_loses_its_affinity_boost() {
+        let fixture = Fixture::new();
+        let (view, _) = fixture.context();
+        let translation = fixture.translation();
+        let group = group_with(
+            "1",
+            vec![
+                target("fast", account("a1", "0.5", Protocol::OpenAiChat, true), 50),
+                target("slow", account("a2", "0.5", Protocol::OpenAiChat, true), 50),
+            ],
+        );
+        // 给两个目标喂出明显不同的性能：slow 的首字慢十倍、吞吐低十倍。
+        let dimension = score::Dimension {
+            protocol: Protocol::OpenAiChat,
+            streaming: false,
+        };
+        let now = 1_000;
+        for _ in 0..score::MIN_SAMPLES {
+            fixture.perf.observe(
+                "fast",
+                dimension,
+                &score::Sample {
+                    kind: score::SampleKind::Rated,
+                    success: true,
+                    first_token: Some(std::time::Duration::from_millis(100)),
+                    total: std::time::Duration::from_millis(400),
+                    output_tokens: Some(50),
+                },
+                now,
+            );
+            fixture.perf.observe(
+                "slow",
+                dimension,
+                &score::Sample {
+                    kind: score::SampleKind::Rated,
+                    success: true,
+                    first_token: Some(std::time::Duration::from_millis(5_000)),
+                    total: std::time::Duration::from_millis(20_000),
+                    output_tokens: Some(5),
+                },
+                now,
+            );
+        }
+        let mut ctx = context!(fixture, view, translation);
+        ctx.now_unix = now;
+        let mut zero = || 0.0_f64;
+        // 绑定明显落后的 slow：安全阀应当拦下倾斜，抽签仍按分数选 fast。
+        let planned = plan(&group, "glm-4.6", &ctx, Some("slow"), &mut zero).unwrap();
+        let first = &planned.layers[0].candidates[0];
+        assert_eq!(
+            first.target.target.id, "fast",
+            "绑定目标明显落后时不得被倾斜到最前"
+        );
+        // 而绑定领先的 fast 时，倾斜照常生效（随机源固定为 0，必中权重最高者）。
+        let planned = plan(&group, "glm-4.6", &ctx, Some("fast"), &mut zero).unwrap();
+        assert_eq!(planned.layers[0].candidates[0].target.target.id, "fast");
     }
 }
