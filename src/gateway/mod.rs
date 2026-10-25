@@ -269,6 +269,8 @@ async fn handle(
         request_bytes,
         started_at,
         started_unix,
+        // 入口捕获，不等到结算再读：一次请求可能跨过多次配置变更（见字段说明）。
+        config_version: state.config.current().version as i64,
         chain,
     })
     .await;

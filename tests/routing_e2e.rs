@@ -1940,3 +1940,76 @@ async fn a_soft_affinity_hit_records_whether_the_binding_was_actually_kept() {
     // 第一次请求还没有绑定，不该记 kept。
     assert_eq!(records[1].sticky_kept, None, "首次请求没有绑定可谈");
 }
+
+/// 请求记录里的配置版本必须是**请求进入网关那一刻**的版本（§24.1）。
+///
+/// 现场（2026-10-25 09:15–09:18）：同一秒内并存的记录带着两个版本号 v=2 与 v=3。
+/// 原因是 `record_for()` 在**结算时**才读 `config.current().version`，而一次请求
+/// 最长能跑两百多秒、跨过任意多次配置变更。这个字段存在的全部意义就是回答
+/// "这条请求用的是哪份配置"，结算时读等于回答"结束时是哪份"，答非所问。
+#[tokio::test]
+async fn the_recorded_config_version_is_the_one_the_request_started_with() {
+    let upstream = FakeUpstream::spawn().await;
+    // 上游挂住，好让请求在途期间推进配置版本。
+    upstream.script([Behavior::Hang]);
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("slow", &upstream.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let entered = akhub.state.config.version();
+
+    let request = tokio::spawn(chat(
+        &akhub,
+        json!({"model": MODEL, "messages": [{"role": "user", "content": "in flight"}]}),
+    ));
+    upstream.wait_for_requests(1).await;
+
+    // 请求在途：新增一个分组让配置**内容**真的变（版本号只在内容变化时前进），
+    // 把版本推到入口版本之后。用 app_settings 造不出这个效果：它不进配置快照。
+    let (_, prefix) = akhub::security::generate_group_key().unwrap();
+    akhub
+        .state
+        .store
+        .insert_group(&akhub::domain::Group {
+            id: akhub::storage::store::ids::group(),
+            name: "在途新增".into(),
+            key_prefix: prefix,
+            key_digest_hex: "0".repeat(64),
+            multiplier_limit: Multiplier::ONE,
+            weights: Default::default(),
+            queue_capacity: 1,
+            max_wait_secs: 60,
+            allow_managed_background: false,
+            allow_degrade: true,
+            created_at: time::OffsetDateTime::now_utc(),
+        })
+        .await
+        .unwrap();
+    akhub.state.config.reload().await.unwrap();
+    let after_reload = akhub.state.config.version();
+    assert!(
+        after_reload > entered,
+        "配置内容变了，版本必须前进：{entered} → {after_reload}"
+    );
+
+    upstream.release();
+    assert_eq!(request.await.unwrap().status(), 200);
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        records = akhub.state.store.list_request_records(10, 0).await.unwrap();
+        if !records.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(records.len(), 1, "请求记录未落盘");
+    assert_eq!(
+        records[0].config_version,
+        Some(entered as i64),
+        "记录必须是入口时的版本 {entered}，不能是在途重载之后的 {after_reload}"
+    );
+}

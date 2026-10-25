@@ -269,6 +269,8 @@ impl TaskRunner {
                     request_bytes: request.request_bytes,
                     started_at: request.started_at,
                     started_unix: request.started_unix,
+                    // 托管任务沿用原请求进入时的版本：它就是"哪个配置生出了这个任务"。
+                    config_version: request.config_version,
                     chain: request.chain.clone(),
                 },
             )
@@ -497,6 +499,8 @@ pub struct ManagedRequest {
     pub request_bytes: usize,
     pub started_at: std::time::Instant,
     pub started_unix: i64,
+    /// 原请求进入网关时的配置版本：托管任务跑在"生出它的那份配置"下。
+    pub config_version: i64,
     pub chain: crate::gateway::responses::ChainPlan,
 }
 
@@ -564,6 +568,7 @@ pub async fn maybe_start_managed(
         request_bytes: forward.request_bytes,
         started_at: forward.started_at,
         started_unix: forward.started_unix,
+        config_version: forward.config_version,
         chain: forward.chain.clone(),
     };
 

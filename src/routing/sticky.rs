@@ -268,8 +268,10 @@ impl Bindings {
     /// 1.0、`sticky_wait_ms` 全部是 0——那个"缓存早就凉了，不值得为它排队"的
     /// 三档衰减从未生效过。
     ///
-    /// 刷新由真正使用了这个绑定的路径负责：[`Self::bind`]（这次调用成功）与
-    /// [`Self::rebind_credential`]（同一账号内换了 Key）都会把时间推到现在。
+    /// 刷新只由 [`Self::bind`]（这次调用真的用它打成功了）负责：它整条覆写绑定，
+    /// 顺带把 `last_used_at` 与 `credential_digest` 一起纠正到当次实际使用的
+    /// 那把 Key 上。所以"同账号内换了 Key"不需要另开一条更新路径——下一次成功
+    /// 就会自愈，多写一条只会变成第二个需要维护的真相。
     pub fn get(&self, key: &Key, now: i64) -> Option<Binding> {
         let entry = {
             let guard = self.inner.read().ok()?;
@@ -339,24 +341,6 @@ impl Bindings {
                 }),
             }),
         );
-    }
-
-    /// 只把绑定里的 Key 换成另一把，保留绑定时间。
-    ///
-    /// 用于"原 Key 不再可用、同账号内换了另一把"的场景：目标没变，所以
-    /// 不需要重新抽签，只需要把凭据亲和更新到新的那把（§4.2.1）。
-    pub fn rebind_credential(&self, key: &Key, credential_digest: Option<&str>, now: i64) {
-        let entry = match self.inner.read() {
-            Ok(guard) => guard.get(key).map(Arc::clone),
-            Err(_) => None,
-        };
-        let Some(entry) = entry else {
-            return;
-        };
-        if let Ok(mut state) = entry.state.lock() {
-            state.credential_digest = credential_digest.map(str::to_string);
-            state.last_used_at = now;
-        }
     }
 
     /// 目标不再合格时清除绑定（§10.2）。

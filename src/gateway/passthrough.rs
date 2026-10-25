@@ -199,6 +199,14 @@ pub struct Forward<'a> {
     pub started_at: Instant,
     /// 请求进入网关时的 Unix 秒，用于请求记录按真实开始时间归档。
     pub started_unix: i64,
+    /// 请求**进入网关那一刻**的配置版本（§24.1）。
+    ///
+    /// 必须在入口捕获，不能等到结算时再读 `config.current()`：一次请求可能跑
+    /// 两百多秒，跨过任意多次配置变更。结算时读会让同一秒内并存的记录带着
+    /// 两个不同版本号（现场 2026-10-25 09:15–09:18 的 v=2 与 v=3 交错），
+    /// 那时"这条请求用的是哪份配置"就再也答不出来——而这个字段存在的全部
+    /// 意义就是回答它。
+    pub config_version: i64,
     /// Responses 状态链处理计划。所有入口都携带；非 Responses 入口它只是
     /// 没有引用与固定候选的空计划。
     pub chain: responses::ChainPlan,
@@ -2564,7 +2572,7 @@ impl Walk<'_> {
             first_token_ms: None,
             input_tokens: self.usage_parts.0.map(|value| value as i64),
             output_tokens: self.usage_parts.1.map(|value| value as i64),
-            config_version: Some(forward.state.config.current().version as i64),
+            config_version: Some(forward.config_version),
             sticky_wait_ms: self.telemetry.sticky_wait.map(|d| d.as_millis() as i64),
             sticky_freshness: self.telemetry.sticky_freshness,
             sticky_origin: self.telemetry.sticky_origin.map(str::to_string),
