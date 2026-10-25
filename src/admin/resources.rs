@@ -4206,6 +4206,10 @@ pub async fn cost(
                         logical_model: logical_model.clone(),
                         effective_multiplier: Multiplier::from_raw(*raw),
                         requests: *requests,
+                        // 内存汇总不保留反事实基准（它按实际用过的倍率归档）。
+                        // 留 `None` 让成本页退回"实际最低档"口径，而不是伪造一个 0。
+                        cheapest_available: None,
+                        dearest_available: None,
                     }
                 })
             })
@@ -4302,6 +4306,15 @@ pub async fn cost(
         let some = Some(sample.effective_multiplier);
         entry.cheapest = entry.cheapest.min(some).or(some);
         entry.dearest = entry.dearest.max(some).or(some);
+        // 反事实基准：请求发生时同模型内最便宜/最贵的**合格目标**倍率（§11.6）。
+        // 它比"实际用过的倍率里的最低档"更诚实：流量从没落到最便宜那档时，
+        // 后者会让"还能再省多少"恒为 0，把真实的优化空间吞掉（§6.8）。
+        if let Some(available) = sample.cheapest_available {
+            entry.cheapest = entry.cheapest.min(Some(available)).or(Some(available));
+        }
+        if let Some(available) = sample.dearest_available {
+            entry.dearest = entry.dearest.max(Some(available)).or(Some(available));
+        }
     }
 
     let model_views: Vec<Value> = models

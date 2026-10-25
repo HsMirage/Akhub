@@ -42,6 +42,88 @@ async fn record(akhub: &Akhub, target: &common::Wired, logical_model: &str, effe
     record_tokens(akhub, target, logical_model, effective, 100, 20).await;
 }
 
+/// 补一条带**反事实基准**的成功请求：记录当时同模型内最便宜的合格目标倍率。
+///
+/// 参数 `cheapest` 是"如果只走最便宜的那个目标，倍率会是多少"——请求发生时
+/// 算得出来，事后无法重算（§11.6）。
+async fn record_with_baseline(
+    akhub: &Akhub,
+    target: &common::Wired,
+    logical_model: &str,
+    effective: &str,
+    cheapest: &str,
+) {
+    let now = akhub::storage::now_unix();
+    let mut record = base_record(akhub, target, logical_model, effective, 100, 20);
+    record.started_at = now - 60;
+    record.cheapest_multiplier = Some(Multiplier::parse(cheapest).unwrap());
+    record.dearest_multiplier = Some(Multiplier::parse("1.0").unwrap());
+    akhub
+        .state
+        .store
+        .insert_request_records(&[record])
+        .await
+        .unwrap();
+}
+
+/// 组装一条成功请求记录（成本聚合的直接输入）。
+fn base_record(
+    akhub: &Akhub,
+    target: &common::Wired,
+    logical_model: &str,
+    effective: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> akhub::storage::store::RequestRecord {
+    let now = akhub::storage::now_unix();
+    akhub::storage::store::RequestRecord {
+        request_id: format!("req-{}", uuid_like()),
+        started_at: now - 60,
+        duration_ms: 10,
+        protocol: Protocol::OpenAiChat,
+        streaming: false,
+        group_id: Some(akhub.group_id.clone()),
+        logical_model: Some(logical_model.into()),
+        target_id: Some(target.target_id.clone()),
+        account_id: Some(target.account_id.clone()),
+        upstream_model: Some("glm-4.6".into()),
+        request_bytes: 100,
+        upstream_status: Some(200),
+        http_status: 200,
+        error_code: None,
+        endpoint: Some("chat_completions".into()),
+        degraded: None,
+        effective_multiplier: Some(Multiplier::parse(effective).unwrap()),
+        cheapest_multiplier: None,
+        dearest_multiplier: None,
+        attempts: 1,
+        queued_ms: 0,
+        sticky_hit: false,
+
+        sticky_kept: None,
+        first_token_ms: None,
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+        config_version: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        sticky_wait_ms: None,
+        sticky_freshness: None,
+        sticky_origin: None,
+        output_tps: None,
+        multiplier_source: None,
+        quota_status: None,
+        filter_summary: None,
+        filter_details: None,
+        selected_layer: None,
+        key_id: None,
+        key_label: None,
+        effort_retries: 0,
+        attempts_detail: Vec::new(),
+    }
+}
+
 /// 带指定 Token 用量的一条成功请求。
 async fn record_tokens(
     akhub: &Akhub,
@@ -51,56 +133,18 @@ async fn record_tokens(
     input_tokens: i64,
     output_tokens: i64,
 ) {
-    let now = akhub::storage::now_unix();
+    let record = base_record(
+        akhub,
+        target,
+        logical_model,
+        effective,
+        input_tokens,
+        output_tokens,
+    );
     akhub
         .state
         .store
-        .insert_request_records(&[akhub::storage::store::RequestRecord {
-            request_id: format!("req-{}", uuid_like()),
-            started_at: now - 60,
-            duration_ms: 10,
-            protocol: Protocol::OpenAiChat,
-            streaming: false,
-            group_id: Some(akhub.group_id.clone()),
-            logical_model: Some(logical_model.into()),
-            target_id: Some(target.target_id.clone()),
-            account_id: Some(target.account_id.clone()),
-            upstream_model: Some("glm-4.6".into()),
-            request_bytes: 100,
-            upstream_status: Some(200),
-            http_status: 200,
-            error_code: None,
-            endpoint: Some("chat_completions".into()),
-            degraded: None,
-            effective_multiplier: Some(Multiplier::parse(effective).unwrap()),
-            cheapest_multiplier: None,
-            dearest_multiplier: None,
-            attempts: 1,
-            queued_ms: 0,
-            sticky_hit: false,
-
-            sticky_kept: None,
-            first_token_ms: None,
-            input_tokens: Some(input_tokens),
-            output_tokens: Some(output_tokens),
-            config_version: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: None,
-            sticky_wait_ms: None,
-            sticky_freshness: None,
-            sticky_origin: None,
-            output_tps: None,
-            multiplier_source: None,
-            quota_status: None,
-            filter_summary: None,
-            filter_details: None,
-            selected_layer: None,
-            key_id: None,
-            key_label: None,
-            effort_retries: 0,
-            attempts_detail: Vec::new(),
-        }])
+        .insert_request_records(&[record])
         .await
         .unwrap();
 }
@@ -808,5 +852,57 @@ async fn cost_page_reports_tokens_and_uses_them_for_shares() {
     assert!(
         (share_b - 0.75).abs() < 0.001,
         "B 的 Token 占比应为 75%：{share_b}"
+    );
+}
+
+/// 「还能再省多少」必须用**反事实基准**，而不是"实际用过的倍率里的最低档"。
+///
+/// 流量从没落到同层最便宜的那个目标上时，后者算出的节省恒为 0——而真实的
+/// 优化空间大于 0。记录里的 `cheapest_multiplier` 就是为此存的（§11.6、§6.8）。
+#[tokio::test]
+async fn saving_uses_the_counterfactual_cheapest_target_not_the_observed_minimum() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "glm-4.6",
+            "m",
+            50,
+        )
+        .multiplier(akhub::domain::MultiplierMode::Manual, "1.0"),
+    )
+    .await;
+
+    // 只走 1.0 这个目标，但当时同层还有 0.5 的合格目标（流量没落到它身上）。
+    for _ in 0..3 {
+        record_with_baseline(&akhub, &a, "glm-4.6", "1.0", "0.5").await;
+    }
+
+    let view: Value = client
+        .get(format!("{}/admin/api/cost?period=day", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = view["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["logical_model"] == "glm-4.6")
+        .expect("glm-4.6 应该在成本页里");
+    assert_eq!(
+        model["cheapest_multiplier"], "0.5",
+        "最便宜基准应当取记录里的合格目标倍率，而不是实际用过的最低档"
+    );
+    let saving = model["saving_vs_cheapest"].as_f64().unwrap();
+    assert!(
+        (saving - 0.5).abs() < 1e-4,
+        "加权均倍率 1.0、最便宜 0.5 → 应当能省 50%，实际 {saving}"
     );
 }

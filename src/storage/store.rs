@@ -1924,7 +1924,12 @@ impl Store {
     /// 流量占比扭曲（§6.8 的口径要求）。SQL 聚合给出 (模型, 倍率, 次数)。
     pub async fn cost_multiplier_samples(&self, since: i64) -> Result<Vec<CostSampleRow>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT group_id, logical_model, effective_multiplier, COUNT(*) AS requests
+            // `cheapest_multiplier` / `dearest_multiplier` 是**请求发生时**同一逻辑模型
+            // 内最便宜/最贵合格目标的倍率，§11.6 记它就是为了给成本页当反事实基准：
+            // 只从"实际用过的倍率"里取 min 会系统性偏低——流量从没落到最便宜的那个
+            // 目标上时，算出来的"还能再省多少"就是 0，而真实优化空间大于 0（§6.8）。
+            "SELECT group_id, logical_model, effective_multiplier, COUNT(*) AS requests,
+                    MIN(cheapest_multiplier) AS cheapest, MAX(dearest_multiplier) AS dearest
              FROM request_records
              WHERE started_at >= ? AND {SUCCESS}
                AND group_id IS NOT NULL AND logical_model IS NOT NULL
@@ -1943,6 +1948,12 @@ impl Store {
                         row.try_get("effective_multiplier")?,
                     ),
                     requests: row.try_get::<i64, _>("requests")?,
+                    cheapest_available: row
+                        .try_get::<Option<i64>, _>("cheapest")?
+                        .map(Multiplier::from_raw),
+                    dearest_available: row
+                        .try_get::<Option<i64>, _>("dearest")?
+                        .map(Multiplier::from_raw),
                 })
             })
             .collect()
@@ -3080,6 +3091,13 @@ pub struct CostSampleRow {
     pub logical_model: String,
     pub effective_multiplier: Multiplier,
     pub requests: i64,
+    /// 这批请求发生时，同一逻辑模型内**最便宜合格目标**的有效倍率（§11.6）。
+    ///
+    /// 成本页的「还能再省多少」必须用它做基准，而不是从"实际用过的倍率"里取
+    /// min——流量从没落到最便宜那个目标上时，后者算出的节省恒为 0。
+    pub cheapest_available: Option<Multiplier>,
+    /// 同上，最贵合格目标的倍率。
+    pub dearest_available: Option<Multiplier>,
 }
 
 /// 校准助手的一条对账记录（§6.8）。
