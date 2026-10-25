@@ -761,8 +761,9 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             "迁移后 target_perf_snapshot 缺少 {column}：{perf_columns:?}"
         );
     }
-    // 老库的 groups 表补了第五个权重列，且默认为 0——升级不该悄悄改掉
-    // 管理员已经配好的四项比例（它们本来就和为 100）。
+    // 老库的 groups 表补了第五个权重列。这次升级不只是加列：旧预设的四维
+    // 权重必须换成同名新预设（否则现场 14 个分组全是预设点出来的，升级后
+    // 命中率权重一律 0、新维度当天就是死的）。
     let group_columns: std::collections::HashSet<String> = sqlx::query("PRAGMA table_info(groups)")
         .fetch_all(reopened.store.pool())
         .await
@@ -774,13 +775,18 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         group_columns.contains("weight_cache_hit"),
         "迁移后 groups 缺少 weight_cache_hit：{group_columns:?}"
     );
-    let cache_weight: i64 = sqlx::query_scalar("SELECT weight_cache_hit FROM groups LIMIT 1")
-        .fetch_one(reopened.store.pool())
-        .await
-        .unwrap();
+    // 这份老库的分组是旧「均衡」40/25/20/15：升级后应变成 40/25/15/10/10。
+    let weights: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT weight_multiplier, weight_reliability, weight_first_token,
+                weight_throughput, weight_cache_hit FROM groups LIMIT 1",
+    )
+    .fetch_one(reopened.store.pool())
+    .await
+    .unwrap();
     assert_eq!(
-        cache_weight, 0,
-        "老库升级后缓存维权重应为 0，不篡改既有比例"
+        weights,
+        (40, 25, 15, 10, 10),
+        "旧「均衡」预设应升级为五维同名预设，而不是把命中率权重留成 0"
     );
     // v17 的回填子查询按 (target_id, protocol, streaming) 取最近请求，索引必须
     // 存在，否则迁移会在请求记录表上全表扫描 × 快照行数。
@@ -826,6 +832,86 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .unwrap();
     // 当前版本；升级检查靠这个数字决定要不要跑迁移（§27）。
     assert_eq!(version, akhub::storage::SCHEMA_VERSION.to_string());
+}
+
+/// v24 只把**恰好等于旧预设**的四维权重换成新预设，手调的组合原样保留。
+///
+/// 这条守的是迁移的边界：现场 14 个分组全是从预设点出来的，不换新预设的话
+/// 第五维权重一律 0、上线当天就是死的；但反过来，管理员亲手调出来的比例
+/// 绝不能被迁移悄悄改掉。两者的区别就是「四个数是否与旧预设完全相等」。
+#[tokio::test]
+async fn the_v24_migration_only_rewrites_weights_that_match_an_old_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+    // 退回 v23：删掉第五列并把版本号写回去。
+    sqlx::query("ALTER TABLE groups DROP COLUMN weight_cache_hit")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '23' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 三个分组：旧「均衡」、旧「成本优先」、一个手调组合。
+    for (id, name, w) in [
+        ("g-balance", "均衡组", (40, 25, 20, 15)),
+        ("g-cost", "成本组", (55, 20, 15, 10)),
+        ("g-custom", "手调组", (33, 27, 21, 19)),
+    ] {
+        sqlx::query(
+            "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
+                weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+                queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
+                created_at)
+             VALUES (?, ?, ?, ?, 1000000, ?, ?, ?, ?, 100, 60, 1, 0, 1)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("{id}-prefix"))
+        .bind(format!("{id}-digest"))
+        .bind(w.0)
+        .bind(w.1)
+        .bind(w.2)
+        .bind(w.3)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let reopened = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let weights = |id: &str| {
+        let pool = reopened.store.pool().clone();
+        let id = id.to_string();
+        async move {
+            sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+                "SELECT weight_multiplier, weight_reliability, weight_first_token,
+                        weight_throughput, weight_cache_hit FROM groups WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        weights("g-balance").await,
+        (40, 25, 15, 10, 10),
+        "旧「均衡」应换成新「均衡」"
+    );
+    assert_eq!(
+        weights("g-cost").await,
+        (55, 20, 10, 5, 10),
+        "旧「成本优先」应换成新「成本优先」"
+    );
+    assert_eq!(
+        weights("g-custom").await,
+        (33, 27, 21, 19, 0),
+        "手调权重不得被迁移改动，第五维留 0（不参与评分）"
+    );
 }
 
 /// v18 重建 `upstream_accounts` 时按列名逐列拷贝。历史上有几列是**直接

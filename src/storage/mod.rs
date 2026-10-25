@@ -800,10 +800,20 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         // v24：调度评分加第五维「缓存命中率」（§9.4）。
         //
         // 两处落库：分组的第五个权重列，以及性能快照里的命中率 EWMA。
-        // 老库的 `weight_cache_hit` 给 0 而不是从别项里挪：迁移不该悄悄改掉
-        // 管理员配好的比例，而旧的四项之和本来就是 100。代价是老库升级后
-        // 五项之和是 100 但缓存维权重为 0——这一维不参与评分，与升级前等价。
-        // 想要它生效就在界面上重新保存一次权重（默认预设已含 10 分）。
+        //
+        // 新列默认 0，对自定义权重的分组就该保持 0：迁移不得悄悄改掉管理员
+        // 亲手调出来的比例。但**整组都是 0 等于这一维在上线当天就是死的**
+        // ——现场 14 个分组全是从预设点出来的，升级后命中率权重一律为 0，
+        // 用户看到的只是一个永远不起作用的第五列。
+        //
+        // 所以只做一件**可证明无歧义**的事：把四个数与旧预设**完全相等**的
+        // 分组，换成同名新预设。相等才动，说明当初是点的按钮而不是手调；
+        // 手调出来的组合几乎不可能恰好等于预设，落不到这里。
+        //
+        // 旧预设 → 新预设（首字与速度各让 5 分给命中率）：
+        //   成本优先 55/20/15/10 → 55/20/10/5/10
+        //   均衡     40/25/20/15 → 40/25/15/10/10
+        //   质量优先 15/30/25/30 → 15/30/20/25/10
         let group_columns = table_columns(pool, "groups").await?;
         if !group_columns.contains("weight_cache_hit") {
             sqlx::query(
@@ -812,6 +822,45 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
             .execute(pool)
             .await
             .context("迁移 groups.weight_cache_hit 失败")?;
+            for (old, new) in [
+                (
+                    (55_i64, 20_i64, 15_i64, 10_i64),
+                    (55_i64, 20_i64, 10_i64, 5_i64, 10_i64),
+                ),
+                ((40, 25, 20, 15), (40, 25, 15, 10, 10)),
+                ((15, 30, 25, 30), (15, 30, 20, 25, 10)),
+            ] {
+                let affected = sqlx::query(
+                    "UPDATE groups
+                        SET weight_multiplier = ?, weight_reliability = ?,
+                            weight_first_token = ?, weight_throughput = ?,
+                            weight_cache_hit = ?
+                      WHERE weight_multiplier = ? AND weight_reliability = ?
+                        AND weight_first_token = ? AND weight_throughput = ?
+                        AND weight_cache_hit = 0",
+                )
+                .bind(new.0)
+                .bind(new.1)
+                .bind(new.2)
+                .bind(new.3)
+                .bind(new.4)
+                .bind(old.0)
+                .bind(old.1)
+                .bind(old.2)
+                .bind(old.3)
+                .execute(pool)
+                .await
+                .context("迁移旧预设权重到五维失败")?
+                .rows_affected();
+                if affected > 0 {
+                    tracing::info!(
+                        groups = affected,
+                        from = ?([old.0, old.1, old.2, old.3]),
+                        to = ?([new.0, new.1, new.2, new.3, new.4]),
+                        "把旧预设的四维权重升级为五维（多出的 10 分给缓存命中率）"
+                    );
+                }
+            }
         }
         let perf_columns = table_columns(pool, "target_perf_snapshot").await?;
         for (column, ddl) in [
