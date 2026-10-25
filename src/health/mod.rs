@@ -972,7 +972,12 @@ impl Admission {
             Outcome::Neutral => {
                 self.release_account_half_open();
                 self.release_key_half_open();
-                crate::sync::lock(&self.target.circuit).release_half_open();
+                // 只还**自己占的**那个半开名额。无条件 release 会把别人的试运行
+                // 名额一起清掉：本次准入发生在熔断 Closed 时（half_open=false），
+                // 期间目标因别的请求熔断、冷却到期、另一个请求 B 抢到了唯一的半开
+                // 名额——本次结束就把它抹了。于是「熔断后只放行一个真实试运行」被
+                // 打破，且 B 失败时看不到 half_open_taken，退避等级不增长。
+                crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
             }
             Outcome::Success => {
                 // 成功一次就清掉凭据的硬停与额度熔断：这是 Key 从"坏"回到
@@ -993,7 +998,8 @@ impl Admission {
                     crate::sync::lock(&key.quota).undo_half_open(self.key_half_open);
                 }
                 self.release_account_half_open();
-                crate::sync::lock(&self.target.circuit).release_half_open();
+                // 同上：只还自己占的。
+                crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
             }
             Outcome::QuotaExhausted { retry_after } => {
                 // `trip` 自己会把半开状态清成"冷却中"，不需要再 release。
@@ -1001,7 +1007,7 @@ impl Admission {
                     Some(key) => crate::sync::lock(&key.quota).trip(now, retry_after),
                     None => crate::sync::lock(&self.account.quota).trip(now, retry_after),
                 }
-                crate::sync::lock(&self.target.circuit).release_half_open();
+                crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
             }
             Outcome::RateLimited { retry_after } => {
                 self.release_account_half_open();
@@ -1742,6 +1748,42 @@ mod tests {
             registry
                 .check(caller("acc", "tgt"), Limits::default())
                 .is_ok()
+        );
+    }
+
+    /// 一个在熔断 **Closed** 期准入的请求，不能清掉别人后来抢到的半开名额。
+    ///
+    /// 无条件 `release_half_open()` 会把 `half_open_taken` 直接置 false：本次
+    /// 准入时 `half_open == false`，期间目标熔断、冷却到期、另一个请求 B 抢到了
+    /// 唯一的试运行名额——本次结算就把它抹掉，于是熔断后「只放行一个真实试运行」
+    /// 的约束被打破；B 若失败也看不到 `half_open_taken`，退避等级不再增长。
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_era_admission_does_not_clear_someone_elses_trial_slot() {
+        let registry = Registry::new();
+        let limits = Limits::default();
+        // 熔断前准入的请求 A：此时 half_open = false。
+        let held = registry.try_admit(caller("acc", "tgt"), limits, 0).unwrap();
+
+        // 把目标打到熔断，再推进到半开，让 B 抢到唯一的试运行名额。
+        for _ in 0..CONSECUTIVE_TRIP {
+            registry
+                .try_admit(caller("acc", "tgt"), limits, 0)
+                .unwrap()
+                .settle(Outcome::Fault, None);
+        }
+        tokio::time::advance(COOLDOWN_BASE * 2).await;
+        let trial = registry
+            .try_admit(caller("acc", "tgt"), limits, 0)
+            .expect("半开名额应当放给第一个请求");
+        assert!(trial.is_half_open(), "这个请求拿的应当是试运行名额");
+
+        // A 现在以 Neutral 结束：它从来没占过半开名额，不能把它清掉。
+        held.settle(Outcome::Neutral, None);
+
+        // 再来一个必须被拒：说明 B 的试运行名额还在。
+        assert!(
+            registry.try_admit(caller("acc", "tgt"), limits, 0).is_err(),
+            "别人的试运行名额被无关请求清掉了"
         );
     }
 

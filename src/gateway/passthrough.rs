@@ -1240,7 +1240,25 @@ impl Walk<'_> {
                         continue;
                     }
                 };
-                match self.admit_with_permit(candidate, credential.as_ref(), permit) {
+                // 这个名额是排队时按**那一刻的候选集合**抢到的：`capacity_any_key`
+                // 会挑一把"最容易空出来"的 Key，抢到的就是**那一把**的 Key 级名额。
+                // 上面重新选 Key 可能选出另一把，直接接管名额会让"名额记在 A 上、
+                // 请求发给 B"——B 的 Key 级上限被绕过，A 的名额被白占（`run()` 里
+                // 明令禁止的那条）。
+                //
+                // 判据：只有当选出的这把 Key **没有** Key 级并发上限时，permit 里
+                // 才一定不含 Key 名额（该级不限 → 不参与排队），接管才是安全的。
+                // 配了上限就丢掉 permit 重新准入——多抢一次名额，但不越过上限。
+                let key_is_bounded = credential
+                    .as_ref()
+                    .is_some_and(|key| key.limits.max_concurrency.is_some());
+                let admission = if key_is_bounded {
+                    drop(permit);
+                    self.try_admit(candidate, credential.as_ref())
+                } else {
+                    self.admit_with_permit(candidate, credential.as_ref(), permit)
+                };
+                match admission {
                     Ok(admission) => {
                         pending.remove(index);
                         match self.run(candidate, admission, sticky_key, credential).await {
