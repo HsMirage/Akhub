@@ -72,6 +72,11 @@ impl EffortFit {
             } else {
                 0
             },
+            // `omitted_failed` 与 `rejected` **同寿命**：它是"这条拒绝路径也走不通"
+            // 的证据，证据一过期就必须跟着失效。否则一旦某次 Omit 失败过，
+            // 此后 24 小时里所有请求都会跳过 Omit 直接降档——把一个临时的上游
+            // 抖动变成了长期的强度下调（§14.6 修订）。
+            omitted_failed: self.rejected_expires > now && self.facts.omitted_failed,
         }
     }
 }
@@ -83,10 +88,15 @@ pub enum EffortPlan {
     Send(Effort),
     /// 不发射 `output_config`，把档位交回上游模型自己的默认。
     ///
-    /// 这是"客户端要的那一档不被接受、又没有更高的档可升"时的处置。**它不是
-    /// 降档**：网关没有替客户端选一个更弱的档位，思考仍然按上游自己的默认强度
-    /// 发生。发一个更低的档位才是降智，那条路不存在（§14.6）。
+    /// 这是"这一档不被接受、又没有更高的档可试"时的**最后兜底**。
+    /// 它本身不是降档：思考仍按上游自己的默认强度发生。
     Omit,
+    /// 向上全都试过且被拒，只能发一个**更低**的档位（§14.6 修订）。
+    ///
+    /// 只在"客户端要的档不被接受、更高的档位也全部被拒"时出现。此时已经
+    /// 走投无路：要么不指定（`Omit`，把强度交给上游默认），要么显式发一个
+    /// 更低的档。按"升级不行才降级"的优先级，`Omit` 排在它前面。
+    Lower(Effort),
 }
 
 /// 某个（账号，上游模型）上档位实测结果的**只读快照**。
@@ -100,6 +110,11 @@ pub struct EffortFacts {
     accepted: u8,
     /// 试过、上游拒过的档位（位图）。
     rejected: u8,
+    /// "不指定档位"这条路已经试过且仍然失败（§14.6 修订）。
+    ///
+    /// 用来保证 `plan()` 里 `Omit` 只出现**一次**：交回上游默认是一种让步，
+    /// 试过还不行就必须显式挑一个档位，不能在同一次会话里反复赌默认值。
+    omitted_failed: bool,
 }
 
 /// 档位在位图里的位。
@@ -166,22 +181,48 @@ impl EffortFacts {
             .find(|level| *level > requested && wanted(self, *level))
     }
 
+    /// 比 `requested` 更低、且满足 `wanted` 的**最高**档位。
+    ///
+    /// 取最高而不是最低：这是向上全部失败后的最后一步，要尽量贴近客户端
+    /// 原本的意图——能退一档解决，就不要退到底。
+    fn highest_below(
+        &self,
+        requested: Effort,
+        wanted: impl Fn(&Self, Effort) -> bool,
+    ) -> Option<Effort> {
+        LEVELS
+            .into_iter()
+            .rev()
+            .find(|level| *level < requested && wanted(self, *level))
+    }
+
     /// 客户端要 `requested` 时该怎么发。
     ///
-    /// 优先级是刻意的：**升到已确认可用的更高档 > 往上试探一档 > 不指定**。
-    /// **降档这条路不存在**——发一个更低的档位等于替客户端降智（§14.6）。
+    /// 优先级（§14.6 修订，按用户明确要求的顺序）：
+    ///
+    /// 1. **升到已确认可用的更高档** —— 确定能成功，且比客户端要的还强；
+    /// 2. **往上试探一档** —— 更高的档位里还有没试过的，逐档往上试；
+    /// 3. **不指定**（`Omit`）—— 更高的都试过且被拒，把强度交回上游默认；
+    /// 4. **降档**（`Lower`）—— 最后手段，见下。
+    ///
+    /// **为什么现在允许降档。** 早先的实现到 `Omit` 就停了，理由是"降档等于替
+    /// 客户端降智"。但 `Omit` 并不比降档更安全：上游的默认强度完全不可知，
+    /// 可能比客户端要的还低。既然两者都可能更弱，显式降档至少是**可控**的——
+    /// 挑一个已经证明可用的档位，而不是赌上游的默认值。
+    ///
+    /// 它排在最后是刻意的：只要能向上找到出路，就绝不往下走。
     pub fn plan(&self, requested: Effort) -> EffortPlan {
         if !self.is_rejected(requested) {
             // 没被拒过就按客户端要的发；被接受过当然也走这里。
             return EffortPlan::Send(requested);
         }
-        // 这一档被拒过。先看有没有**更高**的、已经证明可用的档位——那是确定
-        // 能成功的升档，也是这里最好的结果。
+        // ① 这一档被拒过。先看有没有**更高**的、已经证明可用的档位——那是
+        // 确定能成功的升档，也是这里最好的结果。
         if let Some(higher) = self.lowest_above(requested, |facts, level| facts.is_accepted(level))
         {
             return EffortPlan::Send(higher);
         }
-        // 没有已知可用的更高档，但更高的档位里还有没试过的：往上试**最近的
+        // ② 没有已知可用的更高档，但更高的档位里还有没试过的：往上试**最近的
         // 那一档**。
         //
         // 中转站实现的档位**不单调**（现场：一个站收 low 却拒 medium），所以
@@ -190,7 +231,22 @@ impl EffortFacts {
         if let Some(next) = self.lowest_above(requested, |facts, level| !facts.is_rejected(level)) {
             return EffortPlan::Send(next);
         }
-        // 更高的档位都试过且都被拒：不指定，交回上游自己的默认。
+        // ③ 更高的档位全都试过且被拒。先给一次"不指定"的机会：交回上游默认，
+        // 但只给一次——默认值试过还不行，就必须显式选一档了。
+        if !self.omitted_failed {
+            return EffortPlan::Omit;
+        }
+        // ④ 向上走不通、Omit 也试过：显式降到**已确认可用**的最高档。
+        if let Some(lower) = self.highest_below(requested, |facts, level| facts.is_accepted(level))
+        {
+            return EffortPlan::Lower(lower);
+        }
+        // ⑤ 连一个已知可用的低档都没有：至少挑一个没被拒过的，别发一个必失败的值。
+        if let Some(lower) = self.highest_below(requested, |facts, level| !facts.is_rejected(level))
+        {
+            return EffortPlan::Lower(lower);
+        }
+        // ⑥ 上下都无路可走：交回上游默认。
         EffortPlan::Omit
     }
 
@@ -288,6 +344,20 @@ impl Evidence {
             let fit = map.entry(key).or_insert_with(|| EffortFit::new(now));
             fit.facts.reject(rejected);
             // 同理只续"被拒事实"的期。
+            fit.rejected_expires = now + TTL;
+        }
+    }
+
+    /// 记下「这次没有指定档位，但还是被拒了」（§14.6 修订）。
+    ///
+    /// `plan()` 把 `Omit` 当作向上走不通时的第一次让步：交回上游默认。
+    /// 只有当它也会失败时，才允许显式降档——所以必须有地方把这个失败记下来，
+    /// 否则降档那一步永远不会被触发。
+    pub fn note_omitted_failed(&self, account_id: &str, upstream_model: &str, now: Instant) {
+        let key = (account_id.to_string(), upstream_model.to_string());
+        if let Ok(mut map) = self.effort_fit.write() {
+            let fit = map.entry(key).or_insert_with(|| EffortFit::new(now));
+            fit.facts.omitted_failed = true;
             fit.rejected_expires = now + TTL;
         }
     }
@@ -594,5 +664,107 @@ mod tests {
         evidence.note_supported("a", Endpoint::Responses, now);
         evidence.clear();
         assert!(!evidence.is_supported("a", Endpoint::Responses, now));
+    }
+
+    /// 用户明确要求的顺序（§14.6 修订）：**先升级，向上不行再降级**。
+    ///
+    /// 以客户端要 high 为例，完整演化：
+    ///   high 被拒 → xhigh（升一档试）→ max（继续升）
+    ///   max 被拒 → Omit（向上走不通，先交回上游默认）
+    ///   Omit 也失败 → Lower（显式降档，挑已确认可用的最高档）
+    #[test]
+    fn the_fallback_climbs_first_then_descends_only_after_the_top_fails() {
+        let evidence = Evidence::new();
+        let now = Instant::now();
+
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::High)
+        );
+
+        evidence.note_effort_rejected("a", "m", Effort::High, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::XHigh)
+        );
+
+        evidence.note_effort_rejected("a", "m", Effort::XHigh, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::Max)
+        );
+
+        evidence.note_effort_rejected("a", "m", Effort::Max, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Omit,
+            "向上全都失败时先交回上游默认，不能直接降档"
+        );
+
+        evidence.note_omitted_failed("a", "m", now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Lower(Effort::Medium),
+            "向上与 Omit 都失败后才降一档：挑已知可用的最高档"
+        );
+    }
+
+    /// 降档必须挑**已确认可用**的最高档，而不是就近瞎猜。
+    #[test]
+    fn the_descent_picks_the_highest_level_known_to_work() {
+        let evidence = Evidence::new();
+        let now = Instant::now();
+        evidence.note_effort_accepted("a", "m", Effort::Low, now);
+        evidence.note_effort_accepted("a", "m", Effort::Medium, now);
+        for level in [Effort::High, Effort::XHigh, Effort::Max] {
+            evidence.note_effort_rejected("a", "m", level, now);
+        }
+        evidence.note_omitted_failed("a", "m", now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Lower(Effort::Medium),
+            "要挑已确认可用的最高档，不是最低档"
+        );
+    }
+
+    /// 向上还有活路时，绝不降档——哪怕低档已经确认可用。
+    #[test]
+    fn a_available_upgrade_always_beats_descending() {
+        let evidence = Evidence::new();
+        let now = Instant::now();
+        evidence.note_effort_accepted("a", "m", Effort::Low, now);
+        evidence.note_effort_rejected("a", "m", Effort::High, now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Send(Effort::XHigh),
+            "向上还有未试过的档位时必须先升"
+        );
+    }
+
+    /// `omitted_failed` 必须和"被拒"事实**同寿命**，不能永久生效。
+    ///
+    /// 否则一旦某次 Omit 失败过，此后整个 TTL 内所有请求都会跳过 Omit 直接
+    /// 降档——把一个临时的上游抖动变成长期的强度下调（§14.6 修订）。
+    #[test]
+    fn a_stale_omitted_failure_expires_with_the_rejection_evidence() {
+        let evidence = Evidence::new();
+        let now = Instant::now();
+        for level in [Effort::High, Effort::XHigh, Effort::Max] {
+            evidence.note_effort_rejected("a", "m", level, now);
+        }
+        evidence.note_omitted_failed("a", "m", now);
+        assert_eq!(
+            plan(&evidence, Effort::High, now),
+            EffortPlan::Lower(Effort::Medium),
+            "Omit 也失败过时允许降档"
+        );
+
+        // 证据过期之后：回到"按客户端要的发"，而不是继续降档。
+        let later = now + TTL + Duration::from_secs(1);
+        assert_eq!(
+            plan(&evidence, Effort::High, later),
+            EffortPlan::Send(Effort::High),
+            "证据全部过期后应当重新按客户端要的发"
+        );
     }
 }

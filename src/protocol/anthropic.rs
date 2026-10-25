@@ -1142,15 +1142,19 @@ pub fn align_thinking(
             } else {
                 requested
             };
-            // 这一档在这个（账号，上游模型）上被拒过时的处置：升到已确认可用的
-            // 更高档，或者**不指定**（把强度交回上游自己的默认）。绝不发更低的
-            // 一档——那是替客户端降智，用户会直接感觉到（§14.6）。
+            // 这一档在这个（账号，上游模型）上被拒过时的处置（§14.6 修订）：
+            // 先升级、再往上试探，向上全部不行才考虑降档，最后才交回上游默认。
+            // 顺序由 `EffortFacts::plan` 决定，这里只负责按计划发射。
             let plan = match facts {
                 Some(facts) => facts.plan(requested),
                 None => EffortPlan::Send(requested),
             };
-            if let EffortPlan::Send(effort) = plan {
-                body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+            match plan {
+                EffortPlan::Send(effort) | EffortPlan::Lower(effort) => {
+                    body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+                }
+                // `Omit`：不发射 `output_config`，把强度交回上游默认。
+                EffortPlan::Omit => {}
             }
         }
         return;

@@ -3662,6 +3662,16 @@ async fn classify_upstream_error(
     // 这是（账号，上游模型）级的事实，记下来让重试与之后的请求都换一个这个账号
     // 能接受的档位（§14.6）。
     let shape = adaptive_shape(&prepared.body);
+    // 没有 `output_config.effort` 说明这次走的正是 `Omit`（不指定档位）。
+    // 它也失败了，就必须记下来——否则 `plan()` 永远不会走到"降档"那一步，
+    // 会在同一个 `Omit` 上反复重试（§14.6 修订）。
+    if adaptive_effort_rejection(status, &message, shape) && shape.effort.is_none() {
+        forward.state.runtime.evidence.note_omitted_failed(
+            &target.account.id,
+            &target.target.upstream_model,
+            Instant::now(),
+        );
+    }
     if adaptive_effort_rejection(status, &message, shape)
         && let Some(effort) = shape.effort
     {
