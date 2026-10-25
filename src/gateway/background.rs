@@ -147,13 +147,32 @@ impl RunningTasks {
 /// 返回被标记为 `interrupted` 的任务数。判定依据是心跳：超过
 /// `stale_after` 没有心跳的 `queued`/`running` 任务不可能是活的。
 ///
+/// **启动时请用 [`recover_all_at_startup`]。** 这个带心跳宽限期的版本留给
+/// 「进程里可能还有别的执行者」的场景；启动那一刻进程里一个执行者都没有，任何
+/// `queued`/`running` 都已经是死的，宽限期只会漏掉最近 30 秒内创建的任务。
+///
 /// 只依赖 `Store`，所以可以在 `AppState` 组装完成之前调用。
 pub async fn recover_stale(
     store: &crate::storage::Store,
     stale_after: Duration,
 ) -> anyhow::Result<u64> {
+    recover(store, stale_after.as_secs() as i64).await
+}
+
+/// 启动时把所有遗留的托管任务标记为 `interrupted`，不设心跳宽限期。
+///
+/// 进程刚起来，内存里的执行者表是空的，磁盘上任何 `queued`/`running` 都不可能
+/// 再有人推进。留宽限期会漏掉"进程在任务创建后 30 秒内被杀"的那一批：它们此后
+/// 不会被任何清理路径改写（`prune_background_tasks` 只按 `expires_at` 删，不动
+/// 状态），客户端轮询永远拿到 `queued`，既不变 `interrupted` 也不变 `failed`，
+/// 最长挂到保留期。
+pub async fn recover_all_at_startup(store: &crate::storage::Store) -> anyhow::Result<u64> {
+    recover(store, 0).await
+}
+
+async fn recover(store: &crate::storage::Store, stale_secs: i64) -> anyhow::Result<u64> {
     let now = crate::storage::now_unix();
-    let stale_before = now - stale_after.as_secs() as i64;
+    let stale_before = now - stale_secs;
     let affected = store.stall_background_tasks(stale_before, now).await?;
     if affected > 0 {
         tracing::warn!(

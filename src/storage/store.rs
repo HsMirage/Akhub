@@ -787,7 +787,7 @@ impl Store {
             "UPDATE background_tasks
              SET status = 'interrupted', finished_at = ?, heartbeat_at = ?,
                  error_code = 'gateway_restart'
-             WHERE status IN ('queued', 'running') AND heartbeat_at < ?",
+             WHERE status IN ('queued', 'running') AND heartbeat_at <= ?",
         )
         .bind(finished_at)
         .bind(finished_at)

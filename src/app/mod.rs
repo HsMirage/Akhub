@@ -491,10 +491,10 @@ impl AppState {
         };
 
         // 上次进程遗留的托管后台任务：标记为 interrupted，绝不留假 in_progress
-        // （计划 §29.1）。心跳超过 30 秒没推进的任务不可能是活的。
-        match crate::gateway::background::recover_stale(&store, std::time::Duration::from_secs(30))
-            .await
-        {
+        // （计划 §29.1）。启动这一刻进程里没有任何执行者，所以不设心跳宽限期——
+        // 留 30 秒会漏掉"进程在任务创建后 30 秒内被杀"的那批，它们此后不会被任何
+        // 清理路径改写状态，客户端轮询永远拿到 queued。
+        match crate::gateway::background::recover_all_at_startup(&store).await {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "已把遗留的托管后台任务标记为中断"),
             Err(error) => tracing::warn!(%error, "恢复遗留托管任务失败"),

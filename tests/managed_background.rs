@@ -269,3 +269,44 @@ async fn a_completed_task_stores_its_output_encrypted() {
     let plaintext = akhub.state.cipher.open(&sealed).unwrap();
     assert!(String::from_utf8_lossy(&plaintext).contains("hello"));
 }
+
+/// 启动时要连「刚创建 30 秒内」的遗留任务一起中断。
+///
+/// 只按心跳年龄判定会漏掉这一批：进程在任务创建后 30 秒内被杀，心跳就在宽限期
+/// 内，`recover_stale` 不碰它；此后没有任何清理路径会改写它的状态，客户端轮询
+/// 永远拿到 `queued`，既不变 `interrupted` 也不变 `failed`。
+#[tokio::test]
+async fn startup_recovery_interrupts_even_a_freshly_created_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = common::spawn_akhub_at(dir.path(), None).await.unwrap();
+    let downstream_key = first.key.clone();
+    let now = akhub::storage::now_unix();
+    // 心跳就是此刻：宽限期内的任务，按旧逻辑会被放过。
+    insert_task(
+        &first.state,
+        "bg_akh_fresh",
+        background::status::QUEUED,
+        now,
+    )
+    .await;
+    // 模拟进程被杀：不经过任何清理流程，直接放弃这个实例并重启。
+    std::mem::forget(first);
+
+    // 第二次启动走真实的启动流程（`AppState::bootstrap`），这才是要验的那条路。
+    let second = common::spawn_akhub_at(dir.path(), Some(&downstream_key))
+        .await
+        .unwrap();
+    let task = second
+        .state
+        .store
+        .background_task("bg_akh_fresh", "grp_test")
+        .await
+        .unwrap()
+        .expect("任务还在");
+    assert_eq!(
+        task.status,
+        background::status::INTERRUPTED,
+        "启动时必须连宽限期内的遗留任务一起中断，否则客户端永远看到 queued"
+    );
+    assert_eq!(task.error_code.as_deref(), Some("gateway_restart"));
+}
