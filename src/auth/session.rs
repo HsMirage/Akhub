@@ -17,6 +17,10 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_FAILURES: u32 = 5;
 /// 达到失败上限后的锁定时长。
 const LOCKOUT: Duration = Duration::from_secs(60);
+/// 失败计数表最多跟踪多少个用户名。
+///
+/// 用户名来自未认证的请求体，不设上限就是一个可以被匿名撑大的内存表。
+const MAX_TRACKED_USERNAMES: usize = 4096;
 
 /// 用 Argon2id 哈希管理员密码。
 pub fn hash_password(password: &str) -> Result<String> {
@@ -83,8 +87,19 @@ impl SessionStore {
     }
 
     /// 记录一次登录失败，必要时触发锁定。
+    ///
+    /// 表有上限：`username` 是请求体里的任意字符串，未认证的请求就能往里塞。
+    /// 满了先清掉**已经解锁**的条目；还不够就整体清空——丢掉的只是失败计数
+    /// （最坏是多给几次重试），正在锁定的时间窗由 `LOCKOUT` 保证不会被绕过。
     pub fn record_failure(&self, username: &str) {
         let mut failures = crate::sync::lock(&self.failures);
+        if failures.len() >= MAX_TRACKED_USERNAMES && !failures.contains_key(username) {
+            let now = Instant::now();
+            failures.retain(|_, entry| entry.locked_until.is_some_and(|until| until > now));
+            if failures.len() >= MAX_TRACKED_USERNAMES {
+                failures.clear();
+            }
+        }
         let entry = failures.entry(username.to_string()).or_default();
         entry.count += 1;
         if entry.count >= MAX_FAILURES {
@@ -156,6 +171,23 @@ mod tests {
         assert_ne!(
             hash_password("same").unwrap(),
             hash_password("same").unwrap()
+        );
+    }
+
+    /// 失败计数表不能被子虚乌有的用户名撑大。
+    ///
+    /// `username` 来自未认证的登录请求体：不设上限时，一个循环就能让这张表
+    /// 无限增长。
+    #[test]
+    fn garbage_usernames_cannot_grow_the_failure_table_without_bound() {
+        let store = SessionStore::new();
+        for index in 0..(MAX_TRACKED_USERNAMES * 2) {
+            store.record_failure(&format!("ghost-{index}"));
+        }
+        let tracked = crate::sync::lock(&store.failures).len();
+        assert!(
+            tracked <= MAX_TRACKED_USERNAMES,
+            "失败计数表必须收敛到上限内，实际 {tracked}"
         );
     }
 

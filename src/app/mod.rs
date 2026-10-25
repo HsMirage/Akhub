@@ -363,7 +363,13 @@ impl Runtime {
     /// 丢弃已经不在配置里的账号、目标与分组，避免状态表随改配置无限增长。
     pub fn retain(&self, config: &crate::config::RuntimeConfig) {
         let (accounts, targets) = config.live_ids();
-        self.health.retain(&accounts, &targets);
+        // Key 级动态状态必须跟着**凭据快照**清理，不能只清账号与目标：管理员轮换
+        // 或删掉一把 Key 之后，旧摘要的 `KeyState`（熔断、额度冷却、半开名额）会
+        // 一直留在表里。攒到上限（`MAX_TRACKED`）后开始随机淘汰，被淘汰的可能是
+        // **正在使用**的 Key——等于把已知坏 Key 的硬停悄悄抹掉，下一轮继续打它。
+        let live_keys = self.credentials.current().live_credential_ids();
+        self.health
+            .retain_with_keys(&accounts, &targets, Some(&live_keys));
         self.perf.retain(&targets);
         self.queues.retain(
             &config

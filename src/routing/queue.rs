@@ -7,7 +7,8 @@
 //! 分组只负责一件事：**所有队列加起来的总容量上限**。
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -32,7 +33,7 @@ pub enum WaitOutcome {
 /// 这是**唯一**的分组级队列语义：它不排序、不决定谁先走，只回答"现在还能不
 /// 能再多一个人在等"。超出即 `queue_full`。
 pub struct GroupQueues {
-    inner: RwLock<HashMap<String, Arc<Semaphore>>>,
+    inner: RwLock<HashMap<String, Arc<QueueSlot>>>,
 }
 
 impl Default for GroupQueues {
@@ -77,24 +78,105 @@ impl GroupQueues {
         if capacity == QUEUE_UNLIMITED {
             return 0;
         }
+        // 分母用**信号量当前的额定容量**，不是外部传进来的配置值：缩容还没
+        // 收敛完时两者不同，用配置值减可用名额会算出一个偏大的排队数。
         let semaphore = self.semaphore(group_id, capacity);
-        capacity.saturating_sub(semaphore.available_permits() as u32)
+        let rated = self
+            .inner
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(group_id).map(|slot| slot.rated()))
+            .unwrap_or(capacity as usize);
+        (rated as u32).saturating_sub(semaphore.available_permits() as u32)
     }
 
+    /// 取这个分组的排队信号量，并让它追上当前配置的容量。
+    ///
+    /// **必须跟着 capacity 走。** 早先这里只在表里没有该分组时才用传入的
+    /// capacity 建信号量，已存在就原样返回——参数被静默丢弃。于是管理员改
+    /// 分组排队上限后，旧上限继续生效：调大仍按旧的小上限拒（客户端拿到
+    /// `queue_full`），从「不限」收回成有限值则根本收不回来。只有重启进程
+    /// （状态表重建）才恢复。
+    ///
+    /// 缩容只回收空闲名额（`forget_permits`），在途的等待者不受影响——与
+    /// `health::Budget::reconcile_capacity` 同一条规则：不打断已经在跑的，
+    /// 但总会收敛到新上限。
     fn semaphore(&self, group_id: &str, capacity: u32) -> Arc<Semaphore> {
+        let wanted = capacity as usize;
         if let Ok(guard) = self.inner.read()
             && let Some(found) = guard.get(group_id)
         {
-            return Arc::clone(found);
+            reconcile_permits(found, wanted);
+            return Arc::clone(&found.semaphore);
         }
         let mut guard = crate::sync::write(&self.inner);
-        Arc::clone(
+        let entry = Arc::clone(
             guard
                 .entry(group_id.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(capacity as usize))),
-        )
+                .or_insert_with(|| Arc::new(QueueSlot::new(wanted))),
+        );
+        drop(guard);
+        // 两把锁之间可能有别的线程先建了它，容量得再对一次。
+        reconcile_permits(&entry, wanted);
+        entry.semaphore.clone()
+    }
+}
+
+/// 一个分组的排队闸门：信号量 + 它当前被校准到的额定容量。
+///
+/// **必须自己记着额定容量。** tokio 的 `Semaphore` 只暴露 `available_permits()`，
+/// 而「可用」与「额定」在有人占用时不同。拿 `available` 当额定去校准，会把
+/// 每个占着名额的等待者都当成「空闲名额」，越校准越松——上限直接失效。
+struct QueueSlot {
+    semaphore: Arc<Semaphore>,
+    /// 当前额定容量。校准只在它真的变了时才动信号量。
+    capacity: AtomicUsize,
+    /// 串行化「读容量 → 改信号量 → 写容量」这一步。
+    ///
+    /// 少了它，两个线程一扩一缩交错时 `add_permits` 与 `forget_permits` 会各自
+    /// 基于过期的旧容量算差额，净名额偏离配置值——而且这不是一次性收敛问题：
+    /// 每次 `enter` 都会走到校准。
+    calibrating: Mutex<()>,
+}
+
+impl QueueSlot {
+    fn new(capacity: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity: AtomicUsize::new(capacity),
+            calibrating: Mutex::new(()),
+        }
     }
 
+    /// 当前额定容量（已被占用的也计入）。
+    fn rated(&self) -> usize {
+        self.capacity.load(Ordering::Acquire)
+    }
+}
+
+/// 让信号量的额定容量追到 `wanted`。
+///
+/// 扩容直接补差额；缩容只回收**空闲**名额（`forget_permits`），在途的等待者
+/// 不受影响——与 `health::Budget::reconcile_capacity` 同一条规则：不打断已经
+/// 在跑的，但总会收敛到新上限。
+fn reconcile_permits(slot: &QueueSlot, wanted: usize) {
+    // 快路径：容量没变就完全不碰锁。热路径（每次 `enter`）绝大多数走这里。
+    if slot.rated() == wanted {
+        return;
+    }
+    let _guard = crate::sync::lock(&slot.calibrating);
+    let previous = slot.capacity.swap(wanted, Ordering::AcqRel);
+    if wanted == previous {
+        return;
+    }
+    if wanted > previous {
+        slot.semaphore.add_permits(wanted - previous);
+    } else {
+        slot.semaphore.forget_permits(previous - wanted);
+    }
+}
+
+impl GroupQueues {
     /// 丢弃已不存在的分组。
     pub fn retain(&self, live_groups: &[String]) {
         if let Ok(mut guard) = self.inner.write() {
@@ -180,6 +262,43 @@ pub enum CapacityWaitOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 改了分组的排队总容量之后，新容量必须立刻生效。
+    ///
+    /// `semaphore()` 以前只在表里没有该分组时用传入的 capacity 建信号量；
+    /// 已存在就原样返回，capacity 参数被**静默丢弃**。于是管理员把排队上限从
+    /// 不限收回成一个有限值时，旧的不限队列继续生效（收不回来）；反过来调大
+    /// 上限时仍按旧的小上限拒绝，客户端拿到 `queue_full` 429——两种方向都错，
+    /// 只有重启进程（状态表重建）才恢复。
+    #[tokio::test]
+    async fn changing_the_group_queue_capacity_takes_effect_immediately() {
+        let queues = GroupQueues::new();
+
+        // 先建一个容量 1 的队列并占满它。
+        let held = queues.enter("g", 1).expect("第一个等待者应当放行");
+        assert!(queues.enter("g", 1).is_none(), "容量 1 已满");
+
+        // 调大上限到 2：第二个等待者必须能进来，并**一直占着**名额。
+        let second = queues
+            .enter("g", 2)
+            .expect("调大排队上限后必须立刻多出名额");
+        drop(held);
+        // 此刻：容量 2，`second` 占一个 → 还应有一个空闲。
+        assert!(
+            queues.enter("g", 2).is_some(),
+            "容量 2、占了一个，第二个应当放行"
+        );
+        drop(second);
+
+        // 收紧到 1：`second` 已经放开，所以此刻没有占用者，收紧后应当恰好
+        // 回到「只能有 1 个等待者」——第一个放行、第二个被拒。
+        let last = queues.enter("g", 1).expect("收紧后仍有 1 个名额");
+        assert!(
+            queues.enter("g", 1).is_none(),
+            "收紧到 1 之后第二个等待者必须被拒"
+        );
+        drop(last);
+    }
 
     #[tokio::test]
     async fn a_full_group_queue_refuses_new_waiters() {

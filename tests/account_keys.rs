@@ -1302,3 +1302,70 @@ async fn request_records_carry_the_key_that_served_them() {
 }
 
 // ------------------------------------------------------------- 辅助结构
+
+/// 轮换掉一把 Key 之后，它的动态健康状态必须一起消失。
+///
+/// 不清理的后果不是「多占一点内存」：`keys` 表攒到上限后开始随机淘汰，被淘汰
+/// 的可能是**正在使用**的那把，它的熔断与额度冷却跟着失效——已知坏的 Key
+/// 于是重新参与调度。
+#[tokio::test]
+async fn rotating_a_key_drops_its_stale_health_state() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let account_id = wire_account_with_keys(
+        &akhub,
+        "轮换",
+        &upstream.base_url,
+        &[
+            KeySpec::new("old", "sk-old"),
+            KeySpec::new("keep", "sk-keep"),
+        ],
+        50,
+    )
+    .await;
+
+    // 让两把 Key 都产生一份动态状态（健康表按需创建）。
+    for secret in ["sk-old", "sk-keep"] {
+        let id = akhub::credential::credential_id(
+            &account_id,
+            &akhub::security::credential_digest(secret),
+        );
+        let _ = akhub.state.runtime.health.key(&id);
+    }
+    let before = akhub.state.runtime.health.tracked_keys();
+    assert!(before >= 2, "两把 Key 都应有状态，实际 {before}");
+
+    // 管理员把旧 Key 从池里删掉，只留另一把，然后重载配置。
+    let keep = akhub
+        .state
+        .store
+        .list_account_key_rows(&account_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|key| key.label == "keep")
+        .expect("另一把 Key 还在");
+    akhub
+        .state
+        .store
+        .replace_account_keys(
+            &account_id,
+            &[akhub::storage::store::AccountKeyWrite {
+                id: keep.id,
+                label: keep.label,
+                sealed_key: keep.sealed_key,
+                credential_digest: akhub::security::credential_digest("sk-keep"),
+                limits: keep.limits,
+                enabled: keep.enabled,
+            }],
+        )
+        .await
+        .unwrap();
+    akhub.state.reload_config().await.unwrap();
+
+    let after = akhub.state.runtime.health.tracked_keys();
+    assert!(
+        after < before,
+        "轮换掉的 Key 状态必须被清掉：before={before} after={after}"
+    );
+}

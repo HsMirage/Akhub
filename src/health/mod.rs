@@ -361,6 +361,11 @@ impl Registry {
         self.key(&id).reset();
     }
 
+    /// 当前跟踪的 Key 级状态条数，供诊断与测试观察清理是否生效。
+    pub fn tracked_keys(&self) -> usize {
+        self.keys.read().map(|guard| guard.len()).unwrap_or(0)
+    }
+
     /// 清空全部账号、Key 与目标状态。备份恢复后调用：账号与目标可能整个换了
     /// 一批，旧的熔断与额度计数不再成立（§23.5）。
     pub fn clear_all(&self) {
@@ -1941,6 +1946,39 @@ mod tests {
         }
         drop(held);
         assert_eq!(budget.available(), 1);
+    }
+
+    /// 轮换掉一把 Key 之后，它留下的动态状态必须一起消失。
+    ///
+    /// 不清理的后果不是「多占一点内存」：表攒到上限后开始随机淘汰，被淘汰的可能
+    /// 是**正在使用**的那把 Key，它的熔断与额度冷却跟着失效——已知坏的 Key
+    /// 于是重新参与调度。
+    #[tokio::test(start_paused = true)]
+    async fn rotating_a_key_drops_its_stale_health_state() {
+        let registry = Registry::new();
+        let bad = crate::credential::credential_id("acc", "old-digest");
+        // 连续确认两次才真正硬停（`KEY_INVALID_CONFIRMATIONS`）。
+        for _ in 0..2 {
+            registry
+                .key(&bad)
+                .confirm_invalid(tokio::time::Instant::now());
+        }
+        assert!(
+            registry.key(&bad).key_invalid(),
+            "前置条件：这把 Key 是坏的"
+        );
+
+        let accounts = vec!["acc".to_string()];
+        let targets: Vec<String> = Vec::new();
+
+        // 清理时把存活 Key 集合传成空：旧摘要不在池里了。
+        registry.retain_with_keys(&accounts, &targets, Some(&[]));
+
+        // 取同一 id 时应当拿到一个全新的、干净的状态。
+        assert!(
+            !registry.key(&bad).key_invalid(),
+            "轮换掉的 Key 不能把旧的失效状态带回来"
+        );
     }
 
     /// Key 级并发上限独立生效：一把 Key 满了，另一把照常接（§17.1）。

@@ -54,7 +54,20 @@ pub fn is_managed(id: &str) -> bool {
 #[derive(Default)]
 pub struct RunningTasks {
     handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// 已经结束过的任务 ID。
+    ///
+    /// 调用方是 `spawn` 之后才登记，而快速失败的任务可能在登记之前就跑完并调用
+    /// 了 `finish`。只靠 `handle.is_finished()` 判断仍有竞态（检查通过、拿到锁
+    /// 之前任务结束），如实记录"这个 id 结束过"才没有窗口。
+    ///
+    /// 只保留很短一段时间：登记发生在 `spawn` 之后几微秒内，条目超过
+    /// `FINISHED_RETENTION` 就说明对应的登记已经发生过（或者根本不会来），可以
+    /// 丢掉，免得这张集合自己变成第二个泄漏点。
+    finished: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+/// 已完成 ID 的保留时长。登记就在 `spawn` 之后几微秒，一分钟绰绰有余。
+const FINISHED_RETENTION: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl RunningTasks {
     pub fn new() -> Self {
@@ -62,8 +75,28 @@ impl RunningTasks {
     }
 
     /// 登记一个正在执行的任务。
+    ///
+    /// `handle.is_finished()` 时**不登记**：调用方是 `spawn` 之后才登记，而快速
+    /// 失败的任务（无可用目标、参数错）可能在登记之前就跑完并调用了 `finish`——
+    /// 那时表里还没有它，`finish` 什么也删不掉，紧接着 `register` 把这条已经
+    /// 结束的 handle 插进去，之后再没有任何路径删它：表无界增长，客户端对这个 id
+    /// 调 cancel 还会拿到「已中断上游连接」，实际上根本没有上游连接。
     pub async fn register(&self, id: &str, handle: tokio::task::JoinHandle<()>) {
+        {
+            let mut finished = self.finished.lock().await;
+            finished.retain(|_, at| at.elapsed() < FINISHED_RETENTION);
+            // 这个 id 已经在登记之前跑完了：`finish` 当时删不到东西，这里也不能
+            // 把已经结束的 handle 插进去——那会变成一条永远删不掉的泄漏。
+            if finished.remove(id).is_some() {
+                return;
+            }
+        }
         let mut handles = self.handles.lock().await;
+        // 拿着 handles 锁再查一次：`finish` 只有在删不到东西时才记 finished，
+        // 而那时它已经释放了这把锁，所以两者不会同时"没看到对方"。
+        if handle.is_finished() {
+            return;
+        }
         // 同一 ID 重复登记时先把旧任务中止，避免两个执行者同时推进一条任务。
         if let Some(previous) = handles.insert(id.to_string(), handle) {
             previous.abort();
@@ -71,8 +104,16 @@ impl RunningTasks {
     }
 
     /// 任务自然结束时移除登记。
+    ///
+    /// 删不到时把 id 记进 `finished`：那说明 `spawn` 之后、`register` 之前任务
+    /// 就跑完了，那一次登记必须看到这个标记并放弃插入。
     pub async fn finish(&self, id: &str) {
-        self.handles.lock().await.remove(id);
+        let removed = self.handles.lock().await.remove(id).is_some();
+        if !removed {
+            let mut finished = self.finished.lock().await;
+            finished.retain(|_, at| at.elapsed() < FINISHED_RETENTION);
+            finished.insert(id.to_string(), std::time::Instant::now());
+        }
     }
 
     /// **真正取消**：中止任务，从而 drop 掉上游响应、断开连接。

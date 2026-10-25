@@ -414,7 +414,14 @@ async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
             "up",
             50,
         )
-        .pinned(),
+        .pinned()
+        // 两个账号都要配成并发 1：下面靠"占住名额"把它们变成「忙」。只给第一个
+        // 配的话，第二个的配置是「不限」，占位就只是拿信号量临时压出来的假象——
+        // 配置一旦被重新应用（每次选候选都会做），名额立刻被放开，用例随之失效。
+        .limits(akhub::domain::Limits {
+            max_concurrency: Some(1),
+            ..Default::default()
+        }),
     )
     .await;
 
