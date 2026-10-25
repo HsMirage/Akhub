@@ -600,6 +600,46 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                     .with_context(|| format!("v18 迁移补 upstream_accounts.{column} 失败"))?;
             }
         }
+        // 反方向也要拦：下面的重建用**显式列清单**拷贝，旧表若比清单多出任何一列，
+        // 那些列的数据会在 DROP 之后一起消失，而且不报错。多出来的列只可能来自
+        // "某个中间版本加过、后来又被删掉"的结构——本二进制不认识它，也就无从判断
+        // 该不该保留，直接拒绝启动比静默丢数据安全（与 `check_schema_version` 对
+        // "库比二进制新"的口径一致）。
+        const KNOWN_ACCOUNT_COLUMNS: &[&str] = &[
+            "id",
+            "group_id",
+            "name",
+            "upstream_type",
+            "base_url",
+            "preferred_protocol",
+            "adaptive_protocol",
+            "default_priority",
+            "calibration",
+            "multiplier_mode",
+            "manual_multiplier",
+            "new_api_user_id",
+            "new_api_group",
+            "limit_rpm",
+            "limit_tpm",
+            "limit_concurrency",
+            "allow_private_network",
+            "enabled",
+            "auto_sync",
+            "hide_original",
+            "model_synced_at",
+            "created_at",
+        ];
+        let actual_columns = table_columns(pool, "upstream_accounts").await?;
+        if let Some(unexpected) = actual_columns
+            .iter()
+            .find(|column| !KNOWN_ACCOUNT_COLUMNS.contains(&column.as_str()))
+        {
+            anyhow::bail!(
+                "upstream_accounts 多出本版本不认识的列 `{unexpected}`：\
+                 v18 重建按显式列清单拷贝，继续下去会把那一列的数据静默丢掉。\
+                 请用生成这个库的版本完成升级。"
+            );
+        }
         let mut conn = pool.acquire().await.context("v18 迁移取连接失败")?;
         sqlx::query("PRAGMA foreign_keys = OFF")
             .execute(&mut *conn)

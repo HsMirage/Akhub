@@ -1884,3 +1884,37 @@ async fn the_v20_migration_rebuilds_image_tasks_with_a_scoped_primary_key() {
     assert_eq!(count, 2);
     reopened.close().await;
 }
+
+/// v18 重建按**显式列清单**拷贝，旧表多出一列时必须拒绝启动。
+///
+/// 否则那一列的数据会在 `DROP TABLE` 之后跟旧表一起消失，而且不报错——下次某个
+/// 版本要读它时，暴露出来的只是"这一列全空"。
+#[tokio::test]
+async fn the_v18_migration_refuses_a_database_with_an_unknown_account_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::bootstrap(dir.path(), Settings::default())
+        .await
+        .unwrap();
+    let pool = state.store.pool().clone();
+    // 造一个本版本不认识的列，再退到 v17 逼 v18 重跑。
+    sqlx::query("ALTER TABLE upstream_accounts ADD COLUMN legacy_extra TEXT DEFAULT 'x'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_settings SET value = '17' WHERE key = 'schema_version'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(state);
+
+    match AppState::bootstrap(dir.path(), Settings::default()).await {
+        Ok(_) => panic!("多出未知列的库必须拒绝升级，而不是静默丢掉那一列"),
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("legacy_extra"),
+                "错误里必须点名是哪一列：{message}"
+            );
+        }
+    }
+}
