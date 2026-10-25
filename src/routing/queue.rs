@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::domain::QUEUE_UNLIMITED;
 use crate::health::{Capacity, CapacityPermit};
 
 /// 等待的结果。
@@ -49,20 +50,33 @@ impl GroupQueues {
 
     /// 占一个排队名额。返回 `None` 表示分组队列已满。
     ///
-    /// `capacity` 为 0 表示"不排队"：任何需要等待的请求直接失败。
+    /// 三档语义：`0` 不排队（需要等待的请求直接失败）、`QUEUE_UNLIMITED`
+    /// 不限、其余是正常上限。
     pub fn enter(&self, group_id: &str, capacity: u32) -> Option<QueueTicket> {
         if capacity == 0 {
             return None;
+        }
+        // 不限就是不设闸门：没有名额要占，也就没有「满了」这件事。
+        if capacity == QUEUE_UNLIMITED {
+            return Some(QueueTicket { _permit: None });
         }
         let semaphore = self.semaphore(group_id, capacity);
         semaphore
             .try_acquire_owned()
             .ok()
-            .map(|permit| QueueTicket { _permit: permit })
+            .map(|permit| QueueTicket {
+                _permit: Some(permit),
+            })
     }
 
     /// 当前正在排队的请求数，供后台展示。
+    ///
+    /// 不限的队列不记这个数（没有信号量可查）：真实排队数由在途计数反映，
+    /// 这里报 0 比编一个数字诚实。
     pub fn waiting(&self, group_id: &str, capacity: u32) -> u32 {
+        if capacity == QUEUE_UNLIMITED {
+            return 0;
+        }
         let semaphore = self.semaphore(group_id, capacity);
         capacity.saturating_sub(semaphore.available_permits() as u32)
     }
@@ -90,8 +104,10 @@ impl GroupQueues {
 }
 
 /// 排队名额。析构即归还，客户端断开时自然退出队列（§13.6）。
+///
+/// 不限容量时没有信号量，`_permit` 为空——占位语义相同，只是不需要归还。
 pub struct QueueTicket {
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// 等待一组目标中**任意一个**空出并发名额。
@@ -181,6 +197,27 @@ mod tests {
     async fn a_zero_capacity_group_never_queues() {
         let queues = GroupQueues::new();
         assert!(queues.enter("g1", 0).is_none());
+    }
+
+    /// 不限容量（新默认）永远放行，且不占用任何名额。
+    ///
+    /// 这条与上面那条必须**同时**成立：`0` 是「不排队」，`QUEUE_UNLIMITED`
+    /// 是「不限」。两者混用会把「关掉排队」和「放开排队」变成同一个值。
+    #[tokio::test]
+    async fn an_unlimited_group_queue_never_refuses() {
+        let queues = GroupQueues::new();
+        let mut tickets = Vec::new();
+        // 远超任何现实排队量：不限就是没有闸门，不存在「满了」。
+        for _ in 0..10_000 {
+            tickets.push(
+                queues
+                    .enter("g1", QUEUE_UNLIMITED)
+                    .expect("不限容量不得拒绝任何等待者"),
+            );
+        }
+        // 不限的队列不记排队数（没有信号量可查），报 0 而不是编一个数字。
+        assert_eq!(queues.waiting("g1", QUEUE_UNLIMITED), 0);
+        drop(tickets);
     }
 
     #[tokio::test]

@@ -933,12 +933,13 @@ export function Skeleton({ rows = 3 }: { rows?: number }) {
  * 权重调错时，一眼就能看出是哪一维把分数拉下去的，而不必打开每个目标细看。
  */
 export function ScoreMeter({ score }: { score: Score }) {
+  // 顺序与分组页的权重编辑器一致：倍率 → 可靠性 → 缓存命中率 → 输出速度 → 首字。
   const dimensions: { key: keyof Score; label: string }[] = [
     { key: "multiplier", label: "倍率" },
     { key: "reliability", label: "可靠性" },
-    { key: "first_token", label: "首字延迟" },
-    { key: "throughput", label: "输出速度" },
     { key: "cache_hit", label: "缓存命中率" },
+    { key: "throughput", label: "输出速度" },
+    { key: "first_token", label: "首字延迟" },
   ];
   // 门槛与有效样本量都来自后端：界面写死数字会在调参之后开始说谎（§9.4）。
   const cold = score.warm

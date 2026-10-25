@@ -237,12 +237,18 @@ async fn the_full_configuration_path_works_end_to_end() {
     let key = created["key"].as_str().unwrap().to_string();
     assert!(key.starts_with("akh-"));
     assert_eq!(
-        created["group"]["weights"]["multiplier"], 40,
-        "默认权重应为 40/25/15/10/10"
+        created["group"]["weights"]["multiplier"], 30,
+        "默认权重应为 30/30/15/15/10（均衡）"
     );
     assert_eq!(
-        created["group"]["weights"]["cache_hit"], 10,
-        "缓存命中率是第五个维度，默认 10"
+        created["group"]["weights"]["cache_hit"], 15,
+        "缓存命中率是第五个维度，默认 15"
+    );
+    // 队列总容量默认不限（§6.3）。
+    assert_eq!(
+        created["group"]["queue_capacity"],
+        u32::MAX,
+        "队列容量默认应为不限"
     );
 
     // 列表接口只返回前缀，绝不返回完整 Key。
@@ -1247,11 +1253,12 @@ async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
     // 它是第五维，所以总分不再是 1.0，但四维满分时仍应明显高于 0.9。
     assert_eq!(live["score"]["cache_hit"], 0.6, "{live}");
     // 贡献值也要下发：界面靠它算「这一维占总分百分之几」，缺了会显示 NaN。
+    // 默认权重里命中率是 15，所以 0.6 × 15 / 100 = 0.09。
     assert!(
         live["score"]["contribution"]["cache_hit"]
             .as_f64()
-            .is_some_and(|value| (value - 0.06).abs() < 1e-6),
-        "缓存维贡献应为 0.6 × 10 / 100 = 0.06：{live}"
+            .is_some_and(|value| (value - 0.09).abs() < 1e-6),
+        "缓存维贡献应为 0.6 × 15 / 100 = 0.09：{live}"
     );
     assert!(
         live["score"]["total"].as_f64().unwrap() > 0.9,

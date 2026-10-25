@@ -175,20 +175,28 @@ impl SchedulingWeights {
 }
 
 impl Default for SchedulingWeights {
-    /// 默认 40 / 25 / 15 / 10 / 10（§6.3）。
+    /// 默认 30 / 30 / 15 / 15 / 10（§6.3），按「倍率、可靠性、缓存命中率、
+    /// 输出速度、首字延迟」的顺序理解。
     ///
-    /// 首字与速度各让出 5 分给缓存命中率：命中率直接决定同样一轮对话要付多少
-    /// 输入 Token，而它此前只体现在成本里、从不参与层内选谁。
+    /// 缓存命中率与可靠性并列第二权重：命中率直接决定同样一轮对话要付多少
+    /// 输入 Token，而它此前只体现在成本里、从不参与层内选谁。首字延迟压到
+    /// 最低——它是用户体感最强的一维，但也最容易被单个慢样本带偏。
     fn default() -> Self {
         Self {
-            multiplier: 40,
-            reliability: 25,
-            first_token: 15,
-            throughput: 10,
-            cache_hit: 10,
+            multiplier: 30,
+            reliability: 30,
+            first_token: 10,
+            throughput: 15,
+            cache_hit: 15,
         }
     }
 }
+
+/// 队列总容量「不限」的哨兵值（§6.3）。
+///
+/// 用最大值而不是 0 或 `Option`：0 在这个字段上已经有「不排队」的语义，
+/// 两者混用会让「关掉排队」和「放开排队」变成同一个值。
+pub const QUEUE_UNLIMITED: u32 = u32::MAX;
 
 /// 分组：完全独立的调用空间，也是调度的硬边界（§4.1）。
 ///
@@ -203,6 +211,11 @@ pub struct Group {
     /// 允许使用的最高有效倍率，绝对红线。
     pub multiplier_limit: Multiplier,
     pub weights: SchedulingWeights,
+    /// 队列总容量：所有目标队列加起来最多能有几个请求在等。
+    ///
+    /// 语义有三档，不要混：`0` 是**不排队**（需要等待的请求直接 429），
+    /// `QUEUE_UNLIMITED` 是**不限**，其余是正常上限。默认不限——排队本来就是
+    /// 稀缺路径，先卡住它只会让突发流量直接失败，而不是稍等一下。
     pub queue_capacity: u32,
     /// 层内全忙时最多等待多久；0 表示跟随请求总超时（§6.3）。
     pub max_wait_secs: u32,
@@ -370,9 +383,13 @@ mod tests {
 
     #[test]
     fn default_weights_sum_to_one_hundred() {
+        // 默认 = 「均衡」预设：倍率·可靠性·命中率·速度·首字 = 30/30/15/15/10。
         let weights = SchedulingWeights::default();
-        assert_eq!(weights.multiplier, 40);
-        assert_eq!(weights.cache_hit, 10);
+        assert_eq!(weights.multiplier, 30);
+        assert_eq!(weights.reliability, 30);
+        assert_eq!(weights.cache_hit, 15);
+        assert_eq!(weights.throughput, 15);
+        assert_eq!(weights.first_token, 10);
         assert!(weights.is_valid());
     }
 

@@ -190,7 +190,9 @@ export function Groups({
                         <td>
                           <div
                             className="weights-mini"
-                            title={`倍率 ${group.weights.multiplier} / 可靠性 ${group.weights.reliability} / 首字延迟 ${group.weights.first_token} / 输出速度 ${group.weights.throughput} / 缓存命中率 ${group.weights.cache_hit}`}
+                            title={WEIGHT_FIELDS.map(
+                              ({ key, label }) => `${label} ${group.weights[key]}`,
+                            ).join(" / ")}
                           >
                             {WEIGHT_FIELDS.map(({ key, label }) => (
                               <span
@@ -207,12 +209,12 @@ export function Groups({
                             ))}
                           </div>
                           <div className="text-faint" style={{ fontSize: 11 }}>
-                            {group.weights.multiplier}·{group.weights.reliability}·
-                            {group.weights.first_token}·{group.weights.throughput}·
-                            {group.weights.cache_hit}
+                            {WEIGHT_FIELDS.map(({ key }) => group.weights[key]).join("·")}
                           </div>
                         </td>
-                        <td className="cell-dim">{group.queue_capacity}</td>
+                        <td className="cell-dim">
+                          {group.queue_capacity === 4294967295 ? "不限" : group.queue_capacity}
+                        </td>
                         <td className="mono tabular">
                           {group.max_wait_secs === 0 ? "跟随总超时" : `${group.max_wait_secs}s`}
                         </td>
@@ -329,33 +331,34 @@ export function Groups({
   );
 }
 
+// 顺序即界面顺序与配置工具的读法：倍率 → 可靠性 → 缓存命中率 → 输出速度 → 首字延迟。
 const WEIGHT_FIELDS: { key: keyof SchedulingWeights; label: string }[] = [
   { key: "multiplier", label: "倍率" },
   { key: "reliability", label: "可靠性" },
-  { key: "first_token", label: "首字延迟" },
-  { key: "throughput", label: "输出速度" },
   { key: "cache_hit", label: "缓存命中率" },
+  { key: "throughput", label: "输出速度" },
+  { key: "first_token", label: "首字延迟" },
 ];
 
 const DEFAULT_WEIGHTS: SchedulingWeights = {
-  multiplier: 40,
-  reliability: 25,
-  first_token: 15,
-  throughput: 10,
-  cache_hit: 10,
+  multiplier: 30,
+  reliability: 30,
+  cache_hit: 15,
+  throughput: 15,
+  first_token: 10,
 };
 
 const WEIGHT_PRESETS: { label: string; hint: string; weights: SchedulingWeights }[] = [
   {
     label: "成本优先",
     hint: "更看重倍率，适合以省钱为目标的场景",
-    weights: { multiplier: 55, reliability: 20, first_token: 10, throughput: 5, cache_hit: 10 },
+    weights: { multiplier: 55, reliability: 15, cache_hit: 15, throughput: 10, first_token: 5 },
   },
   { label: "均衡", hint: "默认配置", weights: DEFAULT_WEIGHTS },
   {
     label: "质量优先",
     hint: "更看重可靠性与速度，适合体验优先的场景",
-    weights: { multiplier: 15, reliability: 30, first_token: 20, throughput: 25, cache_hit: 10 },
+    weights: { multiplier: 10, reliability: 30, cache_hit: 20, throughput: 20, first_token: 20 },
   },
 ];
 
@@ -376,7 +379,14 @@ function GroupDrawer({
   const editing = group !== null;
   const [name, setName] = useState(group?.name ?? "");
   const [limit, setLimit] = useState(group?.multiplier_limit ?? "1");
-  const [queue, setQueue] = useState(String(group?.queue_capacity ?? 100));
+  // 空串表示「不限」：与后端 QUEUE_UNLIMITED 对应，界面上比让用户填
+  // 一个 4294967295 好懂得多。
+  const QUEUE_UNLIMITED = 4294967295;
+  const [queue, setQueue] = useState(
+    group?.queue_capacity === undefined || group.queue_capacity === QUEUE_UNLIMITED
+      ? ""
+      : String(group.queue_capacity),
+  );
   const [maxWait, setMaxWait] = useState(String(group?.max_wait_secs ?? 60));
   const [allowDegrade, setAllowDegrade] = useState(group?.allow_degrade ?? true);
   const [weights, setWeights] = useState<Record<keyof SchedulingWeights, string>>({
@@ -401,9 +411,10 @@ function GroupDrawer({
     : weightSum !== 100
       ? `五项之和必须为 100，当前 ${weightSum}`
       : null;
-  const queueValue = Number(queue);
+  // 空 = 不限；否则必须是正整数。0 是「不排队」，仍然允许。
+  const queueValue = queue.trim() === "" ? QUEUE_UNLIMITED : Number(queue);
   const queueError =
-    Number.isInteger(queueValue) && queueValue >= 0 ? null : "必须是非负整数";
+    Number.isInteger(queueValue) && queueValue >= 0 ? null : "必须是非负整数，留空表示不限";
   const maxWaitValue = Number(maxWait);
   const maxWaitError =
     Number.isInteger(maxWaitValue) && maxWaitValue >= 0 && maxWaitValue <= 3600
@@ -422,7 +433,10 @@ function GroupDrawer({
   const dirty =
     name !== (group?.name ?? "") ||
     limit !== (group?.multiplier_limit ?? "1") ||
-    queue !== String(group?.queue_capacity ?? 100) ||
+    queue !==
+      (group === null || group.queue_capacity === QUEUE_UNLIMITED
+        ? ""
+        : String(group.queue_capacity)) ||
     maxWait !== String(group?.max_wait_secs ?? 60) ||
     allowDegrade !== (group?.allow_degrade ?? true) ||
     WEIGHT_FIELDS.some(
@@ -442,7 +456,9 @@ function GroupDrawer({
     `倍率上限 ${limit.trim() || "—"}：有效倍率高于它的目标会被暂停`,
     queueValue === 0
       ? "队列容量 0：任何需要等待的请求都会被直接拒绝"
-      : `队列容量 ${queueValue}，等待超过 ${maxWaitValue === 0 ? "请求总超时" : `${maxWaitValue}s`} 的请求返回 429`,
+      : queueValue === QUEUE_UNLIMITED
+        ? `队列容量不限，等待超过 ${maxWaitValue === 0 ? "请求总超时" : `${maxWaitValue}s`} 的请求返回 429`
+        : `队列容量 ${queueValue}，等待超过 ${maxWaitValue === 0 ? "请求总超时" : `${maxWaitValue}s`} 的请求返回 429`,
     allowDegrade
       ? "故障切换时允许丢弃 thinking 块等白名单能力"
       : "故障切换时宁可失败，也不丢弃任何能力",
@@ -613,7 +629,7 @@ function GroupDrawer({
           <Field
             label="队列总容量"
             error={queueError ?? undefined}
-            hint="所有目标队列加起来的上限，超出返回 429 queue_full。设为 0 表示任何需要等待的请求都直接拒绝。"
+            hint="所有目标队列加起来的上限，超出返回 429 queue_full。留空表示不限（默认）；填 0 表示任何需要等待的请求都直接拒绝。"
           >
             {(id) => (
               <input
@@ -621,6 +637,7 @@ function GroupDrawer({
                 className="input"
                 type="number"
                 min={0}
+                placeholder="不限"
                 value={queue}
                 onChange={(e) => setQueue(e.target.value)}
               />

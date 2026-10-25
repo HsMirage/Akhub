@@ -668,7 +668,10 @@ pub async fn create_group(
         key_digest_hex: state.key_digest.digest_hex(&key),
         multiplier_limit: payload.multiplier_limit,
         weights,
-        queue_capacity: payload.queue_capacity.unwrap_or(100),
+        // 默认不限：排队是稀缺路径，先卡容量只会让突发流量直接 429（§6.3）。
+        queue_capacity: payload
+            .queue_capacity
+            .unwrap_or(crate::domain::QUEUE_UNLIMITED),
         max_wait_secs: validate_max_wait(payload.max_wait_secs)?,
         allow_managed_background: payload.allow_managed_background.unwrap_or(false),
         allow_degrade: payload.allow_degrade.unwrap_or(true),

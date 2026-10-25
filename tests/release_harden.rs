@@ -775,7 +775,9 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         group_columns.contains("weight_cache_hit"),
         "迁移后 groups 缺少 weight_cache_hit：{group_columns:?}"
     );
-    // 这份老库的分组是旧「均衡」40/25/20/15：升级后应变成 40/25/15/10/10。
+    // 这份老库的分组是旧「均衡」40/25/20/15：连过 v24（补第五维）与 v25
+    // （预设重新定标），最终应落在新「均衡」30/30/10/15/15。
+    // 元组顺序是库里的列序：倍率/可靠性/首字/速度/命中率。
     let weights: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT weight_multiplier, weight_reliability, weight_first_token,
                 weight_throughput, weight_cache_hit FROM groups LIMIT 1",
@@ -785,8 +787,8 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
     .unwrap();
     assert_eq!(
         weights,
-        (40, 25, 15, 10, 10),
-        "旧「均衡」预设应升级为五维同名预设，而不是把命中率权重留成 0"
+        (30, 30, 10, 15, 15),
+        "旧预设应一路升到新定标，而不是停在中间版本或把命中率权重留成 0"
     );
     // v17 的回填子查询按 (target_id, protocol, streaming) 取最近请求，索引必须
     // 存在，否则迁移会在请求记录表上全表扫描 × 快照行数。
@@ -897,20 +899,34 @@ async fn the_v24_migration_only_rewrites_weights_that_match_an_old_preset() {
             .unwrap()
         }
     };
+    // 元组顺序是库里的列序：倍率/可靠性/首字/速度/命中率。
+    // v24 先把四维旧预设映射成五维，v25 再把五维映射到新定标——
+    // 从 v23 直升级的库连过两道，最终必须落在新预设上。
     assert_eq!(
         weights("g-balance").await,
-        (40, 25, 15, 10, 10),
-        "旧「均衡」应换成新「均衡」"
+        (30, 30, 10, 15, 15),
+        "旧「均衡」应一路升到新「均衡」30/30/10/15/15"
     );
     assert_eq!(
         weights("g-cost").await,
-        (55, 20, 10, 5, 10),
-        "旧「成本优先」应换成新「成本优先」"
+        (55, 15, 5, 10, 15),
+        "旧「成本优先」应升到新「成本优先」55/15/5/10/15"
     );
     assert_eq!(
         weights("g-custom").await,
         (33, 27, 21, 19, 0),
         "手调权重不得被迁移改动，第五维留 0（不参与评分）"
+    );
+    // v25 之二：队列容量旧默认值 100 改成不限。这里三个分组都是 100，
+    // 全部应变成 QUEUE_UNLIMITED。
+    let queue: i64 = sqlx::query_scalar("SELECT queue_capacity FROM groups WHERE id = 'g-cost'")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        queue as u32,
+        akhub::domain::QUEUE_UNLIMITED,
+        "旧默认值 100 应迁移为不限"
     );
 }
 

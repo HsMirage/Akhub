@@ -61,7 +61,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 不带上游状态码，"上游拒绝"与"网关拒绝"在库里长得一模一样。
 /// 对测试公开：迁移用例本该断言"升到当前版本"，写死数字会在每次加版本时
 /// 无意义地红一遍（§27）。
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -796,6 +796,23 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .context("迁移 request_attempts.effort 失败")?;
         }
     }
+    if from < 25 {
+        // v25 之二：队列总容量默认改为「不限」（§6.3）。
+        //
+        // 只把**旧默认值 100** 改掉：那是上一版没填时的落库值，不是管理员
+        // 挑的数字。显式设过 0（不排队）或别的上限的分组一律不动——那两个
+        // 都是有意的选择，改掉会让限流突然失效或突然开始排队。
+        let affected =
+            sqlx::query("UPDATE groups SET queue_capacity = ? WHERE queue_capacity = 100")
+                .bind(crate::domain::QUEUE_UNLIMITED)
+                .execute(pool)
+                .await
+                .context("迁移分组队列容量默认值失败")?
+                .rows_affected();
+        if affected > 0 {
+            tracing::info!(groups = affected, "队列总容量默认值从 100 改为不限");
+        }
+    }
     if from < 24 {
         // v24：调度评分加第五维「缓存命中率」（§9.4）。
         //
@@ -878,6 +895,76 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                     .execute(pool)
                     .await
                     .with_context(|| format!("迁移 target_perf_snapshot.{column} 失败"))?;
+            }
+        }
+    }
+    if from < 25 {
+        // v25：预设权重重新定标（§6.3）。
+        //
+        // 评价维度改成「倍率、可靠性、缓存命中率、输出速度、首字延迟」，
+        // 三档预设也重排了：命中率与可靠性同等重要，首字延迟降到最低。
+        //
+        // 同样只动**恰好等于上一版预设**的分组，手调比例原样保留。这里认的
+        // 是 v24 刚映射出来的那组值——所以从 v23 直升级的库会连过两道，
+        // 最终落到的就是新预设。
+        //
+        // 元组顺序是**库里的列序**：(倍率, 可靠性, 首字, 速度, 命中率)。
+        // 界面展示的顺序是 倍率·可靠性·命中率·速度·首字，只是排列不同。
+        // 两者混了不会报错——UPDATE 只是影响 0 行，静默什么都不做，
+        // 所以这组数必须对着 v24 的产出逐项核。
+        //
+        //   v24 成本优先 (55,20,10,5,10)  → v25 (55,15,5,10,15)
+        //   v24 均衡     (40,25,15,10,10) → v25 (30,30,10,15,15)
+        //   v24 质量优先 (15,30,20,25,10) → v25 (10,30,20,20,20)
+        // 注意：这一段在 `from < 24` 之前执行，此时 weight_cache_hit **可能还
+        // 不存在**（从 v23 直升级）。缺列时先补上，否则下面按五列匹配的
+        // UPDATE 一条都跑不到，且不会报错。
+        let columns = table_columns(pool, "groups").await?;
+        if !columns.contains("weight_cache_hit") {
+            sqlx::query(
+                "ALTER TABLE groups ADD COLUMN weight_cache_hit INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 groups.weight_cache_hit 失败（v25 前置）")?;
+        }
+        {
+            for (old, new) in [
+                ((55_i64, 20, 10, 5, 10), (55_i64, 15, 5, 10, 15)),
+                ((40, 25, 15, 10, 10), (30, 30, 10, 15, 15)),
+                ((15, 30, 20, 25, 10), (10, 30, 20, 20, 20)),
+            ] {
+                let affected = sqlx::query(
+                    "UPDATE groups
+                        SET weight_multiplier = ?, weight_reliability = ?,
+                            weight_first_token = ?, weight_throughput = ?,
+                            weight_cache_hit = ?
+                      WHERE weight_multiplier = ? AND weight_reliability = ?
+                        AND weight_first_token = ? AND weight_throughput = ?
+                        AND weight_cache_hit = ?",
+                )
+                .bind(new.0)
+                .bind(new.1)
+                .bind(new.2)
+                .bind(new.3)
+                .bind(new.4)
+                .bind(old.0)
+                .bind(old.1)
+                .bind(old.2)
+                .bind(old.3)
+                .bind(old.4)
+                .execute(pool)
+                .await
+                .context("迁移预设权重到新定标失败")?
+                .rows_affected();
+                if affected > 0 {
+                    tracing::info!(
+                        groups = affected,
+                        from = ?([old.0, old.1, old.2, old.3, old.4]),
+                        to = ?([new.0, new.1, new.2, new.3, new.4]),
+                        "预设权重升级到新定标"
+                    );
+                }
             }
         }
     }

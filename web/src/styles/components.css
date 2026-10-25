@@ -1653,10 +1653,19 @@ table.data td.table-empty-cell {
 }
 
 /* 权重编辑器 */
+/* minmax(0,1fr) 而不是 1fr：1fr 的最小值是 auto，输入框的固有宽度会把
+   栅格撑破容器。五列在宽屏并排，窄屏折成两列——否则每个输入框只剩几十
+   像素，数字被截断、标签挤成一团。 */
 .weights {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: var(--space-2);
+}
+
+@media (max-width: 560px) {
+  .weights {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .weights-sum {
@@ -4357,12 +4366,17 @@ table.data tbody tr.is-highlighted {
     top: 0;
     right: 0;
     bottom: 0;
-    width: 100vw;
+    /* 用 100% 而不是 100vw：vw 把**滚动条宽度也算进去**，一旦抽屉内容
+       变长、页面出现竖向滚动条，fixed 定位的抽屉右边缘就会被推到可视区
+       之外；它自己又是 overflow: hidden，右侧内容直接被裁掉——用户看到的
+       就是「白了一块」，必须缩小页面才看得全。百分比按包含块的 content
+       宽度算，天然不含滚动条。 */
+    width: 100%;
     border-radius: 0;
     border: none;
   }
   .drawer-lg {
-    width: 100vw;
+    width: 100%;
   }
 }
 

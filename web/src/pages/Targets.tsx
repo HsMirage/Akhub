@@ -628,9 +628,9 @@ function ModelBlock({
                               <span className="stack" style={{ gap: 4 }}>
                                 <span>倍率 {target.score.multiplier.toFixed(2)}</span>
                                 <span>可靠性 {target.score.reliability.toFixed(2)}</span>
-                                <span>首字延迟 {target.score.first_token.toFixed(2)}</span>
-                                <span>输出速度 {target.score.throughput.toFixed(2)}</span>
                                 <span>缓存命中率 {target.score.cache_hit.toFixed(2)}</span>
+                                <span>输出速度 {target.score.throughput.toFixed(2)}</span>
+                                <span>首字延迟 {target.score.first_token.toFixed(2)}</span>
                                 <span>
                                   综合 {target.score.total.toFixed(2)} · 有效样本{" "}
                                   {target.score.effective_samples.toFixed(1)}/

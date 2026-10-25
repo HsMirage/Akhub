@@ -225,7 +225,7 @@ mod tests {
                 key_digest_hex: "d1".into(),
                 multiplier_limit: Multiplier::ONE,
                 weights: SchedulingWeights::default(),
-                queue_capacity: 100,
+                queue_capacity: crate::domain::QUEUE_UNLIMITED,
                 max_wait_secs: 60,
                 allow_managed_background: false,
                 allow_degrade: true,
