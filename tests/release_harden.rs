@@ -60,6 +60,7 @@ async fn graceful_shutdown_flushes_the_last_snapshot_before_exit() {
             first_token: None,
             total: Duration::from_millis(500),
             output_tokens: Some(10),
+            cache_hit: None,
         },
         akhub::storage::now_unix(),
     );
@@ -528,6 +529,12 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
         .execute(state.store.pool())
         .await
         .unwrap();
+    // v24 之前没有第五个权重列：降级时必须把它也摘掉，否则下面那句
+    // INSERT 会带上一个老库不该有的列，迁移路径就测不到了。
+    sqlx::query("ALTER TABLE groups DROP COLUMN weight_cache_hit")
+        .execute(state.store.pool())
+        .await
+        .unwrap();
     sqlx::query("ALTER TABLE groups DROP COLUMN allow_managed_background")
         .execute(state.store.pool())
         .await
@@ -746,12 +753,35 @@ async fn an_old_database_is_migrated_to_the_current_schema_on_open() {
             .iter()
             .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
             .collect();
-    for column in ["weight", "last_sample_at"] {
+    // v24 加的两个命中率列同样必须在：缺了它们，升级后缓存命中率维恒为
+    // 「没上报」，那 10 分权重白给（§9.4）。
+    for column in ["weight", "last_sample_at", "cache_hit", "cache_samples"] {
         assert!(
             perf_columns.contains(column),
             "迁移后 target_perf_snapshot 缺少 {column}：{perf_columns:?}"
         );
     }
+    // 老库的 groups 表补了第五个权重列，且默认为 0——升级不该悄悄改掉
+    // 管理员已经配好的四项比例（它们本来就和为 100）。
+    let group_columns: std::collections::HashSet<String> = sqlx::query("PRAGMA table_info(groups)")
+        .fetch_all(reopened.store.pool())
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
+        .collect();
+    assert!(
+        group_columns.contains("weight_cache_hit"),
+        "迁移后 groups 缺少 weight_cache_hit：{group_columns:?}"
+    );
+    let cache_weight: i64 = sqlx::query_scalar("SELECT weight_cache_hit FROM groups LIMIT 1")
+        .fetch_one(reopened.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        cache_weight, 0,
+        "老库升级后缓存维权重应为 0，不篡改既有比例"
+    );
     // v17 的回填子查询按 (target_id, protocol, streaming) 取最近请求，索引必须
     // 存在，否则迁移会在请求记录表上全表扫描 × 快照行数。
     let index_count: i64 = sqlx::query_scalar(

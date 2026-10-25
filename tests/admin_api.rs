@@ -238,7 +238,11 @@ async fn the_full_configuration_path_works_end_to_end() {
     assert!(key.starts_with("akh-"));
     assert_eq!(
         created["group"]["weights"]["multiplier"], 40,
-        "默认权重应为 40/25/20/15"
+        "默认权重应为 40/25/15/10/10"
+    );
+    assert_eq!(
+        created["group"]["weights"]["cache_hit"], 10,
+        "缓存命中率是第五个维度，默认 10"
     );
 
     // 列表接口只返回前缀，绝不返回完整 Key。
@@ -794,7 +798,7 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .json(&json!({
         "name": "主力",
         "multiplier_limit": "1",
-        "weights": {"multiplier": 70, "reliability": 10, "first_token": 10, "throughput": 10},
+        "weights": {"multiplier": 70, "reliability": 10, "first_token": 10, "throughput": 5, "cache_hit": 5},
         "queue_capacity": 0,
         "allow_degrade": false,
     }))
@@ -1239,7 +1243,20 @@ async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
     assert_eq!(live["score"]["first_token"], 1.0, "{live}");
     assert_eq!(live["score"]["throughput"], 1.0, "{live}");
     assert_eq!(live["score"]["multiplier"], 1.0, "{live}");
-    assert_eq!(live["score"]["total"], 1.0, "{live}");
+    // 缓存命中率维没有样本（这里的样本不带 usage），按中性分 0.6 计——
+    // 它是第五维，所以总分不再是 1.0，但四维满分时仍应明显高于 0.9。
+    assert_eq!(live["score"]["cache_hit"], 0.6, "{live}");
+    // 贡献值也要下发：界面靠它算「这一维占总分百分之几」，缺了会显示 NaN。
+    assert!(
+        live["score"]["contribution"]["cache_hit"]
+            .as_f64()
+            .is_some_and(|value| (value - 0.06).abs() < 1e-6),
+        "缓存维贡献应为 0.6 × 10 / 100 = 0.06：{live}"
+    );
+    assert!(
+        live["score"]["total"].as_f64().unwrap() > 0.9,
+        "参照系里三项满分的目标总分不该被压下去：{live}"
+    );
     // B 的比值必须相对**在用**的那一个算：2000/4000 与 5/10。
     assert_eq!(slower["score"]["first_token"], 0.5, "{slower}");
     assert_eq!(slower["score"]["throughput"], 0.5, "{slower}");
@@ -1905,6 +1922,7 @@ fn prime_target(
                 first_token: Some(Duration::from_millis(first_token_ms)),
                 total: Duration::from_secs(1),
                 output_tokens: Some(output_tokens),
+                cache_hit: None,
             },
             at,
         );

@@ -328,9 +328,10 @@ impl Store {
         sqlx::query(
             "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                 weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+                weight_cache_hit,
                 queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
                 created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&group.id)
         .bind(&group.name)
@@ -341,6 +342,7 @@ impl Store {
         .bind(group.weights.reliability)
         .bind(group.weights.first_token)
         .bind(group.weights.throughput)
+        .bind(group.weights.cache_hit)
         .bind(group.queue_capacity)
         .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
@@ -356,8 +358,8 @@ impl Store {
         sqlx::query(
             "UPDATE groups SET name = ?, key_prefix = ?, key_digest_hex = ?, multiplier_limit = ?,
                 weight_multiplier = ?, weight_reliability = ?, weight_first_token = ?,
-                weight_throughput = ?, queue_capacity = ?, max_wait_secs = ?,
-                allow_degrade = ?, allow_managed_background = ? WHERE id = ?",
+                weight_throughput = ?, weight_cache_hit = ?, queue_capacity = ?,
+                max_wait_secs = ?, allow_degrade = ?, allow_managed_background = ? WHERE id = ?",
         )
         .bind(&group.name)
         .bind(&group.key_prefix)
@@ -367,6 +369,7 @@ impl Store {
         .bind(group.weights.reliability)
         .bind(group.weights.first_token)
         .bind(group.weights.throughput)
+        .bind(group.weights.cache_hit)
         .bind(group.queue_capacity)
         .bind(group.max_wait_secs)
         .bind(group.allow_degrade)
@@ -1988,6 +1991,7 @@ impl Store {
                         "weight_reliability",
                         "weight_first_token",
                         "weight_throughput",
+                        "weight_cache_hit",
                         "queue_capacity",
                         "max_wait_secs",
                         "allow_degrade",
@@ -2204,9 +2208,10 @@ impl Store {
             sqlx::query(
                 "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                     weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
+                    weight_cache_hit,
                     queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
                     created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(group, "id"))
             .bind(str_field(group, "name"))
@@ -2217,6 +2222,8 @@ impl Store {
             .bind(int_field(group, "weight_reliability"))
             .bind(int_field(group, "weight_first_token"))
             .bind(int_field(group, "weight_throughput"))
+            // 老备份没有这一列：恢复后缓存维权重为 0，等价于升级前的四维评分。
+            .bind(int_field(group, "weight_cache_hit"))
             .bind(int_field(group, "queue_capacity"))
             // 老备份没有这两列：按列默认值恢复，不要把 0 当成管理员的选择。
             .bind(int_field_or(group, "max_wait_secs", 60))
@@ -2697,8 +2704,8 @@ impl Store {
             sqlx::query(
                 "INSERT OR REPLACE INTO target_perf_snapshot (target_id, protocol, streaming,
                     samples, weight, success_rate, first_token_ms, total_ms, output_tps,
-                    last_sample_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    cache_hit, cache_samples, last_sample_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&row.target_id)
             .bind(row.protocol.as_str())
@@ -2709,6 +2716,8 @@ impl Store {
             .bind(row.first_token_ms)
             .bind(row.total_ms)
             .bind(row.output_tps)
+            .bind(row.cache_hit)
+            .bind(row.cache_samples)
             .bind(row.last_sample_at)
             .bind(row.updated_at)
             .execute(&mut *tx)
@@ -2742,6 +2751,8 @@ impl Store {
                     first_token_ms: row.try_get("first_token_ms")?,
                     total_ms: row.try_get("total_ms")?,
                     output_tps: row.try_get("output_tps")?,
+                    cache_hit: row.try_get("cache_hit")?,
+                    cache_samples: row.try_get("cache_samples")?,
                     last_sample_at: row.try_get("last_sample_at")?,
                     updated_at: row.try_get("updated_at")?,
                 })
@@ -3133,6 +3144,12 @@ pub struct PerfSnapshotRow {
     pub first_token_ms: f64,
     pub total_ms: f64,
     pub output_tps: f64,
+    /// 缓存命中率的 EWMA（0-1）与「采到过几次命中率」（§9.4）。
+    ///
+    /// 两个都要存：命中率 0 是正常取值（冷前缀、不做缓存的站点），
+    /// 只存命中率的话，重启后分不清「真没命中」和「上游从不报」。
+    pub cache_hit: f64,
+    pub cache_samples: i64,
     /// **真正的**最近一次采样时刻（不是快照写入时刻）。
     ///
     /// 必须单独存：`updated_at` 每 60 秒被刷成当前时间，拿它当采样时刻会让
@@ -3289,6 +3306,7 @@ fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> Result<Group> {
             reliability: row.try_get::<i64, _>("weight_reliability")? as u32,
             first_token: row.try_get::<i64, _>("weight_first_token")? as u32,
             throughput: row.try_get::<i64, _>("weight_throughput")? as u32,
+            cache_hit: row.try_get::<i64, _>("weight_cache_hit")? as u32,
         },
         queue_capacity: row.try_get::<i64, _>("queue_capacity")? as u32,
         max_wait_secs: row.try_get::<i64, _>("max_wait_secs").unwrap_or(60) as u32,
@@ -3858,6 +3876,8 @@ mod tests {
             first_token_ms: 900.0,
             total_ms: 4_000.0,
             output_tps: 42.0,
+            cache_hit: 0.62,
+            cache_samples: 12,
             last_sample_at: 9_990,
             updated_at: 10_000,
         };
@@ -3876,6 +3896,10 @@ mod tests {
         // updated_at 冒充采样时刻会让陈旧目标在重启后假装新鲜。
         assert!((loaded[0].weight - 28.5).abs() < 1e-9);
         assert_eq!(loaded[0].last_sample_at, 9_990);
+        // 命中率与它的样本数也必须往返：只存命中率的话，重启后 0 分不清
+        // 「真没命中」和「上游从不报」（§9.4）。
+        assert!((loaded[0].cache_hit - 0.62).abs() < 1e-9);
+        assert_eq!(loaded[0].cache_samples, 12);
         assert_eq!(store.prune_perf_snapshots(1_000).await.unwrap(), 1);
     }
 

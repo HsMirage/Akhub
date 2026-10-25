@@ -412,19 +412,10 @@ pub fn usage_tokens(body: &serde_json::Value) -> Option<u64> {
 /// Anthropic 把缓存读写单独上报，必须并入输入侧；上游没给字段就返回 `None`，
 /// 绝不估算。
 pub fn usage_parts(body: &serde_json::Value) -> (Option<u64>, Option<u64>) {
-    let Some(usage) = body.get("usage") else {
-        return (None, None);
-    };
-    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
-    let input = field("prompt_tokens").or_else(|| {
-        field("input_tokens").map(|input| {
-            let cache = field("cache_creation_input_tokens").unwrap_or(0)
-                + field("cache_read_input_tokens").unwrap_or(0);
-            input.saturating_add(cache)
-        })
-    });
-    let output = field("completion_tokens").or_else(|| field("output_tokens"));
-    (input, output)
+    // 走同一份解析：`input` 的「含不含缓存」在三个协议间本来就不一致，
+    // 两处各写一遍必然分叉——记录里的 input_tokens 与成本页会开始互相矛盾。
+    let breakdown = usage_breakdown(body);
+    (breakdown.input, breakdown.output)
 }
 
 /// 从一块 Responses SSE 字节里取出上游声明的响应 ID（§15.1）。
@@ -537,14 +528,49 @@ pub fn usage_breakdown(body: &serde_json::Value) -> UsageBreakdown {
     // **两种 OpenAI 形状都必须认。** 只认 Chat 的形状会让整个 Responses 协议族的
     // 缓存读写与思考 Token 在记录里恒为空——现场 2264 条 Responses 请求里只有 50 条
     // 有缓存读、思考 Token 是 0 条，而同期 Chat 的缓存读上报率是 61.9%（§11.6）。
+    let cache_read =
+        field("cache_read_input_tokens").or_else(|| crate::protocol::cache_read_tokens(usage));
+    let cache_write = field("cache_creation_input_tokens");
+    // `input` 一律是**全部**输入 Token（含缓存读写），与 `Usage::input` 的
+    // 定义一致（见 protocol::canonical）。
+    //
+    // 麻烦在于字段名重名而语义相反：**OpenAI Responses 和 Anthropic 都用
+    // `input_tokens`**，但 Responses 的已含缓存、Anthropic 的不含
+    // （Chat 则用 `prompt_tokens`，同样已含）。所以不能按字段名判断，
+    // 要看协议自己的标记：缓存读写放在**顶层** `cache_*_input_tokens` 的
+    // 只有 Anthropic，OpenAI 两种协议都藏在 details 子对象里。
+    //
+    // 漏了这一步，Anthropic 非流式的分母会偏小、命中率被 clamp 成 1.0，
+    // 而流式侧的 `absorb_anthropic_usage` 是加了的——两条路径给出两个答案。
+    let anthropic_shape = field("cache_read_input_tokens").is_some()
+        || field("cache_creation_input_tokens").is_some();
+    let input = match field("prompt_tokens") {
+        Some(prompt) => Some(prompt),
+        None => field("input_tokens").map(|input| {
+            if anthropic_shape {
+                input.saturating_add(cache_read.unwrap_or(0) + cache_write.unwrap_or(0))
+            } else {
+                input
+            }
+        }),
+    };
     UsageBreakdown {
-        input: field("prompt_tokens").or_else(|| field("input_tokens")),
+        input,
         output: field("completion_tokens").or_else(|| field("output_tokens")),
-        cache_read: field("cache_read_input_tokens")
-            .or_else(|| crate::protocol::cache_read_tokens(usage)),
-        cache_write: field("cache_creation_input_tokens"),
+        cache_read,
+        cache_write,
         reasoning: crate::protocol::reasoning_tokens(usage),
     }
+}
+
+/// 这一次请求的缓存命中率：缓存读 Token ÷ 全部输入 Token（0-1）。
+///
+/// 两个前提都必须成立才给值：上游报了缓存读字段，且报了输入总量。缺任何一项
+/// 都返回 `None` —— 拿「没上报」当「没命中」会让不做缓存的站点无故背 0 分。
+pub fn cache_hit_rate(usage: UsageBreakdown) -> Option<f64> {
+    let read = usage.cache_read?;
+    let input = usage.input?;
+    (input > 0).then(|| (read as f64 / input as f64).clamp(0.0, 1.0))
 }
 
 impl StreamAccounting {
@@ -1104,6 +1130,15 @@ mod tests {
             "Responses 的思考 Token 必须被认出来"
         );
 
+        // Responses 的 input_tokens **已经包含**缓存读，不能再加一次。
+        // 它的字段名和 Anthropic 一样叫 input_tokens，但语义相反——
+        // 按字段名判断会让 Responses 的命中率分母虚高、永远算不出高分。
+        assert_eq!(
+            cache_hit_rate(breakdown),
+            Some(0.768),
+            "768/1000，分母就是上游给的 input_tokens，不再补缓存"
+        );
+
         // Chat 的形状继续照常工作，两种协议共用一个解析器。
         let chat = usage_breakdown(&serde_json::json!({
             "usage": {
@@ -1115,6 +1150,65 @@ mod tests {
         }));
         assert_eq!(chat.cache_read, Some(640));
         assert_eq!(chat.reasoning, Some(16));
+        assert_eq!(cache_hit_rate(chat), Some(0.64), "640/1000");
+    }
+
+    /// 缓存命中率的**分母口径必须与分子一致**（§9.4 第五维）。
+    ///
+    /// 三个协议对 `input` 的定义本来就不一样：
+    /// - OpenAI 的 `prompt_tokens` / `input_tokens` 已经含缓存读；
+    /// - Anthropic 的 `input_tokens` **不含**缓存读写，流式侧
+    ///   `absorb_anthropic_usage` 会把它加回来。
+    ///
+    /// 所以非流式的 `usage_breakdown` 也必须加，否则非流式 Anthropic 的
+    /// 命中率会是 `cache_read / 不含缓存的输入`——分母偏小，命中率被 clamp
+    /// 到 1.0，一个只命中三成的账号看起来像全命中。
+    #[test]
+    fn anthropic_cache_hit_uses_the_same_denominator_on_both_paths() {
+        // 真实 Anthropic 形状：输入 100（不含缓存），缓存读 300、写 600。
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 300,
+                "cache_creation_input_tokens": 600,
+            }
+        });
+        let breakdown = usage_breakdown(&body);
+        assert_eq!(
+            breakdown.input,
+            Some(1000),
+            "全部输入 = 100 + 300 + 600；漏加缓存会让命中率超过 30% 的实际值"
+        );
+        assert_eq!(
+            cache_hit_rate(breakdown),
+            Some(0.3),
+            "300/1000，不是 300/100"
+        );
+
+        // Anthropic 完全不上报缓存时不补任何东西：input_tokens 就是全部输入。
+        // 这条挡住「把所有带 input_tokens 的都当成 Anthropic」的过度修正。
+        let plain = usage_breakdown(&serde_json::json!({
+            "usage": {"input_tokens": 100, "output_tokens": 5}
+        }));
+        assert_eq!(plain.input, Some(100));
+        assert_eq!(cache_hit_rate(plain), None, "没报缓存读就没有命中率可言");
+
+        // 流式路径：同一份 usage 走 StreamAccounting，必须得到同一个命中率。
+        let mut accounting = StreamAccounting::new(Protocol::AnthropicMessages);
+        feed_all(
+            &mut accounting,
+            &[
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":600}}}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":50}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+        );
+        assert_eq!(
+            cache_hit_rate(accounting.usage_breakdown()),
+            Some(0.3),
+            "流式与非流式必须是同一个口径"
+        );
     }
 
     fn feed_all(accounting: &mut StreamAccounting, chunks: &[&str]) {

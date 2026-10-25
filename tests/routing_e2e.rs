@@ -640,6 +640,7 @@ fn prime_target(akhub: &common::Akhub, target_id: &str, first_token_ms: u64, tok
                 first_token: Some(Duration::from_millis(first_token_ms)),
                 total: Duration::from_millis(1000),
                 output_tokens: Some(tokens),
+                cache_hit: None,
             },
             at,
         );

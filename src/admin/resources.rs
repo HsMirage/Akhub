@@ -2548,7 +2548,7 @@ pub struct TargetDto {
     /// 冷却剩余秒数。
     pub cooldown_secs: Option<u64>,
     pub inflight: u32,
-    /// 综合评分与四个分维得分。权重调错时靠这一列自我诊断（§6.9）。
+    /// 综合评分与五个分维得分。权重调错时靠这一列自我诊断（§6.9）。
     pub score: Option<ScoreDto>,
     /// 首字延迟的当前 EWMA（毫秒）；一项样本都没采到时为 None（§6.5）。
     pub first_token_ms: Option<f64>,
@@ -2573,6 +2573,8 @@ pub struct ScoreDto {
     pub reliability: f64,
     pub first_token: f64,
     pub throughput: f64,
+    /// 缓存命中率得分（0-1）。上游从没上报过缓存用量时是中性分。
+    pub cache_hit: f64,
     /// 该目标在这个评分维度上的**有效**样本量（时间衰减后）。
     pub effective_samples: f64,
     /// 判定"可信"的有效样本量门槛，由后端下发（§9.4）。
@@ -2583,9 +2585,9 @@ pub struct ScoreDto {
     /// 它的分数已经旧到不足为凭，需要重新采样。
     pub exploration: f64,
     pub samples: u64,
-    /// 有效样本不足门槛时性能三维用的是保守中性分（§9.4）。
+    /// 有效样本不足门槛时性能各维用的是保守中性分（§9.4）。
     pub warm: bool,
-    /// 各维度的加权贡献（得分 × 权重 ÷ 100），四个加起来就是总分（§6.5）。
+    /// 各维度的加权贡献（得分 × 权重 ÷ 100），五个加起来就是总分（§6.5）。
     ///
     /// 只有归一化得分时，管理员得回分组页查权重才能判断"是哪一维把分数拉下去的"；
     /// 给出贡献值就能直接排序比较。
@@ -2599,6 +2601,7 @@ pub struct ScoreContributionDto {
     pub reliability: f64,
     pub first_token: f64,
     pub throughput: f64,
+    pub cache_hit: f64,
 }
 
 /// 「首字 / 速度」两列背后的样本口径（§6.5）。
@@ -2947,7 +2950,7 @@ fn model_scores(
     let candidates: Vec<_> = values.iter().map(candidate).collect();
     // 参照系只由**能参与调度**的目标定义，与调度器一致（它交给 `score_all` 的
     // 就是 `eligible` 那一批）。这一条和上面的 `cheapest` 同样要紧：倍率分被停用
-    // 账号的低价拉低只是"分偏低"，而性能三维是按"帧内最优"归一化的——一个已经
+    // 账号的低价拉低只是"分偏低"，而性能各维是按"帧内最优"归一化的——一个已经
     // 下线、历史样本很快的账号会把在用目标的首字与吞吐压到 0.05 量级（§9.4）。
     let frame: Vec<_> = values
         .iter()
@@ -2977,6 +2980,7 @@ fn model_scores(
                     reliability: crate::routing::score::NEUTRAL,
                     first_token: crate::routing::score::NEUTRAL,
                     throughput: crate::routing::score::NEUTRAL,
+                    cache_hit: crate::routing::score::NEUTRAL,
                     total: crate::routing::score::NEUTRAL,
                     // 口粮不是"中性分"：它是 0.03~0.24 的底权，没有就是 0。
                     // 前端 `exploration ?? 0` 与这里必须是同一个口径。
@@ -2989,6 +2993,7 @@ fn model_scores(
                 reliability: round4(score.reliability),
                 first_token: round4(score.first_token),
                 throughput: round4(score.throughput),
+                cache_hit: round4(score.cache_hit),
                 exploration: round4(score.exploration),
                 samples: stats.samples,
                 effective_samples: round4(stats.effective_samples(now)),
@@ -2999,6 +3004,7 @@ fn model_scores(
                     reliability: share(score.reliability, weights.reliability),
                     first_token: share(score.first_token, weights.first_token),
                     throughput: share(score.throughput, weights.throughput),
+                    cache_hit: share(score.cache_hit, weights.cache_hit),
                 },
             }
         })
@@ -5099,11 +5105,11 @@ fn require_name(raw: &str, field: &str) -> AdminResult<String> {
     Ok(trimmed.to_string())
 }
 
-/// 调度权重四项之和必须为 100（§6.3）。
+/// 调度权重五项之和必须为 100（§6.3）。
 fn validate_weights(weights: SchedulingWeights) -> AdminResult<SchedulingWeights> {
     if !weights.is_valid() {
         return Err(AdminError::bad_request(format!(
-            "四个调度权重之和必须为 100，当前为 {}",
+            "五个调度权重之和必须为 100，当前为 {}",
             weights.sum()
         )));
     }
@@ -5243,8 +5249,9 @@ mod tests {
         let bad = SchedulingWeights {
             multiplier: 50,
             reliability: 25,
-            first_token: 20,
-            throughput: 15,
+            first_token: 15,
+            throughput: 10,
+            cache_hit: 10,
         };
         let error = validate_weights(bad).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);

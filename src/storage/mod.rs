@@ -61,7 +61,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// 不带上游状态码，"上游拒绝"与"网关拒绝"在库里长得一模一样。
 /// 对测试公开：迁移用例本该断言"升到当前版本"，写死数字会在每次加版本时
 /// 无意义地红一遍（§27）。
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -519,7 +519,7 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
         // v16 只加了列，老库的 last_sample_at 一律是 0 = "不知道有多旧"，读取时
         // 按完全过期处理。这是诚实的默认值，但对**升级者**是个陷阱：升级后所有
         // 账号都会瞬间变成"冷"，要等重新采样才回到参照系；低流量账号（现场实测
-        // 0.71 条/小时）得等十几个小时，而这期间所有人的性能三维又是 0.6——正是
+        // 0.71 条/小时）得等十几个小时，而这期间所有人的性能各维又是 0.6——正是
         // 这次要修的那个症状被升级动作重新制造了一遍。
         //
         // 而 request_records 里就存着每个 (目标, 协议, 是否流式) 的真实请求时刻，
@@ -794,6 +794,42 @@ async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
                 .execute(pool)
                 .await
                 .context("迁移 request_attempts.effort 失败")?;
+        }
+    }
+    if from < 24 {
+        // v24：调度评分加第五维「缓存命中率」（§9.4）。
+        //
+        // 两处落库：分组的第五个权重列，以及性能快照里的命中率 EWMA。
+        // 老库的 `weight_cache_hit` 给 0 而不是从别项里挪：迁移不该悄悄改掉
+        // 管理员配好的比例，而旧的四项之和本来就是 100。代价是老库升级后
+        // 五项之和是 100 但缓存维权重为 0——这一维不参与评分，与升级前等价。
+        // 想要它生效就在界面上重新保存一次权重（默认预设已含 10 分）。
+        let group_columns = table_columns(pool, "groups").await?;
+        if !group_columns.contains("weight_cache_hit") {
+            sqlx::query(
+                "ALTER TABLE groups ADD COLUMN weight_cache_hit INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(pool)
+            .await
+            .context("迁移 groups.weight_cache_hit 失败")?;
+        }
+        let perf_columns = table_columns(pool, "target_perf_snapshot").await?;
+        for (column, ddl) in [
+            (
+                "cache_hit",
+                "ALTER TABLE target_perf_snapshot ADD COLUMN cache_hit REAL NOT NULL DEFAULT 0",
+            ),
+            (
+                "cache_samples",
+                "ALTER TABLE target_perf_snapshot ADD COLUMN cache_samples INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !perf_columns.contains(column) {
+                sqlx::query(ddl)
+                    .execute(pool)
+                    .await
+                    .with_context(|| format!("迁移 target_perf_snapshot.{column} 失败"))?;
+            }
         }
     }
     if from < 23 {

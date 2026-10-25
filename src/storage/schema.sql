@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS groups (
     weight_reliability INTEGER NOT NULL,
     weight_first_token INTEGER NOT NULL,
     weight_throughput INTEGER NOT NULL,
+    -- 缓存命中率维度（§9.4）。与其它四项一样，五项之和必须是 100。
+    weight_cache_hit  INTEGER NOT NULL DEFAULT 0,
     queue_capacity    INTEGER NOT NULL,
     -- 层内全忙时最多等多久（秒）；0 表示跟随请求总超时（§6.3、§13.6）。
     max_wait_secs     INTEGER NOT NULL DEFAULT 60,
@@ -197,6 +199,10 @@ CREATE TABLE IF NOT EXISTS target_perf_snapshot (
     first_token_ms REAL NOT NULL,
     total_ms       REAL NOT NULL,
     output_tps     REAL NOT NULL,
+    -- 缓存命中率的 EWMA（0-1）与「采到过几次命中率」。两个都要存：命中率 0
+    -- 是正常取值（冷前缀、不做缓存的站点），不能拿它当「没有数据」。
+    cache_hit       REAL NOT NULL DEFAULT 0,
+    cache_samples   INTEGER NOT NULL DEFAULT 0,
     -- **真正的**最近一次采样时刻。不能拿 updated_at 代替：它每 60 秒被刷成
     -- 当前时间，会让陈旧目标看起来刚被采样过，时间衰减与探索口粮一起失效。
     last_sample_at INTEGER NOT NULL DEFAULT 0,
@@ -267,6 +273,10 @@ CREATE TABLE IF NOT EXISTS request_records (
     sticky_kept      INTEGER,
     -- 诊断用的用量与时机：首字延迟、输入/输出 token、当时的配置版本（§6.6）。
     first_token_ms   INTEGER,
+    -- 输入 token 一律是**全部**输入（含缓存读写），三个协议同一口径：
+    -- OpenAI 的 prompt_tokens / input_tokens 本来就含，Anthropic 的不含、
+    -- 由网关补齐（见 gateway::stream::usage_breakdown）。不统一的话成本页
+    -- 同一个模型换个协议入口就会差出一截缓存量。
     input_tokens     INTEGER,
     output_tokens    INTEGER,
     config_version   INTEGER,

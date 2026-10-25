@@ -146,20 +146,27 @@ impl Limits {
     }
 }
 
-/// 分组调度权重，四项之和必须为 100（§6.3）。
+/// 分组调度权重，五项之和必须为 100（§6.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulingWeights {
     pub multiplier: u32,
     pub reliability: u32,
     pub first_token: u32,
     pub throughput: u32,
+    /// 缓存命中率。与可靠性一样是天然 0-1 的量，不需要参照系归一化。
+    ///
+    /// `serde(default)` 是给老客户端留的门：只发四项的请求仍然能落成
+    /// 「缓存维权重 0」——和升级前的老库、老备份是同一个语义（见 v24 迁移），
+    /// 而不是直接 400。
+    #[serde(default)]
+    pub cache_hit: u32,
 }
 
 impl SchedulingWeights {
     pub const TOTAL: u32 = 100;
 
     pub fn sum(&self) -> u32 {
-        self.multiplier + self.reliability + self.first_token + self.throughput
+        self.multiplier + self.reliability + self.first_token + self.throughput + self.cache_hit
     }
 
     pub fn is_valid(&self) -> bool {
@@ -168,13 +175,17 @@ impl SchedulingWeights {
 }
 
 impl Default for SchedulingWeights {
-    /// 默认 40 / 25 / 20 / 15（§6.3）。
+    /// 默认 40 / 25 / 15 / 10 / 10（§6.3）。
+    ///
+    /// 首字与速度各让出 5 分给缓存命中率：命中率直接决定同样一轮对话要付多少
+    /// 输入 Token，而它此前只体现在成本里、从不参与层内选谁。
     fn default() -> Self {
         Self {
             multiplier: 40,
             reliability: 25,
-            first_token: 20,
-            throughput: 15,
+            first_token: 15,
+            throughput: 10,
+            cache_hit: 10,
         }
     }
 }
@@ -361,6 +372,7 @@ mod tests {
     fn default_weights_sum_to_one_hundred() {
         let weights = SchedulingWeights::default();
         assert_eq!(weights.multiplier, 40);
+        assert_eq!(weights.cache_hit, 10);
         assert!(weights.is_valid());
     }
 
@@ -369,8 +381,9 @@ mod tests {
         let weights = SchedulingWeights {
             multiplier: 40,
             reliability: 25,
-            first_token: 20,
+            first_token: 15,
             throughput: 10,
+            cache_hit: 5,
         };
         assert!(!weights.is_valid());
     }

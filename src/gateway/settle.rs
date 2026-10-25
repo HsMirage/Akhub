@@ -260,7 +260,7 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     // `deepseek-v4.1-flash` 近 7 天 1848 条请求里 96.8% 属于"上游其实写完了、
     // 只是下游没等到收尾就关了连接"，全部被丢弃，真实生效的只剩 62 条。五个
     // 目标的有效样本量因此全在 0.1~6.6 之间，谁都不是"热"目标——参照系不成立、
-    // 性能三维一律退化成中性分，冷目标的口粮占了抽签权重 84%~97%，评分形同虚设，
+    // 性能各维一律退化成中性分，冷目标的口粮占了抽签权重 84%~97%，评分形同虚设，
     // 抽签接近均匀随机，前缀缓存每轮重建一次。
     //
     // 判据是协议自己的**终止信号**，不是"有没有出现过用量"：Anthropic 的
@@ -292,6 +292,9 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
             // 现在才是真正的"流结束时间"，不是首段提交时间。
             total: settlement.started.elapsed(),
             output_tokens: accounting.output_tokens(),
+            // 这次请求的缓存命中率：喂给评分，让"缓存亲和"成为可被选择的证据。
+            // 字段缺失时是 `None`（上游没上报），绝不拿 0 冒充"没命中"。
+            cache_hit: crate::gateway::stream::cache_hit_rate(accounting.usage_breakdown()),
         },
         crate::storage::now_unix(),
     );

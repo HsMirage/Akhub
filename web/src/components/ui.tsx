@@ -928,7 +928,7 @@ export function Skeleton({ rows = 3 }: { rows?: number }) {
 }
 
 /**
- * 综合评分与四个分维得分的紧凑可视化（§6.9）。
+ * 综合评分与五个分维得分的紧凑可视化（§6.9）。
  *
  * 权重调错时，一眼就能看出是哪一维把分数拉下去的，而不必打开每个目标细看。
  */
@@ -938,11 +938,12 @@ export function ScoreMeter({ score }: { score: Score }) {
     { key: "reliability", label: "可靠性" },
     { key: "first_token", label: "首字延迟" },
     { key: "throughput", label: "输出速度" },
+    { key: "cache_hit", label: "缓存命中率" },
   ];
   // 门槛与有效样本量都来自后端：界面写死数字会在调参之后开始说谎（§9.4）。
   const cold = score.warm
     ? ""
-    : `；有效样本 ${score.effective_samples.toFixed(1)}/${score.warm_threshold}，性能三维暂用中性分`;
+    : `；有效样本 ${score.effective_samples.toFixed(1)}/${score.warm_threshold}，性能各维暂用中性分`;
   return (
     <span className="score">
       <span

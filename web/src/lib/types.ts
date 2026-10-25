@@ -30,6 +30,7 @@ export interface SchedulingWeights {
   reliability: number;
   first_token: number;
   throughput: number;
+  cache_hit: number;
 }
 
 /**
@@ -227,19 +228,20 @@ export interface LogicalModel {
   listed: boolean;
 }
 
-/** 综合评分与四个分维得分（§9.4）。 */
+/** 综合评分与五个分维得分（§9.4）。 */
 export interface Score {
   total: number;
   multiplier: number;
   reliability: number;
   first_token: number;
   throughput: number;
+  cache_hit: number;
   samples: number;
   /** 时间衰减后的有效样本量。评分采信的是它，不是累计条数。 */
   effective_samples: number;
   /** 判定可信的有效样本量门槛，由后端下发，界面不得写死。 */
   warm_threshold: number;
-  /** 有效样本量不足门槛时性能三维用的是保守中性分。 */
+  /** 有效样本量不足门槛时性能各维用的是保守中性分。 */
   warm: boolean;
   /**
    * 探索口粮（§9.5）：与分数无关的抽签底权，随"距上次采样多久"放大到 8 倍。
@@ -250,7 +252,7 @@ export interface Score {
    */
   exploration: number;
   /**
-   * 各维度的加权贡献（得分 × 权重 ÷ 100），四项之和即总分（§6.5）。
+   * 各维度的加权贡献（得分 × 权重 ÷ 100），五项之和即总分（§6.5）。
    *
    * 只有归一化得分时，得回分组页查权重才能判断"是哪一维把分数拉下去的"；
    * 有贡献值就能直接横向比较。
@@ -260,6 +262,7 @@ export interface Score {
     reliability: number;
     first_token: number;
     throughput: number;
+    cache_hit: number;
   };
 }
 

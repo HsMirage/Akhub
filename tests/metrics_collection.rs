@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 struct Script {
     /// 流式响应里是否带 usage 收尾块。
     stream_usage: bool,
+    /// usage 里是否上报缓存读 Token（命中率维的唯一来源）。
+    cache_read: bool,
 }
 
 type SeenBodies = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
@@ -46,20 +48,33 @@ async fn spawn_upstream(script: Script) -> (String, SeenBodies) {
                 "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
             ];
             if script.stream_usage {
-                frames.push(
-                    "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":11,\"total_tokens\":16}}\n\n"
-                        .to_string(),
-                );
+                // 16 个输入里 12 个命中缓存 → 命中率 0.75。
+                let usage = if script.cache_read {
+                    "{\"prompt_tokens\":16,\"completion_tokens\":11,\"total_tokens\":27,\
+                     \"prompt_tokens_details\":{\"cached_tokens\":12}}"
+                } else {
+                    "{\"prompt_tokens\":5,\"completion_tokens\":11,\"total_tokens\":16}"
+                };
+                frames.push(format!(
+                    "data: {{\"id\":\"c1\",\"choices\":[],\"usage\":{usage}}}\n\n"
+                ));
             }
             frames.push("data: [DONE]\n\n".to_string());
             return ([("content-type", "text/event-stream")], frames.concat()).into_response();
         }
+        // 非流式的缓存读同样要认：命中率维不能只有流式一条采集路径（§9.3）。
+        let usage = if script.cache_read {
+            json!({"prompt_tokens": 16, "completion_tokens": 11, "total_tokens": 27,
+                   "prompt_tokens_details": {"cached_tokens": 12}})
+        } else {
+            json!({"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16})
+        };
         axum::Json(json!({
             "id": "c1",
             "object": "chat.completion",
             "model": "m",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "你好"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16},
+            "usage": usage,
         }))
         .into_response()
     }
@@ -79,7 +94,11 @@ async fn spawn_upstream(script: Script) -> (String, SeenBodies) {
 /// 「某模型的样本落在非流式维度」时首字得分恒为中性分，权重全部浪费。
 #[tokio::test]
 async fn a_non_streaming_response_still_feeds_the_first_token_dimension() {
-    let (upstream, _seen) = spawn_upstream(Script { stream_usage: true }).await;
+    let (upstream, _seen) = spawn_upstream(Script {
+        stream_usage: true,
+        cache_read: false,
+    })
+    .await;
     let akhub = spawn_akhub().await;
     let wired = wire_target(
         &akhub,
@@ -125,7 +144,11 @@ async fn a_non_streaming_response_still_feeds_the_first_token_dimension() {
 /// 一直保守占用到窗口过期（§9.3、§17.2）。
 #[tokio::test]
 async fn the_gateway_asks_for_usage_even_when_the_client_did_not() {
-    let (upstream, seen) = spawn_upstream(Script { stream_usage: true }).await;
+    let (upstream, seen) = spawn_upstream(Script {
+        stream_usage: true,
+        cache_read: false,
+    })
+    .await;
     let akhub = spawn_akhub().await;
     let wired = wire_target(
         &akhub,
@@ -172,7 +195,11 @@ async fn the_gateway_asks_for_usage_even_when_the_client_did_not() {
 /// 「网关知道用量」，不是「客户端的响应形状变了」。
 #[tokio::test]
 async fn an_unrequested_usage_chunk_is_not_forwarded_to_the_client() {
-    let (upstream, _seen) = spawn_upstream(Script { stream_usage: true }).await;
+    let (upstream, _seen) = spawn_upstream(Script {
+        stream_usage: true,
+        cache_read: false,
+    })
+    .await;
     let akhub = spawn_akhub().await;
     wire_target(
         &akhub,
@@ -203,7 +230,11 @@ async fn an_unrequested_usage_chunk_is_not_forwarded_to_the_client() {
 /// 同一份流：客户端主动要了 usage 时，必须照常收到。
 #[tokio::test]
 async fn a_requested_usage_chunk_still_reaches_the_client() {
-    let (upstream, _seen) = spawn_upstream(Script { stream_usage: true }).await;
+    let (upstream, _seen) = spawn_upstream(Script {
+        stream_usage: true,
+        cache_read: false,
+    })
+    .await;
     let akhub = spawn_akhub().await;
     wire_target(
         &akhub,
@@ -234,7 +265,11 @@ async fn a_requested_usage_chunk_still_reaches_the_client() {
 /// 非流式：TPM 归还同样依赖响应体里的 usage（§17.2）。
 #[tokio::test]
 async fn a_non_streaming_response_refunds_tpm_with_its_usage() {
-    let (upstream, _seen) = spawn_upstream(Script { stream_usage: true }).await;
+    let (upstream, _seen) = spawn_upstream(Script {
+        stream_usage: true,
+        cache_read: false,
+    })
+    .await;
     let akhub = spawn_akhub().await;
     wire_target(
         &akhub,
@@ -260,5 +295,57 @@ async fn a_non_streaming_response_refunds_tpm_with_its_usage() {
             .unwrap();
         assert_eq!(response.status(), 200, "第 {} 次请求应放行", round + 1);
         let _ = response.text().await.unwrap();
+    }
+}
+
+/// 缓存命中率维必须真的采到数据，且流式与非流式两条路径都算得出来（§9.4）。
+///
+/// 这一维靠上游 usage 里的缓存读字段。只认流式会让「样本都落在非流式维度」的
+/// 目标永远拿中性分，权重白给——和首字 / 速度两维当年是同一个病。
+#[tokio::test]
+async fn cache_hit_is_sampled_on_both_streaming_and_non_streaming_paths() {
+    for streaming in [true, false] {
+        let (upstream, _seen) = spawn_upstream(Script {
+            stream_usage: true,
+            cache_read: true,
+        })
+        .await;
+        let akhub = spawn_akhub().await;
+        let wired = wire_target(
+            &akhub,
+            TargetSpec::new("账号A", &upstream, Protocol::OpenAiChat, "m", "m", 50),
+        )
+        .await;
+
+        let response = client()
+            .post(format!("{}/v1/chat/completions", akhub.base_url))
+            .bearer_auth(&akhub.key)
+            .json(&json!({
+                "model": "m",
+                "stream": streaming,
+                "messages": [{"role": "user", "content": "你好"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let _ = response.text().await.unwrap();
+
+        let stats = akhub.state.runtime.perf.stats(
+            &wired.target_id,
+            Dimension {
+                protocol: Protocol::OpenAiChat,
+                streaming,
+            },
+        );
+        assert_eq!(
+            stats.cache_samples, 1,
+            "流式={streaming} 必须采到命中率：{stats:?}"
+        );
+        assert!(
+            (stats.cache_hit - 0.75).abs() < 1e-6,
+            "12/16 的缓存读应当得到 0.75，实际 {}（流式={streaming}）",
+            stats.cache_hit
+        );
     }
 }

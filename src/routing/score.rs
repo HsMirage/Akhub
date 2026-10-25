@@ -13,7 +13,7 @@ use crate::storage::store::PerfSnapshotRow;
 
 /// EWMA 的平滑系数。0.2 大约相当于"最近 10 次请求主导当前值"。
 const ALPHA: f64 = 0.2;
-/// 有效样本量低于此值时性能三维使用保守中性分（§9.4 的冷启动规则）。
+/// 有效样本量低于此值时性能各维使用保守中性分（§9.4 的冷启动规则）。
 ///
 /// 它数的是**时间衰减后的**样本权重，不是累计条数：一个几百条样本但全是
 /// 上周的账号，有效样本量会衰减到阈值以下，于是自动退出"可信"状态、回到
@@ -88,7 +88,7 @@ const EXPLORATION: f64 = 0.03;
 const MAX_STALE_FACTOR: f64 = 8.0;
 /// 定义性能参照系所需的最少热目标数（§9.4）。
 ///
-/// 只有一个热目标时，它就是参照系里"最快的""吞吐最高的"，三项性能分自动
+/// 只有一个热目标时，它就是参照系里"最快的""吞吐最高的"，性能分自动
 /// 拉满——而这与它实际有多慢无关。它因此永远比拼分只有中性 0.6 的冷目标高
 /// 一截，形成第二个正反馈：最先拿到样本的目标从此赢家通吃。
 /// 一个数据点不构成参照系；不足两个热目标时全体退回中性分，让流量先按倍率
@@ -111,6 +111,11 @@ pub struct Sample {
     pub total: Duration,
     /// 上游报告的输出 Token 数，用于算每秒输出速度。
     pub output_tokens: Option<u64>,
+    /// 这一次请求的缓存命中率：缓存读 Token ÷ 全部输入 Token，0-1。
+    ///
+    /// 上游没上报缓存字段时是 None——「没上报」与「没命中」是两件事，
+    /// 把前者记成 0 会冤枉那些根本不回缓存用量的站点。
+    pub cache_hit: Option<f64>,
 }
 
 /// 一次采样对目标质量判断的效力（§9.3、§12.3）。
@@ -155,6 +160,13 @@ pub struct Stats {
     pub first_token_ms: f64,
     pub total_ms: f64,
     pub output_tps: f64,
+    /// 缓存命中率的 EWMA（0-1）。与可靠性一样是天然 0-1 的量，不做归一化。
+    pub cache_hit: f64,
+    /// 采到过命中率的次数。0 表示「上游从没上报过缓存用量」。
+    ///
+    /// 不能用 `cache_hit > 0` 判断有没有数据：命中率 0 是常态（冷前缀、
+    /// 不缓存的站点），拿它当「没数据」会给这类目标凭空发一份中性分。
+    pub cache_samples: u64,
     /// 最近一次**进统计**的采样时刻（Unix 秒）。0 表示从来没采样过。
     ///
     /// 它同时是权重的衰减起点（见 `weight`）与探索口粮的陈旧度依据（§9.5）。
@@ -179,6 +191,8 @@ impl Default for Stats {
             first_token_ms: 0.0,
             total_ms: 0.0,
             output_tps: 0.0,
+            cache_hit: 0.0,
+            cache_samples: 0,
             last_sample_at: 0,
         }
     }
@@ -201,7 +215,7 @@ impl Stats {
         self.weight * decay_factor((now - self.last_sample_at).max(0) as f64)
     }
 
-    /// 有效样本量是否够信任性能三维（§9.4 修订）。
+    /// 有效样本量是否够信任性能各维（§9.4 修订）。
     ///
     /// 判据是**时间衰减后的**证据量，不是累计条数：一个几百条样本但全是上周的
     /// 账号会失去可信状态，不再定义参照系、也不再压住当下正常的账号。
@@ -254,6 +268,17 @@ impl Stats {
         {
             let tps = tokens as f64 / sample.total.as_secs_f64();
             self.output_tps = ewma_or_seed(self.output_tps, tps);
+        }
+        // 缓存命中率的种子与其它三项不同：**0 是它的正常取值**（冷前缀、
+        // 站点不做缓存），不能像延迟那样拿「0」当「还没初始化」。用
+        // `cache_samples` 单独数「采到过几次命中率」，第一次直接作初值。
+        if let Some(rate) = sample.cache_hit {
+            self.cache_hit = if self.cache_samples == 0 {
+                rate
+            } else {
+                ewma(self.cache_hit, rate)
+            };
+            self.cache_samples = self.cache_samples.saturating_add(1);
         }
     }
 }
@@ -356,6 +381,8 @@ impl Registry {
                     first_token_ms: value.first_token_ms,
                     total_ms: value.total_ms,
                     output_tps: value.output_tps,
+                    cache_hit: value.cache_hit,
+                    cache_samples: value.cache_samples as i64,
                     last_sample_at: value.last_sample_at,
                     updated_at: now,
                 });
@@ -395,6 +422,8 @@ impl Registry {
                     first_token_ms: row.first_token_ms,
                     total_ms: row.total_ms,
                     output_tps: row.output_tps,
+                    cache_hit: row.cache_hit,
+                    cache_samples: row.cache_samples.max(0) as u64,
                     last_sample_at: row.last_sample_at,
                 },
             );
@@ -436,6 +465,8 @@ pub struct Score {
     pub reliability: f64,
     pub first_token: f64,
     pub throughput: f64,
+    /// 缓存命中率得分：命中率本身就是 0-1，不需要参照系归一化。
+    pub cache_hit: f64,
     pub total: f64,
     /// 这个候选此刻的探索口粮，已经含陈旧度放大（§9.5）。
     pub exploration: f64,
@@ -477,7 +508,7 @@ impl Reference {
         // 账号得分被压到 0.2 量级（§9.4 修订）。
         let warm = || candidates.iter().filter(|c| c.stats.is_warm(now));
         // 但**一个**热目标同样不构成参照系：它自动成为"最快"与"吞吐最高"，
-        // 三项性能分全部拉满，而冷目标一律中性 0.6——差距与它实际快慢无关。
+        // 性能分全部拉满，而冷目标一律中性 0.6——差距与它实际快慢无关。
         // 现场表现就是"最先被抽中的那个账号从此赢家通吃"。不足两个热目标时
         // 放弃参照系，全体按中性分处理，等样本攒够再让性能说话（§9.4）。
         if warm().count() < MIN_FRAME_TARGETS {
@@ -562,10 +593,10 @@ pub fn score_all(
 ///
 /// 后台需要给"不能参与调度"的行也算一个参考分（停用账号：管理员想知道重新启用
 /// 它大概是什么水平），但这些行绝不能定义参照系——一个已经下线的账号只要历史
-/// 样本够快，就会按"帧内最优"把全部在用目标的性能三维压下去（§9.4）。调度器
+/// 样本够快，就会按"帧内最优"把全部在用目标的性能各维压下去（§9.4）。调度器
 /// 没有这个毛病：它交给 [`score_all`] 的就是 `eligible` 那一批。
 ///
-/// `frame` 为空等价于"一个热目标都没有"：性能三维对所有人取中性分。
+/// `frame` 为空等价于"一个热目标都没有"：性能各维对所有人取中性分。
 pub fn score_all_with_frame(
     candidates: &[Candidate],
     frame: &[Candidate],
@@ -597,8 +628,8 @@ fn score_one(
         (reference.cheapest / own).clamp(0.0, 1.0)
     };
 
-    // 冷启动：有效样本不足时性能三维用保守中性分，倍率维正常参与（§9.4）。
-    let (reliability, first_token, throughput) = if candidate.stats.is_warm(now) {
+    // 冷启动：有效样本不足时性能各维用保守中性分，倍率维正常参与（§9.4）。
+    let (reliability, first_token, throughput, cache_hit) = if candidate.stats.is_warm(now) {
         let reliability = candidate.stats.success_rate.clamp(0.0, 1.0);
         let first_token =
             if candidate.stats.first_token_ms > 0.0 && reference.fastest_first_token.is_finite() {
@@ -611,15 +642,24 @@ fn score_one(
         } else {
             NEUTRAL
         };
-        (reliability, first_token, throughput)
+        // 缓存命中率同样天然 0-1。上游从没上报过缓存用量（`cache_samples == 0`）
+        // 时取中性分：那是「不知道」，不是「没命中」，按 0 计等于凭上游的
+        // 上报习惯惩罚一个可能很好的目标。
+        let cache_hit = if candidate.stats.cache_samples == 0 {
+            NEUTRAL
+        } else {
+            candidate.stats.cache_hit.clamp(0.0, 1.0)
+        };
+        (reliability, first_token, throughput, cache_hit)
     } else {
-        (NEUTRAL, NEUTRAL, NEUTRAL)
+        (NEUTRAL, NEUTRAL, NEUTRAL, NEUTRAL)
     };
 
     let total = (multiplier * f64::from(weights.multiplier)
         + reliability * f64::from(weights.reliability)
         + first_token * f64::from(weights.first_token)
-        + throughput * f64::from(weights.throughput))
+        + throughput * f64::from(weights.throughput)
+        + cache_hit * f64::from(weights.cache_hit))
         / f64::from(SchedulingWeights::TOTAL);
     let total = if candidate.multiplier_stale {
         total * STALE_PENALTY
@@ -633,6 +673,7 @@ fn score_one(
         reliability,
         first_token,
         throughput,
+        cache_hit,
         total,
         // 口粮按这个候选**自己的**分数分量封顶：分配必须以评分为主导（§9.5）。
         exploration: exploration_floor_for(total, &candidate.stats, now),
@@ -806,6 +847,11 @@ mod tests {
                 first_token_ms,
                 total_ms: first_token_ms * 4.0,
                 output_tps: tps,
+                // 命中率给个中间值而不是 0：本函数默认所有候选在这一维上
+                // 相同，各用例只考察它自己那条规则，别让恒定低分把总分压
+                // 到别的断言的阈值以下。
+                cache_hit: 0.5,
+                cache_samples: MIN_SAMPLES,
                 last_sample_at: NOW,
             },
         }
@@ -898,7 +944,7 @@ mod tests {
 
     /// **一个**热目标不构成参照系（§9.4 修订）。
     ///
-    /// 只把自己算成"全组最快"，三项性能分就会自动拉满，与它实际快慢无关；
+    /// 只把自己算成"全组最快"，性能分就会自动拉满，与它实际快慢无关；
     /// 这会把"最先拿到样本的目标"永久钉在榜首，形成赢家通吃。不足两个热目标
     /// 时全体退回中性分，先按倍率与探索口粮铺开流量，等样本够了再让性能说话。
     #[test]
@@ -950,6 +996,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(100)),
                     total: Duration::from_millis(400),
                     output_tokens: Some(30),
+                    cache_hit: None,
                 },
                 NOW,
             );
@@ -983,6 +1030,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(100)),
                     total: Duration::from_millis(400),
                     output_tokens: Some(30),
+                    cache_hit: None,
                 },
                 at,
             );
@@ -1014,6 +1062,8 @@ mod tests {
                 first_token_ms: 200.0,
                 total_ms: 1_000.0,
                 output_tps: 80.0,
+                cache_hit: 0.5,
+                cache_samples: 300,
                 // 一周前采样过。
                 last_sample_at: NOW - week,
             },
@@ -1029,6 +1079,8 @@ mod tests {
                 first_token_ms: first_ms,
                 total_ms: 4_000.0,
                 output_tps: 30.0,
+                cache_hit: 0.5,
+                cache_samples: 300,
                 last_sample_at: NOW,
             },
         };
@@ -1076,6 +1128,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(900)),
                     total: Duration::from_millis(4_000),
                     output_tokens: Some(30),
+                    cache_hit: None,
                 },
                 at,
             );
@@ -1105,6 +1158,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1_000),
                     output_tokens: Some(80),
+                    cache_hit: None,
                 },
                 NOW,
             );
@@ -1129,6 +1183,8 @@ mod tests {
             first_token_ms: 200.0,
             total_ms: 1_000.0,
             output_tps: 80.0,
+            cache_hit: 0.5,
+            cache_samples: 300,
             last_sample_at: NOW - week,
         };
         assert!(!stats.is_warm(NOW), "一周没采样时不可信");
@@ -1141,6 +1197,7 @@ mod tests {
                 first_token: Some(Duration::from_millis(200)),
                 total: Duration::from_millis(1_000),
                 output_tokens: Some(80),
+                cache_hit: None,
             },
             NOW,
         );
@@ -1165,6 +1222,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1_000),
                     output_tokens: Some(80),
+                    cache_hit: None,
                 },
                 at,
             );
@@ -1186,6 +1244,8 @@ mod tests {
             first_token_ms: 100.0,
             total_ms: 400.0,
             output_tps: 50.0,
+            cache_hit: 0.5,
+            cache_samples: 500,
             last_sample_at: 0,
         };
         assert_eq!(stats.effective_samples(1_000_000), 0.0);
@@ -1217,6 +1277,8 @@ mod tests {
             first_token_ms: 100.0,
             total_ms: 400.0,
             output_tps: 50.0,
+            cache_hit: 0.4,
+            cache_samples: 500,
             // 老库也没有"真正的采样时刻"。
             last_sample_at: 0,
             updated_at: 1_000_000,
@@ -1330,6 +1392,115 @@ mod tests {
         assert!(scores[1].total < scores[0].total);
     }
 
+    /// 缓存命中率是第五个评分维度：命中率高的目标必须拿到更高分，且它
+    /// 天然 0-1，不参与参照系归一化（同可靠性）。
+    #[test]
+    fn cache_hit_is_scored_directly_without_a_reference_frame() {
+        // 两个目标的命中率相差一倍，其余维度完全相同。
+        let high = Candidate {
+            stats: Stats {
+                cache_hit: 0.8,
+                cache_samples: MIN_SAMPLES,
+                ..warm("0.5", 1.0, 900.0, 50.0).stats
+            },
+            ..warm("0.5", 1.0, 900.0, 50.0)
+        };
+        let low = Candidate {
+            stats: Stats {
+                cache_hit: 0.4,
+                cache_samples: MIN_SAMPLES,
+                ..warm("0.5", 1.0, 900.0, 50.0).stats
+            },
+            ..warm("0.50", 1.0, 900.0, 50.0)
+        };
+        let scores = score_all(&[high, low], SchedulingWeights::default(), None, NOW);
+        // 得分就是命中率本身，不经任何参照系换算。
+        assert!((scores[0].cache_hit - 0.8).abs() < 1e-9, "{:?}", scores[0]);
+        assert!((scores[1].cache_hit - 0.4).abs() < 1e-9, "{:?}", scores[1]);
+        assert!(scores[0].total > scores[1].total, "命中率必须参与总分");
+    }
+
+    /// 上游从没上报过缓存用量时取中性分，不能按 0 算。
+    ///
+    /// 「没上报」和「没命中」是两件事：不做缓存的站点永远报不出这个字段，
+    /// 按 0 记等于因为它们的上报习惯把权重白扣掉一档。
+    #[test]
+    fn an_unreported_cache_usage_gets_the_neutral_score() {
+        let silent = Candidate {
+            stats: Stats {
+                // 命中率是 0，但一次都没采到过——那是「不知道」。
+                cache_hit: 0.0,
+                cache_samples: 0,
+                ..warm("0.5", 1.0, 900.0, 50.0).stats
+            },
+            ..warm("0.5", 1.0, 900.0, 50.0)
+        };
+        // 另一个目标确实一次都没命中（采到过，值就是 0）。
+        let really_missed = Candidate {
+            stats: Stats {
+                cache_hit: 0.0,
+                cache_samples: MIN_SAMPLES,
+                ..warm("0.50", 1.0, 900.0, 50.0).stats
+            },
+            ..warm("0.50", 1.0, 900.0, 50.0)
+        };
+        let scores = score_all(
+            &[silent, really_missed],
+            SchedulingWeights::default(),
+            None,
+            NOW,
+        );
+        assert_eq!(scores[0].cache_hit, NEUTRAL, "没上报 ≠ 没命中");
+        assert_eq!(scores[1].cache_hit, 0.0, "真的一次没命中就该是 0");
+        assert!(scores[0].total > scores[1].total);
+    }
+
+    /// 缓存命中率的 0 是正常取值，不能像延迟那样被当成「还没初始化」。
+    ///
+    /// 用 `ewma_or_seed` 时「0 就是没数据」，于是一个持续 0 命中的目标每次
+    /// 观测都会被当成首次、直接覆盖成观测值——一旦有一次命中，旧的分母就
+    /// 丢了，命中率会被瞬间拉满。
+    #[test]
+    fn a_zero_cache_hit_is_a_value_not_an_uninitialised_slot() {
+        let mut stats = Stats::default();
+        // 先 20 次全命中。
+        for _ in 0..20 {
+            stats.observe(
+                &Sample {
+                    kind: SampleKind::Rated,
+                    success: true,
+                    first_token: None,
+                    total: Duration::from_millis(100),
+                    output_tokens: None,
+                    cache_hit: Some(1.0),
+                },
+                NOW,
+            );
+        }
+        let warm_hit = stats.cache_hit;
+        // 之后 20 次全不命中：EWMA 必须一路下来，而不是卡在 1.0。
+        for _ in 0..20 {
+            stats.observe(
+                &Sample {
+                    kind: SampleKind::Rated,
+                    success: true,
+                    first_token: None,
+                    total: Duration::from_millis(100),
+                    output_tokens: None,
+                    cache_hit: Some(0.0),
+                },
+                NOW,
+            );
+        }
+        assert!(warm_hit > 0.9);
+        assert!(
+            stats.cache_hit < 0.05,
+            "持续不命中必须把命中率真的压下来，实际 {}",
+            stats.cache_hit
+        );
+        assert_eq!(stats.cache_samples, 40);
+    }
+
     #[test]
     fn a_stale_multiplier_is_penalised_but_still_selectable() {
         let mut stale = warm("0.5", 1.0, 900.0, 50.0);
@@ -1368,6 +1539,7 @@ mod tests {
                 reliability: 0,
                 first_token: 0,
                 throughput: 0,
+                cache_hit: 0,
             },
             None,
             0,
@@ -1381,6 +1553,7 @@ mod tests {
                 reliability: 0,
                 first_token: 100,
                 throughput: 0,
+                cache_hit: 0,
             },
             None,
             0,
@@ -1536,6 +1709,7 @@ mod tests {
                 reliability: 0.0,
                 first_token: 0.0,
                 throughput: 0.0,
+                cache_hit: 0.0,
                 total: 0.0,
                 exploration: EXPLORATION,
             },
@@ -1552,6 +1726,7 @@ mod tests {
             reliability: total,
             first_token: total,
             throughput: total,
+            cache_hit: total,
             total,
             exploration: EXPLORATION,
         }
@@ -1609,6 +1784,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(1000)),
                     total: Duration::from_millis(4000),
                     output_tokens: Some(400),
+                    cache_hit: None,
                 },
                 0,
             );
@@ -1625,6 +1801,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(200)),
                     total: Duration::from_millis(1000),
                     output_tokens: Some(400),
+                    cache_hit: None,
                 },
                 0,
             );
@@ -1642,6 +1819,7 @@ mod tests {
                 first_token: Some(Duration::from_millis(1000)),
                 total: Duration::from_millis(4000),
                 output_tokens: Some(400),
+                cache_hit: None,
             },
             0,
         );
@@ -1655,6 +1833,7 @@ mod tests {
                 first_token: Some(Duration::from_millis(1)),
                 total: Duration::from_millis(200),
                 output_tokens: None,
+                cache_hit: None,
             },
             0,
         );
@@ -1679,6 +1858,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(500)),
                     total: Duration::from_millis(2_000),
                     output_tokens: Some(200),
+                    cache_hit: None,
                 },
                 NOW,
             );
@@ -1695,6 +1875,7 @@ mod tests {
                 first_token: Some(Duration::from_millis(5_000)),
                 total: Duration::from_millis(20_000),
                 output_tokens: Some(900),
+                cache_hit: None,
             },
             NOW,
         );
@@ -1734,6 +1915,7 @@ mod tests {
                 first_token: None,
                 total: Duration::from_millis(30_000),
                 output_tokens: None,
+                cache_hit: None,
             },
             NOW,
         );
@@ -1764,6 +1946,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(7_000)),
                     total: Duration::from_millis(28_000),
                     output_tokens: Some(800),
+                    cache_hit: None,
                 },
                 at,
             );
@@ -1801,6 +1984,7 @@ mod tests {
                     first_token: Some(Duration::from_millis(700)),
                     total: Duration::from_millis(3000),
                     output_tokens: Some(300),
+                    cache_hit: None,
                 },
                 at,
             );
@@ -1878,6 +2062,7 @@ mod tests {
                     first_token: None,
                     total: Duration::from_millis(10),
                     output_tokens: None,
+                    cache_hit: None,
                 },
                 0,
             );

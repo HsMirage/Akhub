@@ -190,7 +190,7 @@ export function Groups({
                         <td>
                           <div
                             className="weights-mini"
-                            title={`倍率 ${group.weights.multiplier} / 可靠性 ${group.weights.reliability} / 首字延迟 ${group.weights.first_token} / 输出速度 ${group.weights.throughput}`}
+                            title={`倍率 ${group.weights.multiplier} / 可靠性 ${group.weights.reliability} / 首字延迟 ${group.weights.first_token} / 输出速度 ${group.weights.throughput} / 缓存命中率 ${group.weights.cache_hit}`}
                           >
                             {WEIGHT_FIELDS.map(({ key, label }) => (
                               <span
@@ -208,7 +208,8 @@ export function Groups({
                           </div>
                           <div className="text-faint" style={{ fontSize: 11 }}>
                             {group.weights.multiplier}·{group.weights.reliability}·
-                            {group.weights.first_token}·{group.weights.throughput}
+                            {group.weights.first_token}·{group.weights.throughput}·
+                            {group.weights.cache_hit}
                           </div>
                         </td>
                         <td className="cell-dim">{group.queue_capacity}</td>
@@ -333,26 +334,28 @@ const WEIGHT_FIELDS: { key: keyof SchedulingWeights; label: string }[] = [
   { key: "reliability", label: "可靠性" },
   { key: "first_token", label: "首字延迟" },
   { key: "throughput", label: "输出速度" },
+  { key: "cache_hit", label: "缓存命中率" },
 ];
 
 const DEFAULT_WEIGHTS: SchedulingWeights = {
   multiplier: 40,
   reliability: 25,
-  first_token: 20,
-  throughput: 15,
+  first_token: 15,
+  throughput: 10,
+  cache_hit: 10,
 };
 
 const WEIGHT_PRESETS: { label: string; hint: string; weights: SchedulingWeights }[] = [
   {
     label: "成本优先",
     hint: "更看重倍率，适合以省钱为目标的场景",
-    weights: { multiplier: 55, reliability: 20, first_token: 15, throughput: 10 },
+    weights: { multiplier: 55, reliability: 20, first_token: 10, throughput: 5, cache_hit: 10 },
   },
   { label: "均衡", hint: "默认配置", weights: DEFAULT_WEIGHTS },
   {
     label: "质量优先",
     hint: "更看重可靠性与速度，适合体验优先的场景",
-    weights: { multiplier: 15, reliability: 30, first_token: 25, throughput: 30 },
+    weights: { multiplier: 15, reliability: 30, first_token: 20, throughput: 25, cache_hit: 10 },
   },
 ];
 
@@ -381,6 +384,7 @@ function GroupDrawer({
     reliability: String(group?.weights.reliability ?? DEFAULT_WEIGHTS.reliability),
     first_token: String(group?.weights.first_token ?? DEFAULT_WEIGHTS.first_token),
     throughput: String(group?.weights.throughput ?? DEFAULT_WEIGHTS.throughput),
+    cache_hit: String(group?.weights.cache_hit ?? DEFAULT_WEIGHTS.cache_hit),
   });
   const [busy, setBusy] = useState(false);
 
@@ -395,7 +399,7 @@ function GroupDrawer({
   const weightsError = !weightsValid
     ? "每一项都必须是非负整数"
     : weightSum !== 100
-      ? `四项之和必须为 100，当前 ${weightSum}`
+      ? `五项之和必须为 100，当前 ${weightSum}`
       : null;
   const queueValue = Number(queue);
   const queueError =
@@ -431,6 +435,7 @@ function GroupDrawer({
       reliability: String(preset.reliability),
       first_token: String(preset.first_token),
       throughput: String(preset.throughput),
+      cache_hit: String(preset.cache_hit),
     });
 
   const impactSummary = [
@@ -458,6 +463,7 @@ function GroupDrawer({
           reliability: Number(weights.reliability),
           first_token: Number(weights.first_token),
           throughput: Number(weights.throughput),
+          cache_hit: Number(weights.cache_hit),
         },
       };
       if (editing) {
@@ -546,7 +552,7 @@ function GroupDrawer({
           title="调度权重"
           description="只影响同层内的流量分配，低优先级层永远不会被越过"
         >
-          <Field label="四个维度的相对权重" error={weightsError ?? undefined}>
+          <Field label="五个维度的相对权重" error={weightsError ?? undefined}>
             {() => (
               <div>
                 <div className="preset-row">

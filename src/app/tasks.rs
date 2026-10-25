@@ -362,6 +362,7 @@ mod tests {
                 first_token: None,
                 total: Duration::from_millis(1200),
                 output_tokens: Some(100),
+                cache_hit: None,
             },
             crate::storage::now_unix(),
         );

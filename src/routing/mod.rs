@@ -1966,6 +1966,7 @@ mod tests {
                     first_token: Some(std::time::Duration::from_millis(100)),
                     total: std::time::Duration::from_millis(400),
                     output_tokens: Some(50),
+                    cache_hit: None,
                 },
                 now,
             );
@@ -1978,6 +1979,7 @@ mod tests {
                     first_token: Some(std::time::Duration::from_millis(5_000)),
                     total: std::time::Duration::from_millis(20_000),
                     output_tokens: Some(5),
+                    cache_hit: None,
                 },
                 now,
             );
