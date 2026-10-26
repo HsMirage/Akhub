@@ -3886,6 +3886,34 @@ async fn classify_upstream_error(
             public: Some(public),
         });
     }
+    // 历史里的思考块签名只对签发它的渠道有效（§13.7 现场，2026-10-26）。
+    //
+    // 现场：可达鸭-ccmax（Claude Code Max 渠道）认不出别的渠道签发的 thinking，
+    // 会话一旦在别处跑过，回来的请求就收到 `messages.8.content.0: Invalid
+    // \`signature\` in \`thinking\` block`；同一份请求体两秒后在别的渠道 200。
+    // 签名是**渠道的事实**，不是客户端的参数错误；400 在开始生成之前、没消耗
+    // token，所以换一个渠道重试几乎免费（与无法归因的 400 同处置）。
+    if is_foreign_thinking_signature(status, &message) {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            detail = %message,
+            "上游认不出历史思考块上的签名，换渠道重试"
+        );
+        let public = crate::security::redact::ErrorRedactor::new(
+            &target.account.name,
+            &target.account.base_url,
+            api_key,
+        )
+        .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        return Err(AttemptFailure::OpaqueRejection {
+            status,
+            message,
+            public: Some(public),
+        });
+    }
     // 无法归因的 400：上游在开始生成之前就拒了，**没有消耗任何 token**。
     // 换一个渠道重试几乎免费，而直接透给客户端就把"上游此刻抽了"变成了用户可见
     // 的失败（§13.7）。归因得到请求本身的 400 不走这条路。
@@ -3982,6 +4010,27 @@ fn is_session_unroutable(message: &str) -> bool {
         "start a new claude code session",
     ];
     UNROUTABLE.iter().any(|needle| lower.contains(needle))
+}
+
+/// 上游说"这段历史里的思考块签名验不过"（§13.7 现场，2026-10-26）。
+///
+/// thinking 块的签名由签发它的渠道给出，换一条渠道（尤其是 Claude Code Max 这
+/// 类把会话绑在自家订阅上的渠道）就验不过。上游把这件事说成字段错误
+/// （`messages.8.content.0: Invalid \`signature\` in \`thinking\` block`），
+/// 但同一份请求体换一个目标就能过，所以既不能当客户端的参数错误，也不能停下。
+fn is_foreign_thinking_signature(status: StatusCode, message: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    // 必须同时带 "thinking"：`thinking.signature: Field required` 这类形状错误
+    // 是客户端少传了字段，换渠道不会变好。
+    lower.contains("signature")
+        && lower.contains("thinking")
+        && (lower.contains("invalid")
+            || lower.contains("not valid")
+            || lower.contains("mismatch")
+            || lower.contains("does not match"))
 }
 
 fn is_content_filtered(status: StatusCode, message: &str) -> bool {
@@ -4821,6 +4870,45 @@ mod tests {
         let message = "Request was blocked by upstream content filtering";
         assert!(!is_opaque_rejection(StatusCode::BAD_REQUEST, message));
     }
+    /// 历史思考块的签名只对签发渠道有效时，换渠道就能过（§13.7 现场，2026-10-26）。
+    ///
+    /// 现场：可达鸭-ccmax 回了 `messages.8.content.0: Invalid \`signature\` in
+    /// \`thinking\` block`，同一段 983KB 历史两秒后在别的渠道 200。这句里有
+    /// "invalid"，不特判就会被归因成客户端参数错误、直接透传给用户。
+    #[test]
+    fn a_foreign_thinking_signature_is_worth_switching_channels() {
+        for message in [
+            "messages.8.content.0: Invalid `signature` in `thinking` block",
+            "messages.0.content.0: Invalid signature in thinking block",
+            "thinking block signature does not match",
+        ] {
+            assert!(
+                is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                "应当判为换渠道可过：{message}"
+            );
+        }
+    }
+
+    /// 反过来：思考的形状错误不是签名问题，换渠道不会变好。
+    #[test]
+    fn a_thinking_shape_error_is_not_a_signature_rejection() {
+        for message in [
+            "thinking.type: unknown variant `enabled`, expected `adaptive` or `disabled`",
+            "messages.0.content.0.thinking.signature: Field required",
+            "max_tokens: must be greater than thinking.budget_tokens",
+        ] {
+            assert!(
+                !is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                "不该判为签名问题：{message}"
+            );
+        }
+        // 只有 400 走这条路：别的状态码各有自己的处置。
+        assert!(!is_foreign_thinking_signature(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "messages.8.content.0: Invalid `signature` in `thinking` block"
+        ));
+    }
+
     #[test]
     fn only_a_400_can_be_an_opaque_rejection() {
         // 别的状态码各有自己的处置：429 有 Retry-After，5xx 是可切换失败，
