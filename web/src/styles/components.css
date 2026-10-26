@@ -1571,6 +1571,14 @@ table.data td.table-empty-cell {
 
 /* 开关 */
 .switch {
+  /* 必须自身定位：隐藏的 <input> 是 position: absolute，若这里不是定位
+     祖先，它的包含块会落到最近的 positioned 祖先上——抽屉里就是
+     position: fixed 的 .drawer。那样 checkbox 会被摆到抽屉坐标系里很靠下
+     的位置，把 .drawer 的 scrollHeight 撑大；点击时它获得焦点、浏览器滚
+     动最近的可滚动祖先（overflow: hidden 的 .drawer 一样能被程序化滚动），
+     整个抽屉内容被顶上去——表现就是「保存按钮跑到页面中部、下方一大片
+     空白」。定位到开关自身后，焦点滚动最多动 .drawer-body，不会动抽屉。 */
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: var(--space-3);
@@ -1580,6 +1588,9 @@ table.data td.table-empty-cell {
 
 .switch input {
   position: absolute;
+  /* 覆盖在开关文字上而不是挤在行内：它不可见也不接收指针，只为可访问性
+     与键盘操作保留。 */
+  inset: 0;
   opacity: 0;
   pointer-events: none;
 }
