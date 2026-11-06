@@ -58,6 +58,13 @@ const BYTES_PER_TOKEN: usize = 3;
 /// 并发名额有信号量可等，限流窗口只随时间推移释放，没有可等的信号。
 const RATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 一个目标都不合格、但拦路的全是**冷却**时，愿意等它过去的上限（§13.6）。
+///
+/// 冷却从 5 秒起步、按级别指数增长；等 30 秒覆盖前几级，更长的冷却交给客户端
+/// 按 `Retry-After` 重试。不能无限等：首字之前一个字节都不发，等太久会被
+/// CDN 判成源站无响应（§13.4 修订）。
+const RECOVERY_WAIT: Duration = Duration::from_secs(30);
+
 /// 按上游的 `Retry-After` 等待时额外多等的余量，避免卡在冷却结束的临界点上。
 const RETRY_AFTER_MARGIN: Duration = Duration::from_millis(100);
 
@@ -697,25 +704,41 @@ async fn forward_inner<'a>(
         walk.telemetry.sticky_freshness = Some(freshness);
     }
 
-    let plan = match routing::plan(
-        forward.group,
-        &forward.logical_model,
-        &context,
-        // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
-        soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
-            .flatten(),
-        &mut score::random_unit,
-    ) {
-        Ok(plan) => plan,
-        Err(failure) => {
-            // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
-            // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
-            // 与"网关挂了"在事后看起来一模一样（§24.1）。
-            walk.telemetry.filter_summary = failure.filter_summary();
-            walk.telemetry.filter_details = failure.filter_details();
-            return walk.fail(failure.code, failure.message);
+    // 一个目标都不合格时，只有**冷却**值得等：它自己会过去，而停用、倍率超限
+    // 与能力不支持等到天亮也不会变（§13.6）。早先这里一律立刻回 503
+    // `no_eligible_target`，于是"某模型的账号恰好都在冷却"被报成"服务暂不可用"，
+    // 客户端只看到网关挂了——而真正只差几秒。
+    // 等冷却期间同样占一个分组排队名额：它也是"在等"，§13.6 的容量上限对
+    // 它一样适用，否则容量收紧后这里会绕开闸门堆起无界的等待请求。
+    let mut recovery_ticket: Option<queue::QueueTicket> = None;
+    let plan = loop {
+        match routing::plan(
+            forward.group,
+            &forward.logical_model,
+            &context,
+            // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
+            soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
+                .flatten(),
+            &mut score::random_unit,
+        ) {
+            Ok(plan) => break plan,
+            Err(failure) => {
+                // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
+                // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
+                // 与"网关挂了"在事后看起来一模一样（§24.1）。
+                walk.telemetry.filter_summary = failure.filter_summary();
+                walk.telemetry.filter_details = failure.filter_details();
+                let Some(wait) = failure.wait else {
+                    return walk.fail(failure.code, failure.message);
+                };
+                if !walk.await_recovery(wait, &mut recovery_ticket).await {
+                    return walk.fail(failure.code, failure.message);
+                }
+            }
         }
     };
+    // 计划成立，排队的名额立刻还回去：接下来的游走有自己的准入与排队路径。
+    drop(recovery_ticket);
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
     walk.telemetry.filter_summary = Some(plan.filter_summary());
@@ -2313,6 +2336,40 @@ impl Walk<'_> {
             .runtime
             .queues
             .enter(&group.id, group.queue_capacity)
+    }
+
+    /// 计划因冷却而失败时，等到冷却结束再重排（§13.6）。
+    ///
+    /// `wait` 是被拦目标里最早的恢复时间，直接睡到那一刻：冷却没有可等的信号量，
+    /// 没有谁会在恢复时叫醒我们，但也不必轮询——算出终点就能一次睡准。
+    ///
+    /// 等不起就立刻失败：等太久既占住排队名额，又会把可重试的 503 拖成超时。
+    /// 返回 `false` 表示这次没等到，调用方按原来的失败返回。
+    async fn await_recovery(
+        &mut self,
+        wait: Duration,
+        ticket: &mut Option<queue::QueueTicket>,
+    ) -> bool {
+        let until = Instant::now() + wait + RETRY_AFTER_MARGIN;
+        let budget = (self.forward.started_at + RECOVERY_WAIT)
+            .min(self.queue_deadline)
+            .min(self.deadline);
+        // 关闭流程不该被排队请求拖住（§25.3）。
+        if until > budget || self.forward.state.runtime.is_shutting_down() {
+            return false;
+        }
+        // 分组不允许排队（容量 0）或队列已满时，与并发满那条路径同一条规则：
+        // 不等待，立刻返回可重试错误（§13.6）。名额只占一次，整段等待复用。
+        if ticket.is_none() {
+            match self.enter_queue() {
+                Some(entered) => *ticket = Some(entered),
+                None => return false,
+            }
+        }
+        let waited = Instant::now();
+        tokio::time::sleep(wait + RETRY_AFTER_MARGIN).await;
+        self.telemetry.queued += waited.elapsed();
+        true
     }
 
     /// 最后一次失败若是带 `Retry-After` 的 429，且等得起，就返回要等多久。

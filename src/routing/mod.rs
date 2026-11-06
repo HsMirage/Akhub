@@ -133,6 +133,16 @@ pub struct SelectionFailure {
     /// （全在冷却、全停用、倍率超限）恰恰是管理员唯一需要的信息。缺了它，库里
     /// 只剩一句"没有可用的调度目标"，与"网关挂了"看起来一模一样。
     pub filtered: Vec<FilteredReason>,
+    /// 拦路的目标里最早能自己恢复的那一个还要等多久（§13.6）。
+    ///
+    /// 只有**冷却**会自己过去；停用、倍率超限与能力不支持等到天亮也不会变，
+    /// 所以这里只认冷却，其余情况给 `None`（立刻如实报错）。
+    ///
+    /// 为什么必须带上**时长**而不是一个布尔量：冷却的退避是指数的（5 秒起步、
+    /// 上限 300 秒）。只知道"能等"而不知道"要等多久"，调用方就只能盲等一段
+    /// 固定预算——对一个已经冷却 200 秒的目标，这段盲等除了占住排队名额、
+    /// 把 503 拖成超时之外什么也做不到。
+    pub wait: Option<Duration>,
 }
 
 impl SelectionFailure {
@@ -536,6 +546,7 @@ pub fn plan(
             code: ErrorCode::ModelNotFound,
             message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
             filtered: Vec::new(),
+            wait: None,
         });
     };
     if !model.model.enabled {
@@ -543,6 +554,7 @@ pub fn plan(
             code: ErrorCode::ModelNotFound,
             message: format!("逻辑模型 {model_name} 已被停用"),
             filtered: Vec::new(),
+            wait: None,
         });
     }
     // 账号级"隐藏原始模型"可能让一个没有任何下游模型名的目标整体不可达；
@@ -552,15 +564,29 @@ pub fn plan(
             code: ErrorCode::ModelNotFound,
             message: format!("分组「{}」中不存在逻辑模型 {model_name}", group.group.name),
             filtered: Vec::new(),
+            wait: None,
         });
     }
 
     let mut eligible: Vec<(Arc<TargetView>, Multiplier, Vec<Choice>)> = Vec::new();
     let mut reasons: Vec<Ineligible> = Vec::new();
+    // 最早能自己恢复的那个目标还要等多久（§13.6）。只认冷却：别的拦路者
+    // 不会自己好，等多久都没用。
+    let mut wait: Option<Duration> = None;
     for target in &model.targets {
         match check_eligibility(group, target, context) {
             Ok((multiplier, choices)) => eligible.push((Arc::clone(target), multiplier, choices)),
             Err(reason) => {
+                if matches!(
+                    reason,
+                    Ineligible::Unavailable(health::Unavailable::Cooling, _)
+                ) && let Some(remaining) = context
+                    .health
+                    .target(&target.target.id)
+                    .cooldown_remaining(tokio::time::Instant::now())
+                {
+                    wait = Some(wait.map_or(remaining, |earliest| earliest.min(remaining)));
+                }
                 // "忙"不是"坏"：暂时满载的目标仍然进入计划，由排队环节处理。
                 if reason.is_queueable()
                     && let Ok(choices) = endpoints::choices(
@@ -594,7 +620,7 @@ pub fn plan(
     let filtered = merge_reasons(&reasons);
 
     if eligible.is_empty() {
-        return Err(failure(model_name, group, &reasons, filtered));
+        return Err(failure(model_name, group, &reasons, wait, filtered));
     }
 
     // 归一化参照系：倍率是账号级属性，用整个分组作参照系，同一个账号在不同
@@ -827,6 +853,7 @@ fn failure(
     model_name: &str,
     group: &GroupView,
     reasons: &[Ineligible],
+    wait: Option<Duration>,
     filtered: Vec<FilteredReason>,
 ) -> SelectionFailure {
     let all =
@@ -846,6 +873,7 @@ fn failure(
                 None => format!("逻辑模型 {model_name} 无法表达本次请求"),
             },
             filtered,
+            wait: None,
         };
     }
     // 倍率相关的原因最值得单独报出——它是"你的钱包在拦你"，客户端重试没有
@@ -858,6 +886,7 @@ fn failure(
                 group.group.multiplier_limit
             ),
             filtered,
+            wait: None,
         };
     }
     if all(|r| {
@@ -870,6 +899,7 @@ fn failure(
             code: ErrorCode::MultiplierUnknown,
             message: format!("逻辑模型 {model_name} 的所有目标倍率未知且已超过宽限期"),
             filtered,
+            wait: None,
         };
     }
 
@@ -881,6 +911,7 @@ fn failure(
             code: ErrorCode::NoEligibleTarget,
             message: format!("逻辑模型 {model_name} 当前没有可用的调度目标"),
             filtered: Vec::new(),
+            wait: None,
         };
     };
     // 状态码：静态表达问题只有在"无一例外"时才是不可重试的 400（上面已返回）。
@@ -896,6 +927,9 @@ fn failure(
             "逻辑模型 {model_name} 当前没有可用的调度目标：{}",
             chosen.describe_detailed()
         ),
+        // 只要还有**一个**目标是在冷却，等它回来计划就能成立——停用/倍率那些
+        // 不会自己好，但它们不挡着冷却结束后的这一次重排（§13.6）。
+        wait,
         filtered,
     }
 }
@@ -1579,6 +1613,83 @@ mod tests {
         let details = failure.filter_details().expect("要有具体说明");
         assert!(details.contains("已停用"), "{details}");
         assert!(details.contains("冷却中"), "{details}");
+    }
+
+    /// 只有冷却值得等，而且必须报出**还要等多久**（§13.6）。
+    ///
+    /// 只报"能等"是不够的：冷却退避是指数的（5 秒起步、上限 300 秒）。一个
+    /// 已经冷却 200 秒的目标，"能等"会换来一段盲等——占住排队名额，然后把本该
+    /// 立刻返回的可重试 503 拖成客户端超时。
+    #[test]
+    fn only_cooling_failures_report_a_wait() {
+        let fixture = Fixture::new();
+        let (view, _) = fixture.context();
+        let translation = fixture.translation();
+        let cooling = |fixture: &Fixture| {
+            for _ in 0..5 {
+                fixture
+                    .health
+                    .try_admit(
+                        health::Caller {
+                            account_id: "a1",
+                            key_id: None,
+                            target_id: "cooling",
+                        },
+                        Limits::default(),
+                        0,
+                    )
+                    .unwrap()
+                    .settle(health::Outcome::Fault, None);
+            }
+        };
+
+        // 唯一的目标在冷却：等一等它就回来。
+        let group = group_with(
+            "1",
+            vec![target(
+                "cooling",
+                account("a1", "0.5", Protocol::OpenAiChat, true),
+                50,
+            )],
+        );
+        cooling(&fixture);
+        let failure = plan(
+            &group,
+            "glm-4.6",
+            &context!(fixture, view, translation),
+            None,
+            &mut fixed(0.5),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, ErrorCode::NoEligibleTarget);
+        let wait = failure.wait.expect("全部在冷却时必须给出恢复时间");
+        assert!(
+            !wait.is_zero() && wait <= std::time::Duration::from_secs(300),
+            "恢复时间必须落在冷却退避的范围内（上限 300 秒）：{wait:?}"
+        );
+
+        // 停用的账号不会自己好：同一份计划结论里必须标成不可等。
+        let off = group_with(
+            "1",
+            vec![target(
+                "off",
+                account("a2", "0.5", Protocol::OpenAiChat, false),
+                50,
+            )],
+        );
+        assert!(
+            plan(
+                &off,
+                "glm-4.6",
+                &context!(fixture, view, translation),
+                None,
+                &mut fixed(0.5),
+            )
+            .unwrap_err()
+            .wait
+            .is_none(),
+            "停用不是冷却，不能握着请求干等"
+        );
     }
 
     /// 成功路径与失败路径的摘要口径必须一致，否则后台按它聚合会把同一件事算成两类。

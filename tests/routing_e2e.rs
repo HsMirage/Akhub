@@ -163,6 +163,154 @@ async fn queue_full_when_the_group_forbids_waiting() {
     assert_eq!(top.requests(), 0);
 }
 
+/// 全部目标都在冷却时，网关要**等冷却过去再重排**，而不是立刻回 503（§13.6）。
+///
+/// 冷却不像并发名额那样有信号量可等，只随时间推进；早先计划为空就立刻返回
+/// `no_eligible_target` 503，于是"这个模型的账号恰好都在冷却几秒"被报成
+/// "服务暂不可用"——客户端只看到网关挂了，而真正只差几秒。
+#[tokio::test]
+async fn a_model_whose_targets_are_all_cooling_waits_instead_of_failing() {
+    let up = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new("A", &up.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    // 打进冷却：最后一次故障的退避是 5 秒，落在等待预算之内。
+    for _ in 0..5 {
+        akhub
+            .state
+            .runtime
+            .health
+            .try_admit(
+                Caller {
+                    account_id: &a.account_id,
+                    key_id: None,
+                    target_id: &a.target_id,
+                },
+                Limits::default(),
+                0,
+            )
+            .unwrap()
+            .settle(Outcome::Fault, None);
+    }
+    assert_eq!(
+        akhub.state.runtime.health.check(
+            Caller {
+                account_id: &a.account_id,
+                key_id: None,
+                target_id: &a.target_id
+            },
+            Limits::default()
+        ),
+        Err(Unavailable::Cooling),
+        "前提：唯一的账号此刻在冷却"
+    );
+
+    // 冷却结束后请求必须成功：网关自己等过了这段冷却。
+    let response = chat(&akhub, small_body("s", "u")).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "冷却只是暂时的，网关要等它过去，而不是回 503 让客户端重来"
+    );
+    assert_eq!(up.requests(), 1);
+}
+
+/// 等冷却不能超过请求自己的预算：预算不够时立刻按原来的失败返回（§13.6）。
+///
+/// 上面那条用例证明"等得起就等"；这条证明"等不起别手握"——否则冷却等待会把
+/// 请求拖过总超时，客户端最后拿到的是超时而不是可重试的 503。
+#[tokio::test]
+async fn a_cooling_wait_never_outlives_the_request_budget() {
+    let up = FakeUpstream::spawn().await;
+    let settings = Settings {
+        // 总超时比冷却本身（5 秒）还短。
+        request_timeout: Duration::from_millis(400),
+        ..Settings::default()
+    };
+    let akhub = spawn_akhub_with(settings, |_| {}).await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new("A", &up.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    for _ in 0..5 {
+        akhub
+            .state
+            .runtime
+            .health
+            .try_admit(
+                Caller {
+                    account_id: &a.account_id,
+                    key_id: None,
+                    target_id: &a.target_id,
+                },
+                Limits::default(),
+                0,
+            )
+            .unwrap()
+            .settle(Outcome::Fault, None);
+    }
+
+    let started = Instant::now();
+    let response = chat(&akhub, small_body("s", "u")).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "不能为消逝中的冷却干等到总超时：实际 {:?}",
+        started.elapsed()
+    );
+    assert_eq!(response.status(), 503, "等不起时按原来的可重试错误返回");
+    let code = error_code(response).await;
+    assert_eq!(code, "no_eligible_target", "{code}");
+    assert_eq!(up.requests(), 0, "冷却是网关自己的判断，一次都不该打上游");
+}
+
+/// 深冷却（退避已涨到几十秒）不该盲等：立刻回可重试的 503（§13.6）。
+///
+/// 这条钉的是"只报能等、不报等多久"的缺陷：冷却退避是指数的，一个已经冷却
+/// 几十秒的目标，"能等"会换来一段盲等——白占排队名额，还把本该立刻返回的
+/// 可重试 503 拖成客户端超时。
+#[tokio::test]
+async fn a_long_cooldown_fails_fast_instead_of_burning_the_queue() {
+    let up = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new("A", &up.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    // 上游一个 429 把目标打进 120 秒的冷却：远超等待上限，等不起。
+    up.fallback(Behavior::Status(429, Some(120)));
+    assert_eq!(chat(&akhub, small_body("s", "u")).await.status(), 429);
+    let cooldown = akhub
+        .state
+        .runtime
+        .health
+        .target(&a.target_id)
+        .cooldown_remaining(tokio::time::Instant::now())
+        .expect("前提：目标处于冷却中");
+    assert!(
+        cooldown > Duration::from_secs(30),
+        "前提：冷却要长到等不起，实际 {cooldown:?}"
+    );
+
+    let before = up.requests();
+    let started = Instant::now();
+    let response = chat(&akhub, small_body("s", "u")).await;
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "等不起的冷却必须立刻失败，不能盲等到预算耗尽：实际 {waited:?}"
+    );
+    assert_eq!(response.status(), 503);
+    assert_eq!(error_code(response).await, "no_eligible_target");
+    assert_eq!(up.requests(), before, "冷却是网关自己的判断，不该再打上游");
+}
+
 #[tokio::test]
 async fn queue_timeout_when_the_layer_stays_busy_past_the_deadline() {
     let top = FakeUpstream::spawn().await;
