@@ -35,9 +35,14 @@ const KNOWN_FIELDS: &[&str] = &[
     "metadata",
     "store",
     "service_tier",
+    // 只是提示，不改变输出语义：`prompt_cache_key` 在两个 OpenAI 协议之间原样
+    // 带过去、Anthropic 没有对应字段就不发；`safety_identifier` 并入 `user`。
+    "prompt_cache_key",
+    "safety_identifier",
 ];
 
 /// OpenAI 专有采样参数。目标协议表达不了时按白名单降级（§14.8）。
+/// `verbosity` 只影响篇幅，与采样参数同类。
 const SAMPLING_FIELDS: &[&str] = &[
     "frequency_penalty",
     "presence_penalty",
@@ -45,6 +50,7 @@ const SAMPLING_FIELDS: &[&str] = &[
     "logit_bias",
     "logprobs",
     "top_logprobs",
+    "verbosity",
 ];
 
 /// 明确无法在其他协议表达的字段。
@@ -87,6 +93,11 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
     request.stop = string_list(object.get("stop"));
     request.user = object
         .get("user")
+        .or_else(|| object.get("safety_identifier"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    request.prompt_cache_key = object
+        .get("prompt_cache_key")
         .and_then(Value::as_str)
         .map(str::to_string);
     request.parallel_tool_calls = object.get("parallel_tool_calls").and_then(Value::as_bool);
@@ -97,7 +108,7 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
         .into_iter()
         .flatten()
     {
-        parse_message(message, &mut request.messages);
+        parse_message(message, &mut request.messages, &mut request.inexpressible);
     }
 
     for tool in object
@@ -158,7 +169,9 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
 }
 
 /// 解析一条 Chat 消息。`tool` 角色会被折叠进上一条用户轮次的工具结果块。
-fn parse_message(message: &Value, messages: &mut Vec<Message>) {
+///
+/// 中间格式表达不了的内容块记进 `unsupported`，绝不静默跳过（§14.6）。
+fn parse_message(message: &Value, messages: &mut Vec<Message>, unsupported: &mut Vec<String>) {
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -170,7 +183,7 @@ fn parse_message(message: &Value, messages: &mut Vec<Message>) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            content: parse_content(message.get("content").unwrap_or(&Value::Null)),
+            content: parse_content(message.get("content").unwrap_or(&Value::Null), unsupported),
             is_error: false,
         };
         // 工具结果在中间格式里属于用户轮次（Anthropic 的形状）。
@@ -184,7 +197,7 @@ fn parse_message(message: &Value, messages: &mut Vec<Message>) {
         return;
     }
 
-    let mut parts = parse_content(message.get("content").unwrap_or(&Value::Null));
+    let mut parts = parse_content(message.get("content").unwrap_or(&Value::Null), unsupported);
     if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
         parts.push(Part::Refusal(refusal.to_string()));
     }
@@ -199,7 +212,7 @@ fn parse_message(message: &Value, messages: &mut Vec<Message>) {
             0,
             Part::Thinking(ThinkingBlock {
                 text: reasoning.to_string(),
-                ..ThinkingBlock::default()
+                opaque: None,
             }),
         );
     }
@@ -238,12 +251,33 @@ fn parse_message(message: &Value, messages: &mut Vec<Message>) {
     messages.push(Message { role, parts });
 }
 
-fn parse_content(content: &Value) -> Vec<Part> {
+fn parse_content(content: &Value, unsupported: &mut Vec<String>) -> Vec<Part> {
     match content {
         Value::String(text) if !text.is_empty() => vec![Part::text(text.clone())],
-        Value::Array(items) => items.iter().filter_map(parse_content_part).collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|part| {
+                let parsed = parse_content_part(part);
+                if parsed.is_none() {
+                    unsupported.push(describe_unsupported_part(part));
+                }
+                parsed
+            })
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+/// `file_id` 引用的是上游自己的文件资源；`input_audio` 只有 Chat 有。
+fn describe_unsupported_part(part: &Value) -> String {
+    let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+    if part
+        .get("file")
+        .is_some_and(|file| file.get("file_id").is_some())
+    {
+        return "OpenAI Chat 的 file 块（file_id 引用）".into();
+    }
+    format!("OpenAI Chat 的 {kind} 内容块")
 }
 
 fn parse_content_part(part: &Value) -> Option<Part> {
@@ -363,7 +397,8 @@ pub fn parse_response(body: &Value) -> Result<Response, Unsupported> {
     let mut parts = Vec::new();
     if let Some(message) = choice.get("message") {
         let mut collected = Vec::new();
-        parse_message(message, &mut collected);
+        // 响应消息里只有文本、拒绝、思考与工具调用，没有需要拒绝的块。
+        parse_message(message, &mut collected, &mut Vec::new());
         if let Some(first) = collected.into_iter().next() {
             parts = first.parts;
         }
@@ -488,9 +523,13 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     }
     if let Some(thinking) = request.thinking {
         // Chat 只有档位，没有预算；Anthropic 的 budget_tokens 按档位换算，
-        // 上游不认识的 xhigh/max 折到 high。
+        // OpenAI 没有的 max 折到 xhigh 并标记降级。
         let effort = if thinking.enabled {
-            thinking.effort().as_openai_level()
+            let (effort, folded) = thinking.effort().to_openai();
+            if folded {
+                degraded.drop("effort");
+            }
+            effort
         } else {
             "none"
         };
@@ -511,6 +550,9 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     if let Some(user) = &request.user {
         body.insert("user".into(), json!(user));
     }
+    if let Some(key) = &request.prompt_cache_key {
+        body.insert("prompt_cache_key".into(), json!(key));
+    }
     for (field, value) in &request.sampling {
         match sampling_key(field, Protocol::OpenAiChat) {
             Some(target) => {
@@ -523,7 +565,6 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     Ok(Emitted {
         body: Value::Object(body),
         degraded: degraded.into_list(),
-        structured_tool: None,
     })
 }
 
@@ -543,27 +584,20 @@ fn emit_message(
     let mut content: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut refusal: Option<String> = None;
+    // 工具结果里的图片与文件。Chat 的 tool 消息只能是文本，所以像其他网关一样
+    // 把它们挪进紧跟在这一串 tool 消息之后的 user 消息；不能插在两条 tool
+    // 消息之间，否则上游会认为工具调用没有得到回应。
+    let mut tool_media: Vec<Value> = Vec::new();
 
     for part in &message.parts {
+        if !matches!(part, Part::ToolResult { .. }) {
+            flush_tool_media(messages, &mut tool_media);
+        }
         match part {
             Part::Text(text) if text.is_empty() => {}
             Part::Text(text) => content.push(json!({"type": "text", "text": text})),
-            Part::Image { source, detail } => {
-                let mut image = json!({"url": source.to_url()});
-                if let Some(detail) = detail
-                    && let Some(object) = image.as_object_mut()
-                {
-                    object.insert("detail".into(), json!(detail));
-                }
-                content.push(json!({"type": "image_url", "image_url": image}));
-            }
-            Part::Document { source, name } => content.push(json!({
-                "type": "file",
-                "file": {
-                    "filename": name.clone().unwrap_or_else(|| "file".into()),
-                    "file_data": source.to_url(),
-                }
-            })),
+            Part::Image { source, detail } => content.push(emit_image(source, detail)),
+            Part::Document { source, name } => content.push(emit_document(source, name)?),
             Part::Refusal(text) => refusal = Some(text.clone()),
             Part::ToolCall {
                 id,
@@ -581,18 +615,67 @@ fn emit_message(
                 ..
             } => {
                 flush(messages, role, &mut content, &mut tool_calls, &mut refusal);
+                let mut text = Vec::new();
+                for item in result {
+                    match item {
+                        Part::Text(chunk) => text.push(chunk.as_str()),
+                        Part::Image { source, detail } => {
+                            tool_media.push(emit_image(source, detail))
+                        }
+                        Part::Document { source, name } => {
+                            tool_media.push(emit_document(source, name)?)
+                        }
+                        _ => {
+                            return Err(Unsupported::new(
+                                "工具结果里的这种内容块无法在 OpenAI Chat 表达",
+                            ));
+                        }
+                    }
+                }
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": flatten_text(result),
+                    "content": text.join("\n"),
                 }));
             }
             // Chat 的历史里没有思考块的位置（§14.8 白名单内）。
             Part::Thinking(_) => degraded.drop("thinking"),
         }
     }
+    flush_tool_media(messages, &mut tool_media);
     flush(messages, role, &mut content, &mut tool_calls, &mut refusal);
     Ok(())
+}
+
+fn emit_image(source: &MediaSource, detail: &Option<String>) -> Value {
+    let mut image = json!({"url": source.to_url()});
+    if let Some(detail) = detail {
+        image["detail"] = json!(detail);
+    }
+    json!({"type": "image_url", "image_url": image})
+}
+
+/// Chat 的 `file` 只收内联数据：外部 URL 的文档无法表达，而网关绝不为转换
+/// 主动下载外部 URL（§14.6）。
+fn emit_document(source: &MediaSource, name: &Option<String>) -> Result<Value, Unsupported> {
+    if matches!(source, MediaSource::Url(_)) {
+        return Err(Unsupported::new(
+            "外部 URL 引用的文档无法在 OpenAI Chat 表达",
+        ));
+    }
+    Ok(json!({
+        "type": "file",
+        "file": {
+            "filename": name.clone().unwrap_or_else(|| "file".into()),
+            "file_data": source.to_url(),
+        }
+    }))
+}
+
+fn flush_tool_media(messages: &mut Vec<Value>, media: &mut Vec<Value>) {
+    if !media.is_empty() {
+        messages.push(json!({"role": "user", "content": std::mem::take(media)}));
+    }
 }
 
 /// 把积累的内容写成一条消息。全空时不产生空消息。
@@ -629,18 +712,6 @@ fn flush(
         message.insert("refusal".into(), json!(text));
     }
     messages.push(Value::Object(message));
-}
-
-/// 工具结果在 Chat 里只能是文本。图片等非文本块无法表达。
-fn flatten_text(parts: &[Part]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text(text) => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn emit_response_format(format: &OutputFormat) -> Value {
@@ -755,15 +826,27 @@ fn emit_usage(usage: &Usage) -> Value {
 
 /// Chat 的流式解析需要状态：`index` 是 `tool_calls` 数组下标，而中间格式的
 /// `index` 是内容项序号，两者不同；同一个工具调用的名字只在第一帧出现。
+///
+/// Chat 把思考、正文与工具调用混在同一串 delta 里，中间格式却要求它们是各自
+/// 独立的内容项。所以同一时刻只有一个"当前项"：种类一变（思考 → 正文、
+/// 工具 → 正文……）就先关掉当前项、再开新项，正文绝不会落在思考或工具的序号上。
 #[derive(Debug, Default)]
 pub struct StreamParser {
     started: bool,
-    /// 当前文本内容项是否已经开过。
-    text_open: bool,
+    /// 当前打开的内容项：种类与序号。
+    current: Option<(Segment, usize)>,
     /// tool_calls 下标 → 中间格式的内容项序号。
     tools: Vec<(u64, usize)>,
     next_index: usize,
     finished: bool,
+}
+
+/// 流式内容项的种类。工具调用带着它的 tool_calls 下标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    Thinking,
+    Text,
+    Tool(u64),
 }
 
 impl StreamParser {
@@ -874,29 +957,25 @@ impl StreamParser {
     }
 
     fn open_text(&mut self, events: &mut Vec<Event>) -> usize {
-        if self.text_open {
-            return self.next_index - 1;
-        }
-        let index = self.allocate();
-        self.text_open = true;
-        events.push(Event::ItemStart {
-            index,
-            kind: ItemKind::Text,
-        });
-        index
+        self.open(Segment::Text, ItemKind::Text, events)
     }
 
     fn open_thinking(&mut self, events: &mut Vec<Event>) -> usize {
-        // 思考在文本之前；已经开了文本项就不再回头开思考项。
-        if self.text_open {
-            return self.next_index - 1;
+        self.open(Segment::Thinking, ItemKind::Thinking, events)
+    }
+
+    /// 当前项已经是这一种就沿用它；否则关掉当前项，开一个新项。
+    fn open(&mut self, segment: Segment, kind: ItemKind, events: &mut Vec<Event>) -> usize {
+        if let Some((current, index)) = self.current
+            && current == segment
+        {
+            return index;
         }
-        let index = self.allocate();
-        self.text_open = true;
-        events.push(Event::ItemStart {
-            index,
-            kind: ItemKind::Thinking,
-        });
+        self.close_current(events);
+        let index = self.next_index;
+        self.next_index += 1;
+        self.current = Some((segment, index));
+        events.push(Event::ItemStart { index, kind });
         index
     }
 
@@ -904,25 +983,23 @@ impl StreamParser {
         let slot = call.get("index").and_then(Value::as_u64).unwrap_or(0);
         let function = call.get("function");
         let index = match self.tools.iter().find(|(s, _)| *s == slot) {
+            // 已经开过的工具调用：参数片段落回它自己的序号。
             Some((_, index)) => *index,
             None => {
-                let index = self.allocate();
+                let kind = ItemKind::ToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: function
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                let index = self.open(Segment::Tool(slot), kind, events);
                 self.tools.push((slot, index));
-                events.push(Event::ItemStart {
-                    index,
-                    kind: ItemKind::ToolCall {
-                        id: call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: function
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    },
-                });
                 index
             }
         };
@@ -938,23 +1015,14 @@ impl StreamParser {
         }
     }
 
-    fn allocate(&mut self) -> usize {
-        let index = self.next_index;
-        self.next_index += 1;
-        index
+    fn close_current(&mut self, events: &mut Vec<Event>) {
+        if let Some((_, index)) = self.current.take() {
+            events.push(Event::ItemEnd { index });
+        }
     }
 
     fn close_all(&mut self, events: &mut Vec<Event>) {
-        let mut open: Vec<usize> = self.tools.iter().map(|(_, index)| *index).collect();
-        if self.text_open {
-            // 文本项的序号是第一个被分配的。
-            open.push(0);
-        }
-        open.sort_unstable();
-        for index in open {
-            events.push(Event::ItemEnd { index });
-        }
-        self.text_open = false;
+        self.close_current(events);
         self.tools.clear();
     }
 }
@@ -1093,6 +1161,7 @@ pub fn error_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::canonical::Opaque;
 
     #[test]
     fn tool_messages_fold_into_the_user_turn_and_unfold_again() {
@@ -1195,8 +1264,7 @@ mod tests {
             parts: vec![
                 Part::Thinking(ThinkingBlock {
                     text: "推理".into(),
-                    signature: Some("sig".into()),
-                    ..ThinkingBlock::default()
+                    opaque: Some(Opaque::Signature("sig".into())),
                 }),
                 Part::text("答案"),
             ],

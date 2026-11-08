@@ -58,15 +58,17 @@ impl FrameReader {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
         let mut consumed = 0;
-        while let Some(end) = find_frame_end(&self.buffer, consumed) {
+        // 第一帧的结尾只可能出现在上次扫过的位置之后。
+        let mut from = self.scanned;
+        while let Some(end) = find_frame_end(&self.buffer, from) {
             let raw = &self.buffer[consumed..end];
             let frame = parse_frame(&String::from_utf8_lossy(raw));
             consumed = end;
+            from = end;
             frames.push(frame);
         }
         if consumed > 0 {
             self.buffer.drain(..consumed);
-            self.scanned = 0;
         }
         // 扫过的部分下次不必重扫；留 3 字节是为了不漏掉横跨两次输入的分隔符
         // （空行分隔的最后一个字节可能刚到）。

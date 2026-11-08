@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::domain::Protocol;
 use crate::protocol::canonical::{
-    Effort, Event, ItemKind, MediaSource, Message, OutputFormat, Part, Request, Response, Role,
+    Effort, Event, ItemKind, MediaSource, Message, Opaque, Part, Request, Response, Role,
     StopReason, ThinkingBlock, ThinkingConfig, ThinkingDisplay, Tool, ToolChoice, Usage,
 };
 use crate::protocol::degrade::{Degradations, Emitted, Unsupported};
@@ -82,7 +82,7 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
         .map(str::to_string);
 
     if let Some(system) = object.get("system") {
-        let parts = parse_content(system);
+        let parts = parse_content(system, &mut request.inexpressible);
         if !parts.is_empty() {
             request.messages.push(Message {
                 role: Role::System,
@@ -101,7 +101,10 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
             Some("assistant") => Role::Assistant,
             _ => Role::User,
         };
-        let parts = parse_content(message.get("content").unwrap_or(&Value::Null));
+        let parts = parse_content(
+            message.get("content").unwrap_or(&Value::Null),
+            &mut request.inexpressible,
+        );
         request.messages.push(Message { role, parts });
     }
 
@@ -187,78 +190,105 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
 }
 
 /// 内容既可能是纯字符串，也可能是内容块数组。
-fn parse_content(content: &Value) -> Vec<Part> {
+///
+/// 中间格式表达不了的块不会被静默跳过：原因记进 `unsupported`（请求的
+/// `inexpressible`），路由器据此不把这个请求交给需要转换的目标；同协议原生
+/// 透传不经过这里，不受影响（§14.6）。
+fn parse_content(content: &Value, unsupported: &mut Vec<String>) -> Vec<Part> {
     match content {
         Value::String(text) if !text.is_empty() => vec![Part::text(text.clone())],
-        Value::Array(blocks) => blocks.iter().filter_map(parse_block).collect(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| parse_block(block, unsupported))
+            .collect(),
         _ => Vec::new(),
     }
 }
 
-fn parse_block(block: &Value) -> Option<Part> {
-    match block.get("type").and_then(Value::as_str)? {
+fn parse_block(block: &Value, unsupported: &mut Vec<String>) -> Option<Part> {
+    let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+    let part = match kind {
         "text" => Some(Part::text(
             block
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         )),
-        "image" => Some(Part::Image {
-            source: parse_source(block.get("source")?)?,
+        "image" => parse_source(block.get("source")).map(|source| Part::Image {
+            source,
             detail: None,
         }),
-        "document" => Some(Part::Document {
-            source: parse_source(block.get("source")?)?,
+        "document" => parse_source(block.get("source")).map(|source| Part::Document {
+            source,
             name: block
                 .get("title")
                 .and_then(Value::as_str)
                 .map(str::to_string),
         }),
-        "tool_use" => Some(Part::ToolCall {
-            id: block.get("id").and_then(Value::as_str)?.to_string(),
-            name: block.get("name").and_then(Value::as_str)?.to_string(),
-            // 中间格式统一保存 JSON 文本：另外两个协议的原生形状就是文本。
-            arguments: block
-                .get("input")
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "{}".into()),
-        }),
-        "tool_result" => Some(Part::ToolResult {
-            call_id: block
-                .get("tool_use_id")
-                .and_then(Value::as_str)?
-                .to_string(),
-            content: parse_content(block.get("content").unwrap_or(&Value::Null)),
-            is_error: block
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }),
+        "tool_use" => match (
+            block.get("id").and_then(Value::as_str),
+            block.get("name").and_then(Value::as_str),
+        ) {
+            (Some(id), Some(name)) => Some(Part::ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                // 中间格式统一保存 JSON 文本：另外两个协议的原生形状就是文本。
+                arguments: block
+                    .get("input")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "{}".into()),
+            }),
+            _ => None,
+        },
+        "tool_result" => block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(|call_id| Part::ToolResult {
+                call_id: call_id.to_string(),
+                content: parse_content(block.get("content").unwrap_or(&Value::Null), unsupported),
+                is_error: block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }),
+        // 没有签名的思考块（跨协议转换出去、又被客户端原样带回来的那种）只剩
+        // 可见文本，不带任何载荷。
         "thinking" => Some(Part::Thinking(ThinkingBlock {
             text: block
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            signature: block
+            opaque: block
                 .get("signature")
                 .and_then(Value::as_str)
-                .map(str::to_string),
-            ..ThinkingBlock::default()
+                .filter(|signature| !signature.is_empty())
+                .map(|signature| Opaque::Signature(signature.to_string())),
         })),
-        "redacted_thinking" => Some(Part::Thinking(ThinkingBlock {
-            encrypted: block
-                .get("data")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            redacted: true,
-            ..ThinkingBlock::default()
-        })),
+        "redacted_thinking" => block.get("data").and_then(Value::as_str).map(|data| {
+            Part::Thinking(ThinkingBlock {
+                text: String::new(),
+                opaque: Some(Opaque::Redacted(data.to_string())),
+            })
+        }),
         _ => None,
+    };
+    if part.is_none() {
+        // 文件 ID、纯文本 / 内容块来源的文档、search_result、服务端工具块……
+        // 中间格式都没有位置。
+        let detail = match block.get("source").and_then(|s| s.get("type")) {
+            Some(Value::String(source)) if matches!(kind, "image" | "document") => {
+                format!("Anthropic 的 {kind} 块（source.type = {source}）")
+            }
+            _ => format!("Anthropic 的 {kind} 内容块"),
+        };
+        unsupported.push(detail);
     }
+    part
 }
 
-fn parse_source(source: &Value) -> Option<MediaSource> {
+fn parse_source(source: Option<&Value>) -> Option<MediaSource> {
+    let source = source?;
     match source.get("type").and_then(Value::as_str)? {
         "base64" => Some(MediaSource::Base64 {
             media_type: source
@@ -313,7 +343,9 @@ fn parse_tool_choice(choice: &Value) -> Option<ToolChoice> {
 
 /// 解析非流式响应体。
 pub fn parse_response(body: &Value) -> Result<Response, Unsupported> {
-    let parts = parse_content(body.get("content").unwrap_or(&Value::Null));
+    // 响应里认不出的块（服务端工具结果等）只会出现在请求了供应商内置工具时，
+    // 而那种请求在跨协议发射时已经被拒绝。
+    let parts = parse_content(body.get("content").unwrap_or(&Value::Null), &mut Vec::new());
     Ok(Response {
         id: body
             .get("id")
@@ -341,7 +373,8 @@ pub fn parse_response(body: &Value) -> Result<Response, Unsupported> {
 
 fn parse_stop(raw: &str) -> StopReason {
     match raw {
-        "max_tokens" => StopReason::MaxTokens,
+        // 上下文窗口被填满与 max_tokens 一样是"被截断"：下游必须知道答案不完整。
+        "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "tool_use" | "pause_turn" => StopReason::ToolUse,
         "refusal" => StopReason::Refusal,
@@ -485,7 +518,6 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     Ok(Emitted {
         body: Value::Object(body),
         degraded: degraded.into_list(),
-        structured_tool: None,
     })
 }
 
@@ -573,21 +605,25 @@ fn emit_blocks(
                 }
                 blocks.push(block);
             }
-            // 没有签名的思考块 Anthropic 会拒收；来自其他协议的思考只能丢弃。
-            Part::Thinking(thinking) => match (keep_thinking, &thinking.signature) {
-                (true, Some(signature)) => blocks.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking.text,
-                    "signature": signature,
-                })),
-                (true, None) if thinking.redacted && thinking.encrypted.is_some() => {
-                    blocks.push(json!({
+            // 签名与密文只能还给 Anthropic 自己；没有签名的思考块 Anthropic 会
+            // 拒收，所以来自其他协议的思考（以及被带回来的无签名思考）只能丢弃。
+            Part::Thinking(thinking) => {
+                match (
+                    keep_thinking,
+                    thinking.opaque_for(Protocol::AnthropicMessages),
+                ) {
+                    (true, Some(Opaque::Signature(signature))) => blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking.text,
+                        "signature": signature,
+                    })),
+                    (true, Some(Opaque::Redacted(data))) => blocks.push(json!({
                         "type": "redacted_thinking",
-                        "data": thinking.encrypted,
-                    }))
+                        "data": data,
+                    })),
+                    _ => degraded.drop("thinking"),
                 }
-                _ => degraded.drop("thinking"),
-            },
+            }
         }
     }
     Ok(blocks)
@@ -901,19 +937,6 @@ pub fn error_event(
     )
 }
 
-/// `thinking` 配置在 Anthropic 与 OpenAI 之间的档位换算入口，供测试断言。
-pub fn effort_of(config: &ThinkingConfig) -> Effort {
-    config.effort()
-}
-
-/// Anthropic 没有结构化输出，这里保留常量让调用方的错误信息统一。
-pub const OUTPUT_FORMAT_UNSUPPORTED: &str = "Anthropic Messages 无法表达结构化输出 Schema";
-
-/// 供跨协议模块判断"这个中间请求要求的输出格式是否可表达"。
-pub fn supports_output_format(format: Option<&OutputFormat>) -> bool {
-    format.is_none()
-}
-
 // ------------------------------------------------------------ 思考契约（§14.6）
 
 /// 只认手工预算（`enabled`/`disabled` + `budget_tokens`）的老家族。
@@ -1111,7 +1134,9 @@ pub fn align_thinking(
 
     if contract.adaptive {
         body.remove("thinking");
-        body.remove("output_config");
+        // 只有 `effort` 归这里管；`output_config` 的其他子字段（结构化输出的
+        // `format`……）是客户端的原话，必须原样留下。
+        set_effort(body, None);
         if !intent.enabled {
             // 自适应模型默认就思考，`{"type": "disabled"}` 会被上游 400 拒掉：
             // 只能省掉这个字段，并把"客户端明确要求不思考"记成一次降级。
@@ -1133,7 +1158,7 @@ pub fn align_thinking(
         }
         body.insert("thinking".into(), block);
         // 客户端没表态就不替它选档位：自适应模型的默认档位比中间格式猜的高。
-        if let Some(requested) = intent.effort {
+        if let Some(requested) = intent.effort.map(Effort::to_anthropic) {
             // 4.6 只认 low/medium/high/max：把 xhigh 原样发过去只会换回一个
             // "This model does not support effort level 'xhigh'" 的 400，
             // 折到它接受的最强档位。
@@ -1151,7 +1176,7 @@ pub fn align_thinking(
             };
             match plan {
                 EffortPlan::Send(effort) | EffortPlan::Lower(effort) => {
-                    body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+                    set_effort(body, Some(effort));
                 }
                 // `Omit`：不发射 `output_config`，把强度交回上游默认。
                 EffortPlan::Omit => {}
@@ -1160,8 +1185,10 @@ pub fn align_thinking(
         return;
     }
 
-    // 手工契约不认识 `adaptive` 与 `output_config`。发射出来的通常已经是老
-    // 形状，只有"逻辑模型名像新模型、真上游是老模型"时才需要改回来。
+    // 手工契约不认识 `adaptive` 与 `output_config.effort`。发射出来的通常已经
+    // 是老形状，只有"逻辑模型名像新模型、真上游是老模型"时才需要改回来。
+    // `output_config` 的其他子字段不归思考契约管：4.5 系本身就支持
+    // `output_config.format`，认不认交给上游判断，这里绝不替客户端删掉。
     let adaptive_form = body
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))
@@ -1170,7 +1197,7 @@ pub fn align_thinking(
     if !adaptive_form {
         return;
     }
-    body.remove("output_config");
+    set_effort(body, None);
     body.remove("thinking");
     if !intent.enabled {
         body.insert("thinking".into(), json!({"type": "disabled"}));
@@ -1187,9 +1214,30 @@ pub fn align_thinking(
     }
 }
 
+/// 只改写 `output_config.effort`，其余子字段原样保留；对象因此变空时整个删掉。
+fn set_effort(body: &mut Map<String, Value>, effort: Option<Effort>) {
+    let config = body.get_mut("output_config").and_then(Value::as_object_mut);
+    match (config, effort) {
+        (Some(config), Some(effort)) => {
+            config.insert("effort".into(), json!(effort.as_str()));
+        }
+        (Some(config), None) => {
+            config.remove("effort");
+            if config.is_empty() {
+                body.remove("output_config");
+            }
+        }
+        (None, Some(effort)) => {
+            body.insert("output_config".into(), json!({"effort": effort.as_str()}));
+        }
+        (None, None) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::canonical::OutputFormat;
 
     #[test]
     fn system_prompt_and_tool_results_round_trip() {
@@ -1275,8 +1323,7 @@ mod tests {
             role: Role::Assistant,
             parts: vec![Part::Thinking(ThinkingBlock {
                 text: "推理".into(),
-                signature: Some("sig".into()),
-                ..ThinkingBlock::default()
+                opaque: Some(Opaque::Signature("sig".into())),
             })],
         });
         let emitted = emit_request(&native).unwrap();
@@ -1572,9 +1619,10 @@ mod tests {
             request.unknown.is_empty(),
             "output_config 是已知字段，不该把整条请求判成不可转换"
         );
-        // 转给 Chat：Anthropic 专有的 max 折到 high，别的选择原样保留。
+        // 转给 Chat：Anthropic 专有的 max 折到 xhigh，并且必须标记成降级。
         let emitted = crate::protocol::openai_chat::emit_request(&request).unwrap();
-        assert_eq!(emitted.body["reasoning_effort"], "high");
+        assert_eq!(emitted.body["reasoning_effort"], "xhigh");
+        assert_eq!(emitted.degraded, vec!["effort".to_string()]);
     }
 
     #[test]
