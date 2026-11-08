@@ -40,8 +40,6 @@ pub struct Emitted {
     pub body: Value,
     /// 被降级的能力名，按 `X-Akhub-Degraded` 头的口径：`thinking`、`top_k`……
     pub degraded: Vec<String>,
-    /// 用"强制工具调用"表达结构化输出时的合成工具名，响应侧据此还原为文本。
-    pub structured_tool: Option<String>,
 }
 
 impl Emitted {
@@ -49,7 +47,6 @@ impl Emitted {
         Self {
             body,
             degraded: Vec::new(),
-            structured_tool: None,
         }
     }
 

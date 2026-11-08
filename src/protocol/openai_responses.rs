@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 
 use crate::domain::Protocol;
 use crate::protocol::canonical::{
-    Effort, Event, ItemKind, MediaSource, Message, OutputFormat, Part, Request, Response, Role,
-    StopReason, ThinkingBlock, ThinkingConfig, Tool, ToolChoice, Usage,
+    Effort, Event, ItemKind, MediaSource, Message, Opaque, OutputFormat, Part, Request, Response,
+    Role, StopReason, ThinkingBlock, ThinkingConfig, Tool, ToolChoice, Usage,
 };
 use crate::protocol::degrade::{Degradations, Emitted, Unsupported};
 use crate::protocol::{known, sampling_key, string_list};
@@ -34,9 +34,19 @@ const KNOWN_FIELDS: &[&str] = &[
     "store",
     "include",
     "service_tier",
+    // 下面三个只是提示，不改变输出语义：`prompt_cache_key` 在两个 OpenAI 协议
+    // 之间原样带过去，`safety_identifier` 并入 `user`，`stream_options`（只有
+    // `include_obfuscation`）跨协议没有意义，故意不发。Codex CLI 每个请求都带
+    // `prompt_cache_key`，把它当未知字段就等于永远不能切到别的协议。
+    "prompt_cache_key",
+    "safety_identifier",
+    "stream_options",
 ];
 
-const SAMPLING_FIELDS: &[&str] = &["top_logprobs", "truncation"];
+/// 生成参数：目标协议能表达就带过去，否则按白名单降级（§14.8）。
+/// `max_tool_calls` 只限制工具调用次数、`verbosity`（来自 `text.verbosity`）
+/// 只影响篇幅，丢掉都不会让客户端坏掉，但必须标记。
+const SAMPLING_FIELDS: &[&str] = &["top_logprobs", "truncation", "max_tool_calls"];
 
 /// Responses 专有且无法在别处表达的能力。
 const INEXPRESSIBLE_FIELDS: &[&str] = &[
@@ -83,6 +93,11 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
     request.top_p = object.get("top_p").and_then(Value::as_f64);
     request.user = object
         .get("user")
+        .or_else(|| object.get("safety_identifier"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    request.prompt_cache_key = object
+        .get("prompt_cache_key")
         .and_then(Value::as_str)
         .map(str::to_string);
     request.parallel_tool_calls = object.get("parallel_tool_calls").and_then(Value::as_bool);
@@ -95,7 +110,11 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
             parts: vec![Part::text(instructions)],
         });
     }
-    parse_input(object.get("input"), &mut request.messages);
+    parse_input(
+        object.get("input"),
+        &mut request.messages,
+        &mut request.inexpressible,
+    );
 
     for tool in object
         .get("tools")
@@ -113,6 +132,11 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
         .get("text")
         .and_then(|text| text.get("format"))
         .and_then(parse_text_format);
+    if let Some(verbosity) = object.get("text").and_then(|text| text.get("verbosity")) {
+        request
+            .sampling
+            .insert("verbosity".into(), verbosity.clone());
+    }
     // Responses 用 `text.format` 表达结构化输出；`stop` 不是它的参数。
     request.stop = string_list(object.get("stop"));
 
@@ -156,7 +180,7 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
 }
 
 /// `input` 既可以是一段文本，也可以是输入项数组。
-fn parse_input(input: Option<&Value>, messages: &mut Vec<Message>) {
+fn parse_input(input: Option<&Value>, messages: &mut Vec<Message>, unsupported: &mut Vec<String>) {
     match input {
         Some(Value::String(text)) if !text.is_empty() => messages.push(Message {
             role: Role::User,
@@ -164,7 +188,7 @@ fn parse_input(input: Option<&Value>, messages: &mut Vec<Message>) {
         }),
         Some(Value::Array(items)) => {
             for item in items {
-                parse_item(item, messages);
+                parse_item(item, messages, unsupported);
             }
         }
         _ => {}
@@ -172,7 +196,10 @@ fn parse_input(input: Option<&Value>, messages: &mut Vec<Message>) {
 }
 
 /// 解析一个输入项。工具调用与结果是顶层项，要归并到相邻的消息里。
-fn parse_item(item: &Value, messages: &mut Vec<Message>) {
+///
+/// 中间格式没有位置的项（`item_reference`、`compaction`、自定义工具与内置
+/// 工具的调用记录……）记进 `unsupported`，绝不静默跳过（§14.6）。
+fn parse_item(item: &Value, messages: &mut Vec<Message>, unsupported: &mut Vec<String>) {
     let kind = item
         .get("type")
         .and_then(Value::as_str)
@@ -187,7 +214,7 @@ fn parse_item(item: &Value, messages: &mut Vec<Message>) {
                 Some("assistant") => Role::Assistant,
                 _ => Role::User,
             };
-            let parts = parse_content(item.get("content").unwrap_or(&Value::Null));
+            let parts = parse_content(item.get("content").unwrap_or(&Value::Null), unsupported);
             messages.push(Message { role, parts });
         }
         "function_call" => {
@@ -218,7 +245,7 @@ fn parse_item(item: &Value, messages: &mut Vec<Message>) {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                content: parse_output_content(item.get("output")),
+                content: parse_output_content(item.get("output"), unsupported),
                 is_error: false,
             };
             append(messages, Role::User, part);
@@ -235,19 +262,24 @@ fn parse_item(item: &Value, messages: &mut Vec<Message>) {
                         .join("\n")
                 })
                 .unwrap_or_default();
-            let part = Part::Thinking(ThinkingBlock {
-                text,
-                signature: None,
-                encrypted: item
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                id: item.get("id").and_then(Value::as_str).map(str::to_string),
-                redacted: false,
-            });
-            append(messages, Role::Assistant, part);
+            // 没有 `encrypted_content` 的 reasoning 项只剩摘要文本：它的 ID 要么
+            // 是网关跨协议时合成的 `rs_resp_akh_*`，要么指向上游的存储，离开
+            // 原上游都没有意义。
+            let opaque = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|content| !content.is_empty())
+                .map(|content| Opaque::Encrypted {
+                    id: item.get("id").and_then(Value::as_str).map(str::to_string),
+                    content: content.to_string(),
+                });
+            append(
+                messages,
+                Role::Assistant,
+                Part::Thinking(ThinkingBlock { text, opaque }),
+            );
         }
-        _ => {}
+        other => unsupported.push(format!("Responses 的 {other} 输入项")),
     }
 }
 
@@ -262,21 +294,38 @@ fn append(messages: &mut Vec<Message>, role: Role, part: Part) {
     }
 }
 
-fn parse_content(content: &Value) -> Vec<Part> {
+fn parse_content(content: &Value, unsupported: &mut Vec<String>) -> Vec<Part> {
     match content {
         Value::String(text) if !text.is_empty() => vec![Part::text(text.clone())],
-        Value::Array(items) => items.iter().filter_map(parse_content_part).collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|part| parse_content_part(part, unsupported))
+            .collect(),
         _ => Vec::new(),
     }
 }
 
-fn parse_content_part(part: &Value) -> Option<Part> {
-    match part.get("type").and_then(Value::as_str)? {
+fn parse_content_part(part: &Value, unsupported: &mut Vec<String>) -> Option<Part> {
+    let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+    let parsed = parse_known_content_part(kind, part);
+    if parsed.is_none() {
+        // `file_id` 引用的是上游自己的文件资源，跨协议无法表达；未知块同理。
+        let detail = if part.get("file_id").is_some() {
+            format!("Responses 的 {kind} 块（file_id 引用）")
+        } else {
+            format!("Responses 的 {kind} 内容块")
+        };
+        unsupported.push(detail);
+    }
+    parsed
+}
+
+fn parse_known_content_part(kind: &str, part: &Value) -> Option<Part> {
+    match kind {
         "input_text" | "output_text" | "text" => Some(Part::text(
             part.get("text").and_then(Value::as_str).unwrap_or_default(),
         )),
         "input_image" => {
-            // `file_id` 引用的是上游自己的文件资源，跨协议无法表达。
             let url = part.get("image_url").and_then(Value::as_str)?;
             let source = MediaSource::from_url(url);
             Some(Part::Image {
@@ -289,7 +338,15 @@ fn parse_content_part(part: &Value) -> Option<Part> {
             })
         }
         "input_file" => Some(Part::Document {
-            source: MediaSource::from_url(part.get("file_data").and_then(Value::as_str)?),
+            source: part
+                .get("file_data")
+                .and_then(Value::as_str)
+                .map(MediaSource::from_url)
+                .or_else(|| {
+                    part.get("file_url")
+                        .and_then(Value::as_str)
+                        .map(|url| MediaSource::Url(url.to_string()))
+                })?,
             name: part
                 .get("filename")
                 .and_then(Value::as_str)
@@ -306,10 +363,13 @@ fn parse_content_part(part: &Value) -> Option<Part> {
 }
 
 /// `function_call_output.output` 可以是字符串，也可以是内容块数组。
-fn parse_output_content(output: Option<&Value>) -> Vec<Part> {
+fn parse_output_content(output: Option<&Value>, unsupported: &mut Vec<String>) -> Vec<Part> {
     match output {
         Some(Value::String(text)) => vec![Part::text(text.clone())],
-        Some(Value::Array(items)) => items.iter().filter_map(parse_content_part).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|part| parse_content_part(part, unsupported))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -391,7 +451,9 @@ pub fn parse_response(body: &Value) -> Result<Response, Unsupported> {
         .into_iter()
         .flatten()
     {
-        parse_item(item, &mut messages);
+        // 响应里的内置工具调用记录只会出现在请求了内置工具时，而那种请求在
+        // 跨协议发射时已经被拒绝。
+        parse_item(item, &mut messages, &mut Vec::new());
     }
     let parts: Vec<Part> = messages.into_iter().flat_map(|m| m.parts).collect();
 
@@ -529,14 +591,25 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     if let Some(parallel) = request.parallel_tool_calls {
         body.insert("parallel_tool_calls".into(), json!(parallel));
     }
+    let mut text = Map::new();
     if let Some(format) = &request.output_format {
-        body.insert("text".into(), json!({"format": emit_text_format(format)}));
+        text.insert("format".into(), emit_text_format(format));
+    }
+    if let Some(verbosity) = request.sampling.get("verbosity") {
+        text.insert("verbosity".into(), verbosity.clone());
+    }
+    if !text.is_empty() {
+        body.insert("text".into(), Value::Object(text));
     }
     if let Some(thinking) = request.thinking {
         if thinking.enabled {
+            let (effort, folded) = thinking.effort().to_openai();
+            if folded {
+                degraded.drop("effort");
+            }
             body.insert(
                 "reasoning".into(),
-                json!({"effort": thinking.effort().as_openai_level(), "summary": "auto"}),
+                json!({"effort": effort, "summary": "auto"}),
             );
         } else {
             body.insert("reasoning".into(), json!({"effort": "none"}));
@@ -559,7 +632,14 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     if let Some(user) = &request.user {
         body.insert("user".into(), json!(user));
     }
+    if let Some(key) = &request.prompt_cache_key {
+        body.insert("prompt_cache_key".into(), json!(key));
+    }
     for (field, value) in &request.sampling {
+        // `verbosity` 在上面已经放进 `text`。
+        if field == "verbosity" {
+            continue;
+        }
         match sampling_key(field, Protocol::OpenAiResponses) {
             Some(target) => {
                 body.insert(target.into(), value.clone());
@@ -571,7 +651,6 @@ pub fn emit_request(request: &Request) -> Result<Emitted, Unsupported> {
     Ok(Emitted {
         body: Value::Object(body),
         degraded: degraded.into_list(),
-        structured_tool: None,
     })
 }
 
@@ -617,24 +696,28 @@ fn emit_message(
                 }));
             }
             Part::Thinking(thinking) => {
-                // 只有带 encrypted_content 的原生 reasoning 项能被上游接受；
-                // 其他来源的思考文本无处安放，按白名单丢弃（§14.8）。
-                match &thinking.encrypted {
-                    Some(encrypted) => {
+                // 只有来自 Responses 自己、带 encrypted_content 的 reasoning 项能被
+                // 上游接受；Anthropic 的签名与密文、其他来源的纯文本思考都无处
+                // 安放，按白名单丢弃（§14.8）。
+                match thinking.opaque_for(Protocol::OpenAiResponses) {
+                    Some(Opaque::Encrypted {
+                        id,
+                        content: encrypted,
+                    }) => {
                         flush(input, role, &mut content, degraded)?;
                         let mut item = json!({
                             "type": "reasoning",
                             "encrypted_content": encrypted,
                             "summary": summary_blocks(&thinking.text),
                         });
-                        if let Some(id) = &thinking.id
+                        if let Some(id) = id
                             && let Some(object) = item.as_object_mut()
                         {
                             object.insert("id".into(), json!(id));
                         }
                         input.push(item);
                     }
-                    None => degraded.drop("thinking"),
+                    _ => degraded.drop("thinking"),
                 }
             }
             other => content.push(other),
@@ -696,11 +779,18 @@ fn emit_content(
                 }
                 blocks.push(block);
             }
-            Part::Document { source, name } => blocks.push(json!({
-                "type": "input_file",
-                "filename": name.clone().unwrap_or_else(|| "file".into()),
-                "file_data": source.to_url(),
-            })),
+            Part::Document { source, name } => {
+                let mut block = json!({
+                    "type": "input_file",
+                    "filename": name.clone().unwrap_or_else(|| "file".into()),
+                });
+                let (key, value) = match source {
+                    MediaSource::Url(url) => ("file_url", url.clone()),
+                    MediaSource::Base64 { .. } => ("file_data", source.to_url()),
+                };
+                block[key] = json!(value);
+                blocks.push(block);
+            }
             // 这三种在调用方已经被拆成顶层项，不该走到这里。
             Part::ToolCall { .. } | Part::ToolResult { .. } | Part::Thinking(_) => {
                 return Err(Unsupported::new("工具项必须作为顶层输入项发射"));
@@ -1257,9 +1347,10 @@ mod tests {
             role: Role::Assistant,
             parts: vec![Part::Thinking(ThinkingBlock {
                 text: "摘要".into(),
-                encrypted: Some("enc".into()),
-                id: Some("rs_1".into()),
-                ..ThinkingBlock::default()
+                opaque: Some(Opaque::Encrypted {
+                    id: Some("rs_1".into()),
+                    content: "enc".into(),
+                }),
             })],
         });
         let emitted = emit_request(&request).unwrap();
@@ -1273,8 +1364,7 @@ mod tests {
             role: Role::Assistant,
             parts: vec![Part::Thinking(ThinkingBlock {
                 text: "推理".into(),
-                signature: Some("sig".into()),
-                ..ThinkingBlock::default()
+                opaque: Some(Opaque::Signature("sig".into())),
             })],
         });
         let emitted = emit_request(&foreign).unwrap();
