@@ -51,7 +51,6 @@ pub fn is_managed(id: &str) -> bool {
 /// 只保存"能中断上游连接"的句柄；任务结束时移除。进程重启后这张表是空的，
 /// 这正是为什么重启时必须把遗留任务标成 `interrupted`——没有任何东西能恢复
 /// 一个已经不在进程里的连接。
-#[derive(Default)]
 pub struct RunningTasks {
     handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// 已经结束过的任务 ID。
@@ -64,6 +63,21 @@ pub struct RunningTasks {
     /// `FINISHED_RETENTION` 就说明对应的登记已经发生过（或者根本不会来），可以
     /// 丢掉，免得这张集合自己变成第二个泄漏点。
     finished: Mutex<HashMap<String, std::time::Instant>>,
+    /// 同时运行的托管任务名额。超出即 `queue_full`，不无界堆积（§28）。
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// 全局最多同时运行多少个托管后台任务。
+pub const MAX_RUNNING_MANAGED_TASKS: usize = 64;
+
+impl Default for RunningTasks {
+    fn default() -> Self {
+        Self {
+            handles: Mutex::default(),
+            finished: Mutex::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_RUNNING_MANAGED_TASKS)),
+        }
+    }
 }
 
 /// 已完成 ID 的保留时长。登记就在 `spawn` 之后几微秒，一分钟绰绰有余。
@@ -72,6 +86,11 @@ const FINISHED_RETENTION: std::time::Duration = std::time::Duration::from_secs(6
 impl RunningTasks {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 占一个运行名额；名额随任务结束归还。满了返回 `None`。
+    pub fn try_reserve(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.slots).try_acquire_owned().ok()
     }
 
     /// 登记一个正在执行的任务。
@@ -594,6 +613,17 @@ pub async fn maybe_start_managed(
         return None;
     }
 
+    let Some(slot) = forward.state.runtime.background.try_reserve() else {
+        return Some(axum::response::IntoResponse::into_response(
+            crate::gateway::error::GatewayError::new(
+                crate::gateway::error::ErrorCode::QueueFull,
+                "托管后台任务已达并发上限，请稍后重试",
+            )
+            .with_protocol(forward.endpoint.protocol())
+            .with_request_id(forward.request_id),
+        ));
+    };
+
     let task_id = new_id();
     let now = crate::storage::now_unix();
     let task = BackgroundTaskRow {
@@ -637,6 +667,7 @@ pub async fn maybe_start_managed(
     let spawned_task_id = task_id.clone();
     let job_state = Arc::clone(&runner_state);
     let handle = tokio::spawn(async move {
+        let _slot = slot;
         runner.execute(request).await;
         job_state.runtime.background.finish(&spawned_task_id).await;
     });
@@ -662,8 +693,8 @@ fn native_background_available(forward: &crate::gateway::passthrough::Forward<'_
     }
     forward
         .group
-        .models
-        .values()
+        .find_model(&forward.logical_model)
+        .into_iter()
         .flat_map(|model| model.targets.iter())
         .any(|target| target.account.preferred_protocol == crate::domain::Protocol::OpenAiResponses)
 }

@@ -258,3 +258,123 @@ async fn a_native_only_endpoint_skips_a_candidate_that_lacks_the_route() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["akhub_error_code"], "unsupported_parameter", "{body}");
 }
+
+/// 同协议 Anthropic 入口摘掉无签名思考块，带签名的原样保留（§14.8）。
+#[tokio::test]
+async fn unsigned_thinking_blocks_are_stripped_before_anthropic() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "a",
+            &upstream.base_url,
+            Protocol::AnthropicMessages,
+            "m",
+            "m",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = common::messages(
+        &akhub,
+        json!({"model":"m","max_tokens":10,"messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"foreign"},
+                {"type":"thinking","thinking":"own","signature":"sig"},
+                {"type":"text","text":"ok"}
+            ]},
+            {"role":"user","content":"next"}
+        ]}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let sent = upstream.seen.lock().unwrap()[0].body.clone();
+    let blocks = sent["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{sent}");
+    assert_eq!(blocks[0]["signature"], "sig");
+}
+
+/// Responses 入口摘掉不可重放的 reasoning 项。
+#[tokio::test]
+async fn unreplayable_reasoning_items_are_stripped_before_responses() {
+    let upstream = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "a",
+            &upstream.base_url,
+            Protocol::OpenAiResponses,
+            "m",
+            "m",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = common::responses(
+        &akhub,
+        json!({"model":"m","input":[
+            {"type":"reasoning","id":"rs_1","summary":[]},
+            {"type":"reasoning","id":"rs_resp_akh_2","encrypted_content":"x","summary":[]},
+            {"type":"reasoning","id":"rs_3","encrypted_content":"real","summary":[]},
+            {"type":"message","role":"user","content":"hi"}
+        ]}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let sent = upstream.seen.lock().unwrap()[0].body.clone();
+    let items = sent["input"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{sent}");
+    assert_eq!(items[0]["id"], "rs_3");
+}
+
+/// 别的渠道签发的加密状态被拒时换渠道，而不是把 400 透传给客户端（§13.7）。
+#[tokio::test]
+async fn a_foreign_encrypted_content_rejection_reroutes() {
+    let high = FakeUpstream::spawn().await;
+    let low = FakeUpstream::spawn().await;
+    high.fallback(common::Behavior::Json(
+        400,
+        json!({"error":{"message":"The encrypted content for item rs_1 could not be verified."}}),
+    ));
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    for (name, upstream, priority) in [("high", &high, 60), ("low", &low, 50)] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::OpenAiResponses,
+                "m",
+                "m",
+                priority,
+            )
+            .pinned(),
+        )
+        .await;
+    }
+
+    let response = common::responses(&akhub, json!({"model":"m","input":"hi"})).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(low.requests(), 1);
+}
+
+/// 托管任务并发名额用尽后拒绝，名额归还后恢复（§28）。
+#[tokio::test]
+async fn managed_task_slots_are_bounded() {
+    use akhub::gateway::background::{MAX_RUNNING_MANAGED_TASKS, RunningTasks};
+
+    let tasks = RunningTasks::new();
+    let held: Vec<_> = (0..MAX_RUNNING_MANAGED_TASKS)
+        .map(|_| tasks.try_reserve().expect("上限之内应当放行"))
+        .collect();
+    assert!(tasks.try_reserve().is_none(), "超出上限必须拒绝");
+    drop(held);
+    assert!(tasks.try_reserve().is_some());
+}

@@ -268,9 +268,15 @@ async fn native_target(
         .ok()?
         .into_iter()
         .find(|account| account.id == account_id)?;
-    let sealed = state.store.account_sealed_key(&account.id).await.ok()??;
-    let plaintext = state.cipher.open(&sealed).ok()?;
-    let api_key = String::from_utf8(plaintext.to_vec()).ok()?;
+    // 上游资源按凭据隔离：必须回到创建它的那把 Key（§15.1）。
+    let key_id = record.key_id.as_deref()?;
+    let api_key = state
+        .runtime
+        .credentials
+        .current()
+        .by_id(&account.id, key_id)?
+        .secret
+        .to_string();
     Some(NativeTarget {
         account,
         api_key,
@@ -670,6 +676,8 @@ pub struct ChainPlan {
 pub struct PinnedRef {
     pub account_id: String,
     pub upstream_id: String,
+    /// 创建这条响应的那把 Key。上游的响应 ID 按凭据隔离，续链要回到它（§15.1）。
+    pub key_digest: Option<String>,
 }
 
 impl ChainPlan {
@@ -708,9 +716,15 @@ pub async fn resolve_request(
 
     // 原生续链候选：原账号 + 上游 ID。
     if let (Some(account), Some(upstream)) = (&record.account_id, &record.upstream_id) {
+        let pool = state.runtime.credentials.current();
         plan.pinned = Some(PinnedRef {
             account_id: account.clone(),
             upstream_id: upstream.clone(),
+            key_digest: record
+                .key_id
+                .as_deref()
+                .and_then(|key_id| pool.by_id(account, key_id))
+                .map(|key| key.credential_digest.clone()),
         });
     }
 
@@ -902,15 +916,16 @@ pub enum Durability {
     Persist,
 }
 
+type PendingTable =
+    std::sync::Mutex<std::collections::HashMap<(String, String), Arc<ResponseStateRow>>>;
+
 /// 尚未落库（或流式进行中）的状态记录，按（分组，网关 ID）索引。
 ///
 /// 契约（§15.2）：客户端一拿到响应 ID 就可能引用它，记录必须在那一刻已经
 /// 查得到；但请求热路径绝不等 SQLite（§28）。所以写入分两步：先同步放进这张
 /// 表（查询优先看它），再在后台落库，落库完成后从表里移走。表的大小受在途
 /// 请求数与落库延迟约束，不会无界增长。
-static PENDING: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String), Arc<ResponseStateRow>>>,
-> = std::sync::LazyLock::new(Default::default);
+static PENDING: std::sync::LazyLock<PendingTable> = std::sync::LazyLock::new(Default::default);
 
 fn is_pending(slot: &(String, String), record: &Arc<ResponseStateRow>) -> bool {
     crate::sync::lock(&PENDING)

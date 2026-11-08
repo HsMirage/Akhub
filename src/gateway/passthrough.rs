@@ -103,7 +103,7 @@ const MAX_KEY_SWITCHES_PER_TARGET: usize = 3;
 /// 排队等待，与账号层的 §13.6 完全一致；只有一把可用的 Key 都没有时才算这个
 /// 候选不合格。
 enum Picked {
-    Ready(Option<Arc<crate::credential::Credential>>),
+    Ready(Arc<crate::credential::Credential>),
     /// 账号里所有 Key 都只是忙——等一会儿就有名额。
     Busy,
     /// 绑定/钉住的那把 Key 只是忙：应当**等它**，而不是换一把别的。
@@ -998,7 +998,14 @@ async fn forward_inner<'a>(
                 .saturating_duration_since(Instant::now()),
         );
         match walk
-            .wait_and_run(&[candidate], budget, &sticky_key, true, None, None)
+            .wait_and_run(
+                &[candidate],
+                budget,
+                &sticky_key,
+                true,
+                pin.key_digest.as_deref(),
+                None,
+            )
             .await
         {
             Flow::Done(response) => return response,
@@ -1138,9 +1145,9 @@ impl Walk<'_> {
                 ));
             }
             match self.select_credential(candidate, None, None, None) {
-                Picked::Ready(credential) => match self.try_admit(candidate, credential.as_ref()) {
+                Picked::Ready(key) => match self.try_admit(candidate, Some(&key)) {
                     Ok(admission) => {
-                        match self.run(candidate, admission, sticky_key, credential).await {
+                        match self.run(candidate, admission, sticky_key, Some(key)).await {
                             Flow::Continue => {}
                             other => return Err(other),
                         }
@@ -1205,7 +1212,7 @@ impl Walk<'_> {
             while index < pending.len() {
                 let candidate = pending[index];
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
+                    Picked::Ready(key) => Some(key),
                     // 忙：留在 pending 里，稍后按信号量唤醒再试。绑定那把忙
                     // 同样留在这里——下面的名额计算会只为它等。
                     Picked::Busy | Picked::BoundBusy(_) => {
@@ -1281,7 +1288,7 @@ impl Walk<'_> {
                 .map(|candidate| {
                     let credential =
                         match self.select_credential(candidate, pinned, preferred, None) {
-                            Picked::Ready(credential) => credential,
+                            Picked::Ready(key) => Some(key),
                             // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
                             // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
                             // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
@@ -1345,7 +1352,7 @@ impl Walk<'_> {
                 // 被唤醒后重新选一次 Key 并做完整终检：等待期间倍率、配置或
                 // Key 的健康状态都可能已经变了（§13.6）。
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
+                    Picked::Ready(key) => Some(key),
                     // 忙：名额已经到手，先还回去，回到等待循环。绑定那把忙也
                     // 一样——唤醒的是**它的**名额，拿到手就能直接用它。
                     Picked::Busy | Picked::BoundBusy(_) => continue,
@@ -1406,7 +1413,8 @@ impl Walk<'_> {
         };
         let health = &self.forward.state.runtime.health;
         match self.select_credential(candidate, pinned, preferred, None) {
-            Picked::Ready(credential) => {
+            Picked::Ready(key) => {
+                let credential = Some(key);
                 let caller = health::Caller {
                     // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
                     // 用 `credential_id(account_id, digest)` 归类 Key 状态，
@@ -1463,10 +1471,10 @@ impl Walk<'_> {
         // 失效了（§13.6、§17.1）。Key 级由下面的 reconcile_and_check 负责。
         health
             .account(&account.id)
-            .reconcile_capacity(account.limits.max_concurrency);
+            .apply_configured_concurrency(account.limits.max_concurrency);
         health
             .target(&candidate.target.target.id)
-            .reconcile_capacity(candidate.target.target.limits.max_concurrency);
+            .apply_configured_concurrency(candidate.target.target.limits.max_concurrency);
         // Key 状态的时钟是 tokio 的：测试用 `tokio::time::pause` 精确推进冷却。
         let now = tokio::time::Instant::now();
         // 软亲和在这里统一生效：调用方不必各自传递。它只是一条**偏好**，
@@ -1491,7 +1499,7 @@ impl Walk<'_> {
             &mut score::random_unit,
         );
         match choice {
-            crate::credential::KeyChoice::Ready(Some(key)) => Picked::Ready(Some(Arc::clone(key))),
+            crate::credential::KeyChoice::Ready(Some(key)) => Picked::Ready(Arc::clone(key)),
             crate::credential::KeyChoice::Ready(None) => Picked::Unavailable(format!(
                 "账号「{}」没有可用的 API Key（可能未配置、已停用或已全部失效）",
                 account.name
@@ -1608,7 +1616,7 @@ impl Walk<'_> {
         // 不构成 KeyInvalid），但这一次调用已经用它打失败过（§4.2.1）。
         let picked = self.select_credential(candidate, None, None, just_failed);
         match picked {
-            Picked::Ready(Some(next)) => Some(next),
+            Picked::Ready(next) => Some(next),
             _ => None,
         }
     }
@@ -2423,6 +2431,13 @@ impl Walk<'_> {
             degraded = emitted.degraded.clone();
             emitted.body.clone()
         };
+        // 同协议透传不经过转换器，别的渠道留下的不可重放状态要在这里摘掉。
+        if downstream == target_protocol && strip_foreign_replay_state(&mut body, downstream) {
+            let capability = "thinking".to_string();
+            if !degraded.contains(&capability) {
+                degraded.push(capability);
+            }
+        }
         rewrite_model(&mut body, &candidate.target.target.upstream_model);
         // 逻辑模型名常常只是一个别名，发射时按它猜出来的思考契约可能与真正要
         // 发出去的上游模型不一致。这里按上游模型名再对齐一次：新模型不接受
@@ -3091,12 +3106,13 @@ async fn attempt_inner(
             )
         })?;
 
-    let api_key = match credential {
-        Some(credential) => credential.secret.to_string(),
-        None => load_api_key(forward.state, &account.id)
-            .await
-            .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?,
+    let Some(credential) = credential else {
+        return Err(AttemptFailure::switchable(
+            ErrorCode::InternalError,
+            format!("账号「{}」没有选定可用的 API Key", account.name),
+        ));
     };
+    let api_key = credential.secret.to_string();
     // 请求头按**上游端点**的协议构造，与下游用哪个协议进来无关（§14.7）。
     // 原始 multipart 路径必须保留客户端的 Content-Type（尤其是 boundary），
     // 不能让普通 JSON 头覆盖它。
@@ -3265,12 +3281,18 @@ async fn attempt_inner(
             status,
             headers_wait,
             crate::security::redact::ErrorRedactor::new(&account.name, &account.base_url, &api_key),
-            credential,
+            Some(credential),
         )
         .await
     } else {
         commit_body(
-            forward, target, prepared, response, status, sent_at, credential,
+            forward,
+            target,
+            prepared,
+            response,
+            status,
+            sent_at,
+            Some(credential),
         )
         .await
     }
@@ -4264,7 +4286,7 @@ async fn classify_upstream_error(
     // \`signature\` in \`thinking\` block`；同一份请求体两秒后在别的渠道 200。
     // 签名是**渠道的事实**，不是客户端的参数错误；400 在开始生成之前、没消耗
     // token，所以换一个渠道重试几乎免费（与无法归因的 400 同处置）。
-    if is_foreign_thinking_signature(status, &message) {
+    if is_foreign_replayed_state(status, &message) {
         tracing::warn!(
             request_id = forward.request_id,
             account = target.account.name,
@@ -4383,25 +4405,105 @@ fn is_session_unroutable(message: &str) -> bool {
     UNROUTABLE.iter().any(|needle| lower.contains(needle))
 }
 
-/// 上游说"这段历史里的思考块签名验不过"（§13.7 现场，2026-10-26）。
+/// 上游说"这段历史里有别的渠道签发的状态，我验不过"（§13.7 现场，2026-10-26）。
+///
+/// 三种形状：Anthropic 的签名验不过；Anthropic 的无签名思考块（外部上游的思考
+/// 被回放过来，`thinking.signature: Field required`）；OpenAI 的
+/// `encrypted content … could not be verified/decrypted`。
 ///
 /// thinking 块的签名由签发它的渠道给出，换一条渠道（尤其是 Claude Code Max 这
 /// 类把会话绑在自家订阅上的渠道）就验不过。上游把这件事说成字段错误
 /// （`messages.8.content.0: Invalid \`signature\` in \`thinking\` block`），
 /// 但同一份请求体换一个目标就能过，所以既不能当客户端的参数错误，也不能停下。
-fn is_foreign_thinking_signature(status: StatusCode, message: &str) -> bool {
+fn is_foreign_replayed_state(status: StatusCode, message: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
     let lower = message.to_ascii_lowercase();
-    // 必须同时带 "thinking"：`thinking.signature: Field required` 这类形状错误
-    // 是客户端少传了字段，换渠道不会变好。
-    lower.contains("signature")
-        && lower.contains("thinking")
-        && (lower.contains("invalid")
-            || lower.contains("not valid")
-            || lower.contains("mismatch")
-            || lower.contains("does not match"))
+    let encrypted = (lower.contains("encrypted content") || lower.contains("encrypted_content"))
+        && (lower.contains("could not be verified")
+            || lower.contains("could not be decrypted")
+            || lower.contains("verification failed"));
+    // 必须同时带 "thinking"：别的字段的 signature 错误与思考块无关。
+    encrypted
+        || (lower.contains("signature")
+            && lower.contains("thinking")
+            && (lower.contains("invalid")
+                || lower.contains("not valid")
+                || lower.contains("mismatch")
+                || lower.contains("does not match")
+                || lower.contains("field required")))
+}
+
+/// 摘掉请求历史里上游必然拒绝的思考状态，返回是否摘过（§14.8）。
+///
+/// * Anthropic：没有签名的 thinking 块，来自外部上游或转换；
+/// * Responses：没有 `encrypted_content` 的 reasoning 项，以及网关合成的
+///   `rs_resp_akh_` 项。
+fn strip_foreign_replay_state(body: &mut serde_json::Value, protocol: Protocol) -> bool {
+    match protocol {
+        Protocol::AnthropicMessages => {
+            let Some(messages) = body
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                return false;
+            };
+            let mut stripped = false;
+            for message in messages.iter_mut() {
+                let Some(content) = message
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let before = content.len();
+                content.retain(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) != Some("thinking")
+                        || block
+                            .get("signature")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|signature| !signature.is_empty())
+                });
+                stripped |= content.len() != before;
+            }
+            // 只有思考块的消息摘空后是非法的，整条移除。
+            if stripped {
+                messages.retain(|message| {
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|content| !content.is_empty())
+                });
+            }
+            stripped
+        }
+        Protocol::OpenAiResponses => {
+            let Some(items) = body
+                .get_mut("input")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                return false;
+            };
+            let before = items.len();
+            items.retain(|item| {
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+                    return true;
+                }
+                let synthetic = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.starts_with("rs_resp_akh_"));
+                let encrypted = item
+                    .get("encrypted_content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content| !content.is_empty());
+                encrypted && !synthetic
+            });
+            items.len() != before
+        }
+        Protocol::OpenAiChat => false,
+    }
 }
 
 fn is_content_filtered(status: StatusCode, message: &str) -> bool {
@@ -4675,24 +4777,6 @@ fn image_text_bytes(body: &serde_json::Value, raw: Option<&RawBody>) -> usize {
         .filter(|text| !text.starts_with("data:") && text.len() <= MAX_TOKEN_TEXT_BYTES)
         .map(str::len)
         .sum()
-}
-
-/// 兜底凭据来源：数据库里账号凭据信封的第一把 Key。
-///
-/// 常规路径不用它——凭据由 [`crate::credential::CredentialPool`] 在内存里
-/// 提供，这里只覆盖"快照尚未重建"的短暂窗口。错误信息里不能出现任何密钥材料。
-async fn load_api_key(state: &SharedState, account_id: &str) -> Result<String, String> {
-    let sealed = state
-        .store
-        .account_sealed_key(account_id)
-        .await
-        .map_err(|error| format!("读取账号凭据失败：{error}"))?
-        .ok_or_else(|| "账号缺少凭据记录".to_string())?;
-    let plaintext = state
-        .cipher
-        .open(&sealed)
-        .map_err(|error| format!("解密账号凭据失败：{error}"))?;
-    String::from_utf8(plaintext.to_vec()).map_err(|_| "账号凭据不是合法的 UTF-8 文本".to_string())
 }
 
 /// 从 reqwest 错误中提取安全描述，绝不包含完整 URL 或凭据。
@@ -5253,9 +5337,12 @@ mod tests {
             "messages.8.content.0: Invalid `signature` in `thinking` block",
             "messages.0.content.0: Invalid signature in thinking block",
             "thinking block signature does not match",
+            "messages.0.content.0.thinking.signature: Field required",
+            "The encrypted content for item rs_1 could not be verified.",
+            "encrypted_content could not be decrypted",
         ] {
             assert!(
-                is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                is_foreign_replayed_state(StatusCode::BAD_REQUEST, message),
                 "应当判为换渠道可过：{message}"
             );
         }
@@ -5266,16 +5353,15 @@ mod tests {
     fn a_thinking_shape_error_is_not_a_signature_rejection() {
         for message in [
             "thinking.type: unknown variant `enabled`, expected `adaptive` or `disabled`",
-            "messages.0.content.0.thinking.signature: Field required",
             "max_tokens: must be greater than thinking.budget_tokens",
         ] {
             assert!(
-                !is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                !is_foreign_replayed_state(StatusCode::BAD_REQUEST, message),
                 "不该判为签名问题：{message}"
             );
         }
         // 只有 400 走这条路：别的状态码各有自己的处置。
-        assert!(!is_foreign_thinking_signature(
+        assert!(!is_foreign_replayed_state(
             StatusCode::UNPROCESSABLE_ENTITY,
             "messages.8.content.0: Invalid `signature` in `thinking` block"
         ));

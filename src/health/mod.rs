@@ -452,6 +452,11 @@ impl AccountState {
         self.budget.reconcile_capacity(configured);
     }
 
+    /// 按管理员当前配置校准并发上限，`None` 即不限（§17.1）。
+    pub fn apply_configured_concurrency(&self, configured: Option<u32>) {
+        self.budget.apply_configured(configured);
+    }
+
     /// 账号级并发额度（`None` 表示不限），供后台与诊断使用。
     pub fn concurrency_limit(&self) -> Option<u32> {
         (self.budget.capacity() != UNLIMITED).then(|| self.budget.capacity())
@@ -592,7 +597,7 @@ impl KeyState {
     /// 准入路径上校准的，而选 Key 发生在准入之前，不校准就会拿着"1<<20 个名额"
     /// 的信号量做判断，把配了上限的 Key 当成永远有空（§17.1）。
     pub fn reconcile_and_check(&self, budget: Limits, now: Instant) -> Result<(), Unavailable> {
-        self.budget.reconcile_capacity(budget.max_concurrency);
+        self.budget.apply_configured(budget.max_concurrency);
         self.check(budget, now)
     }
 
@@ -663,6 +668,11 @@ impl TargetState {
     /// "这个目标已经满载"会被误判成"有空位"。
     pub fn reconcile_capacity(&self, configured: Option<u32>) {
         self.budget.reconcile_capacity(configured);
+    }
+
+    /// 按管理员当前配置校准并发上限，`None` 即不限（§17.1）。
+    pub fn apply_configured_concurrency(&self, configured: Option<u32>) {
+        self.budget.apply_configured(configured);
     }
 
     /// 用于后台展示的运行状态。
@@ -788,10 +798,20 @@ impl Budget {
     /// 此时保持现状。把它当成"重置为不限"会抹掉已经校准好的上限，满载就会
     /// 被看成有空位（§13.6、§17.1）。
     fn reconcile_capacity(&self, wanted: Option<u32>) {
-        let Some(wanted) = wanted else {
-            return;
-        };
-        let wanted = wanted.max(1);
+        if let Some(wanted) = wanted {
+            self.resize(wanted.max(1));
+        }
+    }
+
+    /// 配置路径用：值就是管理员此刻的配置，`None` 明确表示**不限**。
+    ///
+    /// 与 [`Self::reconcile_capacity`] 的区别正在这里：清除并发上限后，只有配置
+    /// 路径能说"改回不限"，否则旧上限会一直留到重启。
+    fn apply_configured(&self, configured: Option<u32>) {
+        self.resize(configured.map_or(UNLIMITED, |value| value.max(1)));
+    }
+
+    fn resize(&self, wanted: u32) {
         let _guard = crate::sync::lock(&self.capacity_lock);
         let current = self.capacity.load(Ordering::Acquire);
         if wanted == current {
@@ -1717,6 +1737,17 @@ impl SlidingWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 清除并发上限必须立刻生效，不能留到重启（§17.1）。
+    #[test]
+    fn clearing_a_concurrency_limit_takes_effect() {
+        let budget = Budget::new();
+        budget.apply_configured(Some(1));
+        assert_eq!(budget.configured(), Some(1));
+        budget.apply_configured(None);
+        assert_eq!(budget.configured(), None);
+        assert_eq!(budget.available(), UNLIMITED as usize);
+    }
 
     /// 熔断之前放进来的在途请求，结算时既不能抬高退避也不能清掉冷却（§12.3）。
     #[test]
