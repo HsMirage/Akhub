@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use akhub::app::{AppState, Settings, SharedState};
 use akhub::domain::{
-    Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights,
+    Account, DispatchTarget, Group, Limits, LogicalModel, Multiplier, MultiplierMode, Protocol,
+    SchedulingWeights,
 };
 use akhub::storage::store::ids;
 use axum::Router;
@@ -180,7 +180,6 @@ async fn wire_target(
                 id: ids::logical_model(),
                 group_id,
                 name: logical_model.into(),
-                origin: ModelOrigin::Manual,
                 enabled: true,
                 created_at: OffsetDateTime::now_utc(),
             };
@@ -196,8 +195,6 @@ async fn wire_target(
             logical_model_id: model_id,
             account_id: account.id,
             upstream_model: upstream_model.into(),
-            hide_original: false,
-            priority_override: None,
             limits: Limits::default(),
             enabled: true,
             created_at: OffsetDateTime::now_utc(),

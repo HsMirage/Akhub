@@ -46,7 +46,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -98,7 +101,7 @@ async fn create_account(
         "group_id": group_id,
         "name": name,
         "base_url": "https://upstream.example.com",
-        "api_key": "sk-test",
+        "keys": [{"api_key": "sk-test"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -334,60 +337,4 @@ async fn a_name_clash_in_the_target_group_is_refused_with_a_useful_message() {
     let updated: Value = response.json().await.unwrap();
     assert_eq!(updated["group_id"], target);
     assert_eq!(updated["name"], "账号A-新");
-}
-
-#[tokio::test]
-async fn legacy_targets_without_a_catalog_row_move_by_public_name_too() {
-    let (base, client, _dir) = spawn().await;
-    setup_admin(&base, &client).await;
-    let (source, _) = create_group(&base, &client, "主力").await;
-    let (target, target_key) = create_group(&base, &client, "备用").await;
-
-    let account = create_account(&base, &client, &source, "账号A").await;
-    // 老路径：手工建逻辑模型 + 手工建目标，账号目录里没有任何行。
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": source, "name": "claude-sonnet-4-5"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let model_id = model["id"].as_str().unwrap().to_string();
-    let created = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model_id,
-        "account_id": account,
-        "upstream_model": "claude-sonnet-4-5-20250929",
-    }))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(created.status(), 201);
-
-    let response = patch_account(&base, &client, &account, json!({"group_id": target})).await;
-    assert_eq!(response.status(), 200);
-
-    let models = logical_models(&base, &client).await;
-    assert_eq!(
-        models_of(&models, &target),
-        vec![("claude-sonnet-4-5".to_string(), 1)]
-    );
-    // 手工模型不随目标消失：留在旧分组的管理视图里，但没有目标、不对外列出。
-    assert_eq!(
-        models_of(&models, &source),
-        vec![("claude-sonnet-4-5".to_string(), 0)]
-    );
-    assert_eq!(
-        downstream_models(&base, &target_key).await,
-        vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]
-    );
 }

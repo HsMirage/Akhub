@@ -51,7 +51,6 @@ pub struct BackupData {
     pub logical_models: Vec<Value>,
     pub dispatch_targets: Vec<Value>,
     pub account_models: Vec<Value>,
-    pub account_aliases: Vec<Value>,
     /// 系统设置（保留期、超时、同步间隔等）。
     ///
     /// 带 `serde(default)`：v1 时代导出的备份没有这一项，恢复时按默认值处理，
@@ -109,7 +108,6 @@ pub async fn export_backup(
         logical_models: store.backup_logical_models().await?,
         dispatch_targets: store.backup_targets().await?,
         account_models: store.backup_account_models().await?,
-        account_aliases: store.backup_account_aliases().await?,
         app_settings: store.backup_app_settings().await?,
         new_api_sites: store.backup_new_api_sites(cipher).await?,
         group_key_pepper: Some(hex::encode(
@@ -248,7 +246,6 @@ mod tests {
             logical_models: vec![],
             dispatch_targets: vec![],
             account_models: vec![],
-            account_aliases: vec![],
             account_keys: vec![],
             app_settings: vec![],
             new_api_sites: vec![],
@@ -276,7 +273,6 @@ mod tests {
             logical_models: vec![],
             dispatch_targets: vec![],
             account_models: vec![],
-            account_aliases: vec![],
             account_keys: vec![],
             app_settings: vec![],
             new_api_sites: vec![],

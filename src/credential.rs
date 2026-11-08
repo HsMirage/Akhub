@@ -619,19 +619,23 @@ mod tests {
             model_synced_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
         };
+        store.insert_account(&account).await.unwrap();
+        // 一把坏的、一把好的：确认"坏的被跳过"不等于"整个池空了"。
+        let key = |id: &str, sealed: Vec<u8>| crate::storage::store::AccountKeyWrite {
+            id: id.into(),
+            label: String::new(),
+            sealed_key: sealed,
+            credential_digest: String::new(),
+            limits: Limits::default(),
+            enabled: true,
+        };
         store
-            .insert_account(
-                &account,
-                &crate::storage::store::AccountSecrets::new(vec![0xDE, 0xAD], None),
-            )
-            .await
-            .unwrap();
-        // 再补一把好的，确认"坏的被跳过"不等于"整个池空了"。
-        store
-            .upsert_account_secret(
+            .replace_account_keys(
                 &account.id,
-                &cipher.seal(b"sk-good").unwrap(),
-                &crate::security::credential_digest("sk-good"),
+                &[
+                    key("bad", vec![0xDE, 0xAD]),
+                    key("good", cipher.seal(b"sk-good").unwrap()),
+                ],
             )
             .await
             .unwrap();

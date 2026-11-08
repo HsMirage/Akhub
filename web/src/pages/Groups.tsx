@@ -288,8 +288,8 @@ export function Groups({
         requireLabel={`请输入分组名「${confirm?.group.name ?? ""}」以确认删除`}
         message={
           <>
-            删除「{confirm?.group.name}」会连带删除它的全部账号、逻辑模型与调度目标，
-            并使其下游 Key 立即失效。此操作不可撤销。
+            删除「{confirm?.group.name}」后，它的账号会回到「未分配」（凭据与模型目录保留），
+            逻辑模型与调度目标被移除，下游 Key 立即失效。此操作不可撤销。
           </>
         }
         onClose={() => setConfirm(null)}
@@ -382,10 +382,13 @@ function GroupDrawer({
   // 空串表示「不限」：与后端 QUEUE_UNLIMITED 对应，界面上比让用户填
   // 一个 4294967295 好懂得多。
   const QUEUE_UNLIMITED = 4294967295;
+  const QUEUE_DEFAULT = "100";
   const [queue, setQueue] = useState(
-    group?.queue_capacity === undefined || group.queue_capacity === QUEUE_UNLIMITED
-      ? ""
-      : String(group.queue_capacity),
+    group === null || group === undefined
+      ? QUEUE_DEFAULT
+      : group.queue_capacity === QUEUE_UNLIMITED
+        ? ""
+        : String(group.queue_capacity),
   );
   const [maxWait, setMaxWait] = useState(String(group?.max_wait_secs ?? 60));
   const [allowDegrade, setAllowDegrade] = useState(group?.allow_degrade ?? true);
@@ -434,9 +437,11 @@ function GroupDrawer({
     name !== (group?.name ?? "") ||
     limit !== (group?.multiplier_limit ?? "1") ||
     queue !==
-      (group === null || group.queue_capacity === QUEUE_UNLIMITED
-        ? ""
-        : String(group.queue_capacity)) ||
+      (group === null
+        ? QUEUE_DEFAULT
+        : group.queue_capacity === QUEUE_UNLIMITED
+          ? ""
+          : String(group.queue_capacity)) ||
     maxWait !== String(group?.max_wait_secs ?? 60) ||
     allowDegrade !== (group?.allow_degrade ?? true) ||
     WEIGHT_FIELDS.some(
@@ -629,7 +634,7 @@ function GroupDrawer({
           <Field
             label="队列总容量"
             error={queueError ?? undefined}
-            hint="所有目标队列加起来的上限，超出返回 429 queue_full。留空表示不限（默认）；填 0 表示任何需要等待的请求都直接拒绝。"
+            hint="所有目标队列加起来的上限，超出返回 429 queue_full。默认 100；留空表示不限；填 0 表示任何需要等待的请求都直接拒绝。"
           >
             {(id) => (
               <input

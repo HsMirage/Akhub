@@ -45,33 +45,6 @@ impl Protocol {
     }
 }
 
-/// 逻辑模型的来源，决定零目标时是清理还是保留（§4.4）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelOrigin {
-    /// 勾选上游模型时自动创建，最后一个目标移除后自动清理。
-    Auto,
-    /// 管理员显式创建，零目标时保留记录但从 `/v1/models` 移除。
-    Manual,
-}
-
-impl ModelOrigin {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Manual => "manual",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "auto" => Some(Self::Auto),
-            "manual" => Some(Self::Manual),
-            _ => None,
-        }
-    }
-}
-
 /// 账号的倍率来源（§11.2）。每个账号只能选一种。
 ///
 /// 手动来源的状态永远是"已知"，不受自动刷新失败影响；两种自动来源都需要
@@ -284,13 +257,13 @@ impl Account {
     }
 }
 
-/// 逻辑模型：下游看到的名称（§4.4）。
+/// 逻辑模型：下游看到的名称（§4.4）。由账号目录自动调和生成，随最后一个
+/// 调度目标一起消失（§零之一）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalModel {
     pub id: String,
     pub group_id: String,
     pub name: String,
-    pub origin: ModelOrigin,
     pub enabled: bool,
     pub created_at: OffsetDateTime,
 }
@@ -302,14 +275,6 @@ pub struct DispatchTarget {
     pub logical_model_id: String,
     pub account_id: String,
     pub upstream_model: String,
-    /// 是否隐藏这个目标的上游原始模型名。
-    ///
-    /// 为 false 时，除了逻辑模型的对外名，客户端还可以直接用上游真名请求，
-    /// 这样同一模型在不同站点的不同命名都能被同一组目标接住（§16.4）。
-    pub hide_original: bool,
-    /// 历史字段：调度目标不再支持独立优先级覆盖，统一继承账号人工优先级。
-    /// 保留在数据结构里是为了兼容旧备份；配置装配与界面都不再使用它（§9.2 修订）。
-    pub priority_override: Option<i32>,
     /// 逐项覆盖账号的 RPM / TPM / 最大并发（§17.1）。
     pub limits: Limits,
     pub enabled: bool,
@@ -346,10 +311,6 @@ mod tests {
                 serde_json::from_str::<Protocol>(&encoded).unwrap(),
                 protocol
             );
-        }
-        for origin in [ModelOrigin::Auto, ModelOrigin::Manual] {
-            let encoded = serde_json::to_string(&origin).unwrap();
-            assert_eq!(encoded, format!("\"{}\"", origin.as_str()));
         }
         for mode in [
             MultiplierMode::Manual,

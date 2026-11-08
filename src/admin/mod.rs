@@ -75,6 +75,19 @@ impl AdminError {
     }
 }
 
+impl From<crate::config::ConfigWriteError> for AdminError {
+    fn from(error: crate::config::ConfigWriteError) -> Self {
+        match error {
+            crate::config::ConfigWriteError::Conflict { .. } => {
+                Self::new(StatusCode::CONFLICT, error.to_string())
+            }
+            crate::config::ConfigWriteError::Internal(error) => {
+                Self::internal(format!("{error:#}"))
+            }
+        }
+    }
+}
+
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         (self.status, axum::Json(json!({ "error": self.message }))).into_response()
@@ -97,6 +110,8 @@ pub const CONFIG_VERSION_HEADER: &str = "x-akhub-config-version";
 #[derive(Debug, Clone)]
 pub struct Admin {
     pub username: String,
+    /// 这次写操作声明的配置修订号（§7.4）。GET 恒为 `Any`，不会用到它。
+    pub revision: crate::config::Revision,
 }
 
 impl FromRequestParts<SharedState> for Admin {
@@ -121,32 +136,33 @@ impl FromRequestParts<SharedState> for Admin {
             ));
         }
 
-        // 乐观锁（§7.4）：写操作带上它读到的配置版本，与当前版本不一致说明
-        // 别人已经改过配置，返回 409 让用户重新加载，而不是静默覆盖。
-        // 不带头部表示"我知道自己在做什么"（例如脚本初始化），保持兼容。
-        if parts.method != axum::http::Method::GET
-            && let Some(raw) = parts.headers.get(CONFIG_VERSION_HEADER)
-        {
-            let expected = raw
-                .to_str()
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
+        // 乐观锁（§7.4）：写操作必须声明它读到的修订号，比较发生在写事务内部，
+        // 见 `AppState::write_config`。`*` 是显式的"无条件写入"（同 HTTP
+        // `If-Match: *`），给脚本用；没有头不再等于跳过检查。
+        let revision = if parts.method == axum::http::Method::GET {
+            crate::config::Revision::Any
+        } else {
+            let raw = parts
+                .headers
+                .get(CONFIG_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
                 .ok_or_else(|| {
                     AdminError::bad_request(format!(
-                        "{CONFIG_VERSION_HEADER} 必须是配置版本号（整数）"
+                        "写操作必须携带 {CONFIG_VERSION_HEADER} 请求头"
                     ))
                 })?;
-            let current = state.config.current().version;
-            if expected != current {
-                return Err(AdminError::new(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "config_conflict: 配置已被其他修改更新（你的版本 {expected}，当前 {current}），                         请重新加载后再保存，避免覆盖别人的修改。"
-                    ),
-                ));
+            if raw == "*" {
+                crate::config::Revision::Any
+            } else {
+                crate::config::Revision::Expect(raw.parse::<u64>().map_err(|_| {
+                    AdminError::bad_request(format!(
+                        "{CONFIG_VERSION_HEADER} 必须是配置版本号（整数）或 *"
+                    ))
+                })?)
             }
-        }
-        Ok(Admin { username })
+        };
+        Ok(Admin { username, revision })
     }
 }
 
@@ -268,7 +284,9 @@ pub fn router() -> Router<SharedState> {
         )
         .route(
             "/admin/api/accounts/{id}",
-            patch_or_delete(r::update_account, r::delete_account),
+            get(r::get_account)
+                .patch(r::update_account)
+                .delete(r::delete_account),
         )
         .route(
             "/admin/api/accounts/refresh-multipliers",
@@ -317,27 +335,11 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/refresh",
             post(r::refresh_account_models),
         )
-        .route(
-            "/admin/api/accounts/{id}/models/select",
-            post(r::select_account_models),
-        )
         // 写路径的唯一入口：勾选、改名、批量操作都走它，一次请求只调和一遍
         // 目标、只重载一遍配置（逐行接口在几百个模型上会卡住界面）。
         .route(
             "/admin/api/accounts/{id}/models/apply",
             post(r::apply_account_models),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/update",
-            post(r::update_account_model),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/delete",
-            post(r::delete_account_model),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/merge",
-            post(r::merge_account_models),
         )
         .route(
             "/admin/api/accounts/{id}/models/sync",
@@ -348,28 +350,9 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/remove-missing",
             post(r::remove_missing_account_models),
         )
-        .route(
-            "/admin/api/accounts/{id}/aliases",
-            get(r::list_aliases).put(r::update_aliases),
-        )
-        .route(
-            "/admin/api/logical-models",
-            get(r::list_logical_models).post(r::create_logical_model),
-        )
-        .route(
-            "/admin/api/logical-models/{id}",
-            patch_or_delete(r::update_logical_model, r::delete_logical_model),
-        )
-        .route(
-            "/admin/api/targets",
-            get(r::list_targets).post(r::create_target),
-        )
-        .route(
-            "/admin/api/targets/{id}",
-            patch_or_delete(r::update_target, r::delete_target),
-        )
+        .route("/admin/api/logical-models", get(r::list_logical_models))
+        .route("/admin/api/targets", get(r::list_targets))
         .route("/admin/api/requests", get(r::list_requests))
-        .route("/admin/api/metrics", get(r::metrics))
         // 版本检查与自更新（顶部版本号点开的面板）。
         .route(
             "/admin/api/system/update",
@@ -414,17 +397,6 @@ pub async fn attach_config_version(
         response.headers_mut().insert(CONFIG_VERSION_HEADER, value);
     }
     response
-}
-
-/// 把 PATCH 与 DELETE 装配到同一路径上。
-fn patch_or_delete<P, D, TP, TD>(patch: P, delete: D) -> axum::routing::MethodRouter<SharedState>
-where
-    P: axum::handler::Handler<TP, SharedState>,
-    D: axum::handler::Handler<TD, SharedState>,
-    TP: 'static,
-    TD: 'static,
-{
-    axum::routing::patch(patch).delete(delete)
 }
 
 /// 判断是否需要首次设置。无需登录。

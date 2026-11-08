@@ -143,7 +143,6 @@ async fn sealed_samples(store: &Store) -> Result<Vec<Vec<u8>>> {
     sqlx::query_scalar(
         "SELECT blob FROM (
              SELECT sealed_key AS blob FROM upstream_account_keys
-             UNION ALL SELECT api_key FROM upstream_secrets
              UNION ALL SELECT new_api_token FROM upstream_secrets
              UNION ALL SELECT sealed_token FROM new_api_sites
          ) WHERE blob IS NOT NULL AND length(blob) > 24

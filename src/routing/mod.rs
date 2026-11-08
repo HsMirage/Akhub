@@ -1022,8 +1022,8 @@ mod tests {
     use super::*;
     use crate::config::LogicalModelView;
     use crate::domain::{
-        Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, MultiplierMode,
-        Protocol, SchedulingWeights,
+        Account, DispatchTarget, Group, Limits, LogicalModel, MultiplierMode, Protocol,
+        SchedulingWeights,
     };
 
     /// 会自己好的原因排在纯配置问题前面：客户端重试才有意义。
@@ -1075,8 +1075,6 @@ mod tests {
                 logical_model_id: "m1".into(),
                 account_id: account.id.clone(),
                 upstream_model: "glm-4.6".into(),
-                hide_original: false,
-                priority_override: Some(priority),
                 limits: Limits::default(),
                 enabled: true,
                 created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1118,7 +1116,6 @@ mod tests {
                     id: "m1".into(),
                     group_id: "g1".into(),
                     name: "glm-4.6".into(),
-                    origin: ModelOrigin::Auto,
                     enabled: true,
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },

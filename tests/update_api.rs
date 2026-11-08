@@ -43,7 +43,10 @@ async fn spawn() -> (String, reqwest::Client, tempfile::TempDir, Arc<AppState>) 
 
 /// 带 CSRF 头的写请求。
 fn write(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
-    client.post(url).header("x-akhub-csrf", "1")
+    client
+        .post(url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) -> String {
@@ -208,7 +211,8 @@ async fn the_update_endpoints_require_an_admin_session() {
             "GET" => anonymous.get(format!("{base}{path}")),
             _ => anonymous
                 .post(format!("{base}{path}"))
-                .header("x-akhub-csrf", "1"),
+                .header("x-akhub-csrf", "1")
+                .header("x-akhub-config-version", "*"),
         };
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), 401, "{method} {path} 必须要求登录");

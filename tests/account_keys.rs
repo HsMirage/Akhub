@@ -15,7 +15,7 @@ mod common;
 use std::collections::HashMap;
 
 use akhub::domain::{Account, Limits, Multiplier, MultiplierMode, Protocol};
-use akhub::storage::store::{AccountKeyWrite, AccountSecrets, ids};
+use akhub::storage::store::{AccountKeyWrite, ids};
 use common::{
     Akhub, Behavior, FakeUpstream, TargetSpec, chat, insert_account_with_key, spawn_akhub,
     wire_target,
@@ -162,7 +162,7 @@ async fn add_key(akhub: &Akhub, account_id: &str, label: &str, secret: &str) -> 
     akhub
         .state
         .store
-        .upsert_account_keys(account_id, &rows)
+        .replace_account_keys(account_id, &rows)
         .await
         .unwrap();
     akhub.state.reload_config().await.unwrap();
@@ -281,7 +281,7 @@ async fn set_key_enabled(akhub: &Akhub, account_id: &str, index: usize, enabled:
     akhub
         .state
         .store
-        .upsert_account_keys(account_id, &rows)
+        .replace_account_keys(account_id, &rows)
         .await
         .unwrap();
     akhub.state.reload_config().await.unwrap();
@@ -331,7 +331,7 @@ async fn set_key_concurrency(
     akhub
         .state
         .store
-        .upsert_account_keys(account_id, &rows)
+        .replace_account_keys(account_id, &rows)
         .await
         .unwrap();
     akhub.state.reload_config().await.unwrap();
@@ -633,10 +633,7 @@ async fn a_key_level_cap_does_not_bypass_the_account_wide_gate() {
                 },
                 ..account
             },
-            &AccountSecrets {
-                api_key: None,
-                new_api_token: None,
-            },
+            None,
         )
         .await
         .unwrap();
@@ -709,8 +706,6 @@ async fn the_admin_api_reports_the_key_pool_without_leaking_secrets() {
 /// 复制账号把整个 Key 池一起带走，并逐把重新加密（§20.4）。
 #[tokio::test]
 async fn copying_an_account_reencrypts_every_key() {
-    use akhub::storage::store::AccountSecrets;
-
     let upstream = FakeUpstream::spawn().await;
     let akhub = spawn_akhub().await;
     let account_id = wire_account_with_keys(
@@ -763,7 +758,6 @@ async fn copying_an_account_reencrypts_every_key() {
         );
     }
     // 账号级凭据信封的导入路径仍然可用（旧二进制依赖它）。
-    let _ = AccountSecrets::new(copied[0].sealed_key.clone(), None);
 }
 
 /// 重启后 Key 池与粘性绑定一起恢复：同一前缀仍然落在同一把 Key 上。

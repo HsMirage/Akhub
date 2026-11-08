@@ -41,12 +41,10 @@ CREATE TABLE IF NOT EXISTS groups (
 -- 在界面上把它分配给某个分组时才按对外名把模型一起迁过去（§4.2.3）。
 CREATE TABLE IF NOT EXISTS upstream_accounts (
     id                    TEXT PRIMARY KEY,
-    group_id              TEXT REFERENCES groups(id) ON DELETE CASCADE,
+    -- 删除分组时账号回到"未分配"而不是被一起删掉：账号的凭据、模型目录与
+    -- 倍率配置都是管理员的心血，分组只是它被放进的调度空间（§4.2.3）。
+    group_id              TEXT REFERENCES groups(id) ON DELETE SET NULL,
     name                  TEXT NOT NULL,
-    -- 历史列：早期用来区分官方直连、中转站与“OpenAI 兼容”，但全仓没有一处
-    -- 按它分支——端点由协议决定，倍率来源由 multiplier_mode 决定。v12 起不再
-    -- 写入也不用，只为兼容不认识新结构的旧二进制而保留（§4.2）。
-    upstream_type         TEXT NOT NULL DEFAULT '',
     base_url              TEXT NOT NULL,
     preferred_protocol    TEXT NOT NULL,
     adaptive_protocol     INTEGER NOT NULL,
@@ -82,19 +80,13 @@ CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_group_name
     ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL;
 
--- 加密的上游凭据。与账号一一对应，独立成表以便日志与查询默认不触碰密文。
---
--- `api_key` 同时是 Key 池第一把 Key 的**镜像**：Key 池（见下）是唯一真相，
--- 这里保留一份是为了让还不认识 Key 池的旧二进制、以及旧备份的恢复路径
--- 仍然能读到凭据。写入 Key 池时一并更新它。
+-- 账号级的加密凭据（推理用的 Key 在下面的 Key 池里）。与账号一一对应，
+-- 独立成表以便日志与查询默认不触碰密文。
 CREATE TABLE IF NOT EXISTS upstream_secrets (
     account_id    TEXT PRIMARY KEY REFERENCES upstream_accounts(id) ON DELETE CASCADE,
-    api_key       BLOB NOT NULL,
     -- New API 倍率探针的访问令牌，与推理用的 sk-xxx 是两把不同的凭据（§11.2）。
     new_api_token BLOB,
-    updated_at    INTEGER NOT NULL,
-    -- 老库的单把 Key 是否已经展开进 Key 池（§4.2.1 的迁移）。
-    keys_migrated INTEGER NOT NULL DEFAULT 0
+    updated_at    INTEGER NOT NULL
 );
 
 -- 账号内 Key 池（§4.2.1）。每把 Key 独立密封、独立启用开关与限额覆盖。
@@ -118,11 +110,11 @@ CREATE TABLE IF NOT EXISTS upstream_account_keys (
 
 CREATE INDEX IF NOT EXISTS idx_account_keys ON upstream_account_keys(account_id, created_at);
 
+-- 逻辑模型由账号目录自动调和生成，随最后一个调度目标一起消失（§零之一）。
 CREATE TABLE IF NOT EXISTS logical_models (
     id         TEXT PRIMARY KEY,
     group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     name       TEXT NOT NULL,
-    origin     TEXT NOT NULL,
     enabled    INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     UNIQUE (group_id, name)
@@ -133,12 +125,6 @@ CREATE TABLE IF NOT EXISTS dispatch_targets (
     logical_model_id  TEXT NOT NULL REFERENCES logical_models(id) ON DELETE CASCADE,
     account_id        TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     upstream_model    TEXT NOT NULL,
-    -- 对外暴露上游原始名：账号模型管理里的"隐藏原始模型"关掉时为 0。
-    -- 同一逻辑模型下的目标各自决定是否暴露自己的上游名（§16.4）。
-    hide_original     INTEGER NOT NULL DEFAULT 0,
-    -- 历史字段：调度目标不再支持独立优先级覆盖，统一继承账号人工优先级。
-    -- 保留列以免影响旧备份恢复；配置装配时忽略它（§9.2 的修订）。
-    priority_override INTEGER,
     limit_rpm         INTEGER,
     limit_tpm         INTEGER,
     limit_concurrency INTEGER,
@@ -209,32 +195,6 @@ CREATE TABLE IF NOT EXISTS target_perf_snapshot (
     updated_at     INTEGER NOT NULL,
     PRIMARY KEY (target_id, protocol, streaming)
 );
-
--- 分钟级目标性能聚合（§20.1、§22）。后台任务把 request_records 滚进这里，
--- 后台的 /admin/api/metrics 直接读它，不再对明细表做全表扫描。
-CREATE TABLE IF NOT EXISTS performance_buckets (
-    -- 桶起点（unix 秒，按 bucket_secs 对齐）。
-    bucket_start      INTEGER NOT NULL,
-    target_id         TEXT NOT NULL,
-    protocol          TEXT NOT NULL,
-    streaming         INTEGER NOT NULL,
-    requests          INTEGER NOT NULL,
-    success           INTEGER NOT NULL,
-    -- 延迟与吞吐的累加量，除以 requests 得到桶内均值。
-    total_ms_sum      INTEGER NOT NULL,
-    first_token_sum   INTEGER NOT NULL,
-    -- 只有上报了首字的请求才计入，避免把非流式请求的 0 拉进均值。
-    first_token_count INTEGER NOT NULL,
-    output_tokens_sum INTEGER NOT NULL,
-    -- 失败分类计数（§9.3 的 429/5xx/损坏响应维度）。
-    rate_limited      INTEGER NOT NULL DEFAULT 0,
-    server_errors     INTEGER NOT NULL DEFAULT 0,
-    protocol_errors   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_start, target_id, protocol, streaming)
-);
-
-CREATE INDEX IF NOT EXISTS idx_buckets_time ON performance_buckets(bucket_start DESC);
-CREATE INDEX IF NOT EXISTS idx_buckets_target ON performance_buckets(target_id, bucket_start DESC);
 
 -- 不含正文的请求元数据（§24.1）。
 CREATE TABLE IF NOT EXISTS request_records (
@@ -406,22 +366,15 @@ CREATE TABLE IF NOT EXISTS account_models (
     upstream_model TEXT NOT NULL,
     -- 对外名：别名应用后的名字，也是逻辑模型名；未设置别名时等于上游真名。
     public_name  TEXT NOT NULL,
-    -- 别名设置后是否只暴露对外名（隐藏原始上游名）。
-    hide_original INTEGER NOT NULL DEFAULT 0,
     -- 选择集成员。排除过的模型保留记录但 selected = 0（§16.2）。
     selected     INTEGER NOT NULL,
+    -- 管理员**亲手停用过**这一行：只在"启用 → 停用"时置 1，重新启用时清零。
+    -- 与"从没碰过"（selected = 0 且 excluded = 0）必须分开：前者界面显示
+    -- "你停用过"，后者在账号被分配进分组时还能按同组已有模型默认勾选（§16.2）。
+    excluded     INTEGER NOT NULL DEFAULT 0,
     -- 上游列表里已经消失但仍在选择集内：停止新请求，重新出现自动解除（§16.5）。
     missing      INTEGER NOT NULL DEFAULT 0,
     discovered_at INTEGER NOT NULL,
-    PRIMARY KEY (account_id, upstream_model)
-);
-
--- 旧版的独立别名表（§16.4）。v8 起别名就是 account_models.public_name + hide_original，
--- 这里保留建表只为兼容旧备份文件的恢复，运行时不再以它为准。
-CREATE TABLE IF NOT EXISTS account_aliases (
-    account_id     TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
-    upstream_model TEXT NOT NULL,
-    public_name    TEXT NOT NULL,
     PRIMARY KEY (account_id, upstream_model)
 );
 

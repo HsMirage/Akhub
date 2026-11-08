@@ -53,7 +53,66 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
+    write_raw(client, method, url).header("x-akhub-config-version", "*")
+}
+
+/// 只带 CSRF 头、不带配置版本的写请求，供乐观锁用例自己决定版本头。
+fn write_raw(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+) -> reqwest::RequestBuilder {
     client.request(method, url).header("x-akhub-csrf", "1")
+}
+
+/// 把账号的一个上游模型纳入调度（唯一的入口是账号的模型目录，§零之一）。
+async fn bind_model_raw(
+    base: &str,
+    client: &reqwest::Client,
+    account: impl std::fmt::Display,
+    upstream: &str,
+    public: &str,
+) -> reqwest::Response {
+    write(
+        client,
+        reqwest::Method::POST,
+        format!(
+            "{base}/admin/api/accounts/{}/models",
+            account.to_string().trim_matches('"')
+        ),
+    )
+    .json(&json!({"upstream_model": upstream, "public_name": public}))
+    .send()
+    .await
+    .unwrap()
+}
+
+/// 同上，返回生成的调度目标。
+async fn bind_model(
+    base: &str,
+    client: &reqwest::Client,
+    account: impl std::fmt::Display,
+    upstream: &str,
+    public: &str,
+) -> Value {
+    let account = account.to_string().trim_matches('"').to_string();
+    let response = bind_model_raw(base, client, &account, upstream, public).await;
+    assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
+    let listed: Value = client
+        .get(format!("{base}/admin/api/targets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["account_id"] == account.as_str() && row["upstream_model"] == upstream)
+        .expect("目录行应当生成调度目标")
+        .clone()
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -254,12 +313,8 @@ async fn the_full_configuration_path_works_end_to_end() {
         created["group"]["weights"]["cache_hit"], 15,
         "缓存命中率是第五个维度，默认 15"
     );
-    // 队列总容量默认不限（§6.3）。
-    assert_eq!(
-        created["group"]["queue_capacity"],
-        u32::MAX,
-        "队列容量默认应为不限"
-    );
+    // 队列总容量默认有界（§13.6、§28）。
+    assert_eq!(created["group"]["queue_capacity"], 100);
 
     // 列表接口只返回前缀，绝不返回完整 Key。
     let groups: Value = client
@@ -282,7 +337,7 @@ async fn the_full_configuration_path_works_end_to_end() {
         "group_id": group_id,
         "name": "账号A",
         "base_url": "https://api.anthropic.com",
-        "api_key": "sk-上游真Key",
+        "keys": [{"api_key": "sk-上游真Key"}],
         "preferred_protocol": "anthropic_messages",
         "manual_multiplier": "0.5",
     }))
@@ -306,37 +361,16 @@ async fn the_full_configuration_path_works_end_to_end() {
         .unwrap();
     assert!(!accounts.to_string().contains("sk-上游真Key"));
 
-    // 3. 建逻辑模型。
-    let model: Value = write(
+    // 3. 在账号目录里纳入一个上游模型：逻辑模型与调度目标由调和自动生成。
+    let target = bind_model_raw(
+        &base,
         &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
+        &account_id,
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-5",
     )
-    .json(&json!({"group_id": group_id, "name": "claude-sonnet-4-5"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let model_id = model["id"].as_str().unwrap().to_string();
-    assert_eq!(model["listed"], false, "零目标的逻辑模型不进入 /v1/models");
-
-    // 4. 建调度目标。
-    let target = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model_id,
-        "account_id": account_id,
-        "upstream_model": "claude-sonnet-4-5-20250929",
-    }))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(target.status(), 201);
+    .await;
+    assert_eq!(target.status(), 204);
 
     // 5. 配置快照已切换，模型此时可对外提供服务。
     let models: Value = client
@@ -362,77 +396,6 @@ async fn the_full_configuration_path_works_end_to_end() {
         .await
         .unwrap();
     assert_eq!(listed["data"][0]["id"], "claude-sonnet-4-5");
-}
-
-#[tokio::test]
-async fn cross_group_target_binding_is_rejected() {
-    let (base, client, _dir) = spawn().await;
-    setup_admin(&base, &client).await;
-
-    let mut ids = Vec::new();
-    for name in ["组一", "组二"] {
-        let created: Value = write(
-            &client,
-            reqwest::Method::POST,
-            format!("{base}/admin/api/groups"),
-        )
-        .json(&json!({"name": name, "multiplier_limit": "1"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-        ids.push(created["group"]["id"].as_str().unwrap().to_string());
-    }
-
-    let account: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/accounts"),
-    )
-    .json(&json!({
-        "group_id": ids[0],
-        "name": "账号A",
-        "base_url": "https://api.example.com",
-        "api_key": "sk-x",
-        "preferred_protocol": "openai_chat",
-    }))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": ids[1], "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-
-    // 分组是调度硬边界，跨组绑定必须在写入时就失败（§4.1）。
-    let response = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account["id"],
-        "upstream_model": "glm-4.6",
-    }))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(response.status(), 400);
 }
 
 #[tokio::test]
@@ -492,7 +455,7 @@ async fn invalid_configuration_is_rejected_with_useful_messages() {
         "group_id": group_id,
         "name": "内网账号",
         "base_url": "http://169.254.169.254",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -658,7 +621,7 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
         "group_id": group_id,
         "name": "缺令牌",
         "base_url": "https://newapi.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
         "multiplier_mode": "new_api",
         "new_api_user_id": "42",
@@ -678,7 +641,7 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
         "group_id": group_id,
         "name": "零并发",
         "base_url": "https://api.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
         "limits": {"max_concurrency": 0},
     }))
@@ -696,7 +659,7 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
         "group_id": group_id,
         "name": "自动倍率",
         "base_url": "https://newapi.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
         "multiplier_mode": "new_api",
         "manual_multiplier": "0.5",
@@ -768,7 +731,7 @@ async fn phase_two_account_fields_are_validated_and_never_leak_the_token() {
         "group_id": group_id,
         "name": "手动",
         "base_url": "https://api.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -839,7 +802,7 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
         "group_id": group_id,
         "name": "账号A",
         "base_url": "https://api.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
         "manual_multiplier": "0.5",
         "limits": {"rpm": 600, "tpm": 100000, "max_concurrency": 8},
@@ -850,54 +813,23 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .json()
     .await
     .unwrap();
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
 
-    let target: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account["id"],
-        "upstream_model": "glm-4.6",
-        "priority_override": 80,
-        "limits": {"max_concurrency": 2},
-    }))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
+    let target: Value = bind_model(&base, &client, &account["id"], "glm-4.6", "glm-4.6").await;
     // 目标不再有独立优先级：payload 里的旧字段被忽略，统一继承账号默认 0。
     assert_eq!(target["priority"], 0, "目标优先级统一来自账号默认值");
-    assert_eq!(target["priority_override"], Value::Null);
-    assert_eq!(target["hide_original"], false);
+    assert_eq!(target["share"], 1.0, "层内只有它，预计拿走全部流量");
     assert_eq!(target["status"], "active");
     assert_eq!(target["inflight"], 0);
-    // 目标覆盖并发，其余继承账号。
-    assert_eq!(target["effective_limits"]["max_concurrency"], 2);
+    // 目标没有自己的覆盖时，实际限制就是账号的。
     assert_eq!(target["effective_limits"]["rpm"], 600);
     // 没有样本时性能三维是中性分，倍率维是全组最便宜 → 满分。
     assert_eq!(target["score"]["multiplier"], 1.0);
     assert_eq!(target["score"]["warm"], false);
     assert_eq!(target["score"]["samples"], 0);
 
-    // 限制写 0 在目标上同样被拒绝。
+    // 调度视图是只读的：目标的写接口已经删除（§零之一）。
     let id = target["id"].as_str().unwrap();
-    let zero = write(
+    let removed = write(
         &client,
         reqwest::Method::PATCH,
         format!("{base}/admin/api/targets/{id}"),
@@ -906,7 +838,7 @@ async fn targets_expose_runtime_status_scores_and_effective_limits() {
     .send()
     .await
     .unwrap();
-    assert_eq!(zero.status(), 400);
+    assert_eq!(removed.status(), 405);
 }
 
 /// 列表接口必须按行给出与调度器一致的评分（§9.4）。
@@ -932,18 +864,6 @@ async fn list_target_scores_are_per_row_not_shared() {
     let group_id = group["group"]["id"].as_str().unwrap().to_string();
 
     // 一个逻辑模型，三个账号接上去：同层、同模型，倍率不同，评分必须不同。
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
 
     for (index, multiplier) in ["0.5", "1", "0.25"].iter().enumerate() {
         let account: Value = write(
@@ -955,7 +875,7 @@ async fn list_target_scores_are_per_row_not_shared() {
             "group_id": group_id,
             "name": format!("账号{index}"),
             "base_url": "https://api.example.com",
-            "api_key": "sk-x",
+            "keys": [{"api_key": "sk-x"}],
             "preferred_protocol": "openai_chat",
             "manual_multiplier": multiplier,
         }))
@@ -965,20 +885,8 @@ async fn list_target_scores_are_per_row_not_shared() {
         .json()
         .await
         .unwrap();
-        let response = write(
-            &client,
-            reqwest::Method::POST,
-            format!("{base}/admin/api/targets"),
-        )
-        .json(&json!({
-            "logical_model_id": model["id"],
-            "account_id": account["id"],
-            "upstream_model": "glm-4.6",
-        }))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        let response = bind_model_raw(&base, &client, &account["id"], "glm-4.6", "glm-4.6").await;
+        assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
     }
 
     let listed: Value = client
@@ -1041,19 +949,6 @@ async fn the_group_reference_ignores_disabled_accounts() {
     .unwrap();
     let group_id = group["group"]["id"].as_str().unwrap().to_string();
 
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-
     // 两个账号接同一个模型：在用的 0.5 与停用的 0.1。参照系只能由前者定义。
     let mut account_ids = Vec::new();
     for (index, multiplier) in ["0.5", "0.1"].iter().enumerate() {
@@ -1066,7 +961,7 @@ async fn the_group_reference_ignores_disabled_accounts() {
             "group_id": group_id,
             "name": format!("账号{index}"),
             "base_url": "https://api.example.com",
-            "api_key": "sk-x",
+            "keys": [{"api_key": "sk-x"}],
             "preferred_protocol": "openai_chat",
             "manual_multiplier": multiplier,
         }))
@@ -1076,20 +971,8 @@ async fn the_group_reference_ignores_disabled_accounts() {
         .json()
         .await
         .unwrap();
-        let response = write(
-            &client,
-            reqwest::Method::POST,
-            format!("{base}/admin/api/targets"),
-        )
-        .json(&json!({
-            "logical_model_id": model["id"],
-            "account_id": account["id"],
-            "upstream_model": "glm-4.6",
-        }))
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        let response = bind_model_raw(&base, &client, &account["id"], "glm-4.6", "glm-4.6").await;
+        assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
         account_ids.push(account["id"].as_str().unwrap().to_string());
     }
 
@@ -1153,19 +1036,6 @@ async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
     .unwrap();
     let group_id = group["group"]["id"].as_str().unwrap().to_string();
 
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-
     // 三个账号接同一个模型、同层同倍率：倍率与可靠性对三方完全一样，差别只在
     // 速度。最快那个一会儿会被停用——它不能当参照系。
     let mut targets = Vec::new();
@@ -1184,7 +1054,7 @@ async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
             "group_id": group_id,
             "name": format!("账号{name}"),
             "base_url": "https://api.example.com",
-            "api_key": "sk-x",
+            "keys": [{"api_key": "sk-x"}],
             "preferred_protocol": "openai_chat",
             "manual_multiplier": "1",
         }))
@@ -1194,22 +1064,7 @@ async fn the_score_frame_ignores_targets_that_cannot_be_scheduled() {
         .json()
         .await
         .unwrap();
-        let target: Value = write(
-            &client,
-            reqwest::Method::POST,
-            format!("{base}/admin/api/targets"),
-        )
-        .json(&json!({
-            "logical_model_id": model["id"],
-            "account_id": account["id"],
-            "upstream_model": "glm-4.6",
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        let target: Value = bind_model(&base, &client, &account["id"], "glm-4.6", "glm-4.6").await;
         let target_id = target["id"].as_str().unwrap().to_string();
         prime_target(
             &state,
@@ -1306,7 +1161,7 @@ async fn writes_carry_config_version_and_conflict_is_reported() {
     let version: u64 = header.parse().unwrap();
 
     let create = |expected: Option<u64>, name: &str| {
-        let mut builder = write(
+        let mut builder = write_raw(
             &client,
             reqwest::Method::POST,
             format!("{base}/admin/api/groups"),
@@ -1362,8 +1217,9 @@ async fn writes_carry_config_version_and_conflict_is_reported() {
         "写成功后版本号必须前进：{version} → {after}"
     );
 
-    // 不带版本头：老客户端与脚本仍然可用，不强制升级。
-    let no_header = write(
+    // 不带版本头：拒绝。没有头不再等于"跳过检查"——那会让漏带头的客户端
+    // 静默覆盖别人的修改。脚本要无条件写入就显式带 `*`。
+    let no_header = write_raw(
         &client,
         reqwest::Method::POST,
         format!("{base}/admin/api/groups"),
@@ -1372,10 +1228,20 @@ async fn writes_carry_config_version_and_conflict_is_reported() {
     .send()
     .await
     .unwrap();
-    assert_eq!(no_header.status(), 201, "不带头部应当保持兼容");
+    assert_eq!(no_header.status(), 400, "写操作必须带版本头");
+    let wildcard = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "脚本建的", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(wildcard.status(), 201, "显式的 * 表示无条件写入");
 
     // 版本号不是数字时明确报错，而不是当成"没带"。
-    let malformed = write(
+    let malformed = write_raw(
         &client,
         reqwest::Method::POST,
         format!("{base}/admin/api/groups"),
@@ -1440,7 +1306,7 @@ async fn a_stale_version_keeps_failing_until_a_read_refreshes_it() {
     let stale = current + 1000;
 
     let attempt = |version: u64, name: &str| {
-        write(
+        write_raw(
             &client,
             reqwest::Method::POST,
             format!("{base}/admin/api/groups"),
@@ -1512,7 +1378,7 @@ async fn accounts_report_a_health_summary() {
         "group_id": group_id,
         "name": "账号A",
         "base_url": "https://api.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -1535,31 +1401,7 @@ async fn accounts_report_a_health_summary() {
     );
 
     // 加一个目标后：正常，没有原因，目标计数为 1。
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account_id,
-        "upstream_model": "glm-4.6",
-    }))
-    .send()
-    .await
-    .unwrap();
+    bind_model_raw(&base, &client, &account_id, "glm-4.6", "glm-4.6").await;
 
     let listed: Value = client
         .get(format!("{base}/admin/api/accounts"))
@@ -1661,7 +1503,7 @@ async fn groups_report_their_own_alerts() {
         "group_id": group_id,
         "name": "账号A",
         "base_url": "https://api.example.com",
-        "api_key": "sk-x",
+        "keys": [{"api_key": "sk-x"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -1670,31 +1512,7 @@ async fn groups_report_their_own_alerts() {
     .json()
     .await
     .unwrap();
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account["id"],
-        "upstream_model": "glm-4.6",
-    }))
-    .send()
-    .await
-    .unwrap();
+    bind_model_raw(&base, &client, &account["id"], "glm-4.6", "glm-4.6").await;
 
     let listed: Value = client
         .get(format!("{base}/admin/api/groups"))
@@ -1713,124 +1531,6 @@ async fn groups_report_their_own_alerts() {
     assert!(
         row["alerts"].as_array().unwrap().is_empty(),
         "配好之后不该还有告警：{row}"
-    );
-}
-
-/// 停用的目标要说清"为什么不动了"，而不是只给一个灰点（§6.9）。
-#[tokio::test]
-async fn a_disabled_target_reports_its_pause_reason() {
-    let (base, client, _dir) = spawn().await;
-    setup_admin(&base, &client).await;
-    let group: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/groups"),
-    )
-    .json(&json!({"name": "主力", "multiplier_limit": "1"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let group_id = group["group"]["id"].as_str().unwrap().to_string();
-    let account: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/accounts"),
-    )
-    .json(&json!({
-        "group_id": group_id,
-        "name": "账号A",
-        "base_url": "https://api.example.com",
-        "api_key": "sk-x",
-        "preferred_protocol": "openai_chat",
-    }))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let target: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account["id"],
-        "upstream_model": "glm-4.6",
-    }))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let target_id = target["id"].as_str().unwrap().to_string();
-
-    let listed: Value = client
-        .get(format!("{base}/admin/api/targets"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let row = listed["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["id"] == target_id.as_str())
-        .unwrap();
-    assert_eq!(row["status"], "active", "{row}");
-    assert!(row["pause_reason"].is_null(), "{row}");
-
-    // 通过分组开关停用整个账号的调度：目标状态与原因都要立刻反映出来。
-    write(
-        &client,
-        reqwest::Method::PATCH,
-        format!("{base}/admin/api/targets/{target_id}"),
-    )
-    .json(&json!({"enabled": false}))
-    .send()
-    .await
-    .unwrap();
-
-    let listed: Value = client
-        .get(format!("{base}/admin/api/targets"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let row = listed["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["id"] == target_id.as_str())
-        .unwrap();
-    assert_eq!(
-        row["status"], "disabled",
-        "停用的目标状态应当是 disabled：{row}"
-    );
-    assert!(
-        row["pause_reason"].as_str().is_some_and(|r| !r.is_empty()),
-        "停用必须给出原因：{row}"
     );
 }
 
@@ -1970,20 +1670,6 @@ async fn target_ewma_columns_are_per_target_not_per_model() {
     .unwrap();
     let group_id = group["group"]["id"].as_str().unwrap().to_string();
 
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group_id, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let model_id = model["id"].as_str().unwrap().to_string();
-
     // 两个账号接同一个逻辑模型，同层同倍率——只有"请求落在哪个维度"不同。
     let mut targets = Vec::new();
     for name in ["A", "B"] {
@@ -1996,7 +1682,7 @@ async fn target_ewma_columns_are_per_target_not_per_model() {
             "group_id": group_id,
             "name": format!("账号{name}"),
             "base_url": "https://api.example.com",
-            "api_key": "sk-x",
+            "keys": [{"api_key": "sk-x"}],
             "preferred_protocol": "openai_chat",
             "manual_multiplier": "1",
         }))
@@ -2006,22 +1692,14 @@ async fn target_ewma_columns_are_per_target_not_per_model() {
         .json()
         .await
         .unwrap();
-        let target: Value = write(
+        let target: Value = bind_model(
+            &base,
             &client,
-            reqwest::Method::POST,
-            format!("{base}/admin/api/targets"),
+            &account["id"],
+            &format!("glm-4.6-{name}"),
+            "glm-4.6",
         )
-        .json(&json!({
-            "logical_model_id": model_id,
-            "account_id": account["id"],
-            "upstream_model": format!("glm-4.6-{name}"),
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .await;
         targets.push(target["id"].as_str().unwrap().to_string());
     }
 
