@@ -19,6 +19,9 @@ use crate::domain::{
 /// 不认识新结构的旧二进制。空串即“这台实例已经不管理这一列”。
 const LEGACY_UPSTREAM_TYPE: &str = "";
 
+/// 单条 Responses 状态可重放正文（密封后）的上限（§15.2）。
+pub const MAX_RESPONSE_STATE_BODY: usize = 8 * 1024 * 1024;
+
 /// "一次请求成功"的统一 SQL 口径（§6.2、§6.8、§22）。
 ///
 /// 成功 = 2xx **且**没有留下任何网关错误码。两个条件缺一不可：客户端中途断开
@@ -882,7 +885,23 @@ impl Store {
     // ---------------------------------------------------------- Responses 状态
 
     /// 写入一条 Responses 状态链记录。gateway_id 是主键，重复写入覆盖旧值。
+    ///
+    /// 可重放正文超过 [`MAX_RESPONSE_STATE_BODY`] 时不保存正文，只保留最小定位
+    /// 映射（§15.2）：单条几十 MB 的正文足以让库与备份失控，而失去的只是
+    /// "换账号重放"这一种能力，原生续接仍然可用。
     pub async fn upsert_response_state(&self, state: &ResponseStateRow) -> Result<()> {
+        let sealed_body = match &state.sealed_body {
+            Some(body) if body.len() > MAX_RESPONSE_STATE_BODY => {
+                tracing::warn!(
+                    gateway_id = %state.gateway_id,
+                    bytes = body.len(),
+                    limit = MAX_RESPONSE_STATE_BODY,
+                    "Responses 状态正文超过上限，只保存最小定位映射"
+                );
+                None
+            }
+            other => other.as_ref(),
+        };
         sqlx::query(
             "INSERT OR REPLACE INTO response_states (gateway_id, group_id, logical_model,
                 account_id, target_id, key_id, endpoint, upstream_id, sealed_body, protocol,
@@ -897,7 +916,7 @@ impl Store {
         .bind(&state.key_id)
         .bind(&state.endpoint)
         .bind(&state.upstream_id)
-        .bind(&state.sealed_body)
+        .bind(sealed_body)
         .bind(&state.protocol)
         .bind(state.created_at)
         .bind(state.expires_at)
@@ -952,12 +971,19 @@ impl Store {
     }
 
     /// 清理已过期的 Responses 状态。
-    pub async fn prune_response_states(&self, older_than: i64) -> Result<u64> {
-        let affected = sqlx::query("DELETE FROM response_states WHERE expires_at < ?")
-            .bind(older_than)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+    ///
+    /// 分批删除：一条 DELETE 删几十万行会长时间占着写锁，请求记录与状态链的
+    /// 写入都得排在后面。调用方循环到返回值小于 `batch` 为止。
+    pub async fn prune_response_states(&self, older_than: i64, batch: i64) -> Result<u64> {
+        let affected = sqlx::query(
+            "DELETE FROM response_states WHERE rowid IN
+                (SELECT rowid FROM response_states WHERE expires_at < ? LIMIT ?)",
+        )
+        .bind(older_than)
+        .bind(batch)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(affected)
     }
 
@@ -1040,12 +1066,16 @@ impl Store {
     }
 
     /// 清理已过期的任务定位记录。
-    pub async fn prune_image_tasks(&self, older_than: i64) -> Result<u64> {
-        let affected = sqlx::query("DELETE FROM image_tasks WHERE expires_at < ?")
-            .bind(older_than)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+    pub async fn prune_image_tasks(&self, older_than: i64, batch: i64) -> Result<u64> {
+        let affected = sqlx::query(
+            "DELETE FROM image_tasks WHERE rowid IN
+                (SELECT rowid FROM image_tasks WHERE expires_at < ? LIMIT ?)",
+        )
+        .bind(older_than)
+        .bind(batch)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         Ok(affected)
     }
 
@@ -2771,14 +2801,35 @@ impl Store {
     }
 
     /// 删除过期的性能桶（§24.2，与请求明细同一保留期）。
-    pub async fn prune_performance_buckets(&self, older_than: i64) -> Result<u64> {
-        Ok(
-            sqlx::query("DELETE FROM performance_buckets WHERE bucket_start < ?")
-                .bind(older_than)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+    pub async fn prune_performance_buckets(&self, older_than: i64, batch: i64) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM performance_buckets WHERE rowid IN
+                (SELECT rowid FROM performance_buckets WHERE bucket_start < ? LIMIT ?)",
         )
+        .bind(older_than)
+        .bind(batch)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// 归还空闲页（§22）。只在库处于 `auto_vacuum = INCREMENTAL` 时生效：
+    /// 新建的库在打开时就设成这个模式；更早建的库是 NONE，切换必须做一次全量
+    /// VACUUM（锁全库、临时占用双倍空间），这里不替运维做这个决定，直接跳过。
+    pub async fn incremental_vacuum(&self, pages: i64) -> Result<bool> {
+        let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&self.pool)
+            .await?;
+        if mode != 2 {
+            return Ok(false);
+        }
+        // PRAGMA 不接受绑定参数；页数是本进程的常量，不含外部输入。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA incremental_vacuum({pages})"
+        )))
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
     }
 
     /// 批量覆盖性能 EWMA 快照。
@@ -3830,6 +3881,39 @@ mod tests {
         assert_eq!(store.list_request_records(10, 0).await.unwrap().len(), 1);
     }
 
+    /// 超过上限的状态正文不落库，只保留定位映射（§15.2）。
+    #[tokio::test]
+    async fn oversized_response_state_bodies_fall_back_to_the_minimal_mapping() {
+        let store = store().await;
+        let row = |id: &str, size: usize| ResponseStateRow {
+            gateway_id: id.into(),
+            group_id: "g".into(),
+            logical_model: "m".into(),
+            account_id: None,
+            target_id: None,
+            key_id: None,
+            endpoint: None,
+            upstream_id: Some("up".into()),
+            sealed_body: Some(vec![0u8; size]),
+            protocol: None,
+            created_at: 0,
+            expires_at: i64::MAX,
+        };
+        store
+            .upsert_response_state(&row("small", 16))
+            .await
+            .unwrap();
+        store
+            .upsert_response_state(&row("huge", MAX_RESPONSE_STATE_BODY + 1))
+            .await
+            .unwrap();
+        let small = store.response_state("small", "g").await.unwrap().unwrap();
+        assert!(small.sealed_body.is_some());
+        let huge = store.response_state("huge", "g").await.unwrap().unwrap();
+        assert!(huge.sealed_body.is_none(), "超限正文不能落库");
+        assert_eq!(huge.upstream_id.as_deref(), Some("up"), "定位映射保留");
+    }
+
     /// 中断的请求（响应头 200、但带错误码）不得被算成成功（§6.2、§6.8、§22）。
     ///
     /// 线上真实故障：Codex 掉线时 Akhub 记成 200 成功，概览的成功率与成本页
@@ -4225,7 +4309,10 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(store.prune_performance_buckets(2_000).await.unwrap(), 1);
+        assert_eq!(
+            store.prune_performance_buckets(2_000, 100).await.unwrap(),
+            1
+        );
         let left = store
             .list_performance_buckets(0, 10_000, None)
             .await

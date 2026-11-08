@@ -139,11 +139,11 @@ async fn flush(store: &Store, batch: &mut Vec<RequestRecord>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::Protocol;
 
-    fn record(id: &str) -> RequestRecord {
+    pub(crate) fn record(id: &str) -> RequestRecord {
         RequestRecord {
             request_id: id.into(),
             started_at: 1_000,

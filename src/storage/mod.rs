@@ -76,7 +76,14 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(5))
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // WAL 在检查点之后不会自动缩小；不设上限时一次大批量写入留下的
+        // 几百 MB WAL 会一直占着磁盘（§22）。
+        .pragma("journal_size_limit", (64 * 1024 * 1024).to_string())
+        // 新建的库直接用增量回收，清理任务定期 `incremental_vacuum` 归还空闲页。
+        // 对已有的 NONE 库这条 PRAGMA 不生效（需要全量 VACUUM），见
+        // `Store::incremental_vacuum`。
+        .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
 
     // 连接池是 C 库句柄，创建本身不碰数据库文件（真正的打开发生在第一次查询：
     // 那时 [`apply_schema`] 会建表并读结构版本）。因此这里在**运行时之前**就
