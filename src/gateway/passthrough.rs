@@ -3096,15 +3096,8 @@ async fn attempt_inner(
         )
     })?;
 
-    // DNS Rebinding 防护：每次请求前复查解析结果（§23.3）。
-    crate::security::url_guard::assert_resolvable(&url, account.allow_private_network)
-        .await
-        .map_err(|error| {
-            AttemptFailure::switchable(
-                ErrorCode::InternalError,
-                format!("账号「{}」的目标地址被拒绝：{error}", account.name),
-            )
-        })?;
+    // SSRF / DNS Rebinding 防护在共享客户端的解析器与连接层里完成（§23.3），
+    // 这里不再额外做一次 DNS 解析。
 
     let Some(credential) = credential else {
         return Err(AttemptFailure::switchable(
@@ -5084,7 +5077,7 @@ pub const MAX_UPSTREAM_BODY_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// 8 MiB 以内直接在内存里解析；超过后先把原始字节写进数据目录下的临时
 /// 文件，再用 `serde_json::from_reader` 流式解析——避免同时持有一份完整的
-/// 原始字节和解析后的 `Value`。临时文件随 `NamedTempFile` 在本函数返回或
+/// 原始字节和解析后的 `Value`。临时文件随 `NamedTempFile` 在解析完成或
 /// 出错时自动删除（§1291）。
 pub async fn read_body(
     body: Body,
@@ -5135,11 +5128,17 @@ pub async fn read_body(
         }
     }
 
-    let parsed = match &mut file {
-        Some(file) => {
+    let parsed = match file {
+        // 大请求体的解析是数十毫秒级的 CPU 工作，放到阻塞线程池，别占住异步
+        // 工作线程。临时文件随闭包一起移走，解析完在那边析构删除。
+        Some(mut file) => {
             file.flush().map_err(disk_error)?;
             file.as_file_mut().rewind().map_err(disk_error)?;
-            serde_json::from_reader(std::io::BufReader::new(file.as_file_mut()))
+            tokio::task::spawn_blocking(move || {
+                serde_json::from_reader(std::io::BufReader::new(file.as_file_mut()))
+            })
+            .await
+            .map_err(|error| disk_error(std::io::Error::other(error)))?
         }
         None => serde_json::from_slice(&memory),
     };
@@ -5151,7 +5150,6 @@ pub async fn read_body(
         )
         .with_protocol(protocol)
     })?;
-    // `file` 在这里析构，临时文件随之删除。
     Ok((value, size))
 }
 
