@@ -135,7 +135,7 @@ INFO 数据目录已就绪 data_dir=C:\ProgramData\Akhub
 INFO Akhub 已启动，管理后台位于 /admin（监听所有网卡，未开 TLS） addr=0.0.0.0:8080
 ```
 
-浏览器打开 `http://127.0.0.1:8080/admin` 。首次访问是**首次设置页**：需要一个用户名和至少 8 个字符的口令，接口 `POST /admin/api/setup` 只能成功一次。同时检查这些文件已经生成：
+浏览器打开 `http://127.0.0.1:8080/admin` 。首次访问是**首次设置页**：需要启动日志里打印的**首次设置口令**（也保存在数据目录的 `setup-token` 文件里，设置完成后自动删除）、一个用户名和至少 8 个字符的密码，接口 `POST /admin/api/setup` 只能成功一次。同时检查这些文件已经生成：
 
 ```
 Get-ChildItem 'C:\ProgramData\Akhub' -Force | Select-Object Name, Length

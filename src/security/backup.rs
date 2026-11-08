@@ -58,6 +58,26 @@ pub struct BackupData {
     /// 不能因为多了个字段就拒绝一份本来完好的备份（§23.5）。
     #[serde(default)]
     pub app_settings: Vec<Value>,
+    /// New API 站点级凭据：`{base_url, user_id, token}`，令牌明文（整体加密保护）。
+    #[serde(default)]
+    pub new_api_sites: Vec<Value>,
+    /// 分组 Key 摘要用的 pepper（hex）。分组摘要只有配上它才能在别的机器上
+    /// 验证下游 Key（§20.2）。早期备份没有这一项。
+    #[serde(default)]
+    pub group_key_pepper: Option<String>,
+}
+
+impl BackupData {
+    /// 解出 pepper；格式不对视为损坏的备份。
+    pub fn group_key_pepper(&self) -> Result<Option<[u8; 32]>> {
+        let Some(raw) = &self.group_key_pepper else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(raw).context("备份里的分组 Key pepper 不是合法 hex")?;
+        let pepper = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("备份里的分组 Key pepper 长度非法"))?;
+        Ok(Some(pepper))
+    }
 }
 
 /// 导出的加密信封。
@@ -91,6 +111,10 @@ pub async fn export_backup(
         account_models: store.backup_account_models().await?,
         account_aliases: store.backup_account_aliases().await?,
         app_settings: store.backup_app_settings().await?,
+        new_api_sites: store.backup_new_api_sites(cipher).await?,
+        group_key_pepper: Some(hex::encode(
+            crate::security::keyring::load_pepper(store, cipher).await?,
+        )),
     };
     if data.groups.is_empty() {
         bail!("当前配置没有任何分组，导出空备份没有意义");
@@ -115,7 +139,50 @@ pub fn decrypt_backup(bytes: &[u8], password: &str) -> Result<BackupData> {
     if data.groups.is_empty() {
         bail!("备份里没有任何分组：损坏或非 Akhub 备份");
     }
+    data.group_key_pepper()?;
+    validate_restorable(&data)?;
     Ok(data)
+}
+
+/// 恢复前复查账号与站点的 Base URL（§23.3）：备份文件来自外部，不能绕过
+/// 保存账号时的那道 SSRF 校验。账号显式开启了内网访问的才放行内网地址。
+pub fn validate_restorable(data: &BackupData) -> Result<()> {
+    use crate::security::url_guard::{UrlGuardError, validate_base_url};
+    for account in &data.accounts {
+        let raw = account
+            .get("base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let allow_private = match account.get("allow_private_network") {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+            _ => false,
+        };
+        match validate_base_url(raw) {
+            Ok(_) | Err(UrlGuardError::BlockedAddress(_)) if allow_private => {}
+            Ok(_) => {}
+            Err(error) => {
+                let name = account
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                bail!("备份里的账号「{name}」Base URL 不可用：{error}");
+            }
+        }
+    }
+    for site in &data.new_api_sites {
+        let raw = site
+            .get("base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Err(error) = validate_base_url(raw) {
+            // 站点凭据被内网账号共用时同样允许内网：只拦格式问题。
+            if !matches!(error, UrlGuardError::BlockedAddress(_)) {
+                bail!("备份里的站点 {raw} 不可用：{error}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 用 Argon2id + XChaCha20-Poly1305 加密（§23.5）。
@@ -184,6 +251,8 @@ mod tests {
             account_aliases: vec![],
             account_keys: vec![],
             app_settings: vec![],
+            new_api_sites: vec![],
+            group_key_pepper: None,
         };
         let bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "口令123").unwrap();
 
@@ -210,6 +279,8 @@ mod tests {
             account_aliases: vec![],
             account_keys: vec![],
             app_settings: vec![],
+            new_api_sites: vec![],
+            group_key_pepper: None,
         };
         let mut bytes = encrypt_envelope(&serde_json::to_vec(&data).unwrap(), "pw").unwrap();
         // 翻转信封 JSON 里的一个密文字节。

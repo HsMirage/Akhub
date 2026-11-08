@@ -31,6 +31,8 @@ pub enum UpstreamError {
     BadResponse(String),
     #[error("上游模型列表超过大小上限")]
     TooLarge,
+    #[error("上游响应不是 JSON（Content-Type: {0}），请检查 Base URL 是否指向 API 而不是网页")]
+    NotJson(String),
 }
 
 /// 共享的上游 HTTP 客户端。
@@ -41,8 +43,8 @@ pub enum UpstreamError {
 ///
 /// 关键在于 SSRF 校验发生在**解析器内部**：连接实际使用的地址与校验过的
 /// 地址是同一批，中间没有第二次 DNS 解析，因此不存在 DNS Rebinding 的窗口
-/// （§23.3、§26.8）。字面量 IP 不经过解析器，由保存时与发请求前的地址检查
-/// 覆盖。
+/// （§23.3、§26.8）。字面量 IP 不经过解析器，由连接层的 [`LiteralGuard`]
+/// 在建连前拦下——两层都在客户端内部，任何调用路径都绕不过去。
 #[derive(Clone)]
 pub struct UpstreamClient {
     deny_private: reqwest::Client,
@@ -85,8 +87,79 @@ fn build_client(resolver: GuardedResolver) -> reqwest::Result<reqwest::Client> {
         .pool_idle_timeout(Duration::from_secs(90))
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("akhub/", env!("CARGO_PKG_VERSION")))
+        .connector_layer(LiteralGuardLayer {
+            allow_private: resolver.allow_private,
+        })
         .dns_resolver(resolver)
         .build()
+}
+
+/// 连接层的字面量 IP 守卫（§23.3）。
+#[derive(Clone)]
+struct LiteralGuardLayer {
+    allow_private: bool,
+}
+
+impl<S> tower::Layer<S> for LiteralGuardLayer {
+    type Service = LiteralGuard<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        LiteralGuard {
+            inner,
+            allow_private: self.allow_private,
+        }
+    }
+}
+
+/// 建连前检查目标主机：字面量 IP 落在封禁网段就直接失败。
+///
+/// reqwest 交给连接层的目标类型不可命名，只暴露 `Debug`（形如
+/// `Unnameable(https://1.2.3.4/)`），这里从中取出 URI。取不出来时**拒绝连接**：
+/// 宁可所有请求失败被测试抓到，也不能悄悄放过 SSRF 检查。
+#[derive(Clone)]
+struct LiteralGuard<S> {
+    inner: S,
+    allow_private: bool,
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<S, R> tower::Service<R> for LiteralGuard<S>
+where
+    S: tower::Service<R, Error = BoxError>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    R: std::fmt::Debug,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        if !self.allow_private
+            && let Err(error) = check_connect_target(&format!("{request:?}"))
+        {
+            return Box::pin(std::future::ready(Err(error)));
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
+fn check_connect_target(debug: &str) -> Result<(), BoxError> {
+    let uri = debug
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .ok_or("无法确定连接目标，已拒绝")?;
+    let url = Url::parse(uri).map_err(|_| "无法解析连接目标，已拒绝")?;
+    crate::security::url_guard::guard_literal(&url).map_err(|error| error.to_string().into())
 }
 
 /// 解析阶段即完成地址校验的 DNS 解析器（§23.3）。
@@ -301,23 +374,44 @@ pub async fn fetch_model_list(
         .send()
         .await
         .map_err(|_| UpstreamError::BadStatus(0))?;
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        return Err(UpstreamError::BadStatus(status));
+    let bytes = read_json_response(response, MODELS_MAX_BYTES).await?;
+    parse_model_list(&bytes)
+}
+
+/// 读取一个应当是 JSON 的上游响应：校验状态码与 Content-Type，按上限流式读取。
+///
+/// Base URL 填成网站首页时，上游常回 200 + HTML；不看 Content-Type 就会把一页
+/// HTML 当 JSON 解析，报出一句看不懂的语法错误。所有"读上游 JSON"的旁路调用
+/// （模型列表、倍率探针等）都应走这里，口径才一致。
+pub async fn read_json_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, UpstreamError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpstreamError::BadStatus(status.as_u16()));
     }
-    let mut response = response;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.contains("json") {
+        return Err(UpstreamError::NotJson(content_type));
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| UpstreamError::TooLarge)?
     {
-        if bytes.len().saturating_add(chunk.len()) > MODELS_MAX_BYTES {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
             return Err(UpstreamError::TooLarge);
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse_model_list(&bytes)
+    Ok(bytes)
 }
 
 /// 从响应体提取模型 ID 列表：OpenAI `{data:[{id}]}` 与 Anthropic
@@ -487,6 +581,58 @@ fn copy_allowed(from: &HeaderMap, to: &mut HeaderMap, allowed: &[&'static str]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 起一个本机 HTTP 服务，按给定 Content-Type 回一段正文。
+    async fn local_server(content_type: &'static str, body: &'static str) -> String {
+        let app = axum::Router::new().fallback(move || async move {
+            ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// 字面量 IP 不经过解析器：默认客户端必须在连接层拦下它，任何调用路径
+    /// 都不需要自己再查一次（§23.3）。
+    #[tokio::test]
+    async fn the_default_client_refuses_literal_private_addresses() {
+        let base = local_server("application/json", "{}").await;
+        let client = UpstreamClient::new().unwrap();
+        let denied = client.http().get(&base).send().await;
+        assert!(denied.is_err(), "默认客户端不能连到 127.0.0.1");
+        let allowed = client.http_for(true).get(&base).send().await.unwrap();
+        assert_eq!(allowed.status(), 200, "显式开启内网访问的客户端照常可用");
+    }
+
+    #[test]
+    fn the_connect_target_is_read_from_reqwest_debug_output() {
+        assert!(check_connect_target("Unnameable(http://127.0.0.1:8080/)").is_err());
+        assert!(check_connect_target("Unnameable(https://[::1]/)").is_err());
+        assert!(check_connect_target("Unnameable(https://api.example.com/)").is_ok());
+        assert!(check_connect_target("Unnameable(https://1.1.1.1/)").is_ok());
+        assert!(
+            check_connect_target("看不懂的格式").is_err(),
+            "取不到目标必须拒绝"
+        );
+    }
+
+    /// 模型列表回了一页 HTML（Base URL 指向网站首页）：明确报"不是 JSON"。
+    #[tokio::test]
+    async fn a_model_list_that_is_not_json_is_reported_as_such() {
+        let base = local_server("text/html; charset=utf-8", "<html></html>").await;
+        let client = UpstreamClient::new().unwrap();
+        let error = fetch_model_list(client.http_for(true), &base, Protocol::OpenAiChat, "sk-x")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UpstreamError::NotJson(_)), "{error}");
+
+        let base = local_server("application/json", r#"{"data":[{"id":"m1"}]}"#).await;
+        let names = fetch_model_list(client.http_for(true), &base, Protocol::OpenAiChat, "sk-x")
+            .await
+            .unwrap();
+        assert_eq!(names, ["m1"]);
+    }
 
     #[test]
     fn builds_urls_from_a_bare_host() {

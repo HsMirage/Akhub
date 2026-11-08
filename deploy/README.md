@@ -30,7 +30,9 @@
 3. **主密钥归属**。默认自动生成在数据目录里；需要脱离数据目录管理时用
    `AKHUB_MASTER_KEY` 注入 32 字节 hex 或 base64。
 
-部署完成后，打开 `http://<监听地址>/admin` 设置管理员密码，然后在「账号 →
+部署完成后，打开 `http://<监听地址>/admin` 设置管理员密码（需要**首次设置口令**：
+首次启动时打印在日志里——`docker logs akhub` / `journalctl -u akhub`——同时保存在
+数据目录下的 `setup-token`，仅属主可读，设置完成后自动删除），然后在「账号 →
 模型管理」里配好上游即可。**首次启动前不需要任何配置文件。**
 
 ---
@@ -235,7 +237,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now akhub
 ```
 
-单元文件里有四处不能改错：
+单元文件里有五处不能改错：
+
+- `ExecStartPre` + `ExecStart=/var/lib/akhub/runtime/akhub` + `AKHUB_ALLOW_RESTART=1`：
+  运行布局与容器一致。`/usr/local/bin/akhub` 是 root 所有的"安装版"，启动前复制到
+  `akhub` 用户可写的 `/var/lib/akhub/runtime/akhub` 再运行；后台"一键升级"替换的是
+  这份运行副本，因此在 `ProtectSystem=strict` 下也能升级。安装版版本号变化
+  （重新跑 `install.sh` 或 `sudo akhub --update`）时，下次启动会用安装版覆盖运行副本；
+  一键升级过的运行副本在普通重启后保留。
 
 - `Restart=always`：单实例下进程故障是常态恢复路径，重启代价应压到数秒
   （§29 的已知边界）。
@@ -259,11 +268,17 @@ sudo journalctl -u akhub -f
 
 推荐用脚本（可在任意机器上对远端执行，见 §4.2），或手工：
 
+- **后台一键升级**：点版本号 →「一键升级」。下载、校验 sha256、让新二进制自报
+  版本、原子替换运行副本（只保留最近 2 份 `akhub.bak-*`），再由 `Restart=always` 拉起。
+- **手工**：换安装版并重启，`ExecStartPre` 会把它复制进运行目录：
+
 ```bash
-sudo systemctl stop akhub          # SIGTERM，等待在途请求完成
 sudo install -m755 akhub /usr/local/bin/akhub
-sudo systemctl start akhub
+sudo systemctl restart akhub       # SIGTERM 等待在途请求完成，然后启动新版本
 ```
+
+从旧版单元（直接运行 `/usr/local/bin/akhub`）迁移：重跑 `install.sh --service`，
+或手工覆盖 `/etc/systemd/system/akhub.service` 后 `daemon-reload` 并重启。
 
 数据库结构版本随启动自动校验：用**更旧的**二进制打开**更新的**数据库会被拒绝并
 提示升级（§27），不会写坏数据。

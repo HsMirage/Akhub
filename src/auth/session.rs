@@ -1,4 +1,7 @@
 //! 管理员会话：Argon2id 密码校验、内存会话表与登录限速（§23.2）。
+//!
+//! 限速按**客户端地址**而不是用户名：按用户名计数时，匿名者每分钟输错 5 次
+//! 就能把真正的管理员永远锁在门外。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,10 +20,10 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_FAILURES: u32 = 5;
 /// 达到失败上限后的锁定时长。
 const LOCKOUT: Duration = Duration::from_secs(60);
-/// 失败计数表最多跟踪多少个用户名。
+/// 失败计数表最多跟踪多少个客户端地址。
 ///
-/// 用户名来自未认证的请求体，不设上限就是一个可以被匿名撑大的内存表。
-const MAX_TRACKED_USERNAMES: usize = 4096;
+/// 地址来自未认证的连接，不设上限就是一个可以被匿名撑大的内存表。
+const MAX_TRACKED_CLIENTS: usize = 4096;
 
 /// 用 Argon2id 哈希管理员密码。
 pub fn hash_password(password: &str) -> Result<String> {
@@ -29,6 +32,38 @@ pub fn hash_password(password: &str) -> Result<String> {
         .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|e| anyhow!("密码哈希失败：{e}"))
+}
+
+/// 在阻塞线程池里哈希密码：Argon2id 一次要几十毫秒满载 CPU，不能占着
+/// tokio 的工作线程（§19.4）。
+pub async fn hash_password_blocking(password: &str) -> Result<String> {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| anyhow!("密码哈希任务异常：{e}"))?
+}
+
+/// 在阻塞线程池里校验密码。
+///
+/// 用户不存在时（`encoded` 为 `None`）也照样跑一次 Argon2，对着一个固定的
+/// 假哈希：否则"用户名不存在"会比"密码错误"快几十毫秒，用户名可被计时枚举。
+pub async fn verify_password_blocking(password: &str, encoded: Option<String>) -> bool {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    tokio::task::spawn_blocking(move || match encoded {
+        Some(encoded) => verify_password(&password, &encoded),
+        None => {
+            let _ = verify_password(&password, dummy_hash());
+            false
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// 用户不存在时用来"陪跑"的假哈希，参数与真实哈希一致。
+fn dummy_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password("akhub-dummy-password").unwrap_or_default())
 }
 
 /// 校验密码。哈希本身损坏时按验证失败处理，不 panic。
@@ -72,35 +107,34 @@ impl SessionStore {
         }
     }
 
-    /// 该用户当前是否处于登录锁定中。
-    pub fn is_locked(&self, username: &str) -> bool {
+    /// 该客户端当前是否处于登录锁定中。
+    pub fn is_locked(&self, client: &str) -> bool {
         let mut failures = crate::sync::lock(&self.failures);
-        match failures.get(username).and_then(|f| f.locked_until) {
+        match failures.get(client).and_then(|f| f.locked_until) {
             Some(until) if until > Instant::now() => true,
             Some(_) => {
                 // 锁定已过期，顺手清空计数，给一次干净的重试机会。
-                failures.remove(username);
+                failures.remove(client);
                 false
             }
             None => false,
         }
     }
 
-    /// 记录一次登录失败，必要时触发锁定。
+    /// 记录该客户端的一次登录失败，必要时锁定**这个客户端**。
     ///
-    /// 表有上限：`username` 是请求体里的任意字符串，未认证的请求就能往里塞。
-    /// 满了先清掉**已经解锁**的条目；还不够就整体清空——丢掉的只是失败计数
-    /// （最坏是多给几次重试），正在锁定的时间窗由 `LOCKOUT` 保证不会被绕过。
-    pub fn record_failure(&self, username: &str) {
+    /// 表有上限：满了先清掉**已经解锁**的条目；还不够就整体清空——丢掉的只是
+    /// 失败计数（最坏是多给几次重试）。
+    pub fn record_failure(&self, client: &str) {
         let mut failures = crate::sync::lock(&self.failures);
-        if failures.len() >= MAX_TRACKED_USERNAMES && !failures.contains_key(username) {
+        if failures.len() >= MAX_TRACKED_CLIENTS && !failures.contains_key(client) {
             let now = Instant::now();
             failures.retain(|_, entry| entry.locked_until.is_some_and(|until| until > now));
-            if failures.len() >= MAX_TRACKED_USERNAMES {
+            if failures.len() >= MAX_TRACKED_CLIENTS {
                 failures.clear();
             }
         }
-        let entry = failures.entry(username.to_string()).or_default();
+        let entry = failures.entry(client.to_string()).or_default();
         entry.count += 1;
         if entry.count >= MAX_FAILURES {
             entry.locked_until = Some(Instant::now() + LOCKOUT);
@@ -108,9 +142,22 @@ impl SessionStore {
         }
     }
 
-    /// 登录成功：清空失败计数并签发会话令牌。
+    /// 该客户端登录成功：清空它的失败计数。
+    pub fn clear_failures(&self, client: &str) {
+        crate::sync::lock(&self.failures).remove(client);
+    }
+
+    /// 清掉过期会话与已解锁的失败计数。由后台清理任务周期调用：
+    /// 只靠"再次使用时顺带清除"的话，没人再用的过期会话会一直留在内存里。
+    pub fn purge_expired(&self) {
+        let now = Instant::now();
+        crate::sync::lock(&self.sessions).retain(|_, session| session.expires_at > now);
+        crate::sync::lock(&self.failures)
+            .retain(|_, entry| entry.count > 0 || entry.locked_until.is_some_and(|t| t > now));
+    }
+
+    /// 签发会话令牌。
     pub fn create(&self, username: &str) -> Result<String> {
-        crate::sync::lock(&self.failures).remove(username);
         let token = URL_SAFE_NO_PAD.encode(&*crate::security::random_bytes(32)?);
         crate::sync::lock(&self.sessions).insert(
             token.clone(),
@@ -179,14 +226,14 @@ mod tests {
     /// `username` 来自未认证的登录请求体：不设上限时，一个循环就能让这张表
     /// 无限增长。
     #[test]
-    fn garbage_usernames_cannot_grow_the_failure_table_without_bound() {
+    fn garbage_clients_cannot_grow_the_failure_table_without_bound() {
         let store = SessionStore::new();
-        for index in 0..(MAX_TRACKED_USERNAMES * 2) {
+        for index in 0..(MAX_TRACKED_CLIENTS * 2) {
             store.record_failure(&format!("ghost-{index}"));
         }
         let tracked = crate::sync::lock(&store.failures).len();
         assert!(
-            tracked <= MAX_TRACKED_USERNAMES,
+            tracked <= MAX_TRACKED_CLIENTS,
             "失败计数表必须收敛到上限内，实际 {tracked}"
         );
     }
@@ -212,24 +259,46 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failures_lock_the_account() {
+    fn repeated_failures_lock_only_that_client() {
         let store = SessionStore::new();
         for _ in 0..MAX_FAILURES - 1 {
-            store.record_failure("admin");
+            store.record_failure("203.0.113.9");
         }
-        assert!(!store.is_locked("admin"));
-        store.record_failure("admin");
-        assert!(store.is_locked("admin"));
+        assert!(!store.is_locked("203.0.113.9"));
+        store.record_failure("203.0.113.9");
+        assert!(store.is_locked("203.0.113.9"));
+        assert!(!store.is_locked("198.51.100.1"), "别的客户端不受牵连");
     }
 
     #[test]
     fn a_successful_login_clears_the_failure_counter() {
         let store = SessionStore::new();
         for _ in 0..MAX_FAILURES - 1 {
-            store.record_failure("admin");
+            store.record_failure("203.0.113.9");
         }
+        store.clear_failures("203.0.113.9");
+        store.record_failure("203.0.113.9");
+        assert!(!store.is_locked("203.0.113.9"), "成功登录后计数应当归零");
+    }
+
+    #[test]
+    fn expired_sessions_are_purged_without_being_reused() {
+        let store = SessionStore::new();
+        let token = store.create("admin").unwrap();
+        crate::sync::lock(&store.sessions)
+            .get_mut(&token)
+            .unwrap()
+            .expires_at = Instant::now() - Duration::from_secs(1);
         store.create("admin").unwrap();
-        store.record_failure("admin");
-        assert!(!store.is_locked("admin"), "成功登录后计数应当归零");
+        store.purge_expired();
+        assert_eq!(store.len(), 1, "过期会话必须被清理");
+    }
+
+    #[tokio::test]
+    async fn unknown_users_still_pay_for_an_argon2_verification() {
+        let hash = hash_password("正确的密码").unwrap();
+        assert!(verify_password_blocking("正确的密码", Some(hash.clone())).await);
+        assert!(!verify_password_blocking("错误", Some(hash)).await);
+        assert!(!verify_password_blocking("正确的密码", None).await);
     }
 }

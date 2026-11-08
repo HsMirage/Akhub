@@ -160,31 +160,33 @@ pub const ALLOW_RESTART_ENV: &str = "AKHUB_ALLOW_RESTART";
 
 /// 当前进程能不能就地替换自己。
 ///
-/// 两条路都算数：
+/// 只认部署方显式声明的 [`ALLOW_RESTART_ENV`]。两种官方部署形态都走同一套约定：
+/// 把安装好的二进制复制到服务用户**自己可写**的目录再运行，并设这个变量——
 ///
-/// - **原生二进制 + systemd**：进程对所在目录有写权限，退出后有 `Restart=always`
-///   把它拉起来；
-/// - **容器**：入口脚本把二进制复制到**可写的数据卷**再运行（见
-///   deploy/docker-entrypoint.sh），并设 [`ALLOW_RESTART_ENV`] 声明这件事。镜像里的
-///   二进制在只读镜像层、属主 root，以非 root 运行的服务进程覆盖不了它——这正是
-///   容器部署过去升不了级的原因。
+/// - **容器**：入口脚本复制到数据卷里的 `runtime/akhub`（deploy/docker-entrypoint.sh）；
+/// - **systemd**：单元的 `ExecStartPre` 复制到 `/var/lib/akhub/runtime/akhub`
+///   （deploy/akhub.service）。
 ///
-/// 为什么用显式声明而不是"试着写一下当前二进制"：探测成功也可能在真正 rename
-/// 时失败，而这条判断要拿去回答"面板上该不该给一键升级按钮"。
+/// 安装位置本身（镜像层、`/usr/local/bin`）属主是 root，以 `akhub` 用户运行、
+/// 又开了 `ProtectSystem=strict` 的进程覆盖不了它；早期版本凭 `INVOCATION_ID`
+/// 就判定"能替换"，结果 systemd 部署的一键升级每次都失败。
 pub fn can_self_replace() -> bool {
     if cfg!(windows) {
         return false;
-    }
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        return true;
     }
     std::env::var(ALLOW_RESTART_ENV).is_ok_and(|value| value == "1")
 }
 
 /// 重启提示：给人看的那一句。
+///
+/// 命令行 `sudo akhub --update` 不在 systemd 里跑，看不到 `INVOCATION_ID`；
+/// 装了 akhub.service 的机器同样该提示 systemctl——重启时 `ExecStartPre`
+/// 会把新装的二进制复制到运行目录。
 pub fn restart_command() -> String {
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        "systemctl restart akhub".to_string()
+    if std::env::var_os("INVOCATION_ID").is_some()
+        || Path::new("/etc/systemd/system/akhub.service").exists()
+    {
+        "sudo systemctl restart akhub".to_string()
     } else {
         "重启 akhub 进程".to_string()
     }
@@ -912,32 +914,58 @@ impl Registry {
         download(&self.client, &asset.browser_download_url, &archive).await?;
         let expected =
             fetch_checksum(&self.client, &checksums.browser_download_url, &asset.name).await?;
-        verify_sha256(&archive, &expected)?;
-        tracing::info!(asset = %asset.name, "sha256 校验通过");
-
         let stem = asset
             .name
             .strip_suffix(".tar.gz")
-            .ok_or_else(|| format!("不认识的资产名：{}", asset.name))?;
-        let extracted = extract_binary(&archive, workspace.path(), stem)?;
+            .ok_or_else(|| format!("不认识的资产名：{}", asset.name))?
+            .to_string();
+        // 哈希 20 MB 与解压都是同步文件 IO + CPU，放到阻塞线程池（§19.4）。
+        let extracted = {
+            let archive = archive.clone();
+            let unpack_to = workspace.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                verify_sha256(&archive, &expected)?;
+                extract_binary(&archive, &unpack_to, &stem)
+            })
+            .await
+            .map_err(|error| format!("校验/解压任务异常：{error}"))??
+        };
+        tracing::info!(asset = %asset.name, "sha256 校验通过");
 
-        // 备份旧二进制：命名与 install.sh 保持一致，升级回滚时一眼能认出来。
-        let backup = backup_existing(&target)?;
         // 先写到同目录的临时文件再 rename：跨文件系统的 rename 会失败，
         // 而"写一半断电"会让目标文件变成半截二进制。
         let staged = directory.join(format!(".akhub-new-{}", std::process::id()));
-        std::fs::copy(&extracted, &staged)
-            .map_err(|error| format!("写入 {} 失败：{error}", staged.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("设置可执行权限失败：{error}"))?;
-        }
-        std::fs::rename(&staged, &target).map_err(|error| {
-            let _ = std::fs::remove_file(&staged);
-            format!("替换 {} 失败：{error}", target.display())
-        })?;
+        let replaced = {
+            let (staged, target, directory, latest) = (
+                staged.clone(),
+                target.clone(),
+                directory.clone(),
+                latest.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                stage_binary(&extracted, &staged)?;
+                // 换上去之前先让新二进制自己报一次版本：架构不对、动态库缺失、
+                // 发行包装错了版本，都在这里拦下，而不是重启之后才起不来。
+                verify_staged_version(&staged, &latest)?;
+                // 备份旧二进制：命名与 install.sh 保持一致，升级回滚时一眼能认出来。
+                let backup = backup_existing(&target)?;
+                std::fs::rename(&staged, &target)
+                    .map_err(|error| format!("替换 {} 失败：{error}", target.display()))?;
+                // rename 本身要落盘才算数：同步所在目录。
+                sync_dir(&directory);
+                prune_backups(&target, BACKUPS_KEPT);
+                Ok::<_, String>(backup)
+            })
+            .await
+            .map_err(|error| format!("替换任务异常：{error}"))?
+        };
+        let backup = match replaced {
+            Ok(backup) => backup,
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(error);
+            }
+        };
         drop(workspace);
 
         *self.pending.lock().unwrap() = Some(latest.clone());
@@ -1251,6 +1279,79 @@ fn extract_binary(archive: &Path, workspace: &Path, stem: &str) -> Result<PathBu
     }
 }
 
+/// 保留几份 `.bak-*` 旧二进制。每份约 20 MB，不清理会随升级次数无限增长。
+const BACKUPS_KEPT: usize = 2;
+
+/// 把新二进制写到暂存路径：设可执行位并 `sync_all`，确保 rename 之后断电
+/// 不会留下一个长度对、内容是零的文件。
+fn stage_binary(source: &Path, staged: &Path) -> Result<(), String> {
+    std::fs::copy(source, staged)
+        .map_err(|error| format!("写入 {} 失败：{error}", staged.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("设置可执行权限失败：{error}"))?;
+    }
+    std::fs::File::open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("同步 {} 失败：{error}", staged.display()))
+}
+
+/// 运行 `<暂存二进制> --version`，要求输出里报的正是目标版本。
+fn verify_staged_version(staged: &Path, expected: &str) -> Result<(), String> {
+    let output = std::process::Command::new(staged)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("新版本二进制无法执行（{error}），已放弃更新"))?;
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let version = reported.split_whitespace().nth(1).map(normalize_tag);
+    if output.status.success() && version.as_deref() == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "新版本二进制自报版本为「{}」，与目标 v{expected} 不符，已放弃更新",
+            reported.trim()
+        ))
+    }
+}
+
+/// 同步目录项，让 rename 持久化。失败只告警：文件本身已经落盘。
+fn sync_dir(directory: &Path) {
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(directory).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(%error, path = %directory.display(), "同步目录失败");
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+}
+
+/// 只保留最近 `keep` 份 `<名字>.bak-<时间戳>`。时间戳定长，按名字排序即按时间排序。
+fn prune_backups(target: &Path, keep: usize) {
+    let (Some(directory), Some(name)) = (target.parent(), target.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.bak-", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|file| file.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    backups.sort();
+    let excess = backups.len().saturating_sub(keep);
+    for old in backups.into_iter().take(excess) {
+        if let Err(error) = std::fs::remove_file(&old) {
+            tracing::warn!(%error, path = %old.display(), "清理旧二进制备份失败");
+        }
+    }
+}
+
 /// 备份旧二进制；失败只警告，不阻断更新。
 fn backup_existing(target: &Path) -> Result<Option<PathBuf>, String> {
     if !target.exists() {
@@ -1358,6 +1459,44 @@ struct Asset {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[test]
+    fn only_the_newest_backups_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("akhub");
+        std::fs::write(&target, b"current").unwrap();
+        for stamp in ["20260101000000", "20260201000000", "20260301000000"] {
+            std::fs::write(dir.path().join(format!("akhub.bak-{stamp}")), b"old").unwrap();
+        }
+        prune_backups(&target, 2);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "akhub",
+                "akhub.bak-20260201000000",
+                "akhub.bak-20260301000000"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_binary_must_report_the_target_version() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("akhub");
+        std::fs::write(&staged, b"#!/bin/sh\necho akhub 9.9.9\n").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_staged_version(&staged, "9.9.9").is_ok());
+        assert!(verify_staged_version(&staged, "9.9.8").is_err());
+        std::fs::write(&staged, b"not a program").unwrap();
+        assert!(verify_staged_version(&staged, "9.9.9").is_err());
+    }
 
     #[test]
     fn versions_compare_numerically_not_lexically() {
