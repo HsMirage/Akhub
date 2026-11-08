@@ -360,7 +360,8 @@ pub async fn change_password(
         .await
         .map_err(AdminError::internal)?
         .ok_or_else(|| AdminError::unauthorized("管理员账号不存在"))?;
-    if !session::verify_password(&payload.current_password, &hash) {
+    // Argon2 是有意设计的慢计算，放到阻塞线程池，别占住异步工作线程。
+    if !session::verify_password_blocking(&payload.current_password, Some(hash)).await {
         return Err(AdminError::unauthorized("当前密码不正确"));
     }
     if payload.new_password.chars().count() < 12 {
@@ -369,7 +370,9 @@ pub async fn change_password(
     if payload.new_password == payload.current_password {
         return Err(AdminError::bad_request("新密码不能与当前密码相同"));
     }
-    let new_hash = session::hash_password(&payload.new_password).map_err(AdminError::internal)?;
+    let new_hash = session::hash_password_blocking(&payload.new_password)
+        .await
+        .map_err(AdminError::internal)?;
     if !state
         .store
         .update_admin_password(&admin.username, &new_hash)
