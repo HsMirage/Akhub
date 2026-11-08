@@ -1997,6 +1997,10 @@ impl Store {
                     &[
                         "id",
                         "name",
+                        // 分组 Key 只存前缀与摘要；摘要配合随备份迁移的 pepper，
+                        // 恢复后下游 Key 照常可用（§20.2、§23.5）。
+                        "key_prefix",
+                        "key_digest_hex",
                         "multiplier_limit",
                         "weight_multiplier",
                         "weight_reliability",
@@ -2183,12 +2187,42 @@ impl Store {
     ///
     /// 排除 `schema_version`：它是数据库结构版本，由启动时的迁移逻辑管理，
     /// 恢复一份旧备份不该把版本号倒回去。
+    ///
+    /// 也排除与本机主密钥绑定的两条（主密钥校验值、密封的 pepper）：它们在别的
+    /// 机器上解不开。pepper 以明文单独进备份（`group_key_pepper`）。
     pub async fn backup_app_settings(&self) -> Result<Vec<Value>> {
         let rows = sqlx::query("SELECT * FROM app_settings WHERE key <> 'schema_version'")
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
+            .filter(|row| {
+                row.try_get::<String, _>("key").is_ok_and(|key| {
+                    !crate::security::keyring::MACHINE_BOUND_SETTINGS.contains(&key.as_str())
+                })
+            })
             .map(|row| Self::backup_row(row, &["key", "value"]))
+            .collect()
+    }
+
+    /// New API 站点级凭据。令牌是**明文**——备份信封整体已被备份口令加密，
+    /// 恢复时用本机主密钥重新 seal（§23.5）。
+    pub async fn backup_new_api_sites(
+        &self,
+        cipher: &crate::security::Cipher,
+    ) -> Result<Vec<Value>> {
+        let rows = sqlx::query("SELECT base_url, user_id, sealed_token FROM new_api_sites")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let sealed: Vec<u8> = row.try_get("sealed_token")?;
+                let token = String::from_utf8_lossy(&cipher.open(&sealed)?).into_owned();
+                Ok(serde_json::json!({
+                    "base_url": row.try_get::<String, _>("base_url")?,
+                    "user_id": row.try_get::<String, _>("user_id")?,
+                    "token": token,
+                }))
+            })
             .collect()
     }
 
@@ -2214,8 +2248,17 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM groups").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM new_api_sites")
+            .execute(&mut *tx)
+            .await?;
 
         for group in &data.groups {
+            // 更早的备份没导出摘要：写一个不可能匹配、但互不相同的占位值，
+            // 恢复能成功（列上有唯一约束），这些分组的 Key 需要重新生成。
+            let digest = match str_field(group, "key_digest_hex") {
+                digest if digest.is_empty() => format!("unset-{}", str_field(group, "id")),
+                digest => digest,
+            };
             sqlx::query(
                 "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
                     weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
@@ -2227,7 +2270,7 @@ impl Store {
             .bind(str_field(group, "id"))
             .bind(str_field(group, "name"))
             .bind(str_field(group, "key_prefix"))
-            .bind(str_field(group, "key_digest_hex"))
+            .bind(&digest)
             .bind(int_field(group, "multiplier_limit"))
             .bind(int_field(group, "weight_multiplier"))
             .bind(int_field(group, "weight_reliability"))
@@ -2407,7 +2450,10 @@ impl Store {
         // 设置项。`schema_version` 不动——它由启动时的迁移逻辑管理（§23.5）。
         for row in &data.app_settings {
             let key = str_field(row, "key");
-            if key.is_empty() || key == "schema_version" {
+            if key.is_empty()
+                || key == "schema_version"
+                || crate::security::keyring::MACHINE_BOUND_SETTINGS.contains(&key.as_str())
+            {
                 continue;
             }
             sqlx::query(
@@ -2417,6 +2463,36 @@ impl Store {
             )
             .bind(&key)
             .bind(str_field(row, "value"))
+            .bind(crate::storage::now_unix())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for site in &data.new_api_sites {
+            let sealed = cipher
+                .seal(str_field(site, "token").as_bytes())
+                .context("备份恢复时重新加密站点令牌失败")?;
+            sqlx::query(
+                "INSERT INTO new_api_sites (base_url, user_id, sealed_token, updated_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(str_field(site, "base_url"))
+            .bind(str_field(site, "user_id"))
+            .bind(&sealed)
+            .bind(crate::storage::now_unix())
+            .execute(&mut *tx)
+            .await?;
+        }
+        // pepper 跟着备份走：备份里的分组摘要是用它算的。旧备份没有它时保留
+        // 本机现有 pepper（那种备份本来也不带摘要）。
+        if let Some(pepper) = data.group_key_pepper()? {
+            sqlx::query(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+            )
+            .bind(crate::security::keyring::PEPPER_KEY)
+            .bind(crate::security::keyring::seal_pepper(cipher, &pepper)?)
             .bind(crate::storage::now_unix())
             .execute(&mut *tx)
             .await?;

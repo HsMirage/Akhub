@@ -15,7 +15,7 @@ use crate::credential::CredentialPool;
 use crate::health;
 use crate::multiplier;
 use crate::routing::{queue, score, sticky};
-use crate::security::{Cipher, KeyDigest, MasterKey};
+use crate::security::{Cipher, KeyDigest};
 use crate::storage::Store;
 use crate::upstream::UpstreamClient;
 use crate::upstream::evidence::Evidence;
@@ -465,14 +465,18 @@ impl AppState {
     /// 后台任务不在这里启动：由 [`tasks::spawn`] 单独拉起并只持有弱引用，
     /// 这样测试里用完即弃的 `AppState` 不会被一堆常驻任务钉住。
     pub async fn bootstrap(data_dir: &std::path::Path, settings: Settings) -> Result<SharedState> {
-        let master_key = MasterKey::load_or_create(data_dir).context("加载主密钥失败")?;
         let pool = crate::storage::open(data_dir).await?;
         let store = Store::new(pool);
+        // 主密钥必须与数据库核对通过才继续：密钥丢失或配错时拒绝启动，
+        // 绝不带着"所有上游 Key 都解不开"的降级状态对外报就绪（§20.2）。
+        let keys = crate::security::keyring::unlock(data_dir, &store)
+            .await
+            .context("加载主密钥失败")?;
         // 老库的单把凭据已经在 \`storage::open\` 的迁移里展开成 Key 池，这里
         // 直接装载即可（§4.2.1）。
         let config = ConfigService::load(store.clone()).await?;
         let runtime = Runtime::default();
-        restore(&store, &runtime, &master_key).await?;
+        restore(&store, &runtime, &keys.cipher).await?;
 
         // 后台保存过的设置覆盖环境变量/默认值；解析失败只告警，不让进程起不来。
         let settings = match store.app_setting(SETTINGS_KEY).await {
@@ -517,9 +521,9 @@ impl AppState {
         );
 
         let state = Arc::new(AppState {
-            cipher: master_key.cipher(),
-            key_digest: master_key.key_digest(),
-            master_key_from_env: master_key.from_env,
+            cipher: keys.cipher,
+            key_digest: keys.key_digest,
+            master_key_from_env: keys.master_key_from_env,
             config,
             store,
             upstream: UpstreamClient::new().context("构造上游 HTTP 客户端失败")?,
@@ -557,6 +561,10 @@ impl AppState {
     ///
     /// Key 池必须一起重建：管理员刚改了凭据，热路径不能还拿着旧的那把。
     pub async fn reload_config(&self) -> Result<()> {
+        // 恢复备份会换掉分组 Key 的 pepper；先换 pepper 再换配置快照，
+        // 新快照里的摘要才对得上（§23.5）。
+        self.key_digest
+            .replace(crate::security::keyring::load_pepper(&self.store, &self.cipher).await?);
         let config = self.config.reload().await?;
         self.reload_credentials().await?;
         self.runtime.retain(&config);
@@ -585,7 +593,7 @@ impl AppState {
 }
 
 /// 启动时加载快照：粘性直接恢复，评分从快照继续（§20.1）。
-async fn restore(store: &Store, runtime: &Runtime, master_key: &MasterKey) -> Result<()> {
+async fn restore(store: &Store, runtime: &Runtime, cipher: &Cipher) -> Result<()> {
     let now = crate::storage::now_unix();
     // 超过 24 小时的快照宁可丢弃：拿一天前的延迟数据打分还不如中性分。
     let horizon = now - 24 * 3600;
@@ -603,7 +611,7 @@ async fn restore(store: &Store, runtime: &Runtime, master_key: &MasterKey) -> Re
 
     // Key 池没有"快照"可恢复：它是从数据库现读现解密的。这里是唯一的
     // 装载点，之后只在配置写操作后整体替换（§4.2.1）。
-    let credentials = CredentialPool::load(store, &master_key.cipher(), &accounts)
+    let credentials = CredentialPool::load(store, cipher, &accounts)
         .await
         .context("装载账号内 Key 池失败")?;
     let key_total: usize = accounts

@@ -4,6 +4,7 @@
 //! 带 pepper 的 HMAC 摘要，不保存可恢复明文（§20.2）。
 
 pub mod backup;
+pub mod keyring;
 pub mod redact;
 pub mod url_guard;
 
@@ -36,37 +37,44 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
-    /// 加载主密钥；数据目录中不存在时生成一个仅当前用户可读写的新文件。
-    pub fn load_or_create(data_dir: &Path) -> Result<Self> {
+    /// 读取已有的主密钥：优先 `AKHUB_MASTER_KEY`，其次数据目录里的密钥文件。
+    ///
+    /// 两者都没有时返回 `None`，**不在这里生成**：是否允许生成新密钥取决于
+    /// 数据库里有没有用旧密钥加密过的数据，由 [`keyring::unlock`] 决定。
+    pub fn load(data_dir: &Path) -> Result<Option<Self>> {
         if let Ok(raw) = std::env::var("AKHUB_MASTER_KEY") {
             let decoded = decode_key_material(raw.trim())
                 .context("AKHUB_MASTER_KEY 必须是 32 字节的 hex 或 base64 值")?;
-            return Ok(Self {
+            return Ok(Some(Self {
                 bytes: decoded,
                 from_env: true,
-            });
+            }));
         }
 
         let path = master_key_path(data_dir);
-        if path.exists() {
-            let raw = std::fs::read(&path)
-                .with_context(|| format!("读取主密钥文件失败：{}", path.display()))?;
-            if raw.len() != MASTER_KEY_LEN {
-                bail!(
-                    "主密钥文件长度非法：期望 {MASTER_KEY_LEN} 字节，实际 {}",
-                    raw.len()
-                );
-            }
-            let mut bytes = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-            bytes.copy_from_slice(&raw);
-            return Ok(Self {
-                bytes,
-                from_env: false,
-            });
+        if !path.exists() {
+            return Ok(None);
         }
+        let raw = std::fs::read(&path)
+            .with_context(|| format!("读取主密钥文件失败：{}", path.display()))?;
+        if raw.len() != MASTER_KEY_LEN {
+            bail!(
+                "主密钥文件长度非法：期望 {MASTER_KEY_LEN} 字节，实际 {}",
+                raw.len()
+            );
+        }
+        let mut bytes = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        bytes.copy_from_slice(&raw);
+        Ok(Some(Self {
+            bytes,
+            from_env: false,
+        }))
+    }
 
+    /// 生成新的主密钥并写入数据目录（仅当前用户可读写）。
+    pub fn generate(data_dir: &Path) -> Result<Self> {
         let generated = random_bytes(MASTER_KEY_LEN)?;
-        write_private_file(&path, &generated)?;
+        write_private_file(&master_key_path(data_dir), &generated)?;
         let mut bytes = Zeroizing::new([0u8; MASTER_KEY_LEN]);
         bytes.copy_from_slice(&generated);
         Ok(Self {
@@ -80,10 +88,19 @@ impl MasterKey {
         Cipher::new(&derive_subkey(&self.bytes, b"akhub:secret-box:v1"))
     }
 
-    /// 用于下游分组 Key 摘要的 pepper。
-    pub fn key_digest(&self) -> KeyDigest {
-        KeyDigest {
-            pepper: derive_subkey(&self.bytes, b"akhub:group-key-digest:v1"),
+    /// 早期版本由主密钥派生的分组 Key pepper。
+    ///
+    /// 只在"库里已有分组、但还没有独立 pepper"时用作初始值：这些分组的摘要
+    /// 正是用它算的，沿用它才不会让现有下游 Key 全部失效（见 [`keyring`]）。
+    pub(crate) fn derived_digest_pepper(&self) -> [u8; 32] {
+        derive_subkey(&self.bytes, b"akhub:group-key-digest:v1")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(byte: u8) -> Self {
+        Self {
+            bytes: Zeroizing::new([byte; MASTER_KEY_LEN]),
+            from_env: true,
         }
     }
 }
@@ -208,22 +225,38 @@ impl Cipher {
 }
 
 /// 下游分组 Key 的不可逆摘要器。
+///
+/// pepper 是独立随机生成、密封存放在 `app_settings` 里的 32 字节（§20.2），
+/// **不从主密钥派生**：这样它能随加密备份一起迁移，换机恢复后下游 Key 照常
+/// 可用。恢复备份会整体换掉 pepper，所以内部可原子替换。
 #[derive(Clone)]
 pub struct KeyDigest {
-    pepper: [u8; 32],
+    pepper: std::sync::Arc<arc_swap::ArcSwap<[u8; 32]>>,
 }
 
 impl KeyDigest {
+    pub fn new(pepper: [u8; 32]) -> Self {
+        Self {
+            pepper: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(pepper)),
+        }
+    }
+
     /// 固定 pepper 的构造器，只给测试用。
     #[cfg(test)]
     pub fn for_tests(pepper: [u8; 32]) -> Self {
-        Self { pepper }
+        Self::new(pepper)
+    }
+
+    /// 换上新的 pepper（恢复备份之后）。
+    pub fn replace(&self, pepper: [u8; 32]) {
+        self.pepper.store(std::sync::Arc::new(pepper));
     }
 
     /// 计算摘要。相同输入恒等，用于 O(1) 查表；比较在等长数组上进行。
     pub fn digest(&self, key: &str) -> [u8; 32] {
+        let pepper = self.pepper.load();
         let mut mac =
-            <Hmac<Sha256>>::new_from_slice(&self.pepper).expect("HMAC-SHA256 接受任意长度密钥");
+            <Hmac<Sha256>>::new_from_slice(&pepper[..]).expect("HMAC-SHA256 接受任意长度密钥");
         mac.update(key.as_bytes());
         mac.finalize().into_bytes().into()
     }
@@ -277,10 +310,7 @@ mod tests {
     use super::*;
 
     fn test_master() -> MasterKey {
-        MasterKey {
-            bytes: Zeroizing::new([7u8; MASTER_KEY_LEN]),
-            from_env: true,
-        }
+        MasterKey::for_tests(7)
     }
 
     #[test]
@@ -307,7 +337,7 @@ mod tests {
 
     #[test]
     fn digest_is_stable_and_key_specific() {
-        let digest = test_master().key_digest();
+        let digest = KeyDigest::new([7u8; 32]);
         assert_eq!(digest.digest("akh-a"), digest.digest("akh-a"));
         assert_ne!(digest.digest("akh-a"), digest.digest("akh-b"));
     }
