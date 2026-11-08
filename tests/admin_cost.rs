@@ -23,6 +23,7 @@ async fn spawn_admin() -> (Akhub, reqwest::Client) {
             format!("{}/admin/api/setup", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"username": "admin", "password": "correct horse battery"}))
         .send()
         .await
@@ -351,6 +352,7 @@ async fn calibration_is_per_model_and_unaffected_by_other_models() {
                 format!("{base}/admin/api/accounts/{account}/calibrate"),
             )
             .header("x-akhub-csrf", "1")
+            .header("x-akhub-config-version", "*")
             .json(&json!({"logical_model": model, "reported": reported}))
             .send()
             .await
@@ -363,16 +365,42 @@ async fn calibration_is_per_model_and_unaffected_by_other_models() {
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["calibration"], "0.8");
-    assert_eq!(body["group_avg_multiplier"], "0.5");
+    assert_eq!(body["own_avg_multiplier"], "0.5");
     assert_eq!(body["gateway_requests"], 4);
-    assert_eq!(body["exclusive"], json!(true));
 
-    // 换模型 B 对账：均倍率 0.9，同一站点报值下系数完全不同——证明对账
-    // 没有被模型 A 的数据污染。
+    // 模型 B 的流量全在另一个账号上：分母只看本账号自己的样本，别的账号的
+    // 倍率与这笔账无关，所以这里无从对账，而不是借用别人的均倍率。
     let response = calibrate("模型B", "0.9").await;
+    assert_eq!(response.status(), 400);
+
+    // 当前系数不为 1 时，网关记下的有效倍率里已经含了它：新系数要在旧系数上
+    // 修正，而不是把"站点报值 ÷ 网关均倍率"当绝对值写进去——那样每校准一次
+    // 都会漂移一次。旧系数 2、站点报 0.4、网关均倍率 0.5 → 2 × 0.4 ÷ 0.5 = 1.6。
+    let mut account = akhub
+        .state
+        .store
+        .account(&wired_a.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    account.calibration = akhub::domain::Multiplier::parse("2").unwrap();
+    akhub
+        .state
+        .store
+        .update_account(&account, None)
+        .await
+        .unwrap();
+    let response = calibrate("模型A", "0.4").await;
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["group_avg_multiplier"], "0.9");
-    assert_eq!(body["calibration"], "1");
+    assert_eq!(body["previous_calibration"], "2");
+    assert_eq!(body["calibration"], "1.6", "{body}");
+    account.calibration = akhub::domain::Multiplier::ONE;
+    akhub
+        .state
+        .store
+        .update_account(&account, None)
+        .await
+        .unwrap();
 
     // 区间内没流量的模型不能对账。
     let response = calibrate("没流量的模型", "0.5").await;
@@ -426,6 +454,7 @@ async fn copy_creates_an_independent_disabled_clone() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -434,24 +463,27 @@ async fn copy_creates_an_independent_disabled_clone() {
         .request(
             reqwest::Method::POST,
             format!(
-                "{}/admin/api/accounts/{account_id}/models/select",
+                "{}/admin/api/accounts/{account_id}/models/apply",
                 akhub.base_url
             ),
         )
         .header("x-akhub-csrf", "1")
-        .json(&json!({"selected": ["glm-4.6"]}))
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"changes": [{"upstream_model": "glm-4.6", "selected": true}]}))
         .send()
         .await
         .unwrap();
     client
         .request(
-            reqwest::Method::PUT,
-            format!("{}/admin/api/accounts/{account_id}/aliases", akhub.base_url),
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/apply",
+                akhub.base_url
+            ),
         )
         .header("x-akhub-csrf", "1")
-        .json(&json!({"aliases": [
-            {"upstream_model": "glm-4.6", "public_name": "glm"}
-        ]}))
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"changes": [{"upstream_model": "glm-4.6", "alias": "glm"}]}))
         .send()
         .await
         .unwrap();
@@ -462,6 +494,7 @@ async fn copy_creates_an_independent_disabled_clone() {
             format!("{}/admin/api/accounts/{account_id}/copy", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -553,6 +586,7 @@ async fn test_connection_sends_a_real_request_without_polluting_statistics() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"model": "glm-4.6"}))
         .send()
         .await
@@ -580,6 +614,7 @@ async fn test_connection_sends_a_real_request_without_polluting_statistics() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"model": "glm-4.6"}))
         .send()
         .await
@@ -630,6 +665,7 @@ async fn backup_import_rejects_cross_group_targets_without_changing_configuratio
     let response = client
         .post(format!("{}/admin/api/backup/import", akhub.base_url))
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"password":"test-backup-password", "content":String::from_utf8(backup).unwrap()}))
         .send().await.unwrap();
     assert_eq!(response.status(), 400);
@@ -670,6 +706,7 @@ async fn backup_roundtrip_restores_the_full_configuration() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -677,12 +714,13 @@ async fn backup_roundtrip_restores_the_full_configuration() {
         .request(
             reqwest::Method::POST,
             format!(
-                "{}/admin/api/accounts/{account_id}/models/select",
+                "{}/admin/api/accounts/{account_id}/models/apply",
                 akhub.base_url
             ),
         )
         .header("x-akhub-csrf", "1")
-        .json(&json!({"selected": ["glm-4.6"]}))
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"changes": [{"upstream_model": "glm-4.6", "selected": true}]}))
         .send()
         .await
         .unwrap();
@@ -693,6 +731,7 @@ async fn backup_roundtrip_restores_the_full_configuration() {
             format!("{}/admin/api/backup/export", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"password": "备份口令"}))
         .send()
         .await
@@ -724,6 +763,7 @@ async fn backup_roundtrip_restores_the_full_configuration() {
             format!("{}/admin/api/backup/import", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"password": "错误口令", "content": backup_text}))
         .send()
         .await
@@ -738,6 +778,7 @@ async fn backup_roundtrip_restores_the_full_configuration() {
             format!("{}/admin/api/backup/import", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"password": "备份口令", "content": backup_text}))
         .send()
         .await
@@ -951,6 +992,7 @@ async fn restoring_a_backup_clears_the_in_memory_usage_summary() {
     let response = client
         .post(format!("{}/admin/api/backup/import", akhub.base_url))
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({
             "password": "test-backup-password",
             "content": String::from_utf8(backup).unwrap(),

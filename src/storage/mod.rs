@@ -1,5 +1,6 @@
 //! SQLite 持久层：连接池、结构初始化与仓储访问。
 
+pub mod config;
 pub mod store;
 
 use std::path::Path;
@@ -10,58 +11,26 @@ use sqlx::Acquire as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+pub use config::ConfigTx;
 pub use store::Store;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// 当前二进制认识的数据库结构版本（§27 阶段 6 的升级检查）。
+/// 当前二进制认识的数据库结构版本（§20.1、§27）。
 ///
-/// 结构变更时递增并编写迁移；用**更新的** Akhub 写出的数据库不能被**更旧的**
-/// 二进制打开——宁可拒绝启动，也不要在未知结构上写坏数据。
+/// `schema.sql` 就是这个版本的完整结构：新库直接按它建，已有的库只接受
+/// **上一个版本**（v25，对应 v1.1.41），由 [`migrate_v25_to_v26`] 一步升上来。
+/// 更老的库拒绝打开——先用 v1.1.41 把它升到 v25。用**更新的** Akhub 写出的
+/// 数据库同样拒绝：宁可起不来，也不要在不认识的结构上写坏数据。
 ///
-/// v2：请求记录补 `first_token_ms` / `input_tokens` / `output_tokens` /
-/// `config_version`，并新增每次尝试明细表 `request_attempts`（§6.6、§6.8）。
-/// v3：分组补"队列最长等待"`max_wait_secs`（§6.3）。
-/// v4：分组补"允许托管后台"`allow_managed_background`，并新增网关托管后台
-/// 任务表 `background_tasks`（计划 §29.1）。
-/// v5：新增分钟级目标性能聚合表 `performance_buckets`，支撑
-/// `GET /api/metrics`（§7.4、§20.1、§22）。
-/// v6：请求记录补粘性等待/新鲜度、输出速度、倍率来源、额度状态、
-/// 候选过滤原因与选中层（§6.6、§24.1）。
-/// v7：请求记录补 Token 细分：缓存读/写与思考 Token（§11.6）。
-/// v8：模型别名的唯一真相移入 `account_models.public_name`，并新增
-/// `account_models.hide_original` 与 `dispatch_targets.hide_original`；
-/// 同一模型的不同上游名可以按对外名归并，并按需隐藏原始名。
-/// v9：把"隐藏原始模型"提升为账号级 `upstream_accounts.hide_original`；
-/// 打开后只暴露设置了下游模型名的模型。
-/// v10：账号内 Key 池。新增 `upstream_account_keys`，请求记录、尝试明细与
-/// Responses 状态链补 Key 定位列；老库的单把 Key 由
-/// [`migrate_account_keys`] 展开成一把 Key 的池（§4.2.1）。
-/// v11：上游类型合并成"官方 OpenAI / 官方 Anthropic"两家：`openai_compatible`
-/// 归一为 `openai`，`new_api` / `sub2api` 按首选协议落到对应的官方类型。
-/// v12：上游类型整个删掉（§4.2）。它不参与任何路由或倍率决策，留着只会
-/// 让人以为必须选对；`upstream_accounts.upstream_type` 列保留但不再读写。
-/// v18：账号分组可以为空，空表示"未分配"（§4.2.3）。`upstream_accounts`
-/// 的 `group_id` 与分组的外键约束一起重建为可空版本——SQLite 改不了列约束；
-/// 未分配账号不生成调度目标，所以 `dispatch_targets` 不受影响。
-/// v19：异步生图任务的定位记录补"下单那把 Key"的凭据摘要（§14.9、§4.2.1）。
-/// 表本身由 schema.sql 建；这里只给已经建过表的老库补列。列缺失时轮询会退回
-/// 账号第一把 Key——多 Key 账号上那可能问出"没这个任务"。
-/// v20：image_tasks 的主键从单列 task_id 改成 (group_id, account_id, task_id)。
-/// 上游任务 ID 只在**上游站点**内唯一，而多个分组可以指向同一个站点；按单列
-/// 做主键时后下单的分组会覆盖先方的定位行，先方轮询变成永久 404（§14.9、§23.4）。
-/// SQLite 改不了主键，只能重建表；v18 已经示范过这件事的全部坑（见那里的注释）。
-/// v21：请求记录补"候选过滤原因的具体说明"\`filter_details\`（§24.1）。摘要
-/// \`filter_summary\` 只有类别词（"能力不支持×1"），事后复盘定位不到是哪个
-/// 账号、哪项能力、哪个端点；两者分开存，聚合口径不变。
-/// v22：请求记录补"档位重发次数"`effort_retries`，尝试明细补"上游状态码"
-/// `upstream_status`（§14.6、§6.6）。`attempts` 数的是目标个数，数不到**同一个
-/// 目标内**因为思考档位被拒而重发的次数——2026-10-15 现场一次请求打了 4 次
-/// 上游，记录里却是 `attempts=1`，事后只能靠容器日志还原。同理，失败尝试原来
-/// 不带上游状态码，"上游拒绝"与"网关拒绝"在库里长得一模一样。
-/// 对测试公开：迁移用例本该断言"升到当前版本"，写死数字会在每次加版本时
-/// 无意义地红一遍（§27）。
-pub const SCHEMA_VERSION: i64 = 25;
+/// v26：账号随分组删除改为回到"未分配"（外键 SET NULL）；删掉凭据镜像
+/// `upstream_secrets.api_key`、上游类型、目标的隐藏原名与优先级覆盖、目录行的
+/// 隐藏原名、逻辑模型来源、旧别名表与分钟级性能聚合表；目录行补"管理员停用过"
+/// `excluded`。
+pub const SCHEMA_VERSION: i64 = 26;
+
+/// 能直接升级到 [`SCHEMA_VERSION`] 的最老版本。
+const OLDEST_UPGRADABLE: i64 = 25;
 
 /// 打开（必要时创建）数据目录中的 SQLite 数据库并初始化结构。
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
@@ -79,14 +48,12 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .foreign_keys(true);
 
     // 连接池是 C 库句柄，创建本身不碰数据库文件（真正的打开发生在第一次查询：
-    // 那时 [`apply_schema`] 会建表并读结构版本）。因此这里在**运行时之前**就
-    // 建立起整套连接，真正的数据库打开是异步的，不会阻塞 tokio 的工作线程。
+    // 那时 [`prepare_schema`] 会读结构版本并建表）。
     //
-    // 配置写操作（勾选模型、改名、调和调度目标）都是短事务，写仍然会被 SQLite
-    // 串行化，冲突由 `busy_timeout` 兜底。但"一个连接就够"同时意味着**单点**：
-    // 一条连接被卡住以后，请求记录、Responses 状态、粘性落盘与 /health/ready
-    // 会一起挂住，而 SQLite 那边并没有任何锁——2026-10-08 线上就是这样卡了
-    // 31 小时，直到重启才恢复。所以这里留出几条备用连接。
+    // 配置写操作走 `BEGIN IMMEDIATE` 的短事务，写仍然会被 SQLite 串行化，冲突
+    // 由 `busy_timeout` 兜底。但"一个连接就够"同时意味着**单点**：一条连接被
+    // 卡住以后，请求记录、Responses 状态、粘性落盘与 /health/ready 会一起挂住
+    // ——2026-10-08 线上就是这样卡了 31 小时。所以这里留出几条备用连接。
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         // 拿不到连接就快速失败：默认 30 秒会让每个调用点长时间挂住，
@@ -94,8 +61,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect_lazy_with(options);
 
-    apply_schema(&pool).await?;
-    check_schema_version(&pool).await?;
+    prepare_schema(&pool).await?;
     // 库里有加密后的上游凭据与请求元数据，文件本身只给属主读写（§23.2）。
     restrict_to_owner(&db_path);
     Ok(pool)
@@ -133,1079 +99,261 @@ fn restrict_dir_to_owner(dir: &Path) {
     }
 }
 
-/// 升级检查（§27）：数据库的结构版本不得高于当前二进制。
-async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
-    // 老库可能还没有版本行：按 0 处理，交给下面的迁移补齐。
+/// 读结构版本、必要时迁移，再确保全部表与索引存在。
+///
+/// 顺序有讲究：先迁移、后执行 `schema.sql`。`schema.sql` 描述的是**新**结构，
+/// 对一个还停在旧结构的库先执行它，任何引用新列的索引都会失败。
+async fn prepare_schema(pool: &SqlitePool) -> Result<()> {
+    match stored_schema_version(pool).await? {
+        // 全新的库：建表与写版本放在同一个事务里，不会留下"有表没版本"的半截库。
+        None => {
+            let mut tx = pool.begin().await?;
+            sqlx::raw_sql(SCHEMA)
+                .execute(&mut *tx)
+                .await
+                .context("初始化数据库结构失败")?;
+            write_schema_version(&mut tx).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        Some(version) if version > SCHEMA_VERSION => anyhow::bail!(
+            "数据库结构版本 {version} 比当前二进制认识的 {SCHEMA_VERSION} 新：\
+             请先升级 Akhub，不要用旧版本打开新数据库"
+        ),
+        Some(version) if version < OLDEST_UPGRADABLE => anyhow::bail!(
+            "数据库结构版本 {version} 太旧，本版本只能从 v{OLDEST_UPGRADABLE} 升级：\
+             请先升级到 v1.1.41 再升级"
+        ),
+        Some(version) if version < SCHEMA_VERSION => migrate_v25_to_v26(pool).await?,
+        Some(_) => {}
+    }
+    apply_schema(pool).await
+}
+
+/// 库里记录的结构版本；`None` 表示这是一个还没有任何表的新库。
+async fn stored_schema_version(pool: &SqlitePool) -> Result<Option<i64>> {
+    let has_settings: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_settings')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("读取数据库结构失败")?;
+    if !has_settings {
+        return Ok(None);
+    }
     let stored: Option<String> =
         sqlx::query_scalar("SELECT value FROM app_settings WHERE key = 'schema_version'")
             .fetch_optional(pool)
             .await?;
-    let stored_version: i64 = stored.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
-    if stored_version > SCHEMA_VERSION {
-        anyhow::bail!(
-            "数据库结构版本 {stored_version} 比当前二进制认识的 {SCHEMA_VERSION} 新：\
-             请先升级 Akhub，不要用旧版本打开新数据库"
-        );
-    }
-    if stored_version < SCHEMA_VERSION {
-        migrate(pool, stored_version).await?;
-    }
+    // 有表却没有版本行，只可能是很早期的库：按 0 处理，交给"太旧"分支。
+    Ok(Some(
+        stored.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0),
+    ))
+}
+
+async fn write_schema_version(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     sqlx::query(
         "INSERT INTO app_settings (key, value, updated_at) VALUES ('schema_version', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
     .bind(SCHEMA_VERSION.to_string())
     .bind(now_unix())
-    .execute(pool)
+    .execute(conn)
     .await
     .context("写入结构版本失败")?;
     Ok(())
 }
 
-/// 逐版本迁移。只在版本落后时执行，可重复运行（按列名判断是否已存在）。
-async fn migrate(pool: &SqlitePool, from: i64) -> Result<()> {
-    if from < 2 {
-        // v2：请求记录补用量与时机列。新库由 schema.sql 直接建好，这里只补老库。
-        let existing = table_columns(pool, "request_records").await?;
-        for (column, ddl) in [
-            (
-                "first_token_ms",
-                "ALTER TABLE request_records ADD COLUMN first_token_ms INTEGER",
-            ),
-            (
-                "input_tokens",
-                "ALTER TABLE request_records ADD COLUMN input_tokens INTEGER",
-            ),
-            (
-                "output_tokens",
-                "ALTER TABLE request_records ADD COLUMN output_tokens INTEGER",
-            ),
-            (
-                "config_version",
-                "ALTER TABLE request_records ADD COLUMN config_version INTEGER",
-            ),
-        ] {
-            if !existing.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
-            }
-        }
-    }
-    if from < 4 {
-        // v4：分组的托管后台开关（老库补列；任务表由 schema.sql 的
-        // CREATE TABLE IF NOT EXISTS 建好，这里不用重复建）。
-        let existing = table_columns(pool, "groups").await?;
-        if !existing.contains("allow_managed_background") {
-            sqlx::query(
-                "ALTER TABLE groups ADD COLUMN allow_managed_background INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 groups.allow_managed_background 失败")?;
-        }
-    }
-    if from < 3 {
-        // v3：分组补"队列最长等待"（§6.3）。默认 60 秒，0 表示跟随请求总超时。
-        let existing = table_columns(pool, "groups").await?;
-        if !existing.contains("max_wait_secs") {
-            sqlx::query("ALTER TABLE groups ADD COLUMN max_wait_secs INTEGER NOT NULL DEFAULT 60")
-                .execute(pool)
-                .await
-                .context("迁移 groups.max_wait_secs 失败")?;
-        }
-    }
-    if from < 6 {
-        // v6：请求记录补诊断列（§6.6、§24.1）。新库由 schema.sql 直接建好。
-        let existing = table_columns(pool, "request_records").await?;
-        for (column, ddl) in [
-            (
-                "sticky_wait_ms",
-                "ALTER TABLE request_records ADD COLUMN sticky_wait_ms INTEGER",
-            ),
-            (
-                "sticky_freshness",
-                "ALTER TABLE request_records ADD COLUMN sticky_freshness REAL",
-            ),
-            (
-                "output_tps",
-                "ALTER TABLE request_records ADD COLUMN output_tps REAL",
-            ),
-            (
-                "multiplier_source",
-                "ALTER TABLE request_records ADD COLUMN multiplier_source TEXT",
-            ),
-            (
-                "quota_status",
-                "ALTER TABLE request_records ADD COLUMN quota_status TEXT",
-            ),
-            (
-                "filter_summary",
-                "ALTER TABLE request_records ADD COLUMN filter_summary TEXT",
-            ),
-            (
-                "selected_layer",
-                "ALTER TABLE request_records ADD COLUMN selected_layer INTEGER",
-            ),
-        ] {
-            if !existing.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
-            }
-        }
-    }
-    if from < 7 {
-        // v7：Token 细分（§11.6）。上游不上报的项留 NULL，绝不估算。
-        let existing = table_columns(pool, "request_records").await?;
-        for (column, ddl) in [
-            (
-                "cache_read_tokens",
-                "ALTER TABLE request_records ADD COLUMN cache_read_tokens INTEGER",
-            ),
-            (
-                "cache_write_tokens",
-                "ALTER TABLE request_records ADD COLUMN cache_write_tokens INTEGER",
-            ),
-            (
-                "reasoning_tokens",
-                "ALTER TABLE request_records ADD COLUMN reasoning_tokens INTEGER",
-            ),
-        ] {
-            if !existing.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
-            }
-        }
-    }
-    if from < 11 {
-        // v11：上游类型归一化（见 SCHEMA_VERSION 的说明）。用事务包起来，
-        // 并且**先改数据、后写版本**：中途失败整体回滚，下次启动从头再来，
-        // 不会留下"版本已是 11、库里还是旧值"的分叉（§27）。
-        let mut tx = pool.begin().await.context("开始 v11 迁移事务失败")?;
-        sqlx::query(
-            "UPDATE upstream_accounts SET upstream_type = 'openai'
-              WHERE upstream_type = 'openai_compatible'",
-        )
-        .execute(&mut *tx)
-        .await
-        .context("归一化新 OpenAI 兼容账号失败")?;
-        for (legacy, protocol) in [
-            ("new_api", "anthropic_messages"),
-            ("sub2api", "anthropic_messages"),
-        ] {
-            sqlx::query(
-                "UPDATE upstream_accounts SET upstream_type = 'anthropic'
-                  WHERE upstream_type = ? AND preferred_protocol = ?",
-            )
-            .bind(legacy)
-            .bind(protocol)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("归一转发站账号（{legacy}，Anthropic 协议）失败"))?;
-            sqlx::query(
-                "UPDATE upstream_accounts SET upstream_type = 'openai'
-                  WHERE upstream_type = ?",
-            )
-            .bind(legacy)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("归一转发站账号（{legacy}）失败"))?;
-        }
-        tx.commit().await.context("提交 v11 迁移失败")?;
-    }
-    if from < 8 {
-        // v8：别名与"隐藏原始模型"的落点改为账号模型目录；旧别名表的数据
-        // 在迁移时合并进来，之后运行时不再依赖 account_aliases。
-        let model_columns = table_columns(pool, "account_models").await?;
-        if !model_columns.contains("hide_original") {
-            sqlx::query(
-                "ALTER TABLE account_models ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 account_models.hide_original 失败")?;
-        }
-        let target_columns = table_columns(pool, "dispatch_targets").await?;
-        if !target_columns.contains("hide_original") {
-            sqlx::query(
-                "ALTER TABLE dispatch_targets ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 dispatch_targets.hide_original 失败")?;
-        }
-        // 人工优先级的旧默认值是 50；新版默认 0，让同组账号默认同层、由
-        // 评分决定分配。把历史默认值归零，显式设置过其它值的账号不动。
-        sqlx::query(
-            "UPDATE upstream_accounts SET default_priority = 0 WHERE default_priority = 50",
-        )
-        .execute(pool)
-        .await
-        .context("迁移 upstream_accounts.default_priority 失败")?;
-        // 老版弹窗只写别名表，目录快照里还是上游真名。把已保存的别名
-        // 回填到目录行，这样升级后不会丢历史别名。
-        sqlx::query(
-            "UPDATE account_models
-                SET public_name = (
-                    SELECT aa.public_name FROM account_aliases aa
-                    WHERE aa.account_id = account_models.account_id
-                      AND aa.upstream_model = account_models.upstream_model
-                )
-              WHERE EXISTS (
-                    SELECT 1 FROM account_aliases aa
-                    WHERE aa.account_id = account_models.account_id
-                      AND aa.upstream_model = account_models.upstream_model
-              )",
-        )
-        .execute(pool)
-        .await
-        .context("迁移 account_aliases 到 account_models 失败")?;
-    }
-    if from < 9 {
-        // v9：隐藏原始模型从"每行/每目标"提升为账号级开关。旧库如果任一
-        // 目录行或目标勾过隐藏，账号级开关也置 1，保持升级后的可见性不扩大。
-        let account_columns = table_columns(pool, "upstream_accounts").await?;
-        if !account_columns.contains("hide_original") {
-            sqlx::query(
-                "ALTER TABLE upstream_accounts ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 upstream_accounts.hide_original 失败")?;
-        }
-        sqlx::query(
-            "UPDATE upstream_accounts
-                SET hide_original = 1
-              WHERE EXISTS (
-                    SELECT 1 FROM account_models am
-                    WHERE am.account_id = upstream_accounts.id AND am.hide_original != 0
-              ) OR EXISTS (
-                    SELECT 1 FROM dispatch_targets dt
-                    WHERE dt.account_id = upstream_accounts.id AND dt.hide_original != 0
-              )",
-        )
-        .execute(pool)
-        .await
-        .context("迁移账号级 hide_original 失败")?;
-    }
-    if from < 10 {
-        // v10：Key 池的定位列。表与索引由 schema.sql 的 CREATE TABLE IF NOT
-        // EXISTS 建好，这里只补老库缺的列。
-        let secret_columns = table_columns(pool, "upstream_secrets").await?;
-        if !secret_columns.contains("keys_migrated") {
-            sqlx::query(
-                "ALTER TABLE upstream_secrets ADD COLUMN keys_migrated INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 upstream_secrets.keys_migrated 失败")?;
-        }
-        let record_columns = table_columns(pool, "request_records").await?;
-        for (column, ddl) in [
-            (
-                "key_id",
-                "ALTER TABLE request_records ADD COLUMN key_id TEXT",
-            ),
-            (
-                "key_label",
-                "ALTER TABLE request_records ADD COLUMN key_label TEXT",
-            ),
-        ] {
-            if !record_columns.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 request_records.{column} 失败"))?;
-            }
-        }
-        let attempt_columns = table_columns(pool, "request_attempts").await?;
-        for (column, ddl) in [
-            (
-                "key_id",
-                "ALTER TABLE request_attempts ADD COLUMN key_id TEXT",
-            ),
-            (
-                "key_label",
-                "ALTER TABLE request_attempts ADD COLUMN key_label TEXT",
-            ),
-        ] {
-            if !attempt_columns.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 request_attempts.{column} 失败"))?;
-            }
-        }
-        let state_columns = table_columns(pool, "response_states").await?;
-        if !state_columns.contains("key_id") {
-            sqlx::query("ALTER TABLE response_states ADD COLUMN key_id TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 response_states.key_id 失败")?;
-        }
-        // 粘性绑定补"绑的是哪把 Key"。旧快照为 NULL，下一次使用即补齐：
-        // 老会话的缓存本来就已经冷了，重新绑一次没有额外代价。
-        let sticky_columns = table_columns(pool, "sticky_bindings").await?;
-        if !sticky_columns.contains("credential_digest") {
-            sqlx::query("ALTER TABLE sticky_bindings ADD COLUMN credential_digest TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 sticky_bindings.credential_digest 失败")?;
-        }
-    }
-    if from < 13 {
-        // v13：粘性绑定补"最近一次真正换目标的时刻"，供迁移冷却使用（§10.1 修订）。
-        // 旧快照为 NULL 表示"还没迁移过"，不改变任何语义。
-        let sticky_columns = table_columns(pool, "sticky_bindings").await?;
-        if !sticky_columns.contains("migrated_at") {
-            sqlx::query("ALTER TABLE sticky_bindings ADD COLUMN migrated_at INTEGER")
-                .execute(pool)
-                .await
-                .context("迁移 sticky_bindings.migrated_at 失败")?;
-        }
-    }
-    if from < 14 {
-        // v14：粘性绑定补"上次绑定时请求体有多大"，用来识别上下文重写（§10.1 修订）。
-        // 旧快照为 NULL，含义是"不知道"，不触发任何重平衡。
-        let sticky_columns = table_columns(pool, "sticky_bindings").await?;
-        if !sticky_columns.contains("context_bytes") {
-            sqlx::query("ALTER TABLE sticky_bindings ADD COLUMN context_bytes INTEGER")
-                .execute(pool)
-                .await
-                .context("迁移 sticky_bindings.context_bytes 失败")?;
-        }
-    }
-    if from < 16 {
-        // v16：性能快照补"时间衰减权重"与"真正的采样时刻"（§9.4 修订）。
-        // 老库没有这两列时：weight 用 samples 兜底（等价于"按累计条数"的旧
-        // 语义），last_sample_at 留 0 表示"不知道有多旧"——按陈旧处理，让这些
-        // 目标必须重新被采样才能回到参照系，而不是拿旧分数一直占着位置。
-        let perf_columns = table_columns(pool, "target_perf_snapshot").await?;
-        for (column, ddl) in [
-            (
-                "weight",
-                "ALTER TABLE target_perf_snapshot ADD COLUMN weight REAL NOT NULL DEFAULT 0",
-            ),
-            (
-                "last_sample_at",
-                "ALTER TABLE target_perf_snapshot ADD COLUMN last_sample_at INTEGER NOT NULL DEFAULT 0",
-            ),
-        ] {
-            if !perf_columns.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 target_perf_snapshot.{column} 失败"))?;
-            }
-        }
-        // weight 用累计条数兜底（等价于旧语义）。last_sample_at 保持 0 =
-        // "采样时刻未知"，读取时会按完全过期处理，于是这些目标必须重新被采样
-        // 才能回到参照系——不会拿上个月的分数占着"全组最快"的位置。
-        sqlx::query(
-            "UPDATE target_perf_snapshot SET weight = samples WHERE weight <= 0 AND samples > 0",
-        )
-        .execute(pool)
-        .await
-        .context("回填 target_perf_snapshot.weight 失败")?;
-    }
-    if from < 17 {
-        // v17：把 v16 留下的"采样时刻未知"用**真实请求记录**补回来（§9.4 修订）。
-        //
-        // v16 只加了列，老库的 last_sample_at 一律是 0 = "不知道有多旧"，读取时
-        // 按完全过期处理。这是诚实的默认值，但对**升级者**是个陷阱：升级后所有
-        // 账号都会瞬间变成"冷"，要等重新采样才回到参照系；低流量账号（现场实测
-        // 0.71 条/小时）得等十几个小时，而这期间所有人的性能各维又是 0.6——正是
-        // 这次要修的那个症状被升级动作重新制造了一遍。
-        //
-        // 而 request_records 里就存着每个 (目标, 协议, 是否流式) 的真实请求时刻，
-        // 也就是采样时刻本身。能查到就不该假装不知道：拿真实数据回填，比丢弃强。
-        // 查不到（记录已被清理、或该维度从无请求）的保持 0，仍然按过期处理。
-        //
-        // 只碰 last_sample_at <= 0 的行：新版本已经写过的行有真实值，不能被覆盖。
-        // 幂等，可重复运行。
-        //
-        // 这条子查询按 (target_id, protocol, streaming) 过滤。schema.sql 里有对应
-        // 索引，但老库执行到这里时索引可能还没建（CREATE INDEX 在 open 流程的
-        // 另一步），所以显式保证一次，避免在请求记录表上做全表扫描 × 快照行数。
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_records_target_dimension
-                ON request_records(target_id, protocol, streaming, started_at DESC)",
-        )
-        .execute(pool)
-        .await
-        .context("创建 request_records 维度索引失败")?;
-        sqlx::query(
-            "UPDATE target_perf_snapshot
-                SET last_sample_at = COALESCE((
-                    SELECT MAX(r.started_at) FROM request_records r
-                    WHERE r.target_id = target_perf_snapshot.target_id
-                      AND r.protocol  = target_perf_snapshot.protocol
-                      AND r.streaming = target_perf_snapshot.streaming
-                ), 0)
-              WHERE last_sample_at <= 0",
-        )
-        .execute(pool)
-        .await
-        .context("回填 target_perf_snapshot.last_sample_at 失败")?;
-    }
-    if from < 18 {
-        // v18：账号可以"未分配"（§4.2.3）。SQLite 的 ALTER TABLE 改不了列约束，
-        // 只能重建表：建新表 → 拷数据 → 删旧表 → 换名 → 重建索引。
-        //
-        // 外键是这里的全部难点。upstream_secrets、upstream_account_keys、
-        // account_models 等都显式引用 upstream_accounts(id)，而 SQLite 的
-        // legacy_alter_table 默认关闭，直接 RENAME 旧表会把那些引用一并改写成
-        // 备份表名。所以用法是**只删旧表、把新表叫回原名**：RENAME 只改写"其他
-        // 表"里指向它的引用，新表自己的结构原样落地，子表里的引用仍然按名字指向它。
-        //
-        // 三处必须小心的地方：
-        //
-        // 1. PRAGMA foreign_keys 在事务内是**静默无效**的，必须开在事务外；
-        // 2. 外键打开时 DROP TABLE 会先做一次隐式 DELETE，ON DELETE CASCADE
-        //    会把子表里的行**全部级联删掉**——这正是必须关外键的原因；
-        // 3. 连接池只有一条连接，PRAGMA 一发出就作用于之后的全部语句。
-        //
-        // 因为第 3 点，关掉外键之后的每一步都不能用 `?` 提前返回：那会把连接带着
-        // "外键已关"的状态还回池子。这里把整段工作收进一个内层 async 块，先恢复
-        // 外键，再决定成功还是失败。
-        //
-        // 历史缺口：`auto_sync` 是直接加进 schema.sql 的，**从来没有对应的迁移**。
-        // 新库因为它带 DEFAULT 而正常，但比它更老的库升上来时这一列根本不存在——
-        // 而下面的重建要按列名逐列拷贝，缺一列就会整段失败。重建前先把可能缺失的
-        // 列补齐：`CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，指望不上。
-        let account_columns = table_columns(pool, "upstream_accounts").await?;
-        for (column, ddl) in [
-            (
-                "auto_sync",
-                "ALTER TABLE upstream_accounts ADD COLUMN auto_sync INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "hide_original",
-                "ALTER TABLE upstream_accounts ADD COLUMN hide_original INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "model_synced_at",
-                "ALTER TABLE upstream_accounts ADD COLUMN model_synced_at INTEGER",
-            ),
-        ] {
-            if !account_columns.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("v18 迁移补 upstream_accounts.{column} 失败"))?;
-            }
-        }
-        // 反方向也要拦：下面的重建用**显式列清单**拷贝，旧表若比清单多出任何一列，
-        // 那些列的数据会在 DROP 之后一起消失，而且不报错。多出来的列只可能来自
-        // "某个中间版本加过、后来又被删掉"的结构——本二进制不认识它，也就无从判断
-        // 该不该保留，直接拒绝启动比静默丢数据安全（与 `check_schema_version` 对
-        // "库比二进制新"的口径一致）。
-        const KNOWN_ACCOUNT_COLUMNS: &[&str] = &[
-            "id",
-            "group_id",
-            "name",
-            "upstream_type",
-            "base_url",
-            "preferred_protocol",
-            "adaptive_protocol",
-            "default_priority",
-            "calibration",
-            "multiplier_mode",
-            "manual_multiplier",
-            "new_api_user_id",
-            "new_api_group",
-            "limit_rpm",
-            "limit_tpm",
-            "limit_concurrency",
-            "allow_private_network",
-            "enabled",
-            "auto_sync",
-            "hide_original",
-            "model_synced_at",
-            "created_at",
-        ];
-        let actual_columns = table_columns(pool, "upstream_accounts").await?;
-        if let Some(unexpected) = actual_columns
-            .iter()
-            .find(|column| !KNOWN_ACCOUNT_COLUMNS.contains(&column.as_str()))
-        {
-            anyhow::bail!(
-                "upstream_accounts 多出本版本不认识的列 `{unexpected}`：\
-                 v18 重建按显式列清单拷贝，继续下去会把那一列的数据静默丢掉。\
-                 请用生成这个库的版本完成升级。"
-            );
-        }
-        let mut conn = pool.acquire().await.context("v18 迁移取连接失败")?;
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *conn)
-            .await
-            .context("v18 迁移前关闭外键失败")?;
-        let outcome: Result<()> = async {
-            let mut tx = conn.begin().await.context("开始 v18 迁移事务失败")?;
-            sqlx::query(
-                "CREATE TABLE upstream_accounts_v18 (
-                    id                    TEXT PRIMARY KEY,
-                    group_id              TEXT REFERENCES groups(id) ON DELETE CASCADE,
-                    name                  TEXT NOT NULL,
-                    upstream_type         TEXT NOT NULL DEFAULT '',
-                    base_url              TEXT NOT NULL,
-                    preferred_protocol    TEXT NOT NULL,
-                    adaptive_protocol     INTEGER NOT NULL,
-                    default_priority      INTEGER NOT NULL,
-                    calibration           INTEGER NOT NULL,
-                    multiplier_mode       TEXT NOT NULL,
-                    manual_multiplier     INTEGER NOT NULL,
-                    new_api_user_id       TEXT,
-                    new_api_group         TEXT,
-                    limit_rpm             INTEGER,
-                    limit_tpm             INTEGER,
-                    limit_concurrency     INTEGER,
-                    allow_private_network INTEGER NOT NULL,
-                    enabled               INTEGER NOT NULL,
-                    auto_sync             INTEGER NOT NULL DEFAULT 0,
-                    hide_original         INTEGER NOT NULL DEFAULT 0,
-                    model_synced_at       INTEGER,
-                    created_at            INTEGER NOT NULL
-                )",
-            )
-            .execute(&mut *tx)
-            .await
-            .context("v18 迁移建新表失败")?;
-            sqlx::query(
-                "INSERT INTO upstream_accounts_v18
-                    SELECT id, group_id, name, upstream_type, base_url, preferred_protocol,
-                           adaptive_protocol, default_priority, calibration, multiplier_mode,
-                           manual_multiplier, new_api_user_id, new_api_group, limit_rpm,
-                           limit_tpm, limit_concurrency, allow_private_network, enabled,
-                           auto_sync, hide_original, model_synced_at, created_at
-                      FROM upstream_accounts",
-            )
-            .execute(&mut *tx)
-            .await
-            .context("v18 迁移拷贝账号失败")?;
-            sqlx::query("DROP TABLE upstream_accounts")
-                .execute(&mut *tx)
-                .await
-                .context("v18 迁移删除旧表失败")?;
-            sqlx::query("ALTER TABLE upstream_accounts_v18 RENAME TO upstream_accounts")
-                .execute(&mut *tx)
-                .await
-                .context("v18 迁移换名失败")?;
-            for statement in [
-                "CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id)",
-                // 同组内账号名唯一（§4.2）：WHERE 子句把未分配账号排除在外，
-                // 所以"未分配之间重名"合法，而"同组内重名"由数据库硬拦。
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_group_name
-                    ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL",
-            ] {
-                sqlx::query(statement)
-                    .execute(&mut *tx)
-                    .await
-                    .context("v18 迁移重建索引失败")?;
-            }
-            tx.commit().await.context("提交 v18 迁移失败")?;
-            // 引用完整性复查：关着外键的这一段不会产生新的坏引用，但更早的版本
-            // 可能在别的表里留下过孤儿行。**这里绝不能拒绝启动**——"升级后服务
-            // 起不来"是对现有部署最糟的失败模式，而这些孤儿行按定义已经是不可达
-            // 数据（父行早就没了），留着只会让下一次外键检查继续报警。
-            //
-            // 所以：删掉孤儿行、记一条 warn、照常启动。删的是坏数据，不是用户
-            // 的配置；请求记录之类不参与外键的表现在也不再需要它们指向的父行。
-            let orphans = clean_orphan_rows(&mut conn).await?;
-            if orphans > 0 {
-                tracing::warn!(
-                    rows = orphans,
-                    "v18 迁移清理了引用不完整的孤儿行（父行早已不存在，数据不可达）"
-                );
-            }
-            Ok(())
-        }
-        .await;
-        let restored = sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *conn)
-            .await
-            .context("v18 迁移恢复外键失败");
-        drop(conn);
-        outcome?;
-        restored?;
-    }
-    if from < 10 {
-        // 老库的单把凭据展开成"一把 Key 的池"（§4.2.1）。放在迁移里而不是
-        // bootstrap 里：内存库、测试与任何直接 open 的路径都走同一条路，
-        // 不会有"某些调用方建出来的库里 Key 池是空的"这种状态。
-        backfill_account_keys(pool).await?;
-    }
-    if from < 19 {
-        // v19：异步生图任务的定位记录补"下单那把 Key"的凭据摘要（§14.9）。
-        // 表可能压根不存在（从没跑过带这个功能的版本）：PRAGMA 对不存在的表返回
-        // 空列集，这时什么都不用做——schema.sql 已经把它整张建全了。
-        let columns = table_columns(pool, "image_tasks").await?;
-        if !columns.is_empty() && !columns.contains("key_digest") {
-            sqlx::query("ALTER TABLE image_tasks ADD COLUMN key_digest TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 image_tasks.key_digest 失败")?;
-        }
-    }
-    if from < 20 {
-        // v20：image_tasks 的主键改成 (group_id, account_id, task_id)（§14.9）。
-        //
-        // 表可能压根不存在（从没跑过带这个功能的版本）：PRAGMA 对不存在的表返回
-        // 空列集，这时什么都不用做——schema.sql 已经把它整张建全了。
-        //
-        // 存在时只能重建表：SQLite 改不了主键。image_tasks 既不引用别的表，也没有
-        // 别的表引用它，所以不需要 v18 那套关外键的仪式；但"先建新表、按列名拷贝、
-        // 再删旧表换名"的次序必须照旧，否则中途失败就会丢掉定位记录。
-        let columns = table_columns(pool, "image_tasks").await?;
-        if !columns.is_empty() {
-            // v19 可能刚补过这一列，也可能由 schema.sql 建全；更老的形态里它不存在。
-            let has_digest = columns.contains("key_digest");
-            let digest_expr = if has_digest { "key_digest" } else { "NULL" };
-            let mut tx = pool.begin().await.context("开始 v20 迁移事务失败")?;
-            sqlx::query(
-                "CREATE TABLE image_tasks_v20 (
-                    task_id        TEXT NOT NULL,
-                    group_id       TEXT NOT NULL,
-                    account_id     TEXT NOT NULL,
-                    target_id      TEXT,
-                    upstream_model TEXT,
-                    key_digest     TEXT,
-                    created_at     INTEGER NOT NULL,
-                    expires_at     INTEGER NOT NULL,
-                    PRIMARY KEY (group_id, account_id, task_id)
-                )",
-            )
-            .execute(&mut *tx)
-            .await
-            .context("v20 迁移建新表失败")?;
-            let copied = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO image_tasks_v20
-                    (task_id, group_id, account_id, target_id, upstream_model,
-                     key_digest, created_at, expires_at)
-                 SELECT task_id, group_id, account_id, target_id, upstream_model,
-                        {digest_expr}, created_at, expires_at
-                 FROM image_tasks"
-            )))
-            .execute(&mut *tx)
-            .await
-            .context("v20 迁移拷贝既有任务失败")?
-            .rows_affected();
-            sqlx::query("DROP TABLE image_tasks")
-                .execute(&mut *tx)
-                .await
-                .context("v20 迁移删除旧表失败")?;
-            sqlx::query("ALTER TABLE image_tasks_v20 RENAME TO image_tasks")
-                .execute(&mut *tx)
-                .await
-                .context("v20 迁移重命名新表失败")?;
-            // 失败时事务整体回滚（旧表与数据原样保留）并中止启动，版本号不会推进，
-            // 下次启动会重试。带着半迁移的结构继续跑比起不来更危险。
-            tx.commit().await.context("提交 v20 迁移失败")?;
-            tracing::info!(copied, "已迁移异步生图任务定位表的主键");
-        }
-    }
-    if from < 22 {
-        // v22：请求记录补"档位重发次数"，尝试明细补"上游状态码"与"发出的档位"
-        // （§14.6、§6.6）。旧库补列：历史请求没记过这三个数，不猜——重发次数
-        // 默认 0，状态码与档位留 NULL。新库由 schema.sql 直接建好。
-        let columns = table_columns(pool, "request_records").await?;
-        if !columns.contains("effort_retries") {
-            sqlx::query(
-                "ALTER TABLE request_records ADD COLUMN effort_retries INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 request_records.effort_retries 失败")?;
-        }
-        let attempt_columns = table_columns(pool, "request_attempts").await?;
-        if !attempt_columns.contains("upstream_status") {
-            sqlx::query("ALTER TABLE request_attempts ADD COLUMN upstream_status INTEGER")
-                .execute(pool)
-                .await
-                .context("迁移 request_attempts.upstream_status 失败")?;
-        }
-        if !attempt_columns.contains("effort") {
-            sqlx::query("ALTER TABLE request_attempts ADD COLUMN effort TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 request_attempts.effort 失败")?;
-        }
-    }
-    if from < 25 {
-        // v25 之二：队列总容量默认改为「不限」（§6.3）。
-        //
-        // 只把**旧默认值 100** 改掉：那是上一版没填时的落库值，不是管理员
-        // 挑的数字。显式设过 0（不排队）或别的上限的分组一律不动——那两个
-        // 都是有意的选择，改掉会让限流突然失效或突然开始排队。
-        let affected =
-            sqlx::query("UPDATE groups SET queue_capacity = ? WHERE queue_capacity = 100")
-                .bind(crate::domain::QUEUE_UNLIMITED)
-                .execute(pool)
-                .await
-                .context("迁移分组队列容量默认值失败")?
-                .rows_affected();
-        if affected > 0 {
-            tracing::info!(groups = affected, "队列总容量默认值从 100 改为不限");
-        }
-    }
-    if from < 24 {
-        // v24：调度评分加第五维「缓存命中率」（§9.4）。
-        //
-        // 两处落库：分组的第五个权重列，以及性能快照里的命中率 EWMA。
-        //
-        // 新列默认 0，对自定义权重的分组就该保持 0：迁移不得悄悄改掉管理员
-        // 亲手调出来的比例。但**整组都是 0 等于这一维在上线当天就是死的**
-        // ——现场 14 个分组全是从预设点出来的，升级后命中率权重一律为 0，
-        // 用户看到的只是一个永远不起作用的第五列。
-        //
-        // 所以只做一件**可证明无歧义**的事：把四个数与旧预设**完全相等**的
-        // 分组，换成同名新预设。相等才动，说明当初是点的按钮而不是手调；
-        // 手调出来的组合几乎不可能恰好等于预设，落不到这里。
-        //
-        // 旧预设 → 新预设（首字与速度各让 5 分给命中率）：
-        //   成本优先 55/20/15/10 → 55/20/10/5/10
-        //   均衡     40/25/20/15 → 40/25/15/10/10
-        //   质量优先 15/30/25/30 → 15/30/20/25/10
-        let group_columns = table_columns(pool, "groups").await?;
-        if !group_columns.contains("weight_cache_hit") {
-            sqlx::query(
-                "ALTER TABLE groups ADD COLUMN weight_cache_hit INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 groups.weight_cache_hit 失败")?;
-            for (old, new) in [
-                (
-                    (55_i64, 20_i64, 15_i64, 10_i64),
-                    (55_i64, 20_i64, 10_i64, 5_i64, 10_i64),
-                ),
-                ((40, 25, 20, 15), (40, 25, 15, 10, 10)),
-                ((15, 30, 25, 30), (15, 30, 20, 25, 10)),
-            ] {
-                let affected = sqlx::query(
-                    "UPDATE groups
-                        SET weight_multiplier = ?, weight_reliability = ?,
-                            weight_first_token = ?, weight_throughput = ?,
-                            weight_cache_hit = ?
-                      WHERE weight_multiplier = ? AND weight_reliability = ?
-                        AND weight_first_token = ? AND weight_throughput = ?
-                        AND weight_cache_hit = 0",
-                )
-                .bind(new.0)
-                .bind(new.1)
-                .bind(new.2)
-                .bind(new.3)
-                .bind(new.4)
-                .bind(old.0)
-                .bind(old.1)
-                .bind(old.2)
-                .bind(old.3)
-                .execute(pool)
-                .await
-                .context("迁移旧预设权重到五维失败")?
-                .rows_affected();
-                if affected > 0 {
-                    tracing::info!(
-                        groups = affected,
-                        from = ?([old.0, old.1, old.2, old.3]),
-                        to = ?([new.0, new.1, new.2, new.3, new.4]),
-                        "把旧预设的四维权重升级为五维（多出的 10 分给缓存命中率）"
-                    );
-                }
-            }
-        }
-        let perf_columns = table_columns(pool, "target_perf_snapshot").await?;
-        for (column, ddl) in [
-            (
-                "cache_hit",
-                "ALTER TABLE target_perf_snapshot ADD COLUMN cache_hit REAL NOT NULL DEFAULT 0",
-            ),
-            (
-                "cache_samples",
-                "ALTER TABLE target_perf_snapshot ADD COLUMN cache_samples INTEGER NOT NULL DEFAULT 0",
-            ),
-        ] {
-            if !perf_columns.contains(column) {
-                sqlx::query(ddl)
-                    .execute(pool)
-                    .await
-                    .with_context(|| format!("迁移 target_perf_snapshot.{column} 失败"))?;
-            }
-        }
-    }
-    if from < 25 {
-        // v25：预设权重重新定标（§6.3）。
-        //
-        // 评价维度改成「倍率、可靠性、缓存命中率、输出速度、首字延迟」，
-        // 三档预设也重排了：命中率与可靠性同等重要，首字延迟降到最低。
-        //
-        // 同样只动**恰好等于上一版预设**的分组，手调比例原样保留。这里认的
-        // 是 v24 刚映射出来的那组值——所以从 v23 直升级的库会连过两道，
-        // 最终落到的就是新预设。
-        //
-        // 元组顺序是**库里的列序**：(倍率, 可靠性, 首字, 速度, 命中率)。
-        // 界面展示的顺序是 倍率·可靠性·命中率·速度·首字，只是排列不同。
-        // 两者混了不会报错——UPDATE 只是影响 0 行，静默什么都不做，
-        // 所以这组数必须对着 v24 的产出逐项核。
-        //
-        //   v24 成本优先 (55,20,10,5,10)  → v25 (55,15,5,10,15)
-        //   v24 均衡     (40,25,15,10,10) → v25 (30,30,10,15,15)
-        //   v24 质量优先 (15,30,20,25,10) → v25 (10,30,20,20,20)
-        // 注意：这一段在 `from < 24` 之前执行，此时 weight_cache_hit **可能还
-        // 不存在**（从 v23 直升级）。缺列时先补上，否则下面按五列匹配的
-        // UPDATE 一条都跑不到，且不会报错。
-        let columns = table_columns(pool, "groups").await?;
-        if !columns.contains("weight_cache_hit") {
-            sqlx::query(
-                "ALTER TABLE groups ADD COLUMN weight_cache_hit INTEGER NOT NULL DEFAULT 0",
-            )
-            .execute(pool)
-            .await
-            .context("迁移 groups.weight_cache_hit 失败（v25 前置）")?;
-        }
-        {
-            for (old, new) in [
-                ((55_i64, 20, 10, 5, 10), (55_i64, 15, 5, 10, 15)),
-                ((40, 25, 15, 10, 10), (30, 30, 10, 15, 15)),
-                ((15, 30, 20, 25, 10), (10, 30, 20, 20, 20)),
-            ] {
-                let affected = sqlx::query(
-                    "UPDATE groups
-                        SET weight_multiplier = ?, weight_reliability = ?,
-                            weight_first_token = ?, weight_throughput = ?,
-                            weight_cache_hit = ?
-                      WHERE weight_multiplier = ? AND weight_reliability = ?
-                        AND weight_first_token = ? AND weight_throughput = ?
-                        AND weight_cache_hit = ?",
-                )
-                .bind(new.0)
-                .bind(new.1)
-                .bind(new.2)
-                .bind(new.3)
-                .bind(new.4)
-                .bind(old.0)
-                .bind(old.1)
-                .bind(old.2)
-                .bind(old.3)
-                .bind(old.4)
-                .execute(pool)
-                .await
-                .context("迁移预设权重到新定标失败")?
-                .rows_affected();
-                if affected > 0 {
-                    tracing::info!(
-                        groups = affected,
-                        from = ?([old.0, old.1, old.2, old.3, old.4]),
-                        to = ?([new.0, new.1, new.2, new.3, new.4]),
-                        "预设权重升级到新定标"
-                    );
-                }
-            }
-        }
-    }
-    if from < 23 {
-        // v23：请求记录补"绑定目标有没有真的被用上"（§24.1）。
-        //
-        // `sticky_hit` 只说明"找到了一条绑定"：软亲和路径下它在重新抽签**之前**
-        // 就置位，于是系统性高估粘性——现场（AwsClaude / opus-5-5）该字段看着
-        // 82.8%，实测相邻请求仍有 35% 换了账号。补这一列之后，
-        // `hit=true, kept=false` 才让"有绑定但被抽签抽走了"第一次可见。
-        // 历史请求没记过它，留 NULL（不猜）。
-        let columns = table_columns(pool, "request_records").await?;
-        if !columns.contains("sticky_kept") {
-            sqlx::query("ALTER TABLE request_records ADD COLUMN sticky_kept INTEGER")
-                .execute(pool)
-                .await
-                .context("迁移 request_records.sticky_kept 失败")?;
-        }
-    }
-    if from < 21 {
-        // v21：请求记录补"候选过滤原因的具体说明"（§24.1）。摘要列 v6 就有了，
-        // 但只有类别词；这一列回答"到底是哪个账号、哪项能力、哪个端点被过滤"。
-        let columns = table_columns(pool, "request_records").await?;
-        if !columns.contains("filter_details") {
-            sqlx::query("ALTER TABLE request_records ADD COLUMN filter_details TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 request_records.filter_details 失败")?;
-        }
-    }
-    if from < 15 {
-        // v15：请求记录补"粘性键来源"，让守门放行的比例可以按级统计（§24.1）。
-        let record_columns = table_columns(pool, "request_records").await?;
-        if !record_columns.contains("sticky_origin") {
-            sqlx::query("ALTER TABLE request_records ADD COLUMN sticky_origin TEXT")
-                .execute(pool)
-                .await
-                .context("迁移 request_records.sticky_origin 失败")?;
-        }
-    }
-    if from < 5 {
-        // v5：分钟级性能聚合表。老库需要补建；新库已由 schema.sql 建好，
-        // 这里用 CREATE TABLE IF NOT EXISTS 保持幂等（§20.1）。
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS performance_buckets (
-                bucket_start      INTEGER NOT NULL,
-                target_id         TEXT NOT NULL,
-                protocol          TEXT NOT NULL,
-                streaming         INTEGER NOT NULL,
-                requests          INTEGER NOT NULL,
-                success           INTEGER NOT NULL,
-                total_ms_sum      INTEGER NOT NULL,
-                first_token_sum   INTEGER NOT NULL,
-                first_token_count INTEGER NOT NULL,
-                output_tokens_sum INTEGER NOT NULL,
-                rate_limited      INTEGER NOT NULL DEFAULT 0,
-                server_errors     INTEGER NOT NULL DEFAULT 0,
-                protocol_errors   INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (bucket_start, target_id, protocol, streaming)
-            )",
-        )
-        .execute(pool)
-        .await
-        .context("迁移 performance_buckets 建表失败")?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_buckets_time ON performance_buckets(bucket_start DESC)",
-        )
-        .execute(pool)
-        .await
-        .context("迁移 performance_buckets 建索引失败")?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_buckets_target ON performance_buckets(target_id, bucket_start DESC)",
-        )
-        .execute(pool)
-        .await
-        .context("迁移 performance_buckets 建目标索引失败")?;
-    }
-    Ok(())
-}
+/// v25 → v26 的全部语句，按顺序执行（说明见 [`migrate_v25_to_v26`]）。
+const V26_STATEMENTS: &[(&str, &str)] = &[
+    (
+        "CREATE TABLE upstream_accounts_v26 (
+            id                    TEXT PRIMARY KEY,
+            group_id              TEXT REFERENCES groups(id) ON DELETE SET NULL,
+            name                  TEXT NOT NULL,
+            base_url              TEXT NOT NULL,
+            preferred_protocol    TEXT NOT NULL,
+            adaptive_protocol     INTEGER NOT NULL,
+            default_priority      INTEGER NOT NULL,
+            calibration           INTEGER NOT NULL,
+            multiplier_mode       TEXT NOT NULL,
+            manual_multiplier     INTEGER NOT NULL,
+            new_api_user_id       TEXT,
+            new_api_group         TEXT,
+            limit_rpm             INTEGER,
+            limit_tpm             INTEGER,
+            limit_concurrency     INTEGER,
+            allow_private_network INTEGER NOT NULL,
+            enabled               INTEGER NOT NULL,
+            auto_sync             INTEGER NOT NULL DEFAULT 0,
+            hide_original         INTEGER NOT NULL DEFAULT 0,
+            model_synced_at       INTEGER,
+            created_at            INTEGER NOT NULL
+        )",
+        "建新账号表",
+    ),
+    (
+        "INSERT INTO upstream_accounts_v26
+            (id, group_id, name, base_url, preferred_protocol, adaptive_protocol,
+             default_priority, calibration, multiplier_mode, manual_multiplier,
+             new_api_user_id, new_api_group, limit_rpm, limit_tpm, limit_concurrency,
+             allow_private_network, enabled, auto_sync, hide_original,
+             model_synced_at, created_at)
+         SELECT id, group_id, name, base_url, preferred_protocol, adaptive_protocol,
+                default_priority, calibration, multiplier_mode, manual_multiplier,
+                new_api_user_id, new_api_group, limit_rpm, limit_tpm, limit_concurrency,
+                allow_private_network, enabled, auto_sync, hide_original,
+                model_synced_at, created_at
+           FROM upstream_accounts",
+        "拷贝账号",
+    ),
+    ("DROP TABLE upstream_accounts", "删除旧账号表"),
+    (
+        "ALTER TABLE upstream_accounts_v26 RENAME TO upstream_accounts",
+        "账号表换名",
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id)",
+        "重建账号分组索引",
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_group_name
+            ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL",
+        "重建账号重名索引",
+    ),
+    // v25 把"默认 100"的分组全部改成了不限；默认值已恢复有界（§13.6、§28），
+    // 那批分组一起改回来。
+    (
+        "UPDATE groups SET queue_capacity = 100 WHERE queue_capacity = 4294967295",
+        "恢复分组队列默认容量",
+    ),
+    // Key 池早已是唯一真相；镜像列在池被清空时也不会跟着清，留着只会让
+    // "拉取模型"之类的旁路读到一把已经删掉的 Key。
+    (
+        "ALTER TABLE upstream_secrets DROP COLUMN api_key",
+        "删除凭据镜像",
+    ),
+    (
+        "ALTER TABLE upstream_secrets DROP COLUMN keys_migrated",
+        "删除 Key 池迁移标记",
+    ),
+    (
+        "ALTER TABLE dispatch_targets DROP COLUMN hide_original",
+        "删除目标隐藏原名",
+    ),
+    (
+        "ALTER TABLE dispatch_targets DROP COLUMN priority_override",
+        "删除目标优先级覆盖",
+    ),
+    (
+        "ALTER TABLE account_models DROP COLUMN hide_original",
+        "删除目录行隐藏原名",
+    ),
+    // 老库无从知道哪些未启用的行是管理员亲手停用的，一律当作"没碰过"：
+    // 宁可少显示一个"你停用过"，也不要给从没见过的模型挂上它。
+    (
+        "ALTER TABLE account_models ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
+        "补目录行停用标记",
+    ),
+    // 目标从此只由目录调和生成（§16.3）：手工建的目标如果没有对应目录行，下一次
+    // 调和就会被撤下。先把它们补进目录，升级不能悄悄丢调度目标。
+    (
+        "INSERT OR IGNORE INTO account_models
+            (account_id, upstream_model, public_name, selected, excluded, missing, discovered_at)
+         SELECT t.account_id, t.upstream_model, m.name, 1, 0, 0, t.created_at
+           FROM dispatch_targets t
+           JOIN logical_models m ON m.id = t.logical_model_id
+          ORDER BY t.created_at",
+        "把手工目标补进目录",
+    ),
+    // 同一账号 + 上游模型挂在多个逻辑模型上只可能来自旧的手工接口；目录每行只
+    // 对应一个目标。保留目录行指向的那个，其余删除。
+    (
+        "DELETE FROM dispatch_targets
+          WHERE EXISTS (
+                SELECT 1 FROM logical_models m, account_models am
+                 WHERE m.id = dispatch_targets.logical_model_id
+                   AND am.account_id = dispatch_targets.account_id
+                   AND am.upstream_model = dispatch_targets.upstream_model
+                   AND am.public_name <> m.name
+          )
+            AND EXISTS (
+                SELECT 1 FROM dispatch_targets t2
+                  JOIN logical_models m2 ON m2.id = t2.logical_model_id
+                  JOIN account_models am2 ON am2.account_id = t2.account_id
+                                         AND am2.upstream_model = t2.upstream_model
+                 WHERE t2.account_id = dispatch_targets.account_id
+                   AND t2.upstream_model = dispatch_targets.upstream_model
+                   AND am2.public_name = m2.name
+          )",
+        "清理重复目标",
+    ),
+    // 手工逻辑模型的入口已经删除：没有目标的逻辑模型从此不可达，一并清掉。
+    (
+        "DELETE FROM logical_models
+          WHERE id NOT IN (SELECT logical_model_id FROM dispatch_targets)",
+        "清理零目标逻辑模型",
+    ),
+    (
+        "ALTER TABLE logical_models DROP COLUMN origin",
+        "删除逻辑模型来源",
+    ),
+    ("DROP TABLE IF EXISTS account_aliases", "删除旧别名表"),
+    ("DROP TABLE IF EXISTS performance_buckets", "删除性能聚合表"),
+];
 
-/// 删除引用不完整的孤儿行，返回删掉的行数（§27）。
+/// v25 → v26，整段在一个事务里完成，失败时库保持 v25 原样。
 ///
-/// `PRAGMA foreign_key_check` 会列出"子行引用了一个不存在的父行"的全部记录。
-/// 这类行按定义不可达（父行早已不在了，界面上永远打不开它），但**不能因此拒绝
-/// 启动**：老版本没有这个检查，谁的库里攒下几条都不奇怪，而"升级后服务起不来"
-/// 是最糟的失败模式。所以这里直接清掉它们，让库回到自洽状态。
+/// 删列直接用 `ALTER TABLE ... DROP COLUMN`；只有 `upstream_accounts` 要改外键
+/// 动作（CASCADE → SET NULL），SQLite 改不了约束，只能重建表：建新表 → 拷数据
+/// → 删旧表 → 新表改回原名。两件事必须小心：
 ///
-/// 删的时候逐表逐行来，而不是按表一条 `DELETE ... WHERE NOT IN`：
-/// `foreign_key_check` 给的是具体的 (表, rowid)，直接按 rowid 删最精确，
-/// 也避免在删除语句里重新发明一遍外键语义（复合外键、NULL 父键等）。
+/// 1. 外键打开时 `DROP TABLE` 会先做一次隐式 DELETE，级联删光 Key 池、目录与
+///    目标——所以外键要先关掉，而 `PRAGMA foreign_keys` 在事务内静默无效，
+///    只能在事务外、对**同一条连接**设置；
+/// 2. 关掉外键之后任何一步失败都不能用 `?` 直接返回，否则连接会带着"外键已关"
+///    的状态回到池里。整段收进内层 async 块，先恢复外键再决定成败。
 ///
-/// **只在 v18 迁移里调用一次**：那时外键正被关着（见上面的说明），
-/// 否则 `DELETE` 自己会先撞上同一批坏引用。
-async fn clean_orphan_rows(conn: &mut sqlx::SqliteConnection) -> Result<usize> {
-    let dangling = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await
-        .context("v18 迁移检查外键失败")?;
-    if dangling.is_empty() {
-        return Ok(0);
-    }
-    let mut removed = 0usize;
-    for row in &dangling {
-        let table: String = sqlx::Row::try_get(row, "table")?;
-        let rowid: i64 = sqlx::Row::try_get(row, "rowid")?;
-        // 表名来自 SQLite 自己的外键检查结果，但仍只接受标识符字符，
-        // 避免把任何异常内容拼进 SQL。
-        if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            anyhow::bail!("v18 迁移遇到可疑的表名：{table}");
-        }
-        let affected = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE rowid = ?"
-        )))
-        .bind(rowid)
+/// `legacy_alter_table` 默认关闭，所以"新表改回原名"时子表里的引用按名字仍然
+/// 指向它，不会被改写成临时表名。
+async fn migrate_v25_to_v26(pool: &SqlitePool) -> Result<()> {
+    let mut conn = pool.acquire().await.context("v26 迁移取连接失败")?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(&mut *conn)
         .await
-        .with_context(|| format!("v18 迁移清理 {table} 的孤儿行失败"))?
-        .rows_affected();
-        removed += affected as usize;
-    }
-    // 清完之后应当彻底干净；还有残留说明有别的表也在坏（比如删行触发了级联
-    // 又被同一批坏引用挡住），那时再报错也不迟。
-    let left = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await
-        .context("v18 迁移复查外键失败")?;
-    if !left.is_empty() {
-        anyhow::bail!(
-            "v18 迁移清理后仍有 {} 处引用不完整；请先修复数据再升级",
-            left.len()
-        );
-    }
-    Ok(removed)
-}
-/// 把还停在"单把凭据"形状的账号展开成 Key 池（§4.2.1）。
-///
-/// **幂等**，可以反复调用：只处理 \`upstream_account_keys\` 里一行都没有、
-/// 而 \`upstream_secrets.api_key\` 有值的账号。密文直接用原样搬过去——seal 的
-/// 信封本身就是主密钥加密的，不需要也不该在这个没有主密钥的层里解开。
-///
-/// 摘要暂时写空串：它只用于把动态状态归类，而这一类账号此刻还没有任何动态
-/// 状态。真正的摘要在凭据快照装载时按明文现算（[\`crate::credential\`]），
-/// 那才是唯一的真相来源。
-async fn backfill_account_keys(pool: &SqlitePool) -> Result<()> {
-    // 判据只有"这个账号一把 Key 都没有"。\`keys_migrated\` 列保留是为了兼容
-    // 旧库结构，不参与判断：任何把凭据写进 \`upstream_secrets\` 却没建 Key 行的
-    // 路径（老版本、老备份）都会被这里补上。
-    let pending = sqlx::query(
-        "SELECT account_id, api_key FROM upstream_secrets
-          WHERE api_key IS NOT NULL
-            AND NOT EXISTS (
-                  SELECT 1 FROM upstream_account_keys k
-                   WHERE k.account_id = upstream_secrets.account_id
-            )",
-    )
-    .fetch_all(pool)
-    .await
-    .context("读取待展开的账号凭据失败")?;
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let mut tx = pool.begin().await?;
-    for row in &pending {
-        let account_id: String = sqlx::Row::try_get(row, "account_id")?;
-        let sealed: Vec<u8> = sqlx::Row::try_get(row, "api_key")?;
-        sqlx::query(
-            "INSERT INTO upstream_account_keys
-                (id, account_id, label, sealed_key, credential_digest,
-                 limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
-             VALUES (?, ?, '', ?, '', NULL, NULL, NULL, 1, ?)",
-        )
-        .bind(format!("key_{}", ulid::Ulid::generate()))
-        .bind(&account_id)
-        .bind(&sealed)
-        .bind(now_unix())
-        .execute(&mut *tx)
-        .await
-        .context("展开账号 Key 池失败")?;
-    }
-    tx.commit().await?;
-    tracing::info!(
-        count = pending.len(),
-        "已把老库的单把凭据展开成账号内 Key 池"
-    );
-    Ok(())
-}
-
-/// 读取某张表的列名集合。表名来自代码内常量，不是用户输入。
-async fn table_columns(
-    pool: &SqlitePool,
-    table: &str,
-) -> Result<std::collections::HashSet<String>> {
-    Ok(
-        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
-            .fetch_all(pool)
+        .context("v26 迁移前关闭外键失败")?;
+    let outcome: Result<()> = async {
+        let mut tx = conn.begin().await.context("开始 v26 迁移事务失败")?;
+        for (statement, what) in V26_STATEMENTS {
+            sqlx::query(sqlx::AssertSqlSafe(*statement))
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("v26 迁移{what}失败"))?;
+        }
+        let dangling = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&mut *tx)
             .await
-            .with_context(|| format!("读取 {table} 结构失败"))?
-            .iter()
-            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, "name").ok())
-            .collect(),
-    )
+            .context("v26 迁移检查外键失败")?;
+        if !dangling.is_empty() {
+            anyhow::bail!(
+                "v26 迁移后有 {} 处引用不完整，已回滚；请把数据库交给维护者排查",
+                dangling.len()
+            );
+        }
+        write_schema_version(&mut tx).await?;
+        tx.commit().await.context("提交 v26 迁移失败")?;
+        Ok(())
+    }
+    .await;
+    let restored = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .context("v26 迁移恢复外键失败");
+    drop(conn);
+    outcome?;
+    restored?;
+    tracing::info!("数据库结构已从 v25 升级到 v26");
+    Ok(())
 }
 
 /// 打开一个仅存在于内存中的数据库，供测试使用。
@@ -1213,8 +361,7 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_lazy_with(SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true));
-    apply_schema(&pool).await?;
-    backfill_account_keys(&pool).await?;
+    prepare_schema(&pool).await?;
     Ok(pool)
 }
 

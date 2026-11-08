@@ -1,0 +1,488 @@
+-- Akhub 数据库结构。所有语句必须幂等：启动时无条件执行一次。
+-- 时间统一使用 Unix 秒（INTEGER），倍率统一使用放大 10^6 倍的定点整数（§20.3）。
+
+CREATE TABLE IF NOT EXISTS admin_users (
+    id             TEXT PRIMARY KEY,
+    username       TEXT NOT NULL UNIQUE,
+    password_hash  TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL UNIQUE,
+    key_prefix        TEXT NOT NULL,
+    key_digest_hex    TEXT NOT NULL UNIQUE,
+    multiplier_limit  INTEGER NOT NULL,
+    weight_multiplier INTEGER NOT NULL,
+    weight_reliability INTEGER NOT NULL,
+    weight_first_token INTEGER NOT NULL,
+    weight_throughput INTEGER NOT NULL,
+    -- 缓存命中率维度（§9.4）。与其它四项一样，五项之和必须是 100。
+    weight_cache_hit  INTEGER NOT NULL DEFAULT 0,
+    queue_capacity    INTEGER NOT NULL,
+    -- 层内全忙时最多等多久（秒）；0 表示跟随请求总超时（§6.3、§13.6）。
+    max_wait_secs     INTEGER NOT NULL DEFAULT 60,
+    allow_degrade     INTEGER NOT NULL,
+    -- 上游不支持原生后台时，是否允许网关托管后台任务（第二期 §29.1）。默认关。
+    allow_managed_background INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+
+-- group_id 为 NULL 表示"未分配"：账号建好了、还没决定放进哪个分组。
+-- 未分配账号可以配置凭据、模型目录与倍率，但没有调度目标、不参与任何调度；
+-- 在界面上把它分配给某个分组时才按对外名把模型一起迁过去（§4.2.3）。
+CREATE TABLE IF NOT EXISTS upstream_accounts (
+    id                    TEXT PRIMARY KEY,
+    group_id              TEXT REFERENCES groups(id) ON DELETE CASCADE,
+    name                  TEXT NOT NULL,
+    -- 历史列：早期用来区分官方直连、中转站与“OpenAI 兼容”，但全仓没有一处
+    -- 按它分支——端点由协议决定，倍率来源由 multiplier_mode 决定。v12 起不再
+    -- 写入也不用，只为兼容不认识新结构的旧二进制而保留（§4.2）。
+    upstream_type         TEXT NOT NULL DEFAULT '',
+    base_url              TEXT NOT NULL,
+    preferred_protocol    TEXT NOT NULL,
+    adaptive_protocol     INTEGER NOT NULL,
+    default_priority      INTEGER NOT NULL,
+    calibration           INTEGER NOT NULL,
+    multiplier_mode       TEXT NOT NULL,
+    manual_multiplier     INTEGER NOT NULL,
+    new_api_user_id       TEXT,
+    new_api_group         TEXT,
+    limit_rpm             INTEGER,
+    limit_tpm             INTEGER,
+    limit_concurrency     INTEGER,
+    allow_private_network INTEGER NOT NULL,
+    enabled               INTEGER NOT NULL,
+    -- 模型自动同步开关（§16.2）。打开后忽略选择集，全量托管上游模型。
+    auto_sync             INTEGER NOT NULL DEFAULT 0,
+    -- 账号级"隐藏原始模型"开关。打开后只暴露设置了"下游模型名"的模型；
+    -- 没有设置下游模型名的模型不会对下游开放（§16.4 修订）。
+    hide_original         INTEGER NOT NULL DEFAULT 0,
+    -- 上一次自动同步完成的时间；下一次同步时刻在此基础上加间隔与抖动。
+    model_synced_at       INTEGER,
+    created_at            INTEGER NOT NULL
+    -- 表级 UNIQUE (group_id, name) 在这里**不能用**：SQLite 把每个 NULL 都当成
+    -- 互不相等，所以它拦不住"同一分组内重名"。那件事交给下面的部分唯一索引。
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_group ON upstream_accounts(group_id);
+
+-- 同组内账号名唯一（§4.2）。WHERE 子句把未分配账号排除在唯一性之外：
+-- 未分配是暂存区，允许两个账号都叫同一个名字，等分配进分组时再判冲突；
+-- 一旦有了分组，同名就是真实的写错，交给数据库拦下——管理端的
+-- `ensure_account_name_free` 只负责给出可读的报错，不负责兜底正确性。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_group_name
+    ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL;
+
+-- 加密的上游凭据。与账号一一对应，独立成表以便日志与查询默认不触碰密文。
+--
+-- `api_key` 同时是 Key 池第一把 Key 的**镜像**：Key 池（见下）是唯一真相，
+-- 这里保留一份是为了让还不认识 Key 池的旧二进制、以及旧备份的恢复路径
+-- 仍然能读到凭据。写入 Key 池时一并更新它。
+CREATE TABLE IF NOT EXISTS upstream_secrets (
+    account_id    TEXT PRIMARY KEY REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    api_key       BLOB NOT NULL,
+    -- New API 倍率探针的访问令牌，与推理用的 sk-xxx 是两把不同的凭据（§11.2）。
+    new_api_token BLOB,
+    updated_at    INTEGER NOT NULL,
+    -- 老库的单把 Key 是否已经展开进 Key 池（§4.2.1 的迁移）。
+    keys_migrated INTEGER NOT NULL DEFAULT 0
+);
+
+-- 账号内 Key 池（§4.2.1）。每把 Key 独立密封、独立启用开关与限额覆盖。
+-- 凭据级状态（熔断、额度、RPM/并发）按 credential_digest 归类，不按 id：
+-- 改标签或换 nonce 重新密封同一把 Key 时，健康状态必须对得上。
+CREATE TABLE IF NOT EXISTS upstream_account_keys (
+    id                TEXT PRIMARY KEY,
+    account_id        TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    -- 后台展示用的标签。留空时界面按序号显示。
+    label             TEXT NOT NULL DEFAULT '',
+    sealed_key        BLOB NOT NULL,
+    -- 明文凭据经主密钥 pepper 派生的摘要（hex）。绝不用于鉴权，只用于归类状态。
+    credential_digest TEXT NOT NULL,
+    -- Key 级限额覆盖，逐项盖住账号默认值；NULL 表示继承账号。
+    limit_rpm         INTEGER,
+    limit_tpm         INTEGER,
+    limit_concurrency INTEGER,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_keys ON upstream_account_keys(account_id, created_at);
+
+CREATE TABLE IF NOT EXISTS logical_models (
+    id         TEXT PRIMARY KEY,
+    group_id   TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    origin     TEXT NOT NULL,
+    enabled    INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (group_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_targets (
+    id                TEXT PRIMARY KEY,
+    logical_model_id  TEXT NOT NULL REFERENCES logical_models(id) ON DELETE CASCADE,
+    account_id        TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    upstream_model    TEXT NOT NULL,
+    -- 对外暴露上游原始名：账号模型管理里的"隐藏原始模型"关掉时为 0。
+    -- 同一逻辑模型下的目标各自决定是否暴露自己的上游名（§16.4）。
+    hide_original     INTEGER NOT NULL DEFAULT 0,
+    -- 历史字段：调度目标不再支持独立优先级覆盖，统一继承账号人工优先级。
+    -- 保留列以免影响旧备份恢复；配置装配时忽略它（§9.2 的修订）。
+    priority_override INTEGER,
+    limit_rpm         INTEGER,
+    limit_tpm         INTEGER,
+    limit_concurrency INTEGER,
+    enabled           INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL,
+    UNIQUE (logical_model_id, account_id, upstream_model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_targets_model ON dispatch_targets(logical_model_id);
+
+-- 按账号的倍率状态（§11.4）。热路径只读内存，这里是重启后的起点。
+CREATE TABLE IF NOT EXISTS multiplier_snapshots (
+    account_id   TEXT PRIMARY KEY REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    multiplier   INTEGER NOT NULL,
+    source       TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    -- 上游声明的观察时间；与 refreshed_at 不同，后者是 Akhub 自己的拉取时间。
+    observed_at  INTEGER,
+    refreshed_at INTEGER NOT NULL,
+    -- 进入 multiplier_stale 的时刻，宽限期从这里开始计。
+    stale_since  INTEGER,
+    last_error   TEXT
+);
+
+-- 粘性前缀哈希 → 目标（§10.2、§20.1）。只在首次绑定与换号时变化，量很小。
+CREATE TABLE IF NOT EXISTS sticky_bindings (
+    sticky_key    TEXT PRIMARY KEY,
+    group_id      TEXT NOT NULL,
+    logical_model TEXT NOT NULL,
+    target_id     TEXT NOT NULL,
+    -- 绑定的那把 Key（凭据摘要）。粘性绑定绑的是"目标 + Key"：上游的 prompt
+    -- cache 按凭据隔离，只绑目标会在账号内换 Key 时把整份前缀缓存作废
+    -- （§4.2.1 的不变量 B）。旧快照里为 NULL，下一次使用即补齐。
+    credential_digest TEXT,
+    bound_at      INTEGER NOT NULL,
+    last_used_at  INTEGER NOT NULL,
+    -- 最近一次**真正换过目标**的时刻（不是"最近一次被使用"）。迁移冷却用它，
+    -- 所以不能在每次成功重绑时刷新：否则迟滞窗口永远走不完（§10.1 修订）。
+    -- 旧快照为 NULL，表示"还没迁移过"，下一次使用即补齐。
+    migrated_at   INTEGER,
+    -- 上次绑定时请求体有多大。上下文被压缩（/compact）会把它砍掉一大截，
+    -- 那一刻上游的前缀缓存整段失效，迁移因此不该再受冷却约束（§10.1 修订）。
+    context_bytes INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sticky_used ON sticky_bindings(last_used_at);
+
+-- 每个目标的性能 EWMA 快照（§9.3、§20.1）。后台任务每 60 秒批量写一次。
+CREATE TABLE IF NOT EXISTS target_perf_snapshot (
+    target_id      TEXT NOT NULL,
+    protocol       TEXT NOT NULL,
+    streaming      INTEGER NOT NULL,
+    -- 累计采样条数（展示用）。可信度判据是下面的 weight，不是这个数字。
+    samples        INTEGER NOT NULL,
+    -- 时间衰减后的样本权重（§9.4 修订）。老库迁移时用 samples 兜底。
+    weight         REAL NOT NULL DEFAULT 0,
+    success_rate   REAL NOT NULL,
+    first_token_ms REAL NOT NULL,
+    total_ms       REAL NOT NULL,
+    output_tps     REAL NOT NULL,
+    -- 缓存命中率的 EWMA（0-1）与「采到过几次命中率」。两个都要存：命中率 0
+    -- 是正常取值（冷前缀、不做缓存的站点），不能拿它当「没有数据」。
+    cache_hit       REAL NOT NULL DEFAULT 0,
+    cache_samples   INTEGER NOT NULL DEFAULT 0,
+    -- **真正的**最近一次采样时刻。不能拿 updated_at 代替：它每 60 秒被刷成
+    -- 当前时间，会让陈旧目标看起来刚被采样过，时间衰减与探索口粮一起失效。
+    last_sample_at INTEGER NOT NULL DEFAULT 0,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (target_id, protocol, streaming)
+);
+
+-- 分钟级目标性能聚合（§20.1、§22）。后台任务把 request_records 滚进这里，
+-- 后台的 /admin/api/metrics 直接读它，不再对明细表做全表扫描。
+CREATE TABLE IF NOT EXISTS performance_buckets (
+    -- 桶起点（unix 秒，按 bucket_secs 对齐）。
+    bucket_start      INTEGER NOT NULL,
+    target_id         TEXT NOT NULL,
+    protocol          TEXT NOT NULL,
+    streaming         INTEGER NOT NULL,
+    requests          INTEGER NOT NULL,
+    success           INTEGER NOT NULL,
+    -- 延迟与吞吐的累加量，除以 requests 得到桶内均值。
+    total_ms_sum      INTEGER NOT NULL,
+    first_token_sum   INTEGER NOT NULL,
+    -- 只有上报了首字的请求才计入，避免把非流式请求的 0 拉进均值。
+    first_token_count INTEGER NOT NULL,
+    output_tokens_sum INTEGER NOT NULL,
+    -- 失败分类计数（§9.3 的 429/5xx/损坏响应维度）。
+    rate_limited      INTEGER NOT NULL DEFAULT 0,
+    server_errors     INTEGER NOT NULL DEFAULT 0,
+    protocol_errors   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_start, target_id, protocol, streaming)
+);
+
+CREATE INDEX IF NOT EXISTS idx_buckets_time ON performance_buckets(bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_buckets_target ON performance_buckets(target_id, bucket_start DESC);
+
+-- 不含正文的请求元数据（§24.1）。
+CREATE TABLE IF NOT EXISTS request_records (
+    request_id       TEXT PRIMARY KEY,
+    started_at       INTEGER NOT NULL,
+    duration_ms      INTEGER NOT NULL,
+    protocol         TEXT NOT NULL,
+    streaming        INTEGER NOT NULL,
+    group_id         TEXT,
+    logical_model    TEXT,
+    target_id        TEXT,
+    account_id       TEXT,
+    -- 本次请求最终落在账号内的哪把 Key 上（§4.2.1）。只记内部 ID 与标签，
+    -- 绝不记凭据本身（§23.4、§24.1）。
+    key_id           TEXT,
+    key_label        TEXT,
+    upstream_model   TEXT,
+    request_bytes    INTEGER NOT NULL,
+    upstream_status  INTEGER,
+    http_status      INTEGER NOT NULL,
+    error_code       TEXT,
+    -- 实际使用的上游端点，以及为完成请求丢弃的白名单能力（§6.6、§14.8）。
+    endpoint         TEXT,
+    degraded         TEXT,
+    -- 本次实际使用的有效倍率，以及当时同一逻辑模型内最便宜/最贵的合格目标
+    -- 倍率。反事实基准只能在请求发生时记录，事后无法重算（§11.6）。
+    effective_multiplier INTEGER,
+    cheapest_multiplier  INTEGER,
+    dearest_multiplier   INTEGER,
+    -- 尝试过的目标个数、排队时长与是否命中粘性，用于诊断调度行为。
+    attempts         INTEGER NOT NULL,
+    queued_ms        INTEGER NOT NULL,
+    sticky_hit       INTEGER NOT NULL,
+    -- 绑定目标有没有真的被用上（§24.1）：sticky_hit 只说明"找到过绑定"，
+    -- 软亲和下它在重抽签之前就置位，会高估粘性。NULL = 没有绑定可谈。
+    sticky_kept      INTEGER,
+    -- 诊断用的用量与时机：首字延迟、输入/输出 token、当时的配置版本（§6.6）。
+    first_token_ms   INTEGER,
+    -- 输入 token 一律是**全部**输入（含缓存读写），三个协议同一口径：
+    -- OpenAI 的 prompt_tokens / input_tokens 本来就含，Anthropic 的不含、
+    -- 由网关补齐（见 gateway::stream::usage_breakdown）。不统一的话成本页
+    -- 同一个模型换个协议入口就会差出一截缓存量。
+    input_tokens     INTEGER,
+    output_tokens    INTEGER,
+    config_version   INTEGER,
+    -- Token 细分（§11.6）：缓存读写与思考 Token。上游没上报就是 NULL，不估算。
+    cache_read_tokens  INTEGER,
+    cache_write_tokens INTEGER,
+    reasoning_tokens   INTEGER,
+    -- 粘性等待与普通排队分开计（§6.6、§24.1）：粘性等待是为了保住前缀缓存，
+    -- 与临时容量不足的排队是两个不同的成本，混在一个 queued_ms 里无法诊断。
+    sticky_wait_ms   INTEGER,
+    -- 缓存新鲜度系数（§10.3 的三档），解释这次为什么愿意等/不愿意等。
+    sticky_freshness REAL,
+    -- 这次命中的粘性键来自哪一级（chain/session_header/cache_key/stable_prefix）。
+    -- 没有它就无法回答"守门到底放行了多少第 2/3 级的请求"——硬粘性与软亲和
+    -- 在记录里长得一模一样（§24.1）。
+    sticky_origin    TEXT,
+    -- 输出速度（token/秒），流式与非流式都算得出（§24.1）。
+    output_tps       REAL,
+    -- 倍率来源（auto/manual）与本次资格的判定结果（§24.1）。
+    multiplier_source TEXT,
+    quota_status      TEXT,
+    -- 候选过滤原因与最终选中的层（§24.1）。只在诊断时读，不参与调度。
+    -- 摘要只存类别词（"能力不支持×1"），具体说明另存一列：事后复盘要能定位到
+    -- 哪个账号、哪项能力、哪个端点，但聚合口径仍按摘要算。
+    filter_summary   TEXT,
+    filter_details   TEXT,
+    selected_layer   INTEGER,
+    -- 档位重发次数：因为「上游不接受这个思考档位」而在**同一个目标上**重发了
+    -- 几次（§14.6）。`attempts` 数的是目标，数不到同一目标内的重发；没有这一列
+    -- 就看不出"一次请求打了 4 次上游"（2026-10-15 现场：attempts=1，实际 4 次）。
+    effort_retries   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_records_started ON request_records(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_records_group ON request_records(group_id, started_at DESC);
+-- 「这个目标在这个维度上最后一次请求是什么时候」（§9.4 修订的采样时刻回填、
+-- 以及任何按维度取最近样本的诊断）。没有它，v17 迁移要在请求记录表上做一次
+-- 全表扫描 × 快照行数。
+CREATE INDEX IF NOT EXISTS idx_records_target_dimension
+    ON request_records(target_id, protocol, streaming, started_at DESC);
+
+-- 每次上游尝试的明细（§6.6）：换了几个目标、各自用了哪个端点、耗时多久、
+-- 为什么失败、这次失败是否计入尝试预算。与请求记录按 request_id 关联。
+CREATE TABLE IF NOT EXISTS request_attempts (
+    request_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    target_id   TEXT,
+    account_id  TEXT,
+    -- 这次尝试用哪把 Key。多 Key 之后"换了几个目标"已经不足以解释
+    -- "为什么换了三次才通"（§4.2.1、§6.6）。
+    key_id      TEXT,
+    key_label   TEXT,
+    upstream_model TEXT,
+    endpoint    TEXT,
+    started_at  INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    -- ok / failed / missing_endpoint / opaque_rejection / content_filtered /
+    -- effort_exhausted / effort_retry；
+    -- error_code 是网关错误码（失败时）。
+    outcome     TEXT NOT NULL,
+    error_code  TEXT,
+    -- 这一次尝试真正从上游拿到的状态码。网关自己判定的失败（翻译不了、
+    -- multipart 改不了名）没有上游状态码，是 NULL——两者必须能分开，
+    -- 否则"上游拒绝"与"网关拒绝"在事后长得一模一样（2026-10-15 现场）。
+    upstream_status INTEGER,
+    -- 这一次尝试实际发出去的思考档位；NULL = 不指定档位（§14.6）。
+    effort      TEXT,
+    counts_against_budget INTEGER NOT NULL,
+    PRIMARY KEY (request_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempts_request ON request_attempts(request_id);
+
+-- Responses 状态链（§15.1、§15.2）。网关 ID → 上游 ID 的定位映射是必存的
+-- 最小集；可重放正文（加密）只在 store 未显式关闭且保留期大于 0 时保存。
+CREATE TABLE IF NOT EXISTS response_states (
+    gateway_id     TEXT PRIMARY KEY,
+    -- 响应所属分组。查询、删除与引用都必须先过这道门（§26.8）。
+    group_id       TEXT NOT NULL,
+    logical_model  TEXT NOT NULL,
+    account_id     TEXT,
+    target_id      TEXT,
+    -- 创建这条响应时用的那把 Key（§4.2.1、§15.1）。上游的 resp_xxx 是
+    -- 凭据隔离的资源，生命周期代理与链式续写都必须回到同一把 Key。
+    key_id         TEXT,
+    endpoint       TEXT,
+    upstream_id    TEXT,
+    -- 加密的可重放正文：输入项、输出项与工具项的 JSON（§15.2）。
+    sealed_body    BLOB,
+    -- 生成这次响应的入口协议，重建输入时按它解析正文。
+    protocol       TEXT,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_states_expiry ON response_states(expires_at);
+
+-- 异步生图任务的定位记录（§14.9）。客户端轮询时手里拿的是**上游**的任务 ID，
+-- 必须回到当初接单的那个账号去问——别的账号根本不知道这个任务。这里只存定位
+-- 信息，不存任务结果：结果留在上游，过期后按"任务不存在"处理。
+--
+-- 主键是 (group_id, account_id, task_id)，不是单独的 task_id：上游签发的任务 ID
+-- 只在**上游站点**内唯一，而多个分组完全可以指向同一个上游站点。按 task_id 单列
+-- 做主键时，后下单的分组会覆盖先下单分组的定位行，先方轮询就变成永久 404——
+-- 任务还在上游跑，客户端多半会重新下单，真金白银重复扣费（§14.9、§23.4）。
+CREATE TABLE IF NOT EXISTS image_tasks (
+    task_id        TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    account_id     TEXT NOT NULL,
+    target_id      TEXT,
+    upstream_model TEXT,
+    -- 下单那一刻用的那把 Key 的凭据摘要（§4.2.1 的不变量 A）。上游的任务按
+    -- 凭据隔离：换一把 Key 去问同一个任务 ID，它只会当作不存在。
+    key_digest     TEXT,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    PRIMARY KEY (group_id, account_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_image_tasks_expiry ON image_tasks(expires_at);
+
+-- 账号级模型选择集（§16.2）。主键是上游真名：两个不同的上游名可以经别名
+-- 归并到同一个对外名，它们各自占一行，选择后成为同一逻辑模型的两个目标。
+CREATE TABLE IF NOT EXISTS account_models (
+    account_id   TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    -- 上游真名（规范化后，保留大小写）。
+    upstream_model TEXT NOT NULL,
+    -- 对外名：别名应用后的名字，也是逻辑模型名；未设置别名时等于上游真名。
+    public_name  TEXT NOT NULL,
+    -- 别名设置后是否只暴露对外名（隐藏原始上游名）。
+    hide_original INTEGER NOT NULL DEFAULT 0,
+    -- 选择集成员。排除过的模型保留记录但 selected = 0（§16.2）。
+    selected     INTEGER NOT NULL,
+    -- 上游列表里已经消失但仍在选择集内：停止新请求，重新出现自动解除（§16.5）。
+    missing      INTEGER NOT NULL DEFAULT 0,
+    discovered_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, upstream_model)
+);
+
+-- 旧版的独立别名表（§16.4）。v8 起别名就是 account_models.public_name + hide_original，
+-- 这里保留建表只为兼容旧备份文件的恢复，运行时不再以它为准。
+CREATE TABLE IF NOT EXISTS account_aliases (
+    account_id     TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    upstream_model TEXT NOT NULL,
+    public_name    TEXT NOT NULL,
+    PRIMARY KEY (account_id, upstream_model)
+);
+
+-- 校准助手的对账记录（§6.8）。必须按单个模型对账：总用量对账会随模型组合
+-- 漂移，同一个账号连续两个月能算出两个不同的系数。
+CREATE TABLE IF NOT EXISTS calibration_records (
+    id               TEXT PRIMARY KEY,
+    account_id       TEXT NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+    logical_model    TEXT NOT NULL,
+    -- 对账区间（unix 秒）与该区间本账号在该模型上的用量口径。
+    period_start     INTEGER NOT NULL,
+    period_end       INTEGER NOT NULL,
+    gateway_requests INTEGER NOT NULL,
+    -- 站点后台报的扣费倍率或账面值，定点整数；反算出的校准系数。
+    reported         TEXT NOT NULL,
+    calibration      TEXT NOT NULL,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_account ON calibration_records(account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id         TEXT PRIMARY KEY,
+    occurred_at INTEGER NOT NULL,
+    actor      TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    object     TEXT NOT NULL,
+    result     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_time ON admin_audit_log(occurred_at DESC);
+
+-- New API 站点级凭据（§6.4、§11.2）：一个 Base URL 只需配一次访问令牌与
+-- 用户 ID，该站点下的账号自动继承；账号自己的凭据优先。
+CREATE TABLE IF NOT EXISTS new_api_sites (
+    base_url    TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    sealed_token BLOB NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+-- 网关托管的后台任务（计划 §29.1）。状态与执行者都落 SQLite：
+-- 进程重启后能明确区分"还在跑""跟着上游走""已中断"，绝不停留在 in_progress。
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id            TEXT PRIMARY KEY,
+    group_id      TEXT NOT NULL,
+    logical_model TEXT NOT NULL,
+    account_id    TEXT,
+    target_id     TEXT,
+    -- queued / running / completed / incomplete / failed / cancelled / interrupted
+    status        TEXT NOT NULL,
+    upstream_id   TEXT,
+    created_at    INTEGER NOT NULL,
+    -- 任务循环每次推进都会更新；重启时用它判断是否为遗留任务。
+    heartbeat_at  INTEGER NOT NULL,
+    finished_at   INTEGER,
+    error_code    TEXT,
+    -- 加密的输出正文（可重放历史），与响应状态链同一套密封格式。
+    sealed_output BLOB,
+    expires_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_background_status ON background_tasks(status, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_background_expiry ON background_tasks(expires_at);

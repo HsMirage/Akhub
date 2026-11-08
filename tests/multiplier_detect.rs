@@ -44,7 +44,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -105,14 +108,11 @@ async fn give_new_api_credentials(akhub: &common::Akhub, account_id: &str) {
         .find(|account| account.id == account_id)
         .unwrap();
     account.new_api_user_id = Some("42".into());
-    let secrets = akhub::storage::store::AccountSecrets {
-        api_key: None,
-        new_api_token: Some(akhub.state.cipher.seal(b"tok-detect").unwrap()),
-    };
+    let token = akhub.state.cipher.seal(b"tok-detect").unwrap();
     akhub
         .state
         .store
-        .update_account(&account, &secrets)
+        .update_account(&account, Some(&token))
         .await
         .unwrap();
     akhub.state.reload_config().await.unwrap();
@@ -123,7 +123,7 @@ fn account_body(group_id: &str, base_url: &str) -> Value {
         "group_id": group_id,
         "name": "待识别",
         "base_url": base_url,
-        "api_key": "sk-detect",
+        "keys": [{"api_key": "sk-detect"}],
         "preferred_protocol": "openai_chat",
         "manual_multiplier": "1",
         "allow_private_network": true,

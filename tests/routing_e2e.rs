@@ -1903,7 +1903,7 @@ async fn a_rejected_request_records_why_every_target_was_filtered() {
                 enabled: false,
                 ..account
             },
-            &akhub::storage::store::AccountSecrets::default(),
+            None,
         )
         .await
         .unwrap();
@@ -2115,32 +2115,19 @@ async fn the_recorded_config_version_is_the_one_the_request_started_with() {
     ));
     upstream.wait_for_requests(1).await;
 
-    // 请求在途：新增一个分组让配置**内容**真的变（版本号只在内容变化时前进），
-    // 把版本推到入口版本之后。用 app_settings 造不出这个效果：它不进配置快照。
-    let (_, prefix) = akhub::security::generate_group_key().unwrap();
+    // 请求在途：一次管理端写入把修订号推到入口版本之后。
     akhub
         .state
-        .store
-        .insert_group(&akhub::domain::Group {
-            id: akhub::storage::store::ids::group(),
-            name: "在途新增".into(),
-            key_prefix: prefix,
-            key_digest_hex: "0".repeat(64),
-            multiplier_limit: Multiplier::ONE,
-            weights: Default::default(),
-            queue_capacity: 1,
-            max_wait_secs: 60,
-            allow_managed_background: false,
-            allow_degrade: true,
-            created_at: time::OffsetDateTime::now_utc(),
-        })
+        .write_config(
+            akhub::config::Revision::Any,
+            async |_| -> anyhow::Result<()> { Ok(()) },
+        )
         .await
         .unwrap();
-    akhub.state.config.reload().await.unwrap();
     let after_reload = akhub.state.config.version();
     assert!(
         after_reload > entered,
-        "配置内容变了，版本必须前进：{entered} → {after_reload}"
+        "管理端写入后版本必须前进：{entered} → {after_reload}"
     );
 
     upstream.release();

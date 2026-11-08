@@ -167,12 +167,18 @@ export function CalibrationDialog({
                 <span className="metric-value">{result.reported}</span>
               </div>
               <div className="metric">
-                <span className="metric-label">网关加权均倍率</span>
-                <span className="metric-value">{result.group_avg_multiplier}</span>
+                <span className="metric-label">本账号加权均倍率</span>
+                <span className="metric-value">{result.own_avg_multiplier}</span>
               </div>
               <div className="metric">
                 <span className="metric-label">对账请求数</span>
                 <span className="metric-value">{result.gateway_requests.toLocaleString()}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">输入 / 输出 Token</span>
+                <span className="metric-value">
+                  {result.input_tokens.toLocaleString()} / {result.output_tokens.toLocaleString()}
+                </span>
               </div>
             </div>
             <p className="field-hint" style={{ margin: "0 0 10px" }}>

@@ -3,21 +3,11 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
-use time::OffsetDateTime;
 
 use super::now_unix;
 
-use crate::domain::{
-    Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights,
-};
-
-/// 历史列 upstream_accounts.upstream_type 的写占位值（§4.2）。
-///
-/// v12 之前它存的是官方/中转/New API/Sub2API，但它不参与任何路由或倍率决策，
-/// 于是整个删掉。列本身留着：老库上的 NOT NULL 约束拿不掉，直接删列还会破坏
-/// 不认识新结构的旧二进制。空串即“这台实例已经不管理这一列”。
-const LEGACY_UPSTREAM_TYPE: &str = "";
+pub use super::config::{AccountKeyRow, AccountKeyWrite, AccountModelRow};
+use crate::domain::{Multiplier, MultiplierMode, Protocol};
 
 /// "一次请求成功"的统一 SQL 口径（§6.2、§6.8、§22）。
 ///
@@ -28,50 +18,6 @@ const LEGACY_UPSTREAM_TYPE: &str = "";
 /// 用一次 [`format!`] 拼进各条聚合查询：`sqlx::query` 只接受字面量 SQL，而
 /// 拼接进去的只有这个常量，不含任何外部输入。
 const SUCCESS: &str = "http_status >= 200 AND http_status < 300 AND error_code IS NULL";
-/// 一个账号的全部加密凭据信封。
-///
-/// 更新时 `None` 表示"保持原值"——后台不提供读取完整 Key 的接口（§23.2），
-/// 所以"没填"和"清空"必须是两件事，用 `Option` 而不是空字符串区分。
-#[derive(Debug, Default)]
-pub struct AccountSecrets {
-    pub api_key: Option<Vec<u8>>,
-    /// New API 倍率探针的访问令牌，与推理凭据是两把不同的 Key（§11.2）。
-    pub new_api_token: Option<Vec<u8>>,
-}
-
-impl AccountSecrets {
-    /// 新建账号时使用：API Key 必填。
-    pub fn new(api_key: Vec<u8>, new_api_token: Option<Vec<u8>>) -> Self {
-        Self {
-            api_key: Some(api_key),
-            new_api_token,
-        }
-    }
-}
-
-/// 一把已落库的 Key 的元数据与密文（§4.2.1）。**不含明文**。
-#[derive(Debug, Clone)]
-pub struct AccountKeyRow {
-    pub id: String,
-    pub label: String,
-    pub sealed_key: Vec<u8>,
-    /// Key 级限额覆盖，逐项盖住账号默认值。
-    pub limits: Limits,
-    pub enabled: bool,
-}
-
-/// 准备写入 Key 池的一把 Key。密封与摘要都由调用方完成。
-#[derive(Debug, Clone)]
-pub struct AccountKeyWrite {
-    pub id: String,
-    pub label: String,
-    pub sealed_key: Vec<u8>,
-    /// 明文凭据的稳定摘要（hex）。空串表示"调用方没算"，只有迁移路径会这样。
-    pub credential_digest: String,
-    pub limits: Limits,
-    pub enabled: bool,
-}
-
 /// 恢复账号 Key 池，返回每个账号第一把 Key 的密文（供写回镜像用）。
 ///
 /// 两条路径：
@@ -96,6 +42,9 @@ async fn restore_account_keys(
                 continue;
             }
             let api_key = str_field(secret, "api_key");
+            if api_key.is_empty() {
+                continue;
+            }
             let sealed = cipher.seal(api_key.as_bytes())?;
             sqlx::query(
                 "INSERT INTO upstream_account_keys
@@ -161,72 +110,9 @@ async fn restore_account_keys(
     Ok(first)
 }
 
-/// 插入一行 Key 池记录。
-///
-/// 用序号错开创建时间，保证同一个 Key 池内部的顺序稳定可复现：排序键是
-/// `created_at, id`，而一次写入的所有行时间相同，只有错开才能让列表顺序
-/// 等于界面顺序。
-async fn insert_account_key(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    account_id: &str,
-    key: &AccountKeyWrite,
-    index: usize,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO upstream_account_keys
-            (id, account_id, label, sealed_key, credential_digest,
-             limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&key.id)
-    .bind(account_id)
-    .bind(&key.label)
-    .bind(&key.sealed_key)
-    .bind(&key.credential_digest)
-    .bind(key.limits.rpm)
-    .bind(key.limits.tpm)
-    .bind(key.limits.max_concurrency)
-    .bind(key.enabled)
-    .bind(now_unix() + index as i64)
-    .execute(&mut **tx)
-    .await
-    .context("写入账号 Key 池失败")?;
-    Ok(())
-}
-
-/// 把 Key 池的第一把 Key 镜像回 `upstream_secrets.api_key`（§4.2.1）。
-///
-/// 镜像的用途只有一个：让还不认识 Key 池的旧二进制与旧备份恢复路径仍能读到
-/// 凭据。Key 池为空时**不动**镜像——宁可让旧代码读到一把过期的 Key，
-/// 也不要把它清成空值，那会让旧二进制认定"这个账号没有凭据"。
-async fn sync_secret_mirror(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    account_id: &str,
-    keys: &[AccountKeyWrite],
-) -> Result<()> {
-    let Some(first) = keys.first() else {
-        return Ok(());
-    };
-    sqlx::query(
-        "UPDATE upstream_secrets SET api_key = ?, updated_at = ?, keys_migrated = 1
-          WHERE account_id = ?",
-    )
-    .bind(&first.sealed_key)
-    .bind(now_unix())
-    .bind(account_id)
-    .execute(&mut **tx)
-    .await
-    .context("同步凭据镜像失败")?;
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
-}
-
-fn to_time(raw: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(raw).unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
 fn new_id(prefix: &str) -> String {
@@ -319,401 +205,6 @@ impl Store {
         .bind(now_unix())
         .execute(&self.pool)
         .await?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------ 分组
-
-    pub async fn insert_group(&self, group: &Group) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO groups (id, name, key_prefix, key_digest_hex, multiplier_limit,
-                weight_multiplier, weight_reliability, weight_first_token, weight_throughput,
-                weight_cache_hit,
-                queue_capacity, max_wait_secs, allow_degrade, allow_managed_background,
-                created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&group.id)
-        .bind(&group.name)
-        .bind(&group.key_prefix)
-        .bind(&group.key_digest_hex)
-        .bind(group.multiplier_limit.raw())
-        .bind(group.weights.multiplier)
-        .bind(group.weights.reliability)
-        .bind(group.weights.first_token)
-        .bind(group.weights.throughput)
-        .bind(group.weights.cache_hit)
-        .bind(group.queue_capacity)
-        .bind(group.max_wait_secs)
-        .bind(group.allow_degrade)
-        .bind(group.allow_managed_background)
-        .bind(group.created_at.unix_timestamp())
-        .execute(&self.pool)
-        .await
-        .context("写入分组失败")?;
-        Ok(())
-    }
-
-    pub async fn update_group(&self, group: &Group) -> Result<()> {
-        sqlx::query(
-            "UPDATE groups SET name = ?, key_prefix = ?, key_digest_hex = ?, multiplier_limit = ?,
-                weight_multiplier = ?, weight_reliability = ?, weight_first_token = ?,
-                weight_throughput = ?, weight_cache_hit = ?, queue_capacity = ?,
-                max_wait_secs = ?, allow_degrade = ?, allow_managed_background = ? WHERE id = ?",
-        )
-        .bind(&group.name)
-        .bind(&group.key_prefix)
-        .bind(&group.key_digest_hex)
-        .bind(group.multiplier_limit.raw())
-        .bind(group.weights.multiplier)
-        .bind(group.weights.reliability)
-        .bind(group.weights.first_token)
-        .bind(group.weights.throughput)
-        .bind(group.weights.cache_hit)
-        .bind(group.queue_capacity)
-        .bind(group.max_wait_secs)
-        .bind(group.allow_degrade)
-        .bind(group.allow_managed_background)
-        .bind(&group.id)
-        .execute(&self.pool)
-        .await
-        .context("更新分组失败")?;
-        Ok(())
-    }
-
-    pub async fn delete_group(&self, id: &str) -> Result<bool> {
-        let affected = sqlx::query("DELETE FROM groups WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
-    }
-
-    pub async fn list_groups(&self) -> Result<Vec<Group>> {
-        let rows = sqlx::query("SELECT * FROM groups ORDER BY created_at")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_group).collect()
-    }
-
-    // ------------------------------------------------------------------ 账号
-
-    /// 写入账号及其加密凭据。两者必须同一事务，避免出现无凭据的账号。
-    ///
-    /// `group_id` 为 `None` 表示未分配（§4.2.3）。**同组内账号名唯一**由
-    /// `idx_accounts_group_name` 这个部分唯一索引兜底（`WHERE group_id IS NOT
-    /// NULL`，见 schema.sql）：它同时表达了"未分配之间允许重名"与"同组内必须
-    /// 唯一"这两件事，表级 `UNIQUE (group_id, name)` 表达不了后者。管理端在
-    /// 写入前仍会先查一遍（`ensure_account_name_free`），但那是为了给出可读的
-    /// 报错，正确性不依赖它。
-    pub async fn insert_account(&self, account: &Account, secrets: &AccountSecrets) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
-                preferred_protocol, adaptive_protocol, default_priority, calibration,
-                multiplier_mode, manual_multiplier, new_api_user_id, new_api_group,
-                limit_rpm, limit_tpm, limit_concurrency, allow_private_network, enabled,
-                auto_sync, hide_original, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&account.id)
-        .bind(account.group_id.as_deref())
-        .bind(&account.name)
-        .bind(LEGACY_UPSTREAM_TYPE)
-        .bind(&account.base_url)
-        .bind(account.preferred_protocol.as_str())
-        .bind(account.adaptive_protocol)
-        .bind(account.default_priority)
-        .bind(account.calibration.raw())
-        .bind(account.multiplier_mode.as_str())
-        .bind(account.manual_multiplier.raw())
-        .bind(&account.new_api_user_id)
-        .bind(&account.new_api_group)
-        .bind(account.limits.rpm)
-        .bind(account.limits.tpm)
-        .bind(account.limits.max_concurrency)
-        .bind(account.allow_private_network)
-        .bind(account.enabled)
-        .bind(account.auto_sync)
-        .bind(account.hide_original)
-        .bind(account.created_at.unix_timestamp())
-        .execute(&mut *tx)
-        .await
-        .context("写入账号失败")?;
-
-        sqlx::query(
-            "INSERT INTO upstream_secrets (account_id, api_key, new_api_token, updated_at)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(&account.id)
-        .bind(&secrets.api_key)
-        .bind(&secrets.new_api_token)
-        .bind(now_unix())
-        .execute(&mut *tx)
-        .await
-        .context("写入账号凭据失败")?;
-
-        // 凭据同时进 Key 池：池是唯一真相，镜像列只是给旧二进制看的副本
-        // （§4.2.1）。两条路径必须要么都写、要么都不写，否则"表里有凭据、
-        // 池里没有"会让账号在升级后失去全部凭据。
-        if let Some(sealed) = &secrets.api_key {
-            let key = AccountKeyWrite {
-                id: new_id("key"),
-                label: String::new(),
-                sealed_key: sealed.clone(),
-                // 摘要留空：它只用于归类动态状态，真正的摘要由凭据快照按明文
-                // 现算（见 `crate::credential`）。
-                credential_digest: String::new(),
-                limits: Limits::default(),
-                enabled: true,
-            };
-            insert_account_key(&mut tx, &account.id, &key, 0).await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 更新账号；凭据字段为空表示保持原值不变。
-    pub async fn update_account(&self, account: &Account, secrets: &AccountSecrets) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE upstream_accounts SET group_id = ?, name = ?, upstream_type = ?, base_url = ?,
-                preferred_protocol = ?, adaptive_protocol = ?, default_priority = ?,
-                calibration = ?, multiplier_mode = ?, manual_multiplier = ?, new_api_user_id = ?,
-                new_api_group = ?, limit_rpm = ?, limit_tpm = ?, limit_concurrency = ?,
-                allow_private_network = ?, enabled = ?, auto_sync = ?, hide_original = ?
-             WHERE id = ?",
-        )
-        .bind(account.group_id.as_deref())
-        .bind(&account.name)
-        .bind(LEGACY_UPSTREAM_TYPE)
-        .bind(&account.base_url)
-        .bind(account.preferred_protocol.as_str())
-        .bind(account.adaptive_protocol)
-        .bind(account.default_priority)
-        .bind(account.calibration.raw())
-        .bind(account.multiplier_mode.as_str())
-        .bind(account.manual_multiplier.raw())
-        .bind(&account.new_api_user_id)
-        .bind(&account.new_api_group)
-        .bind(account.limits.rpm)
-        .bind(account.limits.tpm)
-        .bind(account.limits.max_concurrency)
-        .bind(account.allow_private_network)
-        .bind(account.enabled)
-        .bind(account.auto_sync)
-        .bind(account.hide_original)
-        .bind(&account.id)
-        .execute(&mut *tx)
-        .await
-        .context("更新账号失败")?;
-
-        // COALESCE 让"留空表示不变"在 SQL 里表达，避免先读后写的竞态。
-        sqlx::query(
-            "UPDATE upstream_secrets
-                SET api_key = COALESCE(?, api_key),
-                    new_api_token = COALESCE(?, new_api_token),
-                    updated_at = ?
-              WHERE account_id = ?",
-        )
-        .bind(&secrets.api_key)
-        .bind(&secrets.new_api_token)
-        .bind(now_unix())
-        .bind(&account.id)
-        .execute(&mut *tx)
-        .await
-        .context("更新账号凭据失败")?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn delete_account(&self, id: &str) -> Result<bool> {
-        let affected = sqlx::query("DELETE FROM upstream_accounts WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
-    }
-
-    pub async fn list_accounts(&self) -> Result<Vec<Account>> {
-        let rows = sqlx::query("SELECT * FROM upstream_accounts ORDER BY created_at")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_account).collect()
-    }
-
-    /// 读取并返回账号的加密凭据信封。
-    ///
-    /// 这是 Key 池**第一把 Key 的镜像**（§4.2.1）：写入 Key 池时同步维护，
-    /// 供还不认识 Key 池的旧二进制与旧备份恢复路径使用。网关自己不读它。
-    pub async fn account_sealed_key(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
-        Ok(
-            sqlx::query_scalar("SELECT api_key FROM upstream_secrets WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
-    }
-
-    // ------------------------------------------------------------ Key 池
-
-    /// 一个账号的 Key 池，按创建时间稳定排序。
-    ///
-    /// 排序必须稳定：Key 池的抽签顺序、界面展示顺序与快照重建后的顺序
-    /// 都要一致，否则"同一份配置"会因为行序不同而给出不同的分配（§4.2.1）。
-    pub async fn list_account_key_rows(&self, account_id: &str) -> Result<Vec<AccountKeyRow>> {
-        let rows = sqlx::query(
-            "SELECT id, label, sealed_key, limit_rpm, limit_tpm, limit_concurrency, enabled
-               FROM upstream_account_keys
-              WHERE account_id = ?
-              ORDER BY created_at, id",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("读取账号 Key 池失败")?;
-        rows.iter()
-            .map(|row| {
-                Ok(AccountKeyRow {
-                    id: row.try_get("id")?,
-                    label: row.try_get("label")?,
-                    sealed_key: row.try_get("sealed_key")?,
-                    limits: Limits {
-                        rpm: row.try_get("limit_rpm")?,
-                        tpm: row.try_get("limit_tpm")?,
-                        max_concurrency: row.try_get("limit_concurrency")?,
-                    },
-                    enabled: row.try_get::<i64, _>("enabled")? != 0,
-                })
-            })
-            .collect()
-    }
-
-    /// 整体替换一个账号的 Key 池，并把第一把 Key 镜像回 `upstream_secrets`。
-    ///
-    /// **刻意的整体替换语义**：Key 池是"一组凭据"而不是"一组可独立编辑的
-    /// 实体"。界面提交完整列表，服务端按 ID 对齐（有 ID 的保留、无 ID 的
-    /// 新建、缺失的删除），这样界面与服务端的认知不会漂移（§4.2.1）。
-    pub async fn replace_account_keys(
-        &self,
-        account_id: &str,
-        keys: &[AccountKeyWrite],
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM upstream_account_keys WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await
-            .context("清空账号 Key 池失败")?;
-        for (index, key) in keys.iter().enumerate() {
-            insert_account_key(&mut tx, account_id, key, index).await?;
-        }
-        sync_secret_mirror(&mut tx, account_id, keys).await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 把已经改好的 Key 池写回（更新标签、限额、启用开关与轮换后的凭据）。
-    ///
-    /// 与 [`Self::replace_account_keys`] 的差别只在语义上：这里不重写已存在
-    /// 的行，因此 Key 的创建时间在只改元数据时保持不变，Key 池的顺序不会
-    /// 因为一次"改了标签"而重排。
-    pub async fn upsert_account_keys(
-        &self,
-        account_id: &str,
-        keys: &[AccountKeyWrite],
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let existing: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM upstream_account_keys WHERE account_id = ? ORDER BY created_at, id",
-        )
-        .bind(account_id)
-        .fetch_all(&mut *tx)
-        .await
-        .context("读取账号 Key 池失败")?;
-
-        for id in &existing {
-            if keys.iter().any(|key| key.id == *id) {
-                continue;
-            }
-            sqlx::query("DELETE FROM upstream_account_keys WHERE id = ? AND account_id = ?")
-                .bind(id)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await
-                .context("删除账号 Key 失败")?;
-        }
-        for (index, key) in keys.iter().enumerate() {
-            if existing.contains(&key.id) {
-                sqlx::query(
-                    "UPDATE upstream_account_keys
-                        SET label = ?, sealed_key = ?, credential_digest = ?,
-                            limit_rpm = ?, limit_tpm = ?, limit_concurrency = ?, enabled = ?
-                      WHERE id = ? AND account_id = ?",
-                )
-                .bind(&key.label)
-                .bind(&key.sealed_key)
-                .bind(&key.credential_digest)
-                .bind(key.limits.rpm)
-                .bind(key.limits.tpm)
-                .bind(key.limits.max_concurrency)
-                .bind(key.enabled)
-                .bind(&key.id)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await
-                .context("更新账号 Key 失败")?;
-            } else {
-                insert_account_key(&mut tx, account_id, key, index).await?;
-            }
-        }
-        sync_secret_mirror(&mut tx, account_id, keys).await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 写下一把 Key 的密文，并把它同步成凭据镜像（§4.2.1）。
-    ///
-    /// 新建账号与"整体替换后只改了一把"的两条路径都走它，避免出现"表里有
-    /// 凭据、Key 池里没有"这种半截状态。
-    pub async fn upsert_account_secret(
-        &self,
-        account_id: &str,
-        sealed: &[u8],
-        digest: &str,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM upstream_account_keys WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await
-            .context("清空账号 Key 池失败")?;
-        let key = AccountKeyWrite {
-            id: new_id("key"),
-            label: String::new(),
-            sealed_key: sealed.to_vec(),
-            credential_digest: digest.to_string(),
-            limits: Limits::default(),
-            enabled: true,
-        };
-        insert_account_key(&mut tx, account_id, &key, 0).await?;
-        sqlx::query(
-            "UPDATE upstream_secrets SET api_key = ?, updated_at = ?, keys_migrated = 1
-              WHERE account_id = ?",
-        )
-        .bind(sealed)
-        .bind(now_unix())
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await
-        .context("同步凭据镜像失败")?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -821,62 +312,6 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
-    }
-
-    // -------------------------------------------------- New API 站点级凭据
-
-    /// 读取某个 Base URL 的站点级 New API 凭据（§6.4）。返回 (用户 ID, 密封令牌)。
-    pub async fn new_api_site(&self, base_url: &str) -> Result<Option<(String, Vec<u8>)>> {
-        let row = sqlx::query("SELECT user_id, sealed_token FROM new_api_sites WHERE base_url = ?")
-            .bind(normalize_site(base_url))
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|row| Ok((row.try_get("user_id")?, row.try_get("sealed_token")?)))
-            .transpose()
-    }
-
-    /// 站点级凭据列表（不回吐令牌本身）。
-    pub async fn list_new_api_sites(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT base_url, user_id FROM new_api_sites ORDER BY base_url")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|row| Ok((row.try_get("base_url")?, row.try_get("user_id")?)))
-            .collect()
-    }
-
-    /// 覆盖写入站点级凭据。
-    pub async fn upsert_new_api_site(
-        &self,
-        base_url: &str,
-        user_id: &str,
-        sealed_token: &[u8],
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO new_api_sites (base_url, user_id, sealed_token, updated_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(base_url) DO UPDATE SET
-                user_id = excluded.user_id,
-                sealed_token = excluded.sealed_token,
-                updated_at = excluded.updated_at",
-        )
-        .bind(normalize_site(base_url))
-        .bind(user_id)
-        .bind(sealed_token)
-        .bind(now_unix())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 删除站点级凭据。
-    pub async fn delete_new_api_site(&self, base_url: &str) -> Result<bool> {
-        let affected = sqlx::query("DELETE FROM new_api_sites WHERE base_url = ?")
-            .bind(normalize_site(base_url))
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
     }
 
     // ---------------------------------------------------------- Responses 状态
@@ -1049,263 +484,6 @@ impl Store {
         Ok(affected)
     }
 
-    /// 读取 New API 倍率探针的访问令牌信封。
-    pub async fn account_sealed_new_api_token(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
-        Ok(
-            sqlx::query_scalar("SELECT new_api_token FROM upstream_secrets WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten(),
-        )
-    }
-
-    // ------------------------------------------------------- 模型选择集与别名
-
-    /// 覆盖写入一个账号的模型目录快照（§16.1）。
-    ///
-    /// 拉取成功后整体替换该账号的目录；`missing` 由调用方按"消失但已选"标好。
-    pub async fn replace_account_models(
-        &self,
-        account_id: &str,
-        models: &[AccountModelRow],
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM account_models WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?;
-        for model in models {
-            sqlx::query(
-                "INSERT INTO account_models (account_id, upstream_model, public_name,
-                    hide_original, selected, missing, discovered_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(account_id)
-            .bind(&model.upstream_model)
-            .bind(&model.public_name)
-            .bind(model.hide_original)
-            .bind(model.selected)
-            .bind(model.missing)
-            .bind(model.discovered_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 一个事务里改写多行目录记录。
-    ///
-    /// 模型管理的勾选/改名常常一次动几十行（`apply_selection` 会把整个选择集
-    /// 写一遍）。逐行 `execute` 意味着一行一个事务、一次 fsync；在 WAL 下这
-    /// 会让"全选 100 个模型"变成 100 次提交。这里一次开事务、一次提交，
-    /// 失败则整批回滚——目录是唯一真相，半批写入会留下与选择集不一致的目录。
-    pub async fn upsert_account_models(
-        &self,
-        account_id: &str,
-        rows: &[AccountModelRow],
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.pool.begin().await?;
-        for row in rows {
-            sqlx::query(
-                "INSERT INTO account_models (account_id, upstream_model, public_name,
-                    hide_original, selected, missing, discovered_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(account_id, upstream_model) DO UPDATE SET
-                    public_name = excluded.public_name,
-                    hide_original = excluded.hide_original,
-                    selected = excluded.selected,
-                    missing = excluded.missing",
-            )
-            .bind(account_id)
-            .bind(&row.upstream_model)
-            .bind(&row.public_name)
-            .bind(row.hide_original)
-            .bind(row.selected)
-            .bind(row.missing)
-            .bind(row.discovered_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 分组内所有账号目录里可选的模型（供创建逻辑模型时挑选，§6.5）。
-    ///
-    /// 返回（对外名, 提供它的账号名），按对外名与账号名排序；已标记缺失的
-    /// 模型不出现。
-    pub async fn group_available_models(&self, group_id: &str) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query(
-            "SELECT am.public_name AS public_name, a.name AS account_name
-             FROM account_models am
-             JOIN upstream_accounts a ON a.id = am.account_id
-             WHERE a.group_id = ? AND am.missing = 0
-             ORDER BY am.public_name, a.name",
-        )
-        .bind(group_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| Ok((row.try_get("public_name")?, row.try_get("account_name")?)))
-            .collect()
-    }
-
-    pub async fn list_account_models(&self, account_id: &str) -> Result<Vec<AccountModelRow>> {
-        let rows =
-            sqlx::query("SELECT * FROM account_models WHERE account_id = ? ORDER BY public_name")
-                .bind(account_id)
-                .fetch_all(&self.pool)
-                .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(AccountModelRow {
-                    upstream_model: row.try_get("upstream_model")?,
-                    public_name: row.try_get("public_name")?,
-                    hide_original: row.try_get("hide_original")?,
-                    selected: row.try_get("selected")?,
-                    missing: row.try_get("missing")?,
-                    discovered_at: row.try_get("discovered_at")?,
-                })
-            })
-            .collect()
-    }
-
-    /// 改写一条目录记录的选择状态。选择集驱动调度目标（§16.3），这里只改标记。
-    pub async fn set_account_model_selected(
-        &self,
-        account_id: &str,
-        upstream_model: &str,
-        selected: bool,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE account_models SET selected = ? WHERE account_id = ? AND upstream_model = ?",
-        )
-        .bind(selected)
-        .bind(account_id)
-        .bind(upstream_model)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 同一条记录的选择与消失标记一起改写（勾选与消失标记总是成对调和）。
-    pub async fn set_account_model_flags(
-        &self,
-        account_id: &str,
-        upstream_model: &str,
-        selected: bool,
-        missing: bool,
-    ) -> Result<()> {
-        sqlx::query("UPDATE account_models SET selected = ?, missing = ? WHERE account_id = ? AND upstream_model = ?")
-            .bind(selected)
-            .bind(missing)
-            .bind(account_id)
-            .bind(upstream_model)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// 覆盖写入一条目录记录的完整配置（别名、隐藏原始名、选择/消失标记）。
-    ///
-    /// 刷新目录时用 [`replace_account_models`] 整表替换；这里用于管理端的
-    /// 逐行增删改，写入后会由调用方把对应调度目标调和到新配置（§16.2）。
-    pub async fn upsert_account_model(
-        &self,
-        account_id: &str,
-        row: &AccountModelRow,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO account_models (account_id, upstream_model, public_name,
-                hide_original, selected, missing, discovered_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_id, upstream_model) DO UPDATE SET
-                public_name = excluded.public_name,
-                hide_original = excluded.hide_original,
-                selected = excluded.selected,
-                missing = excluded.missing",
-        )
-        .bind(account_id)
-        .bind(&row.upstream_model)
-        .bind(&row.public_name)
-        .bind(row.hide_original)
-        .bind(row.selected)
-        .bind(row.missing)
-        .bind(row.discovered_at)
-        .execute(&self.pool)
-        .await
-        .context("写入账号模型目录失败")?;
-        Ok(())
-    }
-
-    /// 删除一条目录记录。调用方负责同时清理调度目标。
-    pub async fn delete_account_model(
-        &self,
-        account_id: &str,
-        upstream_model: &str,
-    ) -> Result<bool> {
-        let affected =
-            sqlx::query("DELETE FROM account_models WHERE account_id = ? AND upstream_model = ?")
-                .bind(account_id)
-                .bind(upstream_model)
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
-        Ok(affected > 0)
-    }
-
-    /// 覆盖写入一个账号的模型别名表（§16.4）。
-    ///
-    /// v8 起运行时以 `account_models.public_name` 为准，这里仅为兼容旧备份
-    /// 恢复与旧接口保留。
-    pub async fn replace_account_aliases(
-        &self,
-        account_id: &str,
-        aliases: &[AccountAliasRow],
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM account_aliases WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?;
-        for alias in aliases {
-            sqlx::query(
-                "INSERT INTO account_aliases (account_id, upstream_model, public_name)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(account_id)
-            .bind(&alias.upstream_model)
-            .bind(&alias.public_name)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn list_account_aliases(&self, account_id: &str) -> Result<Vec<AccountAliasRow>> {
-        let rows = sqlx::query(
-            "SELECT upstream_model, public_name FROM account_aliases WHERE account_id = ?
-             ORDER BY upstream_model",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(AccountAliasRow {
-                    upstream_model: row.try_get("upstream_model")?,
-                    public_name: row.try_get("public_name")?,
-                })
-            })
-            .collect()
-    }
-
     /// 该账号各逻辑模型最近一段时间内的请求次数（§16.3 的取消勾选警告）。
     pub async fn recent_request_counts_by_account(
         &self,
@@ -1323,211 +501,6 @@ impl Store {
         rows.iter()
             .map(|row| Ok((row.try_get("logical_model")?, row.try_get("calls")?)))
             .collect()
-    }
-
-    /// 记录账号上次完成模型同步的时间。
-    pub async fn touch_model_sync(&self, account_id: &str, at: i64) -> Result<()> {
-        sqlx::query("UPDATE upstream_accounts SET model_synced_at = ? WHERE id = ?")
-            .bind(at)
-            .bind(account_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    // -------------------------------------------------------------- 逻辑模型
-
-    pub async fn insert_logical_model(&self, model: &LogicalModel) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO logical_models (id, group_id, name, origin, enabled, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&model.id)
-        .bind(&model.group_id)
-        .bind(&model.name)
-        .bind(model.origin.as_str())
-        .bind(model.enabled)
-        .bind(model.created_at.unix_timestamp())
-        .execute(&self.pool)
-        .await
-        .context("写入逻辑模型失败")?;
-        Ok(())
-    }
-
-    pub async fn update_logical_model(&self, model: &LogicalModel) -> Result<()> {
-        sqlx::query("UPDATE logical_models SET name = ?, enabled = ? WHERE id = ?")
-            .bind(&model.name)
-            .bind(model.enabled)
-            .bind(&model.id)
-            .execute(&self.pool)
-            .await
-            .context("更新逻辑模型失败")?;
-        Ok(())
-    }
-
-    pub async fn delete_logical_model(&self, id: &str) -> Result<bool> {
-        let affected = sqlx::query("DELETE FROM logical_models WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
-    }
-
-    /// 一个事务里落库"配置调和"的全部增删改（§16.3）。
-    ///
-    /// 调和一次可能要建模型、建目标、停用消失的模型、删掉被取消勾选的目标、
-    /// 再清理零目标的自动模型。逐条 `execute` 是逐条事务，在一个几百模型的
-    /// 账号上就是几百次提交；这里合成一次事务，失败整体回滚——半批写入会留下
-    /// "目录说启用了、目标却还没有"的中间态。
-    pub async fn apply_config_delta(
-        &self,
-        models: &[LogicalModel],
-        targets: &[DispatchTarget],
-        target_deletes: &[String],
-        model_deletes: &[String],
-    ) -> Result<()> {
-        if models.is_empty()
-            && targets.is_empty()
-            && target_deletes.is_empty()
-            && model_deletes.is_empty()
-        {
-            return Ok(());
-        }
-        // 新模型必须先于目标写入：目标对 logical_models 有外键。
-        let mut tx = self.pool.begin().await?;
-        for model in models {
-            sqlx::query(
-                "INSERT INTO logical_models (id, group_id, name, origin, enabled, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO NOTHING",
-            )
-            .bind(&model.id)
-            .bind(&model.group_id)
-            .bind(&model.name)
-            .bind(model.origin.as_str())
-            .bind(model.enabled)
-            .bind(model.created_at.unix_timestamp())
-            .execute(&mut *tx)
-            .await
-            .context("写入逻辑模型失败")?;
-        }
-        for target in targets {
-            sqlx::query(
-                "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
-                    hide_original, priority_override, limit_rpm, limit_tpm, limit_concurrency,
-                    enabled, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                    logical_model_id = excluded.logical_model_id,
-                    upstream_model = excluded.upstream_model,
-                    hide_original = excluded.hide_original,
-                    priority_override = excluded.priority_override,
-                    limit_rpm = excluded.limit_rpm,
-                    limit_tpm = excluded.limit_tpm,
-                    limit_concurrency = excluded.limit_concurrency,
-                    enabled = excluded.enabled",
-            )
-            .bind(&target.id)
-            .bind(&target.logical_model_id)
-            .bind(&target.account_id)
-            .bind(&target.upstream_model)
-            .bind(target.hide_original)
-            .bind(target.priority_override)
-            .bind(target.limits.rpm)
-            .bind(target.limits.tpm)
-            .bind(target.limits.max_concurrency)
-            .bind(target.enabled)
-            .bind(target.created_at.unix_timestamp())
-            .execute(&mut *tx)
-            .await
-            .context("写入调度目标失败")?;
-        }
-        for id in target_deletes {
-            sqlx::query("DELETE FROM dispatch_targets WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        // 逻辑模型最后删：目标先消失，外键才放行。
-        for id in model_deletes {
-            sqlx::query("DELETE FROM logical_models WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn list_logical_models(&self) -> Result<Vec<LogicalModel>> {
-        let rows = sqlx::query("SELECT * FROM logical_models ORDER BY created_at")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_logical_model).collect()
-    }
-
-    // -------------------------------------------------------------- 调度目标
-
-    pub async fn insert_target(&self, target: &DispatchTarget) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
-                hide_original, priority_override, limit_rpm, limit_tpm, limit_concurrency,
-                enabled, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&target.id)
-        .bind(&target.logical_model_id)
-        .bind(&target.account_id)
-        .bind(&target.upstream_model)
-        .bind(target.hide_original)
-        .bind(target.priority_override)
-        .bind(target.limits.rpm)
-        .bind(target.limits.tpm)
-        .bind(target.limits.max_concurrency)
-        .bind(target.enabled)
-        .bind(target.created_at.unix_timestamp())
-        .execute(&self.pool)
-        .await
-        .context("写入调度目标失败")?;
-        Ok(())
-    }
-
-    pub async fn update_target(&self, target: &DispatchTarget) -> Result<()> {
-        sqlx::query(
-            "UPDATE dispatch_targets SET upstream_model = ?, logical_model_id = ?, hide_original = ?,
-                priority_override = ?, limit_rpm = ?, limit_tpm = ?, limit_concurrency = ?,
-                enabled = ? WHERE id = ?",
-        )
-        .bind(&target.upstream_model)
-        .bind(&target.logical_model_id)
-        .bind(target.hide_original)
-        .bind(target.priority_override)
-        .bind(target.limits.rpm)
-        .bind(target.limits.tpm)
-        .bind(target.limits.max_concurrency)
-        .bind(target.enabled)
-        .bind(&target.id)
-        .execute(&self.pool)
-        .await
-        .context("更新调度目标失败")?;
-        Ok(())
-    }
-
-    pub async fn delete_target(&self, id: &str) -> Result<bool> {
-        let affected = sqlx::query("DELETE FROM dispatch_targets WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        Ok(affected > 0)
-    }
-
-    pub async fn list_targets(&self) -> Result<Vec<DispatchTarget>> {
-        let rows = sqlx::query("SELECT * FROM dispatch_targets ORDER BY created_at")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_target).collect()
     }
 
     // ------------------------------------------------------------ 请求元数据
@@ -1779,10 +752,17 @@ impl Store {
     }
 
     /// 最近配置变化（§6.2）：来源是管理员审计日志。
+    ///
+    /// 只算真正改配置的动作：测试连接、刷新倍率与拉模型列表也进审计，但它们不是
+    /// "最近的配置变更"，混进去会把真正的改动挤出这个只有几行的列表。
     pub async fn recent_audit(&self, limit: i64) -> Result<Vec<AuditEntry>> {
         let rows = sqlx::query(
             "SELECT occurred_at, actor, action, object, result
-             FROM admin_audit_log ORDER BY occurred_at DESC LIMIT ?",
+             FROM admin_audit_log
+             WHERE action NOT IN ('test_account', 'refresh_multiplier',
+                                  'refresh_all_multipliers', 'refresh_account_models',
+                                  'sync_account_models')
+             ORDER BY occurred_at DESC LIMIT ?",
         )
         .bind(limit.clamp(1, 50))
         .fetch_all(&self.pool)
@@ -2058,8 +1038,6 @@ impl Store {
         rows.iter()
             .map(|row| {
                 let account_id: String = row.try_get("account_id")?;
-                let api_key: Vec<u8> = row.try_get("api_key")?;
-                let plaintext = String::from_utf8_lossy(&cipher.open(&api_key)?).into_owned();
                 let token: Option<Vec<u8>> = row.try_get("new_api_token")?;
                 let token_text = match token {
                     Some(sealed) => {
@@ -2069,7 +1047,6 @@ impl Store {
                 };
                 Ok(serde_json::json!({
                     "account_id": account_id,
-                    "api_key": plaintext,
                     "new_api_token": token_text,
                 }))
             })
@@ -2113,12 +1090,7 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
-            .map(|row| {
-                Self::backup_row(
-                    row,
-                    &["id", "group_id", "name", "origin", "enabled", "created_at"],
-                )
-            })
+            .map(|row| Self::backup_row(row, &["id", "group_id", "name", "enabled", "created_at"]))
             .collect()
     }
 
@@ -2135,8 +1107,6 @@ impl Store {
                         "logical_model_id",
                         "account_id",
                         "upstream_model",
-                        "hide_original",
-                        "priority_override",
                         "limit_rpm",
                         "limit_tpm",
                         "limit_concurrency",
@@ -2160,8 +1130,8 @@ impl Store {
                         "account_id",
                         "upstream_model",
                         "public_name",
-                        "hide_original",
                         "selected",
+                        "excluded",
                         "missing",
                         "discovered_at",
                     ],
@@ -2170,13 +1140,10 @@ impl Store {
             .collect()
     }
 
+    /// v26 删掉了旧别名表，这里恒为空。只为 `security::backup` 的字段还在；
+    /// 那边删掉 `account_aliases` 字段后一并删除本函数。
     pub async fn backup_account_aliases(&self) -> Result<Vec<Value>> {
-        let rows = sqlx::query("SELECT * FROM account_aliases")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|row| Self::backup_row(row, &["account_id", "upstream_model", "public_name"]))
-            .collect()
+        Ok(Vec::new())
     }
 
     /// 备份系统设置（§23.5）。
@@ -2184,9 +1151,11 @@ impl Store {
     /// 排除 `schema_version`：它是数据库结构版本，由启动时的迁移逻辑管理，
     /// 恢复一份旧备份不该把版本号倒回去。
     pub async fn backup_app_settings(&self) -> Result<Vec<Value>> {
-        let rows = sqlx::query("SELECT * FROM app_settings WHERE key <> 'schema_version'")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT * FROM app_settings WHERE key NOT IN ('schema_version', 'config_revision')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter()
             .map(|row| Self::backup_row(row, &["key", "value"]))
             .collect()
@@ -2246,20 +1215,18 @@ impl Store {
         }
         for account in &data.accounts {
             sqlx::query(
-                "INSERT INTO upstream_accounts (id, group_id, name, upstream_type, base_url,
+                "INSERT INTO upstream_accounts (id, group_id, name, base_url,
                     preferred_protocol, adaptive_protocol, default_priority, calibration,
                     multiplier_mode, manual_multiplier, new_api_user_id, new_api_group,
                     limit_rpm, limit_tpm, limit_concurrency, allow_private_network, enabled,
                     auto_sync, hide_original, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(account, "id"))
             // 未分配账号在备份里是 null / 缺字段，不能写成空串——空串会被
             // 当成一个不存在的分组 id（§4.2.3）。
             .bind(str_opt_field(account, "group_id"))
             .bind(str_field(account, "name"))
-            // 同 insert_account：历史列写占位值（§4.2）。
-            .bind(LEGACY_UPSTREAM_TYPE)
             .bind(str_field(account, "base_url"))
             .bind(str_field(account, "preferred_protocol"))
             .bind(bool_field(account, "adaptive_protocol"))
@@ -2282,10 +1249,6 @@ impl Store {
         }
         for secret in &data.secrets {
             // 本机主密钥重新加密：备份里的明文 Key 只在内存停留一瞬（§23.5）。
-            let api_key = str_field(secret, "api_key");
-            let sealed_key = cipher
-                .seal(api_key.as_bytes())
-                .context("备份恢复时重新加密 Key 失败")?;
             let sealed_token = match str_opt_field(secret, "new_api_token") {
                 Some(token) => Some(
                     cipher
@@ -2295,11 +1258,10 @@ impl Store {
                 None => None,
             };
             sqlx::query(
-                "INSERT INTO upstream_secrets (account_id, api_key, new_api_token, updated_at)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO upstream_secrets (account_id, new_api_token, updated_at)
+                 VALUES (?, ?, ?)",
             )
             .bind(str_field(secret, "account_id"))
-            .bind(&sealed_key)
             .bind(&sealed_token)
             .bind(crate::storage::now_unix())
             .execute(&mut *tx)
@@ -2307,30 +1269,17 @@ impl Store {
         }
         // Key 池（§4.2.1）。新备份带 `account_keys`；旧备份没有这一项，由下面
         // 从 `secrets` 展开成"一把 Key 的池"，两条路径都落到同一形状。
-        let restored_keys =
-            restore_account_keys(&mut tx, &data.account_keys, &data.secrets, cipher)
-                .await
-                .context("恢复账号 Key 池失败")?;
-        // 第一把 Key 镜像回 `upstream_secrets`，旧二进制与旧恢复路径仍可用。
-        for (account_id, sealed) in &restored_keys {
-            sqlx::query(
-                "UPDATE upstream_secrets SET api_key = ?, keys_migrated = 1
-                  WHERE account_id = ?",
-            )
-            .bind(sealed)
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+        restore_account_keys(&mut tx, &data.account_keys, &data.secrets, cipher)
+            .await
+            .context("恢复账号 Key 池失败")?;
         for model in &data.logical_models {
             sqlx::query(
-                "INSERT INTO logical_models (id, group_id, name, origin, enabled, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logical_models (id, group_id, name, enabled, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
             )
             .bind(str_field(model, "id"))
             .bind(str_field(model, "group_id"))
             .bind(str_field(model, "name"))
-            .bind(str_field(model, "origin"))
             .bind(bool_field(model, "enabled"))
             .bind(int_field(model, "created_at"))
             .execute(&mut *tx)
@@ -2339,16 +1288,13 @@ impl Store {
         for target in &data.dispatch_targets {
             sqlx::query(
                 "INSERT INTO dispatch_targets (id, logical_model_id, account_id, upstream_model,
-                    hide_original, priority_override, limit_rpm, limit_tpm, limit_concurrency,
-                    enabled, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    limit_rpm, limit_tpm, limit_concurrency, enabled, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(target, "id"))
             .bind(str_field(target, "logical_model_id"))
             .bind(str_field(target, "account_id"))
             .bind(str_field(target, "upstream_model"))
-            .bind(bool_field(target, "hide_original"))
-            .bind(int_opt_field(target, "priority_override"))
             .bind(int_opt_field(target, "limit_rpm"))
             .bind(int_opt_field(target, "limit_tpm"))
             .bind(int_opt_field(target, "limit_concurrency"))
@@ -2360,54 +1306,26 @@ impl Store {
         for row in &data.account_models {
             sqlx::query(
                 "INSERT INTO account_models (account_id, upstream_model, public_name,
-                    hide_original, selected, missing, discovered_at)
+                    selected, excluded, missing, discovered_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(str_field(row, "account_id"))
             .bind(str_field(row, "upstream_model"))
             .bind(str_field(row, "public_name"))
-            .bind(bool_field(row, "hide_original"))
             .bind(bool_field(row, "selected"))
+            .bind(bool_field(row, "excluded"))
             .bind(bool_field(row, "missing"))
             .bind(int_field(row, "discovered_at"))
             .execute(&mut *tx)
             .await?;
         }
-        for row in &data.account_aliases {
-            sqlx::query(
-                "INSERT INTO account_aliases (account_id, upstream_model, public_name)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(str_field(row, "account_id"))
-            .bind(str_field(row, "upstream_model"))
-            .bind(str_field(row, "public_name"))
-            .execute(&mut *tx)
-            .await?;
-        }
-        // 旧备份（v8 之前）的别名只存在 account_aliases 里，恢复时回填到
-        // account_models.public_name；新备份两边都有，回填是无害的幂等操作。
-        sqlx::query(
-            "UPDATE account_models
-                SET public_name = (
-                    SELECT aa.public_name FROM account_aliases aa
-                    WHERE aa.account_id = account_models.account_id
-                      AND aa.upstream_model = account_models.upstream_model
-                )
-              WHERE EXISTS (
-                    SELECT 1 FROM account_aliases aa
-                    WHERE aa.account_id = account_models.account_id
-                      AND aa.upstream_model = account_models.upstream_model
-              )",
-        )
-        .execute(&mut *tx)
-        .await
-        .context("恢复账号模型别名失败")?;
-
         // 系统设置：整体替换而不是合并，否则旧备份恢复后会留下一半新一半旧的
         // 设置项。`schema_version` 不动——它由启动时的迁移逻辑管理（§23.5）。
         for row in &data.app_settings {
             let key = str_field(row, "key");
-            if key.is_empty() || key == "schema_version" {
+            // 配置修订号也不恢复：它只能前进，倒回去会让别的标签页的旧版本号
+            // 重新"有效"（§7.4）。
+            if key.is_empty() || key == "schema_version" || key == "config_revision" {
                 continue;
             }
             sqlx::query(
@@ -2427,28 +1345,6 @@ impl Store {
     }
 
     // ------------------------------------------------------------ 校准记录
-
-    /// 写一条校准对账记录（§6.8）。
-    pub async fn insert_calibration_record(&self, record: &CalibrationRecord) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO calibration_records (id, account_id, logical_model, period_start,
-                period_end, gateway_requests, reported, calibration, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&record.id)
-        .bind(&record.account_id)
-        .bind(&record.logical_model)
-        .bind(record.period_start)
-        .bind(record.period_end)
-        .bind(record.gateway_requests)
-        .bind(&record.reported)
-        .bind(&record.calibration)
-        .bind(record.created_at)
-        .execute(&self.pool)
-        .await
-        .context("写入校准记录失败")?;
-        Ok(())
-    }
 
     /// 一个账号最近的对账记录，新的在前。
     pub async fn list_calibration_records(
@@ -2590,119 +1486,6 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
-    }
-
-    /// 把 `request_records` 里尚未聚合的明细滚进 `performance_buckets`（§22）。
-    ///
-    /// 幂等：先删掉待聚合区间内已有的桶，再从明细重建，所以同一个区间重复调用
-    /// 不会重复计数。`since` 到 `until` 之间按 `bucket_secs` 对齐。
-    pub async fn rollup_performance_buckets(
-        &self,
-        since: i64,
-        until: i64,
-        bucket_secs: i64,
-    ) -> Result<u64> {
-        let bucket = bucket_secs.max(1);
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM performance_buckets WHERE bucket_start >= ? AND bucket_start < ?")
-            .bind(since)
-            .bind(until)
-            .execute(&mut *tx)
-            .await?;
-        // 按（桶、目标、协议、流式）聚合；target_id 为空的记录不参与目标维度聚合。
-        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO performance_buckets (bucket_start, target_id, protocol, streaming,
-                requests, success, total_ms_sum, first_token_sum, first_token_count,
-                output_tokens_sum, rate_limited, server_errors, protocol_errors)
-             SELECT (started_at / ?) * ? AS bucket_start,
-                    target_id, protocol, streaming,
-                    COUNT(*),
-                    SUM(CASE WHEN {SUCCESS} THEN 1 ELSE 0 END),
-                    SUM(duration_ms),
-                    SUM(COALESCE(first_token_ms, 0)),
-                    SUM(CASE WHEN first_token_ms IS NULL THEN 0 ELSE 1 END),
-                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
-                    SUM(CASE WHEN error_code = 'rate_limited' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN error_code = 'upstream_protocol_error' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN error_code = 'upstream_exhausted' THEN 1 ELSE 0 END)
-             FROM request_records
-             WHERE started_at >= ? AND started_at < ? AND target_id IS NOT NULL
-             GROUP BY bucket_start, target_id, protocol, streaming"
-        )))
-        .bind(bucket)
-        .bind(bucket)
-        .bind(since)
-        .bind(until)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected())
-    }
-
-    /// 读取某个时间范围内的分钟桶（§7.4 的 `/admin/api/metrics`）。
-    pub async fn list_performance_buckets(
-        &self,
-        since: i64,
-        until: i64,
-        target_id: Option<&str>,
-    ) -> Result<Vec<PerformanceBucketRow>> {
-        // 两条固定语句，不用动态拼串：sqlx 只接受字面量 SQL。
-        let query = if let Some(target) = target_id {
-            sqlx::query(concat!(
-                "SELECT bucket_start, target_id, protocol, streaming, requests, success, ",
-                "total_ms_sum, first_token_sum, first_token_count, output_tokens_sum, ",
-                "rate_limited, server_errors, protocol_errors FROM performance_buckets ",
-                "WHERE bucket_start >= ? AND bucket_start < ? AND target_id = ? ",
-                "ORDER BY bucket_start DESC, target_id LIMIT 10000"
-            ))
-            .bind(since)
-            .bind(until)
-            .bind(target)
-        } else {
-            sqlx::query(concat!(
-                "SELECT bucket_start, target_id, protocol, streaming, requests, success, ",
-                "total_ms_sum, first_token_sum, first_token_count, output_tokens_sum, ",
-                "rate_limited, server_errors, protocol_errors FROM performance_buckets ",
-                "WHERE bucket_start >= ? AND bucket_start < ? ",
-                "ORDER BY bucket_start DESC, target_id LIMIT 10000"
-            ))
-            .bind(since)
-            .bind(until)
-        };
-        let rows = query.fetch_all(&self.pool).await?;
-        rows.iter()
-            .map(|row| {
-                Ok(PerformanceBucketRow {
-                    bucket_start: row.try_get("bucket_start")?,
-                    target_id: row.try_get("target_id")?,
-                    // 库里的协议字符串一定是本进程写进去的；真遇到脏数据就退回
-                    // OpenAI Chat（§18 的错误体形状默认值），不要因此丢掉整条记录。
-                    protocol: Protocol::parse(row.try_get("protocol")?)
-                        .unwrap_or(Protocol::OpenAiChat),
-                    streaming: row.try_get::<i64, _>("streaming")? != 0,
-                    requests: row.try_get("requests")?,
-                    success: row.try_get("success")?,
-                    total_ms_sum: row.try_get("total_ms_sum")?,
-                    first_token_sum: row.try_get("first_token_sum")?,
-                    first_token_count: row.try_get("first_token_count")?,
-                    output_tokens_sum: row.try_get("output_tokens_sum")?,
-                    rate_limited: row.try_get("rate_limited")?,
-                    server_errors: row.try_get("server_errors")?,
-                    protocol_errors: row.try_get("protocol_errors")?,
-                })
-            })
-            .collect()
-    }
-
-    /// 删除过期的性能桶（§24.2，与请求明细同一保留期）。
-    pub async fn prune_performance_buckets(&self, older_than: i64) -> Result<u64> {
-        Ok(
-            sqlx::query("DELETE FROM performance_buckets WHERE bucket_start < ?")
-                .bind(older_than)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
-        )
     }
 
     /// 批量覆盖性能 EWMA 快照。
@@ -3177,28 +1960,6 @@ pub struct PerfSnapshotRow {
     pub updated_at: i64,
 }
 
-/// 一个分钟级性能桶（§20.1、§22）。
-///
-/// 这是 `GET /admin/api/metrics` 的数据源：后台读它而不是对 `request_records`
-/// 做全表扫描，明细表清理后历史趋势仍然保留。
-#[derive(Debug, Clone, PartialEq)]
-pub struct PerformanceBucketRow {
-    /// 桶起点（Unix 秒，按桶宽对齐）。
-    pub bucket_start: i64,
-    pub target_id: String,
-    pub protocol: Protocol,
-    pub streaming: bool,
-    pub requests: i64,
-    pub success: i64,
-    pub total_ms_sum: i64,
-    pub first_token_sum: i64,
-    pub first_token_count: i64,
-    pub output_tokens_sum: i64,
-    pub rate_limited: i64,
-    pub server_errors: i64,
-    pub protocol_errors: i64,
-}
-
 /// 一条 Responses 状态链记录（§15.1、§15.2）。
 #[derive(Debug, Clone)]
 pub struct ResponseStateRow {
@@ -3242,27 +2003,6 @@ pub struct ImageTaskRow {
     pub key_digest: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
-}
-
-/// 账号模型目录里的一条记录：上游真名、对外名与选择状态（§16.2）。
-#[derive(Debug, Clone)]
-pub struct AccountModelRow {
-    /// 上游真名（规范化后，保留大小写）。
-    pub upstream_model: String,
-    /// 对外名；未设置别名时等于上游真名。
-    pub public_name: String,
-    /// 别名存在时，是否只暴露对外名、隐藏上游真名。
-    pub hide_original: bool,
-    pub selected: bool,
-    pub missing: bool,
-    pub discovered_at: i64,
-}
-
-/// 账号级模型别名：上游真名 → 对外名（§16.4）。
-#[derive(Debug, Clone)]
-pub struct AccountAliasRow {
-    pub upstream_model: String,
-    pub public_name: String,
 }
 
 /// 备份 JSON 对象里的字符串字段；缺失按空串处理（恢复前的校验应已兜底）。
@@ -3310,111 +2050,6 @@ fn bool_field(object: &serde_json::Value, key: &str) -> bool {
             .unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0),
         None => false,
     }
-}
-
-fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> Result<Group> {
-    Ok(Group {
-        id: row.try_get("id")?,
-        name: row.try_get("name")?,
-        key_prefix: row.try_get("key_prefix")?,
-        key_digest_hex: row.try_get("key_digest_hex")?,
-        multiplier_limit: Multiplier::from_raw(row.try_get("multiplier_limit")?),
-        weights: SchedulingWeights {
-            multiplier: row.try_get::<i64, _>("weight_multiplier")? as u32,
-            reliability: row.try_get::<i64, _>("weight_reliability")? as u32,
-            first_token: row.try_get::<i64, _>("weight_first_token")? as u32,
-            throughput: row.try_get::<i64, _>("weight_throughput")? as u32,
-            cache_hit: row.try_get::<i64, _>("weight_cache_hit")? as u32,
-        },
-        queue_capacity: row.try_get::<i64, _>("queue_capacity")? as u32,
-        max_wait_secs: row.try_get::<i64, _>("max_wait_secs").unwrap_or(60) as u32,
-        allow_degrade: row.try_get("allow_degrade")?,
-        allow_managed_background: row
-            .try_get::<i64, _>("allow_managed_background")
-            .unwrap_or(0)
-            != 0,
-        created_at: to_time(row.try_get("created_at")?),
-    })
-}
-
-/// 从三个可空列还原限制组。
-fn row_to_limits(row: &sqlx::sqlite::SqliteRow) -> Result<Limits> {
-    Ok(Limits {
-        rpm: row
-            .try_get::<Option<i64>, _>("limit_rpm")?
-            .map(|v| v as u32),
-        tpm: row
-            .try_get::<Option<i64>, _>("limit_tpm")?
-            .map(|v| v as u32),
-        max_concurrency: row
-            .try_get::<Option<i64>, _>("limit_concurrency")?
-            .map(|v| v as u32),
-    })
-}
-
-fn row_to_account(row: &sqlx::sqlite::SqliteRow) -> Result<Account> {
-    let protocol: String = row.try_get("preferred_protocol")?;
-    let mode: String = row.try_get("multiplier_mode")?;
-    Ok(Account {
-        id: row.try_get("id")?,
-        // NULL 表示未分配（§4.2.3），不是一个叫 NULL 的分组。
-        group_id: row.try_get("group_id")?,
-        name: row.try_get("name")?,
-        // upstream_type 是历史列：v12 起既不写也不用（§4.2）。库里留着它，
-        // 只是为了让不认识新结构的旧二进制仍能启动；读取一律忽略。
-        base_url: row.try_get("base_url")?,
-        preferred_protocol: Protocol::parse(&protocol)
-            .with_context(|| format!("数据库中的协议无法识别：{protocol}"))?,
-        adaptive_protocol: row.try_get("adaptive_protocol")?,
-        default_priority: row.try_get::<i64, _>("default_priority")? as i32,
-        calibration: Multiplier::from_raw(row.try_get("calibration")?),
-        multiplier_mode: MultiplierMode::parse(&mode)
-            .with_context(|| format!("数据库中的倍率来源无法识别：{mode}"))?,
-        manual_multiplier: Multiplier::from_raw(row.try_get("manual_multiplier")?),
-        new_api_user_id: row.try_get("new_api_user_id")?,
-        new_api_group: row.try_get("new_api_group")?,
-        limits: row_to_limits(row)?,
-        allow_private_network: row.try_get("allow_private_network")?,
-        enabled: row.try_get("enabled")?,
-        auto_sync: row.try_get("auto_sync")?,
-        hide_original: row.try_get("hide_original")?,
-        model_synced_at: row.try_get("model_synced_at")?,
-        created_at: to_time(row.try_get("created_at")?),
-    })
-}
-
-fn row_to_logical_model(row: &sqlx::sqlite::SqliteRow) -> Result<LogicalModel> {
-    let origin: String = row.try_get("origin")?;
-    Ok(LogicalModel {
-        id: row.try_get("id")?,
-        group_id: row.try_get("group_id")?,
-        name: row.try_get("name")?,
-        origin: ModelOrigin::parse(&origin)
-            .with_context(|| format!("数据库中的逻辑模型来源无法识别：{origin}"))?,
-        enabled: row.try_get("enabled")?,
-        created_at: to_time(row.try_get("created_at")?),
-    })
-}
-
-fn row_to_target(row: &sqlx::sqlite::SqliteRow) -> Result<DispatchTarget> {
-    Ok(DispatchTarget {
-        id: row.try_get("id")?,
-        logical_model_id: row.try_get("logical_model_id")?,
-        account_id: row.try_get("account_id")?,
-        upstream_model: row.try_get("upstream_model")?,
-        hide_original: row.try_get("hide_original")?,
-        priority_override: row
-            .try_get::<Option<i64>, _>("priority_override")?
-            .map(|v| v as i32),
-        limits: row_to_limits(row)?,
-        enabled: row.try_get("enabled")?,
-        created_at: to_time(row.try_get("created_at")?),
-    })
-}
-
-/// 站点级凭据的匹配键：去掉首尾空白与结尾斜杠，大小写不敏感由调用方保证。
-fn normalize_site(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<RequestRecord> {
@@ -3500,7 +2135,11 @@ pub mod ids {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ModelOrigin, SchedulingWeights};
+    use crate::domain::{
+        Account, DispatchTarget, Group, Limits, LogicalModel, Multiplier, MultiplierMode, Protocol,
+        SchedulingWeights,
+    };
+    use time::OffsetDateTime;
 
     async fn store() -> Store {
         Store::new(crate::storage::open_in_memory().await.unwrap())
@@ -3546,8 +2185,15 @@ mod tests {
         }
     }
 
-    fn sealed(api_key: &[u8]) -> AccountSecrets {
-        AccountSecrets::new(api_key.to_vec(), None)
+    fn key(id: &str, sealed: &[u8], enabled: bool) -> AccountKeyWrite {
+        AccountKeyWrite {
+            id: id.into(),
+            label: String::new(),
+            sealed_key: sealed.to_vec(),
+            credential_digest: String::new(),
+            limits: Limits::default(),
+            enabled,
+        }
     }
 
     #[tokio::test]
@@ -3572,82 +2218,59 @@ mod tests {
         assert_eq!(loaded[0].weights, SchedulingWeights::default());
     }
 
+    /// 兜底凭据取 Key 池里第一把**启用的** Key；池被清空就是没有凭据，
+    /// 不能再从任何旁路读到一把已经删掉的 Key（v26 删掉镜像列的原因）。
     #[tokio::test]
-    async fn account_and_secret_are_written_together() {
+    async fn sealed_key_follows_the_first_enabled_pool_key() {
         let store = store().await;
         let group = sample_group();
         store.insert_group(&group).await.unwrap();
         let account = sample_account(&group.id);
+        store.insert_account(&account).await.unwrap();
+        assert!(
+            store
+                .account_sealed_key(&account.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         store
-            .insert_account(&account, &sealed(b"sealed"))
+            .replace_account_keys(
+                &account.id,
+                &[key("k1", b"first", false), key("k2", b"second", true)],
+            )
             .await
             .unwrap();
-
         assert_eq!(
             store
                 .account_sealed_key(&account.id)
                 .await
                 .unwrap()
                 .unwrap(),
-            b"sealed"
+            b"second"
         );
-        let loaded = store.list_accounts().await.unwrap();
-        assert_eq!(loaded[0].preferred_protocol, Protocol::AnthropicMessages);
-        assert_eq!(
-            loaded[0].configured_effective_multiplier(),
-            Multiplier::parse("0.5").unwrap()
+
+        store.replace_account_keys(&account.id, &[]).await.unwrap();
+        assert!(
+            store
+                .account_sealed_key(&account.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
+    /// 删分组不再删账号：账号回到未分配，逻辑模型与目标随分组消失（§4.2.3）。
     #[tokio::test]
-    async fn an_empty_credential_patch_keeps_the_existing_key() {
-        let store = store().await;
-        let group = sample_group();
-        store.insert_group(&group).await.unwrap();
-        let mut account = sample_account(&group.id);
-        store
-            .insert_account(&account, &sealed(b"original"))
-            .await
-            .unwrap();
-
-        // 只改名字，不碰凭据：后台不提供读回完整 Key 的接口，所以"没填"
-        // 必须原样保留，而不是把 Key 清空。
-        account.name = "账号A改名".into();
-        store
-            .update_account(&account, &AccountSecrets::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .account_sealed_key(&account.id)
-                .await
-                .unwrap()
-                .unwrap(),
-            b"original"
-        );
-
-        store
-            .update_account(&account, &sealed(b"rotated"))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .account_sealed_key(&account.id)
-                .await
-                .unwrap()
-                .unwrap(),
-            b"rotated"
-        );
-    }
-
-    #[tokio::test]
-    async fn deleting_a_group_cascades_to_accounts_and_models() {
+    async fn deleting_a_group_unassigns_its_accounts() {
         let store = store().await;
         let group = sample_group();
         store.insert_group(&group).await.unwrap();
         let account = sample_account(&group.id);
+        store.insert_account(&account).await.unwrap();
         store
-            .insert_account(&account, &sealed(b"sealed"))
+            .replace_account_keys(&account.id, &[key("k1", b"sealed", true)])
             .await
             .unwrap();
 
@@ -3655,7 +2278,6 @@ mod tests {
             id: ids::logical_model(),
             group_id: group.id.clone(),
             name: "claude-sonnet-4-5".into(),
-            origin: ModelOrigin::Manual,
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -3665,9 +2287,7 @@ mod tests {
                 id: ids::target(),
                 logical_model_id: model.id.clone(),
                 account_id: account.id.clone(),
-                hide_original: false,
                 upstream_model: "claude-sonnet-4-5-20250929".into(),
-                priority_override: None,
                 limits: Limits::default(),
                 enabled: true,
                 created_at: OffsetDateTime::now_utc(),
@@ -3676,15 +2296,18 @@ mod tests {
             .unwrap();
 
         assert!(store.delete_group(&group.id).await.unwrap());
-        assert!(store.list_accounts().await.unwrap().is_empty());
+        let accounts = store.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].group_id, None);
         assert!(store.list_logical_models().await.unwrap().is_empty());
         assert!(store.list_targets().await.unwrap().is_empty());
-        assert!(
+        assert_eq!(
             store
-                .account_sealed_key(&account.id)
+                .list_account_key_rows(&account.id)
                 .await
                 .unwrap()
-                .is_none()
+                .len(),
+            1
         );
     }
 
@@ -3835,21 +2458,6 @@ mod tests {
         let samples = store.cost_multiplier_samples(0).await.unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].requests, 1);
-
-        // 分钟桶与上面同一口径（§22）。
-        store
-            .rollup_performance_buckets(0, 4_000, 3_600)
-            .await
-            .unwrap();
-        let buckets = store
-            .list_performance_buckets(0, 4_000, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            buckets.iter().map(|bucket| bucket.success).sum::<i64>(),
-            1,
-            "分钟桶也必须把中断排除在成功之外：{buckets:?}"
-        );
     }
 
     #[tokio::test]
@@ -3858,15 +2466,11 @@ mod tests {
         let group = sample_group();
         store.insert_group(&group).await.unwrap();
         let account = sample_account(&group.id);
-        store
-            .insert_account(&account, &sealed(b"sealed"))
-            .await
-            .unwrap();
+        store.insert_account(&account).await.unwrap();
         let model = LogicalModel {
             id: ids::logical_model(),
             group_id: group.id.clone(),
             name: "glm-4.6".into(),
-            origin: ModelOrigin::Manual,
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -3875,9 +2479,7 @@ mod tests {
             id: ids::target(),
             logical_model_id: model.id.clone(),
             account_id: account.id.clone(),
-            hide_original: false,
             upstream_model: "glm-4.6".into(),
-            priority_override: None,
             limits: Limits::default(),
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
@@ -3927,15 +2529,11 @@ mod tests {
         let group = sample_group();
         store.insert_group(&group).await.unwrap();
         let account = sample_account(&group.id);
-        store
-            .insert_account(&account, &sealed(b"sealed"))
-            .await
-            .unwrap();
+        store.insert_account(&account).await.unwrap();
         let model = LogicalModel {
             id: ids::logical_model(),
             group_id: group.id.clone(),
             name: "glm-4.6".into(),
-            origin: ModelOrigin::Manual,
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -3944,9 +2542,7 @@ mod tests {
             id: ids::target(),
             logical_model_id: model.id.clone(),
             account_id: account.id.clone(),
-            hide_original: false,
             upstream_model: "glm-4.6".into(),
-            priority_override: None,
             limits: Limits::default(),
             enabled: true,
             created_at: OffsetDateTime::now_utc(),
@@ -3986,175 +2582,11 @@ mod tests {
         assert_eq!(loaded[0].sticky_key, "prefix-a");
 
         // 目标被删除后，指向它的绑定必须一起消失，否则重启会复活一个死目标。
-        store.delete_target(&target.id).await.unwrap();
+        let mut tx = store.begin_config().await.unwrap();
+        tx.apply_config_delta(&[], &[], std::slice::from_ref(&target.id), &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         assert_eq!(store.prune_sticky_bindings(0).await.unwrap(), 2);
-    }
-
-    fn bucket_record(
-        id: &str,
-        started_at: i64,
-        target: &str,
-        status: i64,
-        code: Option<&str>,
-    ) -> RequestRecord {
-        RequestRecord {
-            request_id: id.into(),
-            started_at,
-            duration_ms: 100,
-            protocol: Protocol::OpenAiChat,
-            streaming: false,
-            group_id: Some("g1".into()),
-            logical_model: Some("glm-4.6".into()),
-            target_id: Some(target.into()),
-            account_id: Some("a1".into()),
-            upstream_model: None,
-            request_bytes: 64,
-            upstream_status: Some(status),
-            http_status: status,
-            error_code: code.map(str::to_string),
-            endpoint: Some("chat_completions".into()),
-            degraded: None,
-            effective_multiplier: None,
-            cheapest_multiplier: None,
-            dearest_multiplier: None,
-            attempts: 1,
-            first_token_ms: Some(50),
-            input_tokens: Some(10),
-            output_tokens: Some(20),
-            config_version: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: None,
-            sticky_wait_ms: None,
-            sticky_freshness: None,
-            sticky_origin: None,
-            output_tps: None,
-            multiplier_source: None,
-            quota_status: None,
-            filter_summary: None,
-            filter_details: None,
-            selected_layer: None,
-            key_id: None,
-            key_label: None,
-            effort_retries: 0,
-            attempts_detail: Vec::new(),
-            queued_ms: 0,
-            sticky_hit: false,
-
-            sticky_kept: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn performance_buckets_roll_up_request_records() {
-        let store = store().await;
-        // 同一分钟内的两条成功 + 一条 429，分属两个目标。
-        store
-            .insert_request_records(&[
-                bucket_record("r1", 1_200, "tgt-a", 200, None),
-                bucket_record("r2", 1_230, "tgt-a", 200, None),
-                bucket_record("r3", 1_250, "tgt-b", 429, Some("rate_limited")),
-            ])
-            .await
-            .unwrap();
-
-        // 只滚 [1200, 1260) 这一分钟。
-        let rows = store
-            .rollup_performance_buckets(1_200, 1_260, 60)
-            .await
-            .unwrap();
-        assert_eq!(rows, 2, "两个目标各一个桶");
-
-        let buckets = store
-            .list_performance_buckets(1_200, 1_260, None)
-            .await
-            .unwrap();
-        assert_eq!(buckets.len(), 2);
-        let a = buckets.iter().find(|b| b.target_id == "tgt-a").unwrap();
-        assert_eq!(a.requests, 2);
-        assert_eq!(a.success, 2);
-        assert_eq!(a.total_ms_sum, 200);
-        assert_eq!(a.first_token_count, 2);
-        assert_eq!(a.output_tokens_sum, 60);
-        let b = buckets.iter().find(|b| b.target_id == "tgt-b").unwrap();
-        assert_eq!(b.requests, 1);
-        assert_eq!(b.success, 0, "429 不算成功");
-        assert_eq!(b.rate_limited, 1, "429 要单独计数（§9.3）");
-
-        // 按目标筛选。
-        let only_b = store
-            .list_performance_buckets(1_200, 1_260, Some("tgt-b"))
-            .await
-            .unwrap();
-        assert_eq!(only_b.len(), 1);
-        assert_eq!(only_b[0].target_id, "tgt-b");
-    }
-
-    #[tokio::test]
-    async fn rolling_up_the_same_window_twice_does_not_double_count() {
-        let store = store().await;
-        store
-            .insert_request_records(&[bucket_record("r1", 1_200, "tgt-a", 200, None)])
-            .await
-            .unwrap();
-        store
-            .rollup_performance_buckets(1_200, 1_260, 60)
-            .await
-            .unwrap();
-        store
-            .rollup_performance_buckets(1_200, 1_260, 60)
-            .await
-            .unwrap();
-        let buckets = store
-            .list_performance_buckets(1_200, 1_260, None)
-            .await
-            .unwrap();
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].requests, 1, "重复聚合必须幂等");
-    }
-
-    #[tokio::test]
-    async fn without_target_id_records_do_not_enter_target_buckets() {
-        let store = store().await;
-        let mut record = bucket_record("r1", 1_200, "tgt-a", 200, None);
-        // 没选中目标就失败的请求不该污染目标维度的聚合。
-        record.target_id = None;
-        store.insert_request_records(&[record]).await.unwrap();
-        let rows = store
-            .rollup_performance_buckets(1_200, 1_260, 60)
-            .await
-            .unwrap();
-        assert_eq!(rows, 0);
-    }
-
-    #[tokio::test]
-    async fn performance_buckets_are_pruned_by_retention() {
-        let store = store().await;
-        store
-            .insert_request_records(&[
-                bucket_record("r1", 1_200, "tgt-a", 200, None),
-                bucket_record("r2", 5_000, "tgt-a", 200, None),
-            ])
-            .await
-            .unwrap();
-        store
-            .rollup_performance_buckets(1_200, 5_060, 60)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .list_performance_buckets(0, 10_000, None)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(store.prune_performance_buckets(2_000).await.unwrap(), 1);
-        let left = store
-            .list_performance_buckets(0, 10_000, None)
-            .await
-            .unwrap();
-        assert_eq!(left.len(), 1);
-        assert!(left[0].bucket_start > 2_000);
     }
 }

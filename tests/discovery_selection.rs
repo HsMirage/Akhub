@@ -24,6 +24,7 @@ async fn spawn_admin() -> (Akhub, reqwest::Client) {
             format!("{}/admin/api/setup", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"username": "admin", "password": "correct horse battery"}))
         .send()
         .await
@@ -45,11 +46,12 @@ async fn create_account(
             format!("{}/admin/api/accounts", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({
             "group_id": akhub.group_id,
             "name": name,
             "base_url": upstream.base_url,
-            "api_key": format!("key-{name}"),
+            "keys": [{"api_key": format!("key-{name}")}],
             "preferred_protocol": Protocol::OpenAiChat.as_str(),
             "allow_private_network": true,
         }))
@@ -77,6 +79,7 @@ async fn refresh(client: &reqwest::Client, akhub: &Akhub, account_id: &str) -> V
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -89,7 +92,30 @@ async fn refresh(client: &reqwest::Client, akhub: &Akhub, account_id: &str) -> V
     response.json().await.unwrap()
 }
 
-/// 批量应用选择集。
+/// 直接提交一批目录改动。
+async fn apply(
+    client: &reqwest::Client,
+    akhub: &Akhub,
+    account_id: &str,
+    changes: Value,
+) -> reqwest::Response {
+    client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account_id}/models/apply",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"changes": changes}))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 把目录勾选成期望集合：全部走唯一的写路径 `models/apply`。
 async fn select(
     client: &reqwest::Client,
     akhub: &Akhub,
@@ -97,19 +123,31 @@ async fn select(
     selected: &[&str],
     force: bool,
 ) -> reqwest::Response {
+    let rows = akhub
+        .state
+        .store
+        .list_account_models(account_id)
+        .await
+        .unwrap();
+    let changes: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let want = selected.contains(&row.upstream_model.as_str())
+                || selected.contains(&row.public_name.as_str());
+            json!({"upstream_model": row.upstream_model, "selected": want})
+        })
+        .collect();
     client
         .request(
             reqwest::Method::POST,
             format!(
-                "{}/admin/api/accounts/{account_id}/models/select",
+                "{}/admin/api/accounts/{account_id}/models/apply",
                 akhub.base_url
             ),
         )
         .header("x-akhub-csrf", "1")
-        .json(&json!({
-            "selected": selected,
-            "force": force,
-        }))
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"changes": changes, "force": force}))
         .send()
         .await
         .unwrap()
@@ -179,8 +217,6 @@ async fn fetching_models_then_selecting_builds_merged_dispatch_targets() {
     assert!(!models.contains_key("gpt-4o"), "没勾的不建目标");
 
     // 目标优先级继承账号默认人工优先级（§16.3）：默认 0。
-    let targets = akhub.state.store.list_targets().await.unwrap();
-    assert!(targets.iter().all(|t| t.priority_override.is_none()));
     let config = akhub.state.config.current();
     let view = config
         .groups
@@ -209,34 +245,25 @@ async fn aliases_merge_the_same_model_from_different_sites() {
     let account_a = create_account(&akhub, &client, &a, "站点A").await;
     let account_b = create_account(&akhub, &client, &b, "站点B").await;
 
-    // 别名在下一次拉取时生效（§16.4）。
-    let response = client
-        .request(
-            reqwest::Method::PUT,
-            format!("{}/admin/api/accounts/{account_a}/aliases", akhub.base_url),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"aliases": [
-            {"upstream_model": "claude-sonnet-4-5-20250929", "public_name": "claude-sonnet-4-5"}
-        ]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 204, "{}", response.text().await.unwrap());
-    let response = client
-        .request(
-            reqwest::Method::PUT,
-            format!("{}/admin/api/accounts/{account_b}/aliases", akhub.base_url),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"aliases": [
-            {"upstream_model": "anthropic/claude-sonnet-4.5", "public_name": "claude-sonnet-4-5"}
-        ]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 204);
-
+    // 别名写在目录行上，刷新也保得住（§16.4）。
+    refresh(&client, &akhub, &account_a).await;
+    refresh(&client, &akhub, &account_b).await;
+    let renamed = apply(
+        &client,
+        &akhub,
+        &account_a,
+        json!([{"upstream_model": "claude-sonnet-4-5-20250929", "alias": "claude-sonnet-4-5"}]),
+    )
+    .await;
+    assert_eq!(renamed.status(), 200, "{}", renamed.text().await.unwrap());
+    let renamed = apply(
+        &client,
+        &akhub,
+        &account_b,
+        json!([{"upstream_model": "anthropic/claude-sonnet-4.5", "alias": "claude-sonnet-4-5"}]),
+    )
+    .await;
+    assert_eq!(renamed.status(), 200);
     for (account, name) in [(&account_a, "站点A"), (&account_b, "站点B")] {
         let entries = refresh(&client, &akhub, account).await;
         assert_eq!(entries[0]["public_name"], "claude-sonnet-4-5", "{name}");
@@ -291,22 +318,16 @@ async fn model_manager_merges_aliases_and_toggles_original_exposure() {
     refresh(&client, &akhub, &account_id).await;
 
     // 两个上游真名一键归并到同一个下游模型名。
-    let response = client
-        .request(
-            reqwest::Method::POST,
-            format!(
-                "{}/admin/api/accounts/{account_id}/models/merge",
-                akhub.base_url
-            ),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({
-            "upstream_models": ["gpt-5.6-sol-openai", "gpt-5.6-sol-old"],
-            "public_name": "gpt-5.6-sol"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let response = apply(
+        &client,
+        &akhub,
+        &account_id,
+        json!([
+            {"upstream_model": "gpt-5.6-sol-openai", "alias": "gpt-5.6-sol", "selected": true},
+            {"upstream_model": "gpt-5.6-sol-old", "alias": "gpt-5.6-sol", "selected": true},
+        ]),
+    )
+    .await;
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     let rows: Vec<Value> = response.json().await.unwrap();
     assert_eq!(rows.len(), 2);
@@ -326,6 +347,7 @@ async fn model_manager_merges_aliases_and_toggles_original_exposure() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"hide_original": true}))
         .send()
         .await
@@ -343,7 +365,6 @@ async fn model_manager_merges_aliases_and_toggles_original_exposure() {
         .json()
         .await
         .unwrap();
-    assert!(rows.iter().all(|row| row["hide_original"] == true));
     assert!(
         rows.iter()
             .all(|row| row["exposed_names"] == json!(["gpt-5.6-sol"]))
@@ -373,6 +394,7 @@ async fn model_manager_merges_aliases_and_toggles_original_exposure() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"hide_original": false}))
         .send()
         .await
@@ -400,20 +422,14 @@ async fn model_manager_merges_aliases_and_toggles_original_exposure() {
     );
 
     // 删除其中一行，只移除它自己的目标。
-    let response = client
-        .request(
-            reqwest::Method::POST,
-            format!(
-                "{}/admin/api/accounts/{account_id}/models/delete",
-                akhub.base_url
-            ),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"upstream_model": "gpt-5.6-sol-old"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 204);
+    let response = apply(
+        &client,
+        &akhub,
+        &account_id,
+        json!([{"upstream_model": "gpt-5.6-sol-old", "delete": true}]),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
     assert_eq!(
         logical_models(&akhub)
             .await
@@ -451,6 +467,7 @@ async fn account_hide_original_blocks_models_without_downstream_name() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"hide_original": true}))
         .send()
         .await
@@ -500,6 +517,7 @@ async fn a_failed_fetch_keeps_the_existing_catalog() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -575,6 +593,7 @@ async fn vanished_models_are_marked_and_manual_models_survive() {
             format!("{}/admin/api/accounts/{account}/models", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"upstream_model": "自定义-内部模型"}))
         .send()
         .await
@@ -598,6 +617,7 @@ async fn vanished_models_are_marked_and_manual_models_survive() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -725,6 +745,7 @@ async fn apply_changes(
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({ "changes": changes, "force": force }))
         .send()
         .await
@@ -746,6 +767,7 @@ async fn remove_missing(
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap()
@@ -940,7 +962,7 @@ async fn a_batch_unselect_of_a_traffic_heavy_model_needs_confirmation() {
 }
 
 #[tokio::test]
-async fn the_per_row_endpoints_keep_working_with_the_batched_core() {
+async fn renaming_and_enabling_a_row_in_one_change() {
     // 逐行接口是旧前端与脚本的兼容路径：它复用批量核心，所以响应形状、
     // 校验与调和行为都必须和批量完全一致（不能回退成“本次新增”为真）。
     let (akhub, client) = spawn_admin().await;
@@ -949,19 +971,13 @@ async fn the_per_row_endpoints_keep_working_with_the_batched_core() {
     let account = create_account(&akhub, &client, &upstream, "站点A").await;
     refresh(&client, &akhub, &account).await;
 
-    let response = client
-        .request(
-            reqwest::Method::POST,
-            format!(
-                "{}/admin/api/accounts/{account}/models/update",
-                akhub.base_url
-            ),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"upstream_model": "solo", "alias": "solo-alias", "selected": true}))
-        .send()
-        .await
-        .unwrap();
+    let response = apply(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "solo", "alias": "solo-alias", "selected": true}]),
+    )
+    .await;
     assert_eq!(
         response.status(),
         200,
@@ -1076,6 +1092,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": true}))
         .send()
         .await
@@ -1090,6 +1107,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -1173,6 +1191,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -1185,6 +1204,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": false}))
         .send()
         .await
@@ -1203,6 +1223,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": true}))
         .send()
         .await
@@ -1275,6 +1296,7 @@ async fn managed_rename_is_allowed_but_toggling_is_not() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": true}))
         .send()
         .await
@@ -1322,41 +1344,6 @@ async fn managed_rename_is_allowed_but_toggling_is_not() {
     )
     .await;
     assert_eq!(response.status(), 409, "托管下删除仍应被拒绝");
-
-    // 逐行接口（旧前端 / 脚本）同样只放行改名。
-    let response = client
-        .request(
-            reqwest::Method::POST,
-            format!(
-                "{}/admin/api/accounts/{account_id}/models/update",
-                akhub.base_url
-            ),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"upstream_model": "m2", "alias": "m2-alias"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        200,
-        "逐行接口的改名也要放行：{}",
-        response.text().await.unwrap()
-    );
-    let response = client
-        .request(
-            reqwest::Method::POST,
-            format!(
-                "{}/admin/api/accounts/{account_id}/models/update",
-                akhub.base_url
-            ),
-        )
-        .header("x-akhub-csrf", "1")
-        .json(&json!({"upstream_model": "m2", "selected": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 409, "逐行接口的停用仍应被拒绝");
 }
 
 #[tokio::test]
@@ -1380,6 +1367,7 @@ async fn one_click_removes_vanished_models_and_their_targets() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": true}))
         .send()
         .await
@@ -1398,6 +1386,7 @@ async fn one_click_removes_vanished_models_and_their_targets() {
             ),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();
@@ -1513,6 +1502,7 @@ async fn empty_or_invalid_model_lists_never_wipe_the_catalog() {
                 ),
             )
             .header("x-akhub-csrf", "1")
+            .header("x-akhub-config-version", "*")
             .send()
             .await
             .unwrap();
@@ -1572,73 +1562,6 @@ async fn the_selection_set_survives_a_second_fetch_with_new_models_unchecked() {
     assert_eq!(a3["is_new"], false, "见过一次就不再标记新增");
 }
 
-#[tokio::test]
-async fn a_manual_logical_model_keeps_its_last_target_removed_but_stays_hidden() {
-    // §26.5：手工创建的逻辑模型在最后一个目标被移除后保留记录，
-    // 但从 /v1/models 消失（零目标不外显）。
-    let (akhub, client) = spawn_admin().await;
-    let upstream = FakeUpstream::spawn().await;
-    upstream.set_models(Some(json!({"data": [{"id": "glm-4.6"}]})));
-    let account = create_account(&akhub, &client, &upstream, "站点A").await;
-    refresh(&client, &akhub, &account).await;
-    select(&client, &akhub, &account, &["glm-4.6"], false).await;
-
-    // 换成手工语义的逻辑模型（先删自动创建的，再按管理员视角重建）。
-    let models = akhub.state.store.list_logical_models().await.unwrap();
-    let auto = models.iter().find(|m| m.name == "glm-4.6").unwrap().clone();
-    akhub
-        .state
-        .store
-        .delete_logical_model(&auto.id)
-        .await
-        .unwrap();
-    akhub
-        .state
-        .store
-        .insert_logical_model(&akhub::domain::LogicalModel {
-            id: auto.id.clone(),
-            group_id: auto.group_id.clone(),
-            name: auto.name.clone(),
-            origin: akhub::domain::ModelOrigin::Manual,
-            enabled: true,
-            created_at: auto.created_at,
-        })
-        .await
-        .unwrap();
-    // 目标外键指向逻辑模型，删除会级联；按选择集语义重建目标。
-    akhub.state.reload_config().await.unwrap();
-    akhub::discovery::add_manual_model(
-        &akhub.state,
-        &find_account(&akhub, &account).await,
-        "glm-4.6",
-        None,
-    )
-    .await
-    .unwrap();
-
-    // 取消勾选：目标移除，逻辑模型保留。
-    select(&client, &akhub, &account, &[], false).await;
-    let models = akhub.state.store.list_logical_models().await.unwrap();
-    assert!(
-        models.iter().any(|m| m.name == "glm-4.6"),
-        "手工模型零目标时保留记录"
-    );
-    let listed: Value = client
-        .get(format!("{}/v1/models", akhub.base_url))
-        .bearer_auth(&akhub.key)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        listed["data"].as_array().map(Vec::len),
-        Some(0),
-        "零目标的手工模型从 /v1/models 消失：{listed}"
-    );
-}
-
 /// 乐观锁的误报回归（§7.4，2026-10-15 修订）。
 ///
 /// 现场症状：管理员在表单里刚填完内容，点保存却收到"配置已被其他会话修改，
@@ -1666,6 +1589,7 @@ async fn a_no_op_managed_sync_does_not_invalidate_the_clients_version() {
             format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"auto_sync": true}))
         .send()
         .await
@@ -1767,6 +1691,7 @@ async fn a_real_concurrent_change_still_conflicts() {
             format!("{}/admin/api/groups", akhub.base_url),
         )
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"name": "别人建的分组", "multiplier_limit": "1"}))
         .send()
         .await
@@ -1797,4 +1722,273 @@ async fn a_real_concurrent_change_still_conflicts() {
             .is_some_and(|text| text.contains("config_conflict")),
         "错误里要能认出是版本冲突：{body}"
     );
+}
+
+/// 上游下架的模型有自己的状态，不能被说成"管理员已停用"（§12.2、§16.5）。
+#[tokio::test]
+async fn a_vanished_model_reports_missing_model_not_admin_disabled() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "m1"}, {"id": "m2"}]})));
+    let account = create_account(&akhub, &client, &upstream, "站点A").await;
+    refresh(&client, &akhub, &account).await;
+    select(&client, &akhub, &account, &["m1", "m2"], false).await;
+    upstream.set_models(Some(json!({"data": [{"id": "m1"}]})));
+    refresh(&client, &akhub, &account).await;
+
+    let listed: Value = client
+        .get(format!("{}/admin/api/targets", akhub.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["upstream_model"] == "m2")
+        .unwrap();
+    assert_eq!(row["status"], "missing_model", "{row}");
+    assert_eq!(row["pause_reason"], "上游已不再提供该模型", "{row}");
+}
+
+/// "你停用过"只给亲手停用的行；从没碰过的未启用行不算（§16.2）。
+#[tokio::test]
+async fn excluded_is_only_set_by_turning_a_row_off() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "on"}, {"id": "never"}]})));
+    let account = create_account(&akhub, &client, &upstream, "站点A").await;
+    let rows = refresh(&client, &akhub, &account).await;
+    assert!(rows.iter().all(|row| row["excluded"] == false), "{rows:?}");
+
+    select(&client, &akhub, &account, &["on"], false).await;
+    apply(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "on", "selected": false}]),
+    )
+    .await;
+    let rows = refresh(&client, &akhub, &account).await;
+    let excluded = |name: &str| {
+        rows.iter()
+            .find(|row| row["upstream_model"] == name)
+            .unwrap()["excluded"]
+            .clone()
+    };
+    assert_eq!(excluded("on"), true);
+    assert_eq!(excluded("never"), false);
+}
+
+/// 账号被分配进分组时，同组已有的同名模型默认勾选；亲手停用过的不动（§16.2）。
+#[tokio::test]
+async fn assigning_an_account_preselects_models_the_group_already_has() {
+    let (akhub, client) = spawn_admin().await;
+    let resident_up = FakeUpstream::spawn().await;
+    resident_up.set_models(Some(json!({"data": [{"id": "shared"}, {"id": "off"}]})));
+    let resident = create_account(&akhub, &client, &resident_up, "老账号").await;
+    refresh(&client, &akhub, &resident).await;
+    select(&client, &akhub, &resident, &["shared", "off"], false).await;
+
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [{"id": "shared"}, {"id": "off"}, {"id": "other"}]
+    })));
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!("{}/admin/api/accounts", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({
+            "group_id": null,
+            "name": "新账号",
+            "base_url": upstream.base_url,
+            "keys": [{"api_key": "key-new"}],
+            "preferred_protocol": "openai_chat",
+            "allow_private_network": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let account = response.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    refresh(&client, &akhub, &account).await;
+    select(&client, &akhub, &account, &["off"], false).await;
+    apply(
+        &client,
+        &akhub,
+        &account,
+        json!([{"upstream_model": "off", "selected": false}]),
+    )
+    .await;
+
+    let moved = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"group_id": akhub.group_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200);
+
+    let rows = akhub
+        .state
+        .store
+        .list_account_models(&account)
+        .await
+        .unwrap();
+    let selected = |name: &str| {
+        rows.iter()
+            .find(|r| r.upstream_model == name)
+            .unwrap()
+            .selected
+    };
+    assert!(selected("shared"), "同组已有的同名模型默认勾选");
+    assert!(!selected("off"), "亲手停用过的保持停用");
+    assert!(!selected("other"), "同组没有的不勾选");
+}
+
+/// 只有一个分组时，没说放哪儿的新账号直接进去（§4.2.3）。
+#[tokio::test]
+async fn a_new_account_joins_the_only_group_by_default() {
+    let (akhub, client) = spawn_admin().await;
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!("{}/admin/api/accounts", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({
+            "name": "新账号",
+            "base_url": "https://upstream.example.com",
+            "preferred_protocol": "openai_chat",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["group_id"], akhub.group_id.as_str());
+}
+
+/// 拉模型只认 Key 池：池清空后不能再从任何旁路读到旧 Key（§4.2.1）。
+#[tokio::test]
+async fn fetching_models_requires_a_key_in_the_pool() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({"data": [{"id": "m1"}]})));
+    let account = create_account(&akhub, &client, &upstream, "站点A").await;
+    assert_eq!(refresh(&client, &akhub, &account).await.len(), 1);
+
+    akhub
+        .state
+        .store
+        .replace_account_keys(&account, &[])
+        .await
+        .unwrap();
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            format!(
+                "{}/admin/api/accounts/{account}/models/refresh",
+                akhub.base_url
+            ),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502, "Key 池清空就是没有凭据");
+}
+
+/// 写操作中途失败必须整体回滚：改名撞车时，同一请求里的其它改动都不落库（§21）。
+#[tokio::test]
+async fn a_failed_account_save_changes_nothing() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    let account = create_account(&akhub, &client, &upstream, "甲").await;
+    create_account(&akhub, &client, &upstream, "乙").await;
+    let before = akhub.state.config.version();
+    // 校验抓不住的失败：两个账号同名的唯一索引在事务里才炸。这里直接走写路径。
+    let result = akhub
+        .state
+        .write_config(
+            akhub::config::Revision::Any,
+            async |tx| -> anyhow::Result<()> {
+                let mut row = tx.account(&account).await?.unwrap();
+                row.default_priority = 77;
+                tx.update_account(&row, None).await?;
+                row.name = "乙".into();
+                tx.update_account(&row, None).await
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(find_account(&akhub, &account).await.default_priority, 0);
+    assert_eq!(akhub.state.config.version(), before, "失败的写入不推进版本");
+}
+
+/// 版本检查覆盖配置快照以外的写入：两个标签页改未分配账号的 Key 池也要冲突（§7.4）。
+#[tokio::test]
+async fn editing_an_unassigned_account_bumps_the_revision() {
+    let (akhub, client) = spawn_admin().await;
+    let version = |response: &reqwest::Response| -> u64 {
+        response.headers()["x-akhub-config-version"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let created = client
+        .request(
+            reqwest::Method::POST,
+            format!("{}/admin/api/accounts", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({
+            "group_id": null,
+            "name": "暂存",
+            "base_url": "https://upstream.example.com",
+            "preferred_protocol": "openai_chat",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let stale = version(&created);
+    let id = created.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let patch = |revision: String, key: &'static str| {
+        client
+            .request(
+                reqwest::Method::PATCH,
+                format!("{}/admin/api/accounts/{id}", akhub.base_url),
+            )
+            .header("x-akhub-csrf", "1")
+            .header("x-akhub-config-version", revision)
+            .json(&json!({"keys": [{"api_key": key}]}))
+            .send()
+    };
+    assert_eq!(
+        patch(stale.to_string(), "sk-a").await.unwrap().status(),
+        200
+    );
+    let conflict = patch(stale.to_string(), "sk-b").await.unwrap();
+    assert_eq!(conflict.status(), 409, "第二个标签页不能静默覆盖 Key 池");
 }

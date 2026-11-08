@@ -304,23 +304,11 @@ pub(crate) async fn account_api_key(
     context: &Context,
     account: &Account,
 ) -> Result<Option<String>> {
-    // 先看 Key 池。`upstream_secrets.api_key` 只是第一把 Key 的镜像，而建号与
-    // 写池是两步：只有旧二进制或旧备份恢复路径才可能留下"池里有、镜像没有"
-    // 的账号，但那种账号照样得能探测。
     let pool = context.store.list_account_key_rows(&account.id).await?;
-    if let Some(row) = pool.iter().find(|row| row.enabled) {
-        let plaintext = context.cipher.open(&row.sealed_key)?;
-        let key = String::from_utf8(plaintext.to_vec())?;
-        return Ok((!key.trim().is_empty()).then_some(key));
-    }
-    let Some(sealed) = context.store.account_sealed_key(&account.id).await? else {
+    let Some(row) = pool.iter().find(|row| row.enabled) else {
         return Ok(None);
     };
-    // 建号时"暂时没有凭据"会把镜像写成空串：那是没 Key，不是信封坏了。
-    if sealed.is_empty() {
-        return Ok(None);
-    }
-    let plaintext = context.cipher.open(&sealed)?;
+    let plaintext = context.cipher.open(&row.sealed_key)?;
     let key = String::from_utf8(plaintext.to_vec())?;
     Ok((!key.trim().is_empty()).then_some(key))
 }

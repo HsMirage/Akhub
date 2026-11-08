@@ -2,7 +2,6 @@ import type {
   Account,
   AccountKeyInput,
   AccountModel,
-  Alias,
   AvailableModel,
   CalibrationRecord,
   CalibrationResult,
@@ -16,7 +15,6 @@ import type {
   Page,
   RequestFilters,
   RequestPage,
-  SelectionWarning,
   Settings,
   SettingsPatch,
   SetupStatus,
@@ -43,7 +41,7 @@ const CONFIG_VERSION_HEADER = "x-akhub-config-version";
  *
  * 每次响应都会刷新它，写操作把它带回去；服务端发现版本对不上就返回 409，
  * 从而把"打开两个标签页各改一半、后保存的覆盖先保存的"挡在门外（§7.4）。
- * 用 0 表示"还没读到过"，此时不带头部，服务端按兼容模式处理。
+ * 写操作一律带上它；0 表示"还没读到过"，服务端会判成冲突，让界面先重新加载。
  */
 let configVersion = 0;
 
@@ -108,14 +106,6 @@ interface RequestOptions {
    * 只会让用户以为刚做的改动要丢了——而它其实已经自动存下来了。
    */
   quietConflict?: boolean;
-  /**
-   * 不携带配置版本号（§7.4 的乐观锁）。
-   *
-   * 只给**不修改配置**的写操作用：测试连接这类动作与配置
-   * 版本无关，带上版本号只会被并发的配置写入判成冲突（409），让用户看到一条与
-   * 当前操作毫无关系的"配置已被修改"。服务端把"不带头部"定义为兼容模式。
-   */
-  skipConfigVersion?: boolean;
 }
 
 async function request<T>(
@@ -142,9 +132,7 @@ async function sendOnce<T>(
     headers.set(CSRF_HEADER, "1");
     // 版本号在**真正发出前**才读取：排队等待期间前一个写操作已经把
     // `configVersion` 刷新过了。用旧值就会把自己判成冲突（见 `enqueueWrite`）。
-    if (configVersion > 0 && !options.skipConfigVersion) {
-      headers.set(CONFIG_VERSION_HEADER, String(configVersion));
-    }
+    headers.set(CONFIG_VERSION_HEADER, String(configVersion));
   }
 
   let response: Response;
@@ -230,8 +218,6 @@ export interface AccountInput {
   base_url: string;
   /** 账号内 Key 池（§4.2.1）。整体替换；缺省时后台不动 Key 池。 */
   keys?: AccountKeyInput[];
-  /** 旧版单 Key 字段。给出且 `keys` 缺省时等价于"把池换成这一把"。 */
-  api_key?: string;
   preferred_protocol: Account["preferred_protocol"];
   adaptive_protocol?: boolean;
   default_priority?: number;
@@ -248,15 +234,6 @@ export interface AccountInput {
   auto_sync?: boolean;
   /** 账号级隐藏原始模型；打开后没设置下游模型名的模型不对外暴露。 */
   hide_original?: boolean;
-}
-
-export interface TargetInput {
-  logical_model_id: string;
-  account_id: string;
-  upstream_model: string;
-  priority_override?: number | null;
-  limits?: Limits;
-  enabled?: boolean;
 }
 
 /**
@@ -320,6 +297,7 @@ export const api = {
   createAccount: (input: AccountInput) => post<Account>("/accounts", input),
   updateAccount: (id: string, input: Partial<AccountInput>) =>
     patch<Account>(`/accounts/${id}`, input),
+  account: (id: string) => request<Account>(`/accounts/${id}`),
   deleteAccount: (id: string) => del(`/accounts/${id}`),
   refreshMultiplier: (id: string) =>
     post<MultiplierRefreshResult>(`/accounts/${id}/refresh-multiplier`),
@@ -339,24 +317,14 @@ export const api = {
    * 接口让表单当场就能验证凭据、把分组和倍率一起带回来，不必"先存再点开"。
    */
   previewNewApiGroups: (input: NewApiPreviewInput) =>
-    post<NewApiPreviewResult>("/new-api/preview-groups", input, {
-      skipConfigVersion: true,
-    }),
+    post<NewApiPreviewResult>("/new-api/preview-groups", input),
   /** 一键独立复制：停用状态的「名称 - 副本」，Key 重新加密（§6.4）。 */
   copyAccount: (id: string) => post<Account>(`/accounts/${id}/copy`),
   /**
    * 测试连接：发一次真实 `hi`，不参与任何统计（§6.4）。
-   *
-   * 不携带配置版本号：它不修改配置，带上只会被并发的配置写入（比如后台托管
-   * 同步刚发现了新模型）判成 409，让用户看到一条与"测试连接"毫无关系的
-   * "配置已被其他会话修改"（见 `RequestOptions.skipConfigVersion`）。
    */
   testAccount: (id: string, model?: string) =>
-    post<TestResult>(
-      `/accounts/${id}/test`,
-      { model: model || undefined },
-      { skipConfigVersion: true },
-    ),
+    post<TestResult>(`/accounts/${id}/test`, { model: model || undefined }),
   /**
    * 清除某一把 Key 的失效标记与熔断（§12.3）。
    *
@@ -388,8 +356,8 @@ export const api = {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       [CSRF_HEADER]: "1",
+      [CONFIG_VERSION_HEADER]: String(configVersion),
     };
-    if (configVersion > 0) headers[CONFIG_VERSION_HEADER] = String(configVersion);
     const response = await fetch(BASE + "/backup/export", {
       method: "POST",
       headers,
@@ -420,22 +388,11 @@ export const api = {
       upstream_model: upstreamModel,
       public_name: publicName || undefined,
     }),
-  /** 修改一行模型目录的下游模型名 / 启用状态（§16.3）。 */
-  updateAccountModel: (
-    id: string,
-    payload: {
-      upstream_model: string;
-      /** null 表示不改；空字符串表示清空下游模型名。 */
-      alias?: string | null;
-      selected?: boolean;
-    },
-  ) => post<AccountModel[]>(`/accounts/${id}/models/update`, payload),
   /**
    * 批量应用模型目录改动（§16.3）。
    *
    * 界面的勾选只改本地草稿，点「保存」才走这里：一次请求提交整批改动，服务端
-   * 只调和一遍目标、只重载一遍配置。逐行 `updateAccountModel` 在几百个模型时
-   * 会明显卡住。停用有流量的模型时返回 409，由调用方确认后带 `force` 重发。
+   * 只调和一遍目标、只重载一遍配置。停用有流量的模型时返回 409，由调用方确认后带 `force` 重发。
    *
    * 配置版本冲突也由调用方（模型管理对话框）自己重试，所以这里静默处理：
    * 不再触发全局的"配置已被其他会话修改"弹窗（§7.4）。
@@ -455,38 +412,6 @@ export const api = {
       { changes, force },
       { quietConflict: true },
     ),
-  /** 从账号目录永久删除一行并移除其目标（§16.5）。 */
-  deleteAccountModel: (id: string, upstreamModel: string) =>
-    post<void>(`/accounts/${id}/models/delete`, { upstream_model: upstreamModel }),
-  /** 把多行合并到同一个下游模型名（§16.4）。 */
-  mergeAccountModels: (id: string, upstreamModels: string[], publicName: string) =>
-    post<AccountModel[]>(`/accounts/${id}/models/merge`, {
-      upstream_models: upstreamModels,
-      public_name: publicName,
-    }),
-  /** 批量应用选择集。409 时返回二次确认数据而不是抛错（§16.3）。 */
-  selectAccountModels: async (
-    id: string,
-    selected: string[],
-    force = false,
-  ): Promise<
-    { needs_confirm: SelectionWarning[] } | { created_targets: number; removed_targets: number }
-  > => {
-    try {
-      return await post<{ created_targets: number; removed_targets: number }>(
-        `/accounts/${id}/models/select`,
-        { selected, force },
-      );
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) {
-        const payload = cause.payload as
-          | { needs_confirm?: SelectionWarning[]; warnings?: SelectionWarning[] }
-          | null;
-        return { needs_confirm: payload?.needs_confirm ?? payload?.warnings ?? [] };
-      }
-      throw cause;
-    }
-  },
   /** 立即执行一轮托管同步（§16.2）。 */
   syncAccountModels: (id: string) =>
     post<{ managed_models: number }>(`/accounts/${id}/models/sync`),
@@ -498,26 +423,8 @@ export const api = {
   removeMissingAccountModels: (id: string) =>
     post<{ removed: number }>(`/accounts/${id}/models/remove-missing`),
 
-  aliases: (id: string) => request<Alias[]>(`/accounts/${id}/aliases`),
-  updateAliases: (id: string, aliases: Alias[]) =>
-    request<void>(`/accounts/${id}/aliases`, {
-      method: "PUT",
-      body: JSON.stringify({ aliases }),
-    }),
-
   models: () => requestAllPages<LogicalModel>("/logical-models"),
-  createModel: (input: { group_id: string; name: string; enabled?: boolean }) =>
-    post<LogicalModel>("/logical-models", input),
-  updateModel: (id: string, input: { name?: string; enabled?: boolean }) =>
-    patch<void>(`/logical-models/${id}`, input),
-  deleteModel: (id: string) => del(`/logical-models/${id}`),
-
   targets: () => requestAllPages<DispatchTarget>("/targets"),
-  createTarget: (input: TargetInput) => post<DispatchTarget>("/targets", input),
-  updateTarget: (id: string, input: Partial<TargetInput>) =>
-    patch<DispatchTarget>(`/targets/${id}`, input),
-  deleteTarget: (id: string) => del(`/targets/${id}`),
-
   requests: (filters: RequestFilters = {}) => {
     const params = new URLSearchParams();
     const setNumber = (key: string, value: number | undefined) => {
@@ -555,10 +462,7 @@ export const api = {
    * 浏览器与反向代理都不会等这么久。进度改由 `updateStatus` 的 progress 字段轮询。
    */
   runUpgrade: () =>
-    post<{ started: boolean; notice: string }>("/system/upgrade", undefined, {
-      // 升级不改配置，带上乐观锁只会被并发的配置写入判成 409。
-      skipConfigVersion: true,
-    }),
+    post<{ started: boolean; notice: string }>("/system/upgrade"),
   /** 重启服务：优雅关闭自己，交给 systemd 拉起新版本。 */
   restartService: () => post<{ restarting: boolean }>("/system/restart"),
 

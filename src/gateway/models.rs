@@ -156,8 +156,7 @@ mod tests {
     use super::*;
     use crate::config::{LogicalModelView, TargetView};
     use crate::domain::{
-        Account, DispatchTarget, Group, LogicalModel, ModelOrigin, Multiplier, Protocol,
-        SchedulingWeights,
+        Account, DispatchTarget, Group, LogicalModel, Multiplier, Protocol, SchedulingWeights,
     };
 
     fn model_view(name: &str, enabled: bool, target_count: usize) -> Arc<LogicalModelView> {
@@ -190,8 +189,6 @@ mod tests {
                         logical_model_id: name.into(),
                         account_id: "a1".into(),
                         upstream_model: format!("{name}-真名"),
-                        hide_original: false,
-                        priority_override: None,
                         limits: crate::domain::Limits::default(),
                         enabled: true,
                         created_at: OffsetDateTime::UNIX_EPOCH,
@@ -206,7 +203,6 @@ mod tests {
                 id: name.into(),
                 group_id: "g1".into(),
                 name: name.into(),
-                origin: ModelOrigin::Auto,
                 enabled,
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },

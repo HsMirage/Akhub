@@ -31,7 +31,10 @@ async fn spawn() -> (String, reqwest::Client, tempfile::TempDir, Arc<AppState>) 
 }
 
 fn write(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
-    client.post(url).header("x-akhub-csrf", "1")
+    client
+        .post(url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -193,6 +196,7 @@ async fn the_upgrade_endpoint_requires_an_admin_session() {
     let response = anonymous
         .post(format!("{base}/admin/api/system/upgrade"))
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap();

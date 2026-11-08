@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use akhub::app::{AppState, Settings, SharedState};
 use akhub::domain::{
-    Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights,
+    Account, DispatchTarget, Group, Limits, LogicalModel, Multiplier, MultiplierMode, Protocol,
+    SchedulingWeights,
 };
-use akhub::storage::store::{AccountSecrets, ids};
+use akhub::storage::store::ids;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
@@ -951,11 +951,7 @@ pub async fn insert_account_with_key(
     api_key: &str,
 ) -> String {
     let sealed = state.cipher.seal(api_key.as_bytes()).unwrap();
-    state
-        .store
-        .insert_account(account, &AccountSecrets::new(sealed.clone(), None))
-        .await
-        .unwrap();
+    state.store.insert_account(account).await.unwrap();
     let key_id = format!("key_{}", account.id);
     state
         .store
@@ -1012,10 +1008,7 @@ pub async fn wire_target(akhub: &Akhub, spec: TargetSpec<'_>) -> Wired {
             .store
             .update_account(
                 &account,
-                &AccountSecrets {
-                    api_key: None,
-                    new_api_token: Some(state.cipher.seal(token.as_bytes()).unwrap()),
-                },
+                Some(&state.cipher.seal(token.as_bytes()).unwrap()),
             )
             .await
             .unwrap();
@@ -1054,7 +1047,6 @@ pub async fn wire_extra_target(
                 id: ids::logical_model(),
                 group_id: akhub.group_id.clone(),
                 name: logical_model.into(),
-                origin: ModelOrigin::Manual,
                 enabled: true,
                 created_at: OffsetDateTime::now_utc(),
             };
@@ -1068,13 +1060,28 @@ pub async fn wire_extra_target(
         logical_model_id: model_id,
         account_id: account_id.into(),
         upstream_model: upstream_model.into(),
-        hide_original: false,
-        priority_override: None,
         limits: Limits::default(),
         enabled: true,
         created_at: OffsetDateTime::now_utc(),
     };
     state.store.insert_target(&target).await.unwrap();
+    // 目标由目录调和维护（§16.3）：没有目录行的目标会在下一次调和时被撤下，
+    // 所以夹具要造出与真实账号同样形状的数据。
+    state
+        .store
+        .upsert_account_model(
+            account_id,
+            &akhub::storage::store::AccountModelRow {
+                upstream_model: upstream_model.into(),
+                public_name: logical_model.into(),
+                selected: true,
+                excluded: false,
+                missing: false,
+                discovered_at: akhub::storage::now_unix(),
+            },
+        )
+        .await
+        .unwrap();
     state.reload_config().await.unwrap();
     target.id
 }

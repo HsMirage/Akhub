@@ -47,7 +47,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -109,7 +112,7 @@ async fn create_new_api_account(
         "group_id": group_id,
         "name": "冰峰-ccmax",
         "base_url": upstream.base_url,
-        "api_key": "sk-ccmax-key",
+        "keys": [{"api_key": "sk-ccmax-key"}],
         "preferred_protocol": "openai_chat",
         "multiplier_mode": "new_api",
         "manual_multiplier": "1",
