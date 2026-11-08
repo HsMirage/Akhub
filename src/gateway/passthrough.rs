@@ -963,6 +963,37 @@ async fn forward_inner<'a>(
         }
     }
 
+    // 第一步（响应链）：上一轮落在哪个账号，这一轮就先争取它（§15.2）。
+    //
+    // 响应链的粘性键取自本轮的 `previous_response_id`，每一轮都换，绑定表永远
+    // 命中不了；同层权重相同时每轮都会随机落号——要么整段历史重放（缓存全丢），
+    // 要么 store:false 直接 `response_state_expired`。状态库里记着原账号，
+    // 这里把它当强绑定：只在当前最高合格层里找，绝不跨层（§9.5）。
+    if let Some(pin) = forward.chain.pinned.as_ref()
+        && let Some(candidate) = plan.layers.first().and_then(|layer| {
+            layer
+                .candidates
+                .iter()
+                .find(|candidate| candidate.target.account.id == pin.account_id)
+        })
+        && !walk.already_tried(candidate, None)
+    {
+        walk.telemetry.sticky_hit = true;
+        walk.telemetry.sticky_wait.get_or_insert(Duration::ZERO);
+        let budget = sticky::wait_budget(forward.request_bytes, 0).min(
+            walk.queue_deadline
+                .saturating_duration_since(Instant::now()),
+        );
+        match walk
+            .wait_and_run(&[candidate], budget, &sticky_key, true, None, None)
+            .await
+        {
+            Flow::Done(response) => return response,
+            Flow::QueueFull => return walk.queue_full(),
+            Flow::Continue | Flow::Exhausted => {}
+        }
+    }
+
     // 第二步：逐层游走。层内先耗尽，再降层；层内全忙则在本层排队（§13.6）。
     for layer in &plan.layers {
         if walk.attempted.len() >= routing::MAX_TARGET_ATTEMPTS {
@@ -2973,6 +3004,9 @@ fn classify_outcome(
             // 目标本身不可用（熔断、限流）不该再算一次故障：状态机刚刚才因为
             // 它拒绝过这次请求，重复计数只会让冷却无谓地翻倍。
             ErrorCode::RateLimited | ErrorCode::MultiplierExceeded => health::Outcome::Neutral,
+            // 响应链落到了没有状态的目标上：是调度落点的问题，不是目标坏了，
+            // 扣它的可靠性只会冤枉一个健康账号（§15.2）。
+            ErrorCode::ResponseStateExpired => health::Outcome::Neutral,
             _ => health::Outcome::Fault,
         },
     }

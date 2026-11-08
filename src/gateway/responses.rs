@@ -677,11 +677,6 @@ impl ChainPlan {
         }
     }
 
-    /// 粘性键的引用锚点：有引用时粘性以引用为准（§10.1 的第 1 级）。
-    pub fn sticky_reference(&self) -> Option<&str> {
-        self.reference.as_deref()
-    }
-
     /// 资格过滤与转换所依据的请求体：有可重放合并体时用它——引用不在里面，
     /// 跨协议目标因此保持合格；否则用客户端的原始请求体。
     pub fn body_for_translation<'a>(&'a self, original: &'a Value) -> &'a Value {

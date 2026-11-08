@@ -164,3 +164,48 @@ async fn a_short_retry_after_cooldown_keeps_the_strong_binding() {
     assert_eq!(first.requests() + second.requests(), 2);
     assert!(started.elapsed() >= Duration::from_millis(900));
 }
+
+/// 响应链在同层权重相同时必须一直落在原账号上，走原生续链（§15.2）。
+///
+/// 粘性键取自每轮都变的 `previous_response_id`，以前从不命中，每轮随机落号。
+#[tokio::test]
+async fn a_responses_chain_stays_on_its_account_with_equal_priorities() {
+    let first = FakeUpstream::spawn().await;
+    let second = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    for (name, upstream) in [("a", &first), ("b", &second)] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::OpenAiResponses,
+                "m",
+                "m",
+                0,
+            )
+            .pinned(),
+        )
+        .await;
+    }
+
+    let mut previous: Option<String> = None;
+    for turn in 0..8 {
+        let mut body = json!({"model":"m","input":format!("第 {turn} 轮")});
+        if let Some(id) = &previous {
+            body["previous_response_id"] = json!(id);
+        }
+        let response = common::responses(&akhub, body).await;
+        assert_eq!(response.status(), 200, "第 {turn} 轮");
+        let body: Value = response.json().await.unwrap();
+        previous = Some(body["id"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (first.requests(), second.requests());
+    assert!(a == 8 || b == 8, "整条链必须落在同一个账号上：a={a} b={b}");
+    let seen = if a == 8 { &first } else { &second };
+    let last = seen.seen.lock().unwrap().last().unwrap().body.clone();
+    assert!(
+        last.get("previous_response_id").is_some(),
+        "后续轮次必须走原生续链：{last}"
+    );
+}
