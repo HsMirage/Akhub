@@ -209,3 +209,52 @@ async fn a_responses_chain_stays_on_its_account_with_equal_priorities() {
         "后续轮次必须走原生续链：{last}"
     );
 }
+
+/// 只能原生转发的端点在某个候选上 404 时，只排除这个候选、换下一个（§15.4）。
+#[tokio::test]
+async fn a_native_only_endpoint_skips_a_candidate_that_lacks_the_route() {
+    let missing = FakeUpstream::spawn().await;
+    let present = FakeUpstream::spawn().await;
+    missing.fallback(common::Behavior::Status(404, None));
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    for (name, upstream) in [("missing", &missing), ("present", &present)] {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                "m",
+                "m",
+                50,
+            )
+            .pinned(),
+        )
+        .await;
+    }
+
+    for _ in 0..6 {
+        let response = common::client()
+            .post(format!("{}/v1/messages/count_tokens", akhub.base_url))
+            .header("x-api-key", &akhub.key)
+            .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "另一个候选有这条路由");
+    }
+    assert_eq!(present.requests(), 6);
+
+    // 全部候选都没有这条路由：如实回 400 unsupported_parameter，而不是可重试的 503。
+    present.fallback(common::Behavior::Status(404, None));
+    let response = common::client()
+        .post(format!("{}/v1/messages/count_tokens", akhub.base_url))
+        .header("x-api-key", &akhub.key)
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["akhub_error_code"], "unsupported_parameter", "{body}");
+}

@@ -811,6 +811,19 @@ async fn forward_inner<'a>(
     };
     // 计划成立，排队的名额立刻还回去：接下来的游走有自己的准入与排队路径。
     drop(recovery_ticket);
+    let mut plan = plan;
+    // 只能原生转发的端点：层内先试首选协议天然提供这条路由的账号，减少白撞
+    // 404。只在层内重排，绝不跨层（§9.2）。
+    if forward.endpoint.is_native_only() {
+        for layer in &mut plan.layers {
+            layer.candidates.sort_by_key(|candidate| {
+                !endpoints::serves_natively(
+                    candidate.target.account.preferred_protocol,
+                    forward.endpoint,
+                )
+            });
+        }
+    }
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
     walk.telemetry.filter_summary = Some(plan.filter_summary());
@@ -2201,35 +2214,29 @@ impl Walk<'_> {
                             upstream_status = status.as_u16(),
                             "本次请求的端点被拒绝，尝试其他可表达的端点"
                         );
-                        // 辅助端点（count_tokens / compact / input_tokens）没有
-                        // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
-                        // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
+                        // 辅助端点（count_tokens / compact / input_tokens / 图片）没有
+                        // 转换备胎：这个目标确实没有这条路由。只排除**这个候选**、
+                        // 换下一个——别的账号可能有（§15.4）。全部候选都没有时，
+                        // 最后一次失败的 unsupported_parameter 如实告诉客户端。
                         if self.forward.endpoint.is_native_only() {
-                            // 端点走错了是**本次尝试**的失败，不是请求本身的：
-                            // 但辅助端点没有转换备胎，只能如实告诉客户端。
-                            tracing::warn!(
+                            tracing::info!(
                                 request_id = self.forward.request_id,
                                 account = candidate.target.account.name,
                                 model = candidate.target.target.upstream_model,
                                 endpoint = self.forward.endpoint.path(),
                                 upstream_status = status.as_u16(),
-                                "辅助端点在当前目标上不存在，且没有可转换的备胎"
+                                "辅助端点在当前目标上不存在，换下一个候选"
                             );
-                            return Err(AttemptFailure::Terminal(
-                                Box::new(
-                                    GatewayError::new(
-                                        ErrorCode::UnsupportedParameter,
-                                        format!(
-                                            "当前模型不支持 /{} 端点",
-                                            self.forward.endpoint.path()
-                                        ),
-                                    )
-                                    .with_protocol(self.forward.endpoint.protocol())
-                                    .with_request_id(self.forward.request_id)
-                                    .into_response(),
+                            return Err(AttemptFailure::Switchable {
+                                code: ErrorCode::UnsupportedParameter,
+                                message: format!(
+                                    "当前模型不支持 /{} 端点",
+                                    self.forward.endpoint.path()
                                 ),
-                                Some(status),
-                            ));
+                                upstream_status: Some(status),
+                                retry_after: None,
+                                upstream_body: Some(body),
+                            });
                         }
                         let detail = upstream_error_message(&body)
                             .map(|message| format!("：{message}"))
