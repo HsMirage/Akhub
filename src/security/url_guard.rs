@@ -42,12 +42,19 @@ pub fn validate_base_url(raw: &str) -> Result<Url, UrlGuardError> {
         return Err(UrlGuardError::EmbeddedCredentials);
     }
     // 字面量 IP 在保存时即可判定，无需等到发请求。
-    if let Some(ip) = host_as_ip(&url)
-        && is_blocked(ip)
-    {
-        return Err(UrlGuardError::BlockedAddress(ip));
-    }
+    guard_literal(&url)?;
     Ok(url)
+}
+
+/// 主机是字面量 IP 且落在封禁网段时拒绝；域名一律放行（交给解析器复查）。
+///
+/// 字面量 IP 不经过 DNS 解析器，解析器层面的 SSRF 校验对它不起作用，所以共享
+/// 上游客户端在建立连接前用它补上这一环（见 `upstream::LiteralGuard`）。
+pub fn guard_literal(url: &Url) -> Result<(), UrlGuardError> {
+    match host_as_ip(url) {
+        Some(ip) if is_blocked(ip) => Err(UrlGuardError::BlockedAddress(ip)),
+        _ => Ok(()),
+    }
 }
 
 /// 把主机名解析成字面量 IP。IPv6 在 URL 中带方括号，必须先剥掉再解析，
@@ -70,12 +77,8 @@ pub async fn assert_resolvable(url: &Url, allow_private: bool) -> Result<(), Url
         return Ok(());
     }
     let host = url.host_str().ok_or(UrlGuardError::MissingHost)?;
-    if let Some(ip) = host_as_ip(url) {
-        return if is_blocked(ip) {
-            Err(UrlGuardError::BlockedAddress(ip))
-        } else {
-            Ok(())
-        };
+    if host_as_ip(url).is_some() {
+        return guard_literal(url);
     }
 
     let port = url.port_or_known_default().unwrap_or(443);
@@ -116,6 +119,8 @@ fn is_blocked_v4(ip: Ipv4Addr) -> bool {
         || (a == 192 && b == 0 && ip.octets()[2] == 0)
         // 198.18.0.0/15 基准测试
         || (a == 198 && (18..20).contains(&b))
+        // 240.0.0.0/4 保留网段（含 255.255.255.255）
+        || a >= 240
         || a == 0
 }
 
@@ -123,8 +128,21 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_blocked_v4(v4);
     }
-    let first = ip.segments()[0];
+    let segments = ip.segments();
+    let first = segments[0];
+    // 64:ff9b::/96 NAT64：末 32 位就是被翻译的 IPv4 地址，按它判定。
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [hi, lo] = [segments[6], segments[7]];
+        return is_blocked_v4(Ipv4Addr::new(
+            (hi >> 8) as u8,
+            hi as u8,
+            (lo >> 8) as u8,
+            lo as u8,
+        ));
+    }
     ip.is_loopback()
+        // 2002::/16 6to4：内嵌任意 IPv4，经中继可到达内网，整体阻止。
+        || first == 0x2002
         || ip.is_unspecified()
         || ip.is_multicast()
         // fc00::/7 唯一本地地址
@@ -183,6 +201,21 @@ mod tests {
         assert!(is_blocked("fd00::1".parse().unwrap()));
         assert!(is_blocked("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!is_blocked("1.1.1.1".parse().unwrap()));
+        assert!(is_blocked("240.0.0.1".parse().unwrap()));
+        assert!(is_blocked("255.255.255.255".parse().unwrap()));
+        assert!(
+            is_blocked("64:ff9b::7f00:1".parse().unwrap()),
+            "NAT64 内嵌 127.0.0.1"
+        );
+        assert!(
+            is_blocked("64:ff9b::a9fe:a9fe".parse().unwrap()),
+            "NAT64 内嵌元数据地址"
+        );
+        assert!(
+            !is_blocked("64:ff9b::101:101".parse().unwrap()),
+            "NAT64 内嵌 1.1.1.1"
+        );
+        assert!(is_blocked("2002:7f00:1::1".parse().unwrap()), "6to4");
         assert!(!is_blocked("2606:4700::1111".parse().unwrap()));
     }
 }
