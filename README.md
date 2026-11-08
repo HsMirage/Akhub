@@ -270,7 +270,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `AKHUB_UPDATE_DISABLED` | 无 | 设为 `1` 关闭版本检查 |
 | `AKHUB_UPDATE_API` | GitHub API | 自建镜像或离线环境可指向另一个 Release 接口 |
 | `AKHUB_DEPLOY` | 自动判定 | `binary` / `docker` / `source`，用于纠正部署形态判断 |
-| `AKHUB_ALLOW_RESTART` | 无 | 设为 `1` 允许后台"重启服务"（默认只在 systemd 下开放） |
+| `AKHUB_ALLOW_RESTART` | 无 | 设为 `1` 声明"二进制可替换、退出后会被拉起"：开放后台一键升级与"重启服务"。官方 systemd 单元与容器入口都已设置 |
 | `RUST_LOG` | `akhub=info,warn` | 日志级别 |
 
 命令行：`akhub --version`、`akhub --healthcheck`、`akhub --update [--version vX.Y.Z]`、

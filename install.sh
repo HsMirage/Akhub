@@ -246,14 +246,19 @@ if [ "$WITH_SERVICE" = "1" ]; then
         unit="${inner}/deploy/akhub.service"
         if [ -f "$unit" ]; then
             info "安装 systemd 单元"
-            $SUDO install -m 644 "$unit" /etc/systemd/system/akhub.service
+            # 单元按"安装版 -> /var/lib/akhub/runtime/akhub 运行副本"的布局启动
+            # （与容器一致），一键升级替换的是运行副本。安装目录不是默认值时改写路径。
+            sed "s#/usr/local/bin/akhub#${target}#g" "$unit" | $SUDO tee /etc/systemd/system/akhub.service >/dev/null
+            $SUDO chmod 644 /etc/systemd/system/akhub.service
             $SUDO systemctl daemon-reload
             # 单元里写死了 User=akhub 与 StateDirectory=akhub，先把用户建出来。
             if ! id akhub >/dev/null 2>&1; then
                 info "创建系统用户 akhub"
                 $SUDO useradd --system --home-dir /var/lib/akhub --create-home akhub
             fi
-            $SUDO systemctl enable --now akhub
+            $SUDO systemctl enable akhub
+            # 重启而不是 start：服务已在运行时，ExecStartPre 才会把新装的二进制换进运行目录。
+            $SUDO systemctl restart akhub
             info "服务已启动：systemctl status akhub"
         else
             warn "归档里没有 deploy/akhub.service，跳过"
