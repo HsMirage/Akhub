@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::supervisor::supervise;
 use super::{AppState, SharedState};
 use crate::multiplier::refresh;
 
@@ -56,15 +57,28 @@ impl RefreshHandle {
 ///
 /// 句柄取自 `state.refresh`：后台接口拿到的是同一个对象，因此"立即刷新"按钮
 /// 在任务启动后自然生效，启动前按下也只是静默忽略。
+///
+/// 周期任务都在 [`supervise`] 下运行：一次 panic 只会让它稍后重启，不会让
+/// 清理、快照或聚合从此停掉。
 pub fn spawn(state: &SharedState) {
-    tokio::spawn(snapshots(Arc::downgrade(state)));
+    let weak = Arc::downgrade(state);
+    supervise("快照落盘", {
+        let weak = weak.clone();
+        move || snapshots(weak.clone())
+    });
     tokio::spawn(multiplier_refresh(
         Arc::downgrade(state),
         state.refresh.clone(),
     ));
-    tokio::spawn(model_sync(Arc::downgrade(state)));
-    tokio::spawn(cleanup(Arc::downgrade(state)));
-    tokio::spawn(rollup(Arc::downgrade(state)));
+    supervise("模型同步", {
+        let weak = weak.clone();
+        move || model_sync(weak.clone())
+    });
+    supervise("过期清理", {
+        let weak = weak.clone();
+        move || cleanup(weak.clone())
+    });
+    supervise("性能分钟桶聚合", move || rollup(weak.clone()));
 }
 
 /// 把请求明细滚进分钟桶（§22 的"性能分钟桶聚合"）。

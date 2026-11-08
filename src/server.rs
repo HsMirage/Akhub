@@ -13,6 +13,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::app::SharedState;
 
+/// 关闭时等待请求记录落盘的上限。
+const RECORDER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 装配全部路由。
 pub fn router(state: SharedState) -> Router {
     assemble(
@@ -215,6 +218,14 @@ pub async fn serve_with_shutdown(
 
     // 关闭前把最后一分钟的粘性与性能数据刷完，否则重启会白丢一分钟（§22）。
     crate::app::tasks::flush_snapshots(&state).await;
+    // 请求记录同理：通道里还没落盘的那一批不能随进程一起丢掉。限时，
+    // 数据库卡住时不让它把关闭拖到监督进程来 SIGKILL（§25.3）。
+    if tokio::time::timeout(RECORDER_FLUSH_TIMEOUT, state.recorder.flush())
+        .await
+        .is_err()
+    {
+        tracing::warn!("关闭时刷写请求记录超时，剩余记录已放弃");
+    }
     result
 }
 

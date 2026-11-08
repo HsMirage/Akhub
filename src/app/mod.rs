@@ -2,6 +2,7 @@
 
 pub mod live_stats;
 pub mod recorder;
+pub mod supervisor;
 pub mod tasks;
 
 use std::sync::Arc;

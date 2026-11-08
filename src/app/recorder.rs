@@ -19,10 +19,16 @@ const BATCH_SIZE: usize = 128;
 /// 即使不满一批，也至少这么久刷一次盘。
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 通道里的消息：一条记录，或"把此前收到的都刷盘后告诉我"。
+enum Message {
+    Record(Box<RequestRecord>),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 /// 请求元数据的写入端。克隆开销极低，可自由分发到各请求任务。
 #[derive(Clone)]
 pub struct RequestRecorder {
-    sender: mpsc::Sender<RequestRecord>,
+    sender: mpsc::Sender<Message>,
     dropped: Arc<AtomicU64>,
     /// 保留期设为 0 时改走内存汇总（§24.2）；由设置服务在运行时可改。
     settings: crate::app::SettingsService,
@@ -43,7 +49,12 @@ impl RequestRecorder {
             settings,
             live,
         };
-        tokio::spawn(drain(store, receiver));
+        // 接收端放进锁里：落盘任务 panic 后由监督者重启，新实例接着用同一个
+        // 接收端（tokio 的锁不会因 panic 而中毒）。
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        super::supervisor::supervise("请求记录落盘", move || {
+            drain(store.clone(), Arc::clone(&receiver))
+        });
         recorder
     }
 
@@ -56,12 +67,26 @@ impl RequestRecorder {
             self.live.record(&record);
             return;
         }
-        if self.sender.try_send(record).is_err() {
+        if self
+            .sender
+            .try_send(Message::Record(Box::new(record)))
+            .is_err()
+        {
             let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             // 只在 2 的幂次上告警，避免故障时日志自身变成压力源。
             if total.is_power_of_two() {
                 tracing::warn!(dropped = total, "请求元数据通道已满，正在丢弃记录");
             }
+        }
+    }
+
+    /// 等通道里此前的记录全部落盘（优雅关闭时调用，§25.3）。
+    ///
+    /// 落盘任务按顺序处理消息，所以刷盘请求排在所有已发送记录之后。
+    pub async fn flush(&self) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self.sender.send(Message::Flush(done)).await.is_ok() {
+            let _ = wait.await;
         }
     }
 
@@ -72,7 +97,8 @@ impl RequestRecorder {
 }
 
 /// 后台任务：攒批写入，通道关闭后把剩余记录刷完再退出。
-async fn drain(store: Store, mut receiver: mpsc::Receiver<RequestRecord>) {
+async fn drain(store: Store, receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>) {
+    let mut receiver = receiver.lock().await;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -80,11 +106,15 @@ async fn drain(store: Store, mut receiver: mpsc::Receiver<RequestRecord>) {
     loop {
         tokio::select! {
             received = receiver.recv() => match received {
-                Some(record) => {
-                    batch.push(record);
+                Some(Message::Record(record)) => {
+                    batch.push(*record);
                     if batch.len() >= BATCH_SIZE {
                         flush(&store, &mut batch).await;
                     }
+                }
+                Some(Message::Flush(done)) => {
+                    flush(&store, &mut batch).await;
+                    let _ = done.send(());
                 }
                 // 发送端全部释放：刷完最后一批后退出。
                 None => {
@@ -215,6 +245,20 @@ mod tests {
             recorder.record(record(&format!("req_{i}")));
         }
         assert_eq!(recorder.dropped(), 8);
+    }
+
+    /// flush 返回时，此前记录的请求已经在库里（优雅关闭依赖这一点）。
+    #[tokio::test]
+    async fn flush_waits_until_pending_records_are_written() {
+        let store = Store::new(crate::storage::open_in_memory().await.unwrap());
+        let recorder = RequestRecorder::spawn(
+            store.clone(),
+            crate::app::SettingsService::new(crate::app::Settings::default()),
+            Arc::new(crate::app::live_stats::LiveStats::new()),
+        );
+        recorder.record(record("req_flush"));
+        recorder.flush().await;
+        assert_eq!(store.list_request_records(10, 0).await.unwrap().len(), 1);
     }
 
     /// 保留期为 0 时不落库，只进内存汇总；改回非 0 后恢复落库（§3、§24.2）。
