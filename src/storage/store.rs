@@ -2338,49 +2338,6 @@ mod tests {
         assert_eq!(loaded[0].weights, SchedulingWeights::default());
     }
 
-    /// 兜底凭据取 Key 池里第一把**启用的** Key；池被清空就是没有凭据，
-    /// 不能再从任何旁路读到一把已经删掉的 Key（v26 删掉镜像列的原因）。
-    #[tokio::test]
-    async fn sealed_key_follows_the_first_enabled_pool_key() {
-        let store = store().await;
-        let group = sample_group();
-        store.insert_group(&group).await.unwrap();
-        let account = sample_account(&group.id);
-        store.insert_account(&account).await.unwrap();
-        assert!(
-            store
-                .account_sealed_key(&account.id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        store
-            .replace_account_keys(
-                &account.id,
-                &[key("k1", b"first", false), key("k2", b"second", true)],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .account_sealed_key(&account.id)
-                .await
-                .unwrap()
-                .unwrap(),
-            b"second"
-        );
-
-        store.replace_account_keys(&account.id, &[]).await.unwrap();
-        assert!(
-            store
-                .account_sealed_key(&account.id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
     /// 删分组不再删账号：账号回到未分配，逻辑模型与目标随分组消失（§4.2.3）。
     #[tokio::test]
     async fn deleting_a_group_unassigns_its_accounts() {

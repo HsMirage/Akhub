@@ -232,20 +232,6 @@ impl Store {
         read_account_keys(self.pool(), account_id).await
     }
 
-    /// 账号 Key 池里**第一把启用的** Key 的密文（§4.2.1）。
-    ///
-    /// 给"只需要一把 Key"的旁路用：Responses 生命周期代理、快照重建前的兜底
-    /// 凭据。拉取模型与倍率探测要的是"401/403 就换下一把"，走
-    /// [`Self::list_account_key_rows`] 自己遍历。
-    pub async fn account_sealed_key(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .list_account_key_rows(account_id)
-            .await?
-            .into_iter()
-            .find(|key| key.enabled)
-            .map(|key| key.sealed_key))
-    }
-
     /// 读取 New API 倍率探针的访问令牌信封。
     pub async fn account_sealed_new_api_token(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
         Ok(

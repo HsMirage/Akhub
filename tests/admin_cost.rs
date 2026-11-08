@@ -527,17 +527,19 @@ async fn copy_creates_an_independent_disabled_clone() {
     let sealed_original = akhub
         .state
         .store
-        .account_sealed_key(&account_id)
+        .list_account_key_rows(&account_id)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap()[0]
+        .sealed_key
+        .clone();
     let sealed_copy = akhub
         .state
         .store
-        .account_sealed_key(&copy_id)
+        .list_account_key_rows(&copy_id)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap()[0]
+        .sealed_key
+        .clone();
     assert_ne!(
         sealed_original, sealed_copy,
         "复制必须重新加密，不能共享密文"
@@ -805,10 +807,11 @@ async fn backup_roundtrip_restores_the_full_configuration() {
     let sealed = akhub
         .state
         .store
-        .account_sealed_key(&accounts[0].id)
+        .list_account_key_rows(&accounts[0].id)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap()[0]
+        .sealed_key
+        .clone();
     let key = akhub.state.cipher.open(&sealed).unwrap();
     assert_eq!(String::from_utf8_lossy(&key), "key-站点A");
     // 选择集跟着回来。
