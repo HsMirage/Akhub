@@ -502,6 +502,53 @@ struct Prepared {
     degraded: Vec<String>,
 }
 
+/// 强绑定的目标不在计划的最高层里、但只是"忙"时，返回这一轮要等多久。
+///
+/// "忙"指 429 + `Retry-After` 的冷却或半开名额被占（§10.2"忙不属于失效"）。
+/// 只在三个条件同时成立时等待，否则返回 `None` 走原逻辑（清绑定、重新抽签）：
+///
+/// * 目标的优先级不低于当前最高合格层——粘性绝不跨层（§9.5）；
+/// * 剩余冷却在这次请求的粘性等待预算之内；
+/// * 截止时间之前还等得起。
+fn sticky_busy_wait(
+    forward: &Forward<'_>,
+    plan: &routing::Plan,
+    target_id: &str,
+    budget: Duration,
+    started: Instant,
+) -> Option<Duration> {
+    if routing::binding_target(plan, target_id, true).is_some() {
+        return None;
+    }
+    let target = forward
+        .group
+        .find_model(&forward.logical_model)?
+        .targets
+        .iter()
+        .find(|target| target.target.id == target_id)?;
+    if plan
+        .layers
+        .first()
+        .is_some_and(|layer| target.priority < layer.priority)
+    {
+        return None;
+    }
+    let remaining = forward
+        .state
+        .runtime
+        .health
+        .target(target_id)
+        .sticky_busy_wait(tokio::time::Instant::now())?;
+    let left = budget.saturating_sub(started.elapsed());
+    // 半开被占时没有确切时长，按限流同样的短间隔轮询试运行的结果。
+    let wait = if remaining.is_zero() {
+        RATE_POLL_INTERVAL.min(left)
+    } else {
+        remaining + RETRY_AFTER_MARGIN
+    };
+    (!left.is_zero() && wait <= left).then_some(wait)
+}
+
 /// 三级门限：账号总额度 → Key 覆盖 → 目标覆盖（§4.2.1）。
 fn admission_limits(
     candidate: &routing::Candidate,
@@ -711,30 +758,55 @@ async fn forward_inner<'a>(
     // 等冷却期间同样占一个分组排队名额：它也是"在等"，§13.6 的容量上限对
     // 它一样适用，否则容量收紧后这里会绕开闸门堆起无界的等待请求。
     let mut recovery_ticket: Option<queue::QueueTicket> = None;
+    // 强绑定的目标只是"忙"（429 冷却或半开被占）时，粘性请求按 §10.3 原地等，
+    // 而不是看它不在计划里就清绑定。预算与下面第一步的粘性等待同一口径。
+    let sticky_busy_budget = existing
+        .as_ref()
+        .filter(|_| !soft)
+        .map(|binding| sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at))
+        .unwrap_or_default();
+    let sticky_busy_started = Instant::now();
     let plan = loop {
-        match routing::plan(
-            forward.group,
-            &forward.logical_model,
-            &context,
-            // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
-            soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
-                .flatten(),
-            &mut score::random_unit,
-        ) {
-            Ok(plan) => break plan,
-            Err(failure) => {
-                // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
-                // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
-                // 与"网关挂了"在事后看起来一模一样（§24.1）。
-                walk.telemetry.filter_summary = failure.filter_summary();
-                walk.telemetry.filter_details = failure.filter_details();
-                let Some(wait) = failure.wait else {
-                    return walk.fail(failure.code, failure.message);
-                };
-                if !walk.await_recovery(wait, &mut recovery_ticket).await {
-                    return walk.fail(failure.code, failure.message);
+        let plan = loop {
+            match routing::plan(
+                forward.group,
+                &forward.logical_model,
+                &context,
+                // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
+                soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
+                    .flatten(),
+                &mut score::random_unit,
+            ) {
+                Ok(plan) => break plan,
+                Err(failure) => {
+                    // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
+                    // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
+                    // 与"网关挂了"在事后看起来一模一样（§24.1）。
+                    walk.telemetry.filter_summary = failure.filter_summary();
+                    walk.telemetry.filter_details = failure.filter_details();
+                    let Some(wait) = failure.wait else {
+                        return walk.fail(failure.code, failure.message);
+                    };
+                    if !walk.await_recovery(wait, &mut recovery_ticket).await {
+                        return walk.fail(failure.code, failure.message);
+                    }
                 }
             }
+        };
+        let busy_wait = existing.as_ref().filter(|_| !soft).and_then(|binding| {
+            sticky_busy_wait(
+                &forward,
+                &plan,
+                &binding.target_id,
+                sticky_busy_budget,
+                sticky_busy_started,
+            )
+        });
+        let Some(wait) = busy_wait else {
+            break plan;
+        };
+        if !walk.await_sticky_busy(wait, &mut recovery_ticket).await {
+            break plan;
         }
     };
     // 计划成立，排队的名额立刻还回去：接下来的游走有自己的准入与排队路径。
@@ -2397,6 +2469,34 @@ impl Walk<'_> {
         tokio::time::sleep(wait + RETRY_AFTER_MARGIN).await;
         self.telemetry.queued += waited.elapsed();
         true
+    }
+
+    /// 粘性绑定的目标只是"忙"时原地等一段（§10.3）。等待记到 sticky_wait。
+    ///
+    /// 与 `await_recovery` 一样占一个分组排队名额；容量为 0 或已满、或正在关闭
+    /// 时返回 false，调用方放弃等待、按原逻辑处理绑定。
+    async fn await_sticky_busy(
+        &mut self,
+        wait: Duration,
+        ticket: &mut Option<queue::QueueTicket>,
+    ) -> bool {
+        if self.forward.state.runtime.is_shutting_down()
+            || Instant::now() + wait > self.queue_deadline.min(self.deadline)
+        {
+            return false;
+        }
+        if ticket.is_none() {
+            match self.enter_queue() {
+                Some(entered) => *ticket = Some(entered),
+                None => return false,
+            }
+        }
+        let mut shutdown = self.forward.state.runtime.subscribe_shutdown();
+        let waited = Instant::now();
+        let outcome = queue::sleep_unless_shutdown(wait, &mut shutdown).await;
+        let total = self.telemetry.sticky_wait.unwrap_or_default() + waited.elapsed();
+        self.telemetry.sticky_wait = Some(total);
+        !matches!(outcome, queue::CapacityWaitOutcome::ShuttingDown)
     }
 
     /// 最后一次失败若是带 `Retry-After` 的 429，且等得起，就返回要等多久。

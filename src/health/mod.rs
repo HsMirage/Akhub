@@ -696,6 +696,11 @@ impl TargetState {
         crate::sync::lock(&self.circuit).cooldown_remaining(now)
     }
 
+    /// 粘性请求眼里这个目标是不是只是"忙"（429 冷却或半开被占），要等多久。
+    pub fn sticky_busy_wait(&self, now: Instant) -> Option<Duration> {
+        crate::sync::lock(&self.circuit).sticky_busy_wait(now)
+    }
+
     /// 不消耗任何额度的资格检查，用于 §9.1 的硬性过滤。
     ///
     /// 顺序是"坏不坏"优先于"忙不忙"：一个既熔断又满载的目标必须报熔断，
@@ -1022,7 +1027,7 @@ impl Admission {
                 let mut circuit = crate::sync::lock(&self.target.circuit);
                 match retry_after {
                     // 上游明确说了多久，就照做，不叠加自己的指数退避。
-                    Some(wait) => circuit.trip(now, Some(wait)),
+                    Some(wait) => circuit.trip_rate_limited(now, wait),
                     // 没给恢复时间的孤立 429 只触发本次切换，够多够密才熔断。
                     None => circuit.on_fault(now),
                 }
@@ -1406,6 +1411,11 @@ struct Circuit {
     /// 指数冷却的级别。成功一次即清零。
     level: u32,
     half_open_taken: bool,
+    /// 当前这段冷却是不是上游 429 + `Retry-After` 造成的。
+    ///
+    /// 这种冷却是"忙"，不是"坏"：上游明说了几秒后就好。粘性请求据此原地等待
+    /// 而不是清掉绑定（§10.2"忙不属于失效"、§10.3）。
+    rate_limited: bool,
     consecutive: u32,
     failures: SlidingWindow,
     totals: SlidingWindow,
@@ -1417,6 +1427,7 @@ impl Default for Circuit {
             cooldown_until: None,
             level: 0,
             half_open_taken: false,
+            rate_limited: false,
             consecutive: 0,
             failures: SlidingWindow::new(FAULT_WINDOW),
             totals: SlidingWindow::new(FAULT_WINDOW),
@@ -1484,6 +1495,27 @@ impl Circuit {
         }
         self.cooldown_until = Some(now + wait);
         self.half_open_taken = false;
+        self.rate_limited = false;
+    }
+
+    /// 上游 429 带了 `Retry-After`：按它冷却，并记下这段冷却只是"忙"。
+    fn trip_rate_limited(&mut self, now: Instant, wait: Duration) {
+        self.trip(now, Some(wait));
+        self.rate_limited = true;
+    }
+
+    /// 对粘性请求而言这个目标是不是只是"忙"：返回还要等多久。
+    ///
+    /// * 429 + `Retry-After` 的冷却：等剩余时间；
+    /// * 半开名额已被别的请求占走：试运行的结果马上就到，返回零表示"短轮询"。
+    ///
+    /// 其余冷却（故障熔断）是"坏"，返回 `None`。
+    fn sticky_busy_wait(&self, now: Instant) -> Option<Duration> {
+        match self.phase(now) {
+            Phase::Cooling if self.rate_limited => self.cooldown_remaining(now),
+            Phase::HalfOpenTaken => Some(Duration::ZERO),
+            _ => None,
+        }
     }
 
     /// 记一次故障。半开试运行失败会直接延长冷却；否则按 §12.3 的阈值判定。
@@ -1496,6 +1528,7 @@ impl Circuit {
             self.half_open_taken = false;
             self.level = self.level.saturating_add(1);
             self.cooldown_until = Some(now + self.backoff_for(self.level));
+            self.rate_limited = false;
             return;
         }
 
@@ -1507,6 +1540,7 @@ impl Circuit {
             self.level = self.level.saturating_add(1);
             self.cooldown_until = Some(now + self.backoff_for(self.level));
             self.consecutive = 0;
+            self.rate_limited = false;
         }
     }
 

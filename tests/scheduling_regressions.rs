@@ -102,3 +102,65 @@ async fn a_rate_limited_wait_does_not_spin() {
     assert!(started.elapsed() >= Duration::from_secs(2));
     assert_eq!(limited.requests(), 1, "窗口没释放前不能再打上游");
 }
+
+/// 429 + 短 `Retry-After` 的冷却是"忙"不是"坏"：同一会话的下一个请求必须
+/// 等过这段冷却、留在原目标上，而不是清掉强绑定换号（§10.2、§10.3）。
+#[tokio::test]
+async fn a_short_retry_after_cooldown_keeps_the_strong_binding() {
+    use akhub::health::{Caller, Outcome};
+
+    let first = FakeUpstream::spawn().await;
+    let second = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub_with(Default::default(), |_| {}).await;
+    let a = wire_target(
+        &akhub,
+        TargetSpec::new("a", &first.base_url, Protocol::OpenAiChat, "m", "m", 50),
+    )
+    .await;
+    let b = wire_target(
+        &akhub,
+        TargetSpec::new("b", &second.base_url, Protocol::OpenAiChat, "m", "m", 50),
+    )
+    .await;
+
+    let mut body = common::bulky_chat_body("sys", "hello");
+    body["model"] = json!("m");
+    body["prompt_cache_key"] = json!("session-429");
+    assert_eq!(chat(&akhub, body.clone()).await.status(), 200);
+    let (bound, bound_upstream) = if first.requests() == 1 {
+        (&a, &first)
+    } else {
+        (&b, &second)
+    };
+
+    akhub
+        .state
+        .runtime
+        .health
+        .try_admit(
+            Caller {
+                account_id: &bound.account_id,
+                key_id: None,
+                target_id: &bound.target_id,
+            },
+            Limits::default(),
+            0,
+        )
+        .unwrap()
+        .settle(
+            Outcome::RateLimited {
+                retry_after: Some(Duration::from_secs(1)),
+            },
+            None,
+        );
+
+    let started = Instant::now();
+    assert_eq!(chat(&akhub, body).await.status(), 200);
+    assert_eq!(
+        bound_upstream.requests(),
+        2,
+        "短冷却期间同一会话必须等原目标，而不是换号"
+    );
+    assert_eq!(first.requests() + second.requests(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+}
