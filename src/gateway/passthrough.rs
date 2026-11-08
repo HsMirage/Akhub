@@ -3326,8 +3326,8 @@ async fn commit_stream(
                 None,
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::MemoryOnly,
+            );
             Some(StreamStateSeed {
                 gateway_id: gateway,
                 upstream_id: None,
@@ -3379,6 +3379,10 @@ async fn commit_stream(
                 degraded: Some(degraded),
             }),
             Err(failure) => {
+                // 这次尝试作废：骨架记录跟着撤掉，换号后会用新的网关 ID。
+                if let Some(seed) = &stream_state {
+                    responses::forget_pending(&forward.chain.group_id, &seed.gateway_id);
+                }
                 Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
             }
         };
@@ -3422,8 +3426,8 @@ async fn commit_stream(
                                 None,
                                 upstream_protocol,
                                 credential,
-                            )
-                            .await;
+                                responses::Durability::MemoryOnly,
+                            );
                             let body = translate::passthrough_responses_stream(
                                 prefix,
                                 response,
@@ -3711,8 +3715,8 @@ async fn commit_body(
                 Some(&value),
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::Persist,
+            );
             Body::from(value.to_string())
         } else {
             Body::from(bytes)
@@ -3747,8 +3751,8 @@ async fn commit_body(
                 Some(&value),
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::Persist,
+            );
             Body::from(value.to_string())
         } else {
             Body::from(converted.to_string())
@@ -3780,11 +3784,12 @@ async fn commit_body(
 /// 保存一次 Responses 响应的状态链记录（§15.2）。
 ///
 /// `upstream_body` 是上游的原始响应：定位映射取它的 ID，可重放正文取入口
-/// 请求体加输出项。**在返回响应之前同步落库**：客户端拿到响应 ID 后可能
-/// 立刻引用它，晚一步写入就会出现竞态。写失败只记日志——状态链是增强
-/// 能力，不能让它影响主流程。
+/// 请求体加输出项。客户端拿到响应 ID 后可能立刻引用它，所以记录在返回响应
+/// 之前就**同步放进内存表**、查询优先看它；落库在后台进行，热路径不等
+/// SQLite（§28）。流式响应只放骨架（`MemoryOnly`），流结束时由结算改写成
+/// 完整记录落库或删除。写失败只记日志——状态链是增强能力，不能影响主流程。
 #[allow(clippy::too_many_arguments)]
-async fn record_response_state(
+fn record_response_state(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
     prepared: &Prepared,
@@ -3795,6 +3800,7 @@ async fn record_response_state(
     // 创建这条响应用的那把 Key（§4.2.1 的不变量 A、§15.1）。上游的
     // `resp_xxx` 按凭据隔离，续写与生命周期代理必须回到同一把 Key。
     credential: Option<&Arc<crate::credential::Credential>>,
+    durability: responses::Durability,
 ) {
     // 只有上游本身是 Responses 时才有可续链的上游 ID；跨协议转来的响应
     // 没有原生 Responses ID，续链只能靠保存的正文。
@@ -3832,8 +3838,8 @@ async fn record_response_state(
         output_items.as_ref(),
         final_response,
         state.settings.get().response_state_days,
-    )
-    .await;
+        durability,
+    );
 }
 
 /// 异步生图任务定位记录的有效期（秒）。
