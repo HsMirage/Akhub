@@ -914,37 +914,17 @@ fn api_root_path(url: &reqwest::Url) -> String {
 /// 与“地址拼错了”，而管理员能看到的只有这一行文本。给出实际请求的地址，
 /// 才能一眼分辨是上游不认还是 Base URL 填得不对。
 async fn read_json_body(endpoint: &str, response: reqwest::Response) -> Result<Vec<u8>> {
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if !status.is_success() {
-        // 状态码单独挂一层：识别动作靠它区分“端点不存在”与“这次没到上游”，
-        // 用错误文本判断太脆。
-        return Err(
-            anyhow::Error::new(HttpStatus(status.as_u16())).context(format!(
-                "探针返回 HTTP {}（GET {endpoint}）",
-                status.as_u16()
-            )),
-        );
-    }
-    if !content_type.contains("json") {
-        bail!("探针响应的 Content-Type 不是 JSON：{content_type}");
-    }
-
-    let mut response = response;
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("读取探针响应失败")? {
-        if body.len() + chunk.len() > MAX_BODY {
-            bail!("探针响应超过 {MAX_BODY} 字节上限");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    crate::upstream::read_json_response(response, MAX_BODY)
+        .await
+        .map_err(|error| match error {
+            // 状态码单独挂一层：识别动作靠它区分“端点不存在”与“这次没到上游”，
+            // 用错误文本判断太脆。
+            crate::upstream::UpstreamError::BadStatus(code) => anyhow::Error::new(HttpStatus(code))
+                .context(format!("探针返回 HTTP {code}（GET {endpoint}）")),
+            other => {
+                anyhow::Error::new(other).context(format!("读取探针响应失败（GET {endpoint}）"))
+            }
+        })
 }
 
 /// 识别动作的裁定表。这三行是它与普通刷新之间最大的行为差异：

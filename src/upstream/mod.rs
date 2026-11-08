@@ -29,7 +29,7 @@ pub enum UpstreamError {
     BadStatus(u16),
     #[error("上游模型列表格式异常：{0}")]
     BadResponse(String),
-    #[error("上游模型列表超过大小上限")]
+    #[error("上游响应超过大小上限")]
     TooLarge,
     #[error("上游响应不是 JSON（Content-Type: {0}），请检查 Base URL 是否指向 API 而不是网页")]
     NotJson(String),
@@ -404,7 +404,7 @@ pub async fn read_json_response(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| UpstreamError::TooLarge)?
+        .map_err(|error| UpstreamError::BadResponse(format!("读取响应失败：{error}")))?
     {
         if bytes.len().saturating_add(chunk.len()) > max_bytes {
             return Err(UpstreamError::TooLarge);
