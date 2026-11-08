@@ -268,7 +268,8 @@ cat <<EOF
   1. 前台试跑（首次会在数据目录生成主密钥）：
        AKHUB_DATA_DIR=./data ${target}
      默认监听 0.0.0.0:8080（所有网卡）。只给本机用时加 AKHUB_LISTEN=127.0.0.1:8080。
-  2. 打开 http://127.0.0.1:8080/admin 设置管理员密码。
+  2. 打开 http://127.0.0.1:8080/admin 设置管理员密码。首次设置口令打印在启动日志里，
+     也保存在数据目录的 setup-token 文件中（systemd 部署：sudo cat /var/lib/akhub/setup-token）。
   3. 长期运行推荐 systemd（见 deploy/README.md）或 Docker：
        docker run -d --name akhub -p 127.0.0.1:8080:8080 -v akhub-data:/data ${IMAGE}:latest
 

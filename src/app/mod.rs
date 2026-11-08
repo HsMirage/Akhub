@@ -512,6 +512,14 @@ impl AppState {
             sweep_stale_temp_files(&temp_dir);
         }
 
+        // 首次设置口令（§23.2）：还没有管理员时生成并打印，已有管理员时清掉残留。
+        if store.needs_setup().await? {
+            let token = crate::auth::setup_token::ensure(data_dir)?;
+            crate::auth::setup_token::announce(data_dir, &token);
+        } else {
+            crate::auth::setup_token::remove(data_dir);
+        }
+
         // 请求记录器要看保留期决定"落库还是只进内存"，所以必须在设置服务之后建。
         let settings_service = SettingsService::new(settings);
         let recorder = RequestRecorder::spawn(

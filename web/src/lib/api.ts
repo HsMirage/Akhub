@@ -298,8 +298,13 @@ async function requestAllPages<T>(path: string): Promise<Page<T>> {
 
 export const api = {
   setupStatus: () => request<SetupStatus>("/setup/status"),
-  setup: (username: string, password: string) =>
-    post<{ username: string }>("/setup", { username, password }),
+  /** 首次设置必须带上启动日志 / 数据目录里的一次性口令（§23.2）。 */
+  setup: (username: string, password: string, setupToken: string) =>
+    request<{ username: string }>("/setup", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+      headers: { "x-akhub-setup-token": setupToken },
+    }),
   login: (username: string, password: string) =>
     post<{ username: string }>("/auth/login", { username, password }),
   logout: () => post<void>("/auth/logout"),

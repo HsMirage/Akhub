@@ -1,6 +1,7 @@
 //! 下游分组 Key 鉴权与管理员会话。
 
 pub mod session;
+pub mod setup_token;
 
 use axum::http::HeaderMap;
 

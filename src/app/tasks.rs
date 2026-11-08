@@ -280,6 +280,8 @@ async fn cleanup(state: Weak<AppState>) {
             }
         }
 
+        state.sessions.purge_expired();
+
         let config = state.config.current();
         let (_, targets) = config.live_ids();
         state.runtime.sticky.prune(&targets, now);

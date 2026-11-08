@@ -25,6 +25,16 @@ async fn spawn() -> (String, reqwest::Client, tempfile::TempDir, Arc<AppState>) 
     });
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        // 首次设置必须带口令（§23.2）：测试直接读数据目录里的口令文件。
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-akhub-setup-token"),
+            reqwest::header::HeaderValue::from_str(
+                std::fs::read_to_string(dir.path().join("setup-token"))
+                    .unwrap_or_default()
+                    .trim(),
+            )
+            .unwrap(),
+        )]))
         .build()
         .unwrap();
     (format!("http://{addr}"), client, dir, state)

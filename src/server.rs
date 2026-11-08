@@ -186,8 +186,11 @@ pub async fn serve_with_shutdown(
         shutdown_state.runtime.begin_shutdown();
         let _ = stopping_tx.send(());
     };
-    let serving = axum::serve(listener, router(state.clone()).into_make_service())
-        .with_graceful_shutdown(graceful);
+    let serving = axum::serve(
+        listener,
+        router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful);
     let hard_stop = async move {
         if stopping_rx.await.is_err() {
             // 信号发送端消失表示服务已经结束，这里永远等下去。
