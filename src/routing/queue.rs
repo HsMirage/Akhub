@@ -16,18 +16,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::domain::QUEUE_UNLIMITED;
 use crate::health::{Capacity, CapacityPermit};
 
-/// 等待的结果。
-#[derive(Debug)]
-pub enum WaitOutcome {
-    /// 某个目标空出了名额：索引指向传入的候选列表，名额随结果一起交给调用方。
-    ///
-    /// 名额必须带走而不是在这里释放：tokio 的 Semaphore 按 FIFO 唤醒，带着它
-    /// 进门才能保证等了 30 秒的请求不会在最后一步被刚到的新请求插队。
-    Ready(usize, OwnedSemaphorePermit),
-    /// 等待预算耗尽。粘性请求据此降级为无粘性请求重新选择（§10.3）。
-    TimedOut,
-}
-
 /// 分组级的排队总容量。
 ///
 /// 这是**唯一**的分组级队列语义：它不排序、不决定谁先走，只回答"现在还能不
@@ -192,36 +180,11 @@ pub struct QueueTicket {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
-/// 等待一组目标中**任意一个**空出并发名额。
+/// 等待一组候选中**任意一个**的账号、Key 与目标容量同时可用。
 ///
-/// 这正是"无粘性、当前层全满 → 进入任意目标队列；任何一个目标释放槽位即唤醒"
-/// 的实现：`select_all` 在第一个 `acquire` 完成时返回，其余等待被丢弃。
-///
-/// 传入单个目标时它同时也是"粘性命中但目标忙"的等待路径。
-pub async fn wait_for_any(permits: Vec<Arc<Semaphore>>, budget: Duration) -> WaitOutcome {
-    if permits.is_empty() || budget.is_zero() {
-        return WaitOutcome::TimedOut;
-    }
-
-    let acquisitions = permits.into_iter().enumerate().map(|(index, semaphore)| {
-        Box::pin(async move {
-            // 名额只是"门票"：真正的准入还要重做倍率与健康终检（§13.1）。
-            semaphore
-                .acquire_owned()
-                .await
-                .ok()
-                .map(|permit| (index, permit))
-        })
-    });
-
-    match tokio::time::timeout(budget, futures::future::select_all(acquisitions)).await {
-        Ok((Some((index, permit)), _, _)) => WaitOutcome::Ready(index, permit),
-        // 只有 Semaphore 被关闭才会拿到 None，本进程内不会发生。
-        _ => WaitOutcome::TimedOut,
-    }
-}
-
-/// 等待一个候选的账号共享容量与目标局部容量同时可用。
+/// "无粘性、当前层全满 → 进入任意目标队列；任何一个目标释放槽位即唤醒"：
+/// `select_all` 在第一个 `acquire` 完成时返回，其余等待被丢弃。传入单个候选时
+/// 它同时也是"粘性命中但目标忙"的等待路径。
 ///
 /// `shutdown` 置位时立即返回 `ShuttingDown`：关闭流程不该被排队请求拖住
 /// （§25.3 第 2 步）。
@@ -247,6 +210,22 @@ pub async fn wait_for_any_capacity(
                 _ => CapacityWaitOutcome::TimedOut,
             }
         }
+        _ = shutdown.changed() => CapacityWaitOutcome::ShuttingDown,
+    }
+}
+
+/// 没有信号量可等时（RPM / TPM 限流、各级都不限并发）按轮询间隔睡一段。
+///
+/// 返回 `TimedOut` 让调用方回到循环顶部重新准入；关闭信号同样能打断它。
+pub async fn sleep_unless_shutdown(
+    duration: Duration,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> CapacityWaitOutcome {
+    if *shutdown.borrow() {
+        return CapacityWaitOutcome::ShuttingDown;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => CapacityWaitOutcome::TimedOut,
         _ = shutdown.changed() => CapacityWaitOutcome::ShuttingDown,
     }
 }
@@ -339,6 +318,14 @@ mod tests {
         drop(tickets);
     }
 
+    fn target_only(semaphore: &Arc<Semaphore>) -> Capacity {
+        Capacity {
+            account: None,
+            key: None,
+            target: Some(Arc::clone(semaphore)),
+        }
+    }
+
     #[tokio::test]
     async fn releasing_any_target_wakes_the_waiter() {
         let busy = Arc::new(Semaphore::new(1));
@@ -346,14 +333,19 @@ mod tests {
         let held_busy = Arc::clone(&busy).try_acquire_owned().unwrap();
         let held_idle = Arc::clone(&idle).try_acquire_owned().unwrap();
 
-        let waiter = tokio::spawn(wait_for_any(
-            vec![Arc::clone(&busy), Arc::clone(&idle)],
-            Duration::from_secs(5),
-        ));
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let capacities = vec![target_only(&busy), target_only(&idle)];
+        let waiter = tokio::spawn(async move {
+            wait_for_any_capacity(capacities, Duration::from_secs(5), &mut shutdown).await
+        });
+        tokio::task::yield_now().await;
         // 第二个目标先空出来，等待者就该被它唤醒，而不是死等第一个。
         drop(held_idle);
         let outcome = waiter.await.unwrap();
-        assert!(matches!(outcome, WaitOutcome::Ready(1, _)), "{outcome:?}");
+        assert!(
+            matches!(outcome, CapacityWaitOutcome::Ready(1, _)),
+            "{outcome:?}"
+        );
         // 名额随结果带走：在它被释放前，空闲目标对别人仍然是满的。
         assert!(Arc::clone(&idle).try_acquire_owned().is_err());
         drop(outcome);
@@ -365,9 +357,15 @@ mod tests {
     async fn an_exhausted_budget_times_out_instead_of_hanging() {
         let full = Arc::new(Semaphore::new(1));
         let _held = Arc::clone(&full).try_acquire_owned().unwrap();
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         assert!(matches!(
-            wait_for_any(vec![full], Duration::from_secs(3)).await,
-            WaitOutcome::TimedOut
+            wait_for_any_capacity(
+                vec![target_only(&full)],
+                Duration::from_secs(3),
+                &mut shutdown
+            )
+            .await,
+            CapacityWaitOutcome::TimedOut
         ));
     }
 
@@ -376,30 +374,23 @@ mod tests {
         // 小请求的等待预算是 0：重建缓存几乎不花钱，等待纯属浪费（§10.3）。
         let full = Arc::new(Semaphore::new(1));
         let _held = Arc::clone(&full).try_acquire_owned().unwrap();
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         assert!(matches!(
-            wait_for_any(vec![full], Duration::ZERO).await,
-            WaitOutcome::TimedOut
+            wait_for_any_capacity(vec![target_only(&full)], Duration::ZERO, &mut shutdown).await,
+            CapacityWaitOutcome::TimedOut
         ));
     }
 
+    /// 限流轮询必须真的让出时间，而不是立刻返回。
     #[tokio::test(start_paused = true)]
-    async fn a_long_sticky_wait_does_not_block_a_ready_request() {
-        // §26.3：粘性请求长等待不阻塞可立即执行的无粘性请求。
-        let sticky_target = Arc::new(Semaphore::new(1));
-        let free_target = Arc::new(Semaphore::new(1));
-        let _held = Arc::clone(&sticky_target).try_acquire_owned().unwrap();
-
-        // 粘性请求死等自己那个已满的目标，预算 90 秒。
-        let sticky = tokio::spawn(wait_for_any(
-            vec![Arc::clone(&sticky_target)],
-            Duration::from_secs(90),
+    async fn the_rate_poll_sleep_actually_waits() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            sleep_unless_shutdown(Duration::from_secs(1), &mut shutdown).await,
+            CapacityWaitOutcome::TimedOut
         ));
-        // 无粘性请求根本不排队——它的目标是空的，立刻拿到名额。
-        let free = Arc::clone(&free_target).try_acquire_owned();
-        assert!(free.is_ok(), "空闲目标必须立即可用，不能被粘性请求卡住");
-
-        tokio::time::advance(Duration::from_secs(91)).await;
-        assert!(matches!(sticky.await.unwrap(), WaitOutcome::TimedOut));
+        assert!(started.elapsed() >= Duration::from_secs(1));
     }
 
     #[tokio::test]

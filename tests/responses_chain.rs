@@ -92,13 +92,21 @@ async fn the_client_only_ever_sees_gateway_response_ids() {
 
     // 定位映射已经保存：网关 ID 能查到上游 ID。
     let now = akhub::storage::now_unix();
-    let row = akhub
-        .state
-        .store
-        .response_state(gateway_id, &akhub.group_id)
-        .await
-        .unwrap()
-        .expect("状态行必须已保存");
+    // 落库在后台进行（§28）：引用立即可用靠内存表，库里稍后才有。
+    let mut row = None;
+    for _ in 0..100 {
+        row = akhub
+            .state
+            .store
+            .response_state(gateway_id, &akhub.group_id)
+            .await
+            .unwrap();
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let row = row.expect("状态行必须已保存");
     assert_eq!(row.upstream_id.as_deref(), Some("resp_1"));
     assert!(row.expires_at > now);
     assert!(row.sealed_body.is_some(), "store 默认开启，正文必须保存");
@@ -219,12 +227,8 @@ async fn store_false_keeps_native_continuation_but_never_switches() {
     .await
     .unwrap();
     let gateway_id = first["id"].as_str().unwrap().to_string();
-    let row = akhub
-        .state
-        .store
-        .response_state(&gateway_id, &akhub.group_id)
+    let row = saved_state(&akhub, &gateway_id)
         .await
-        .unwrap()
         .expect("store:false 仍要保存最小定位映射");
     assert!(row.sealed_body.is_none(), "store:false 不保存正文");
 
@@ -354,6 +358,21 @@ async fn expired_states_report_response_state_expired() {
         .unwrap();
     let gateway_id = first["id"].as_str().unwrap().to_string();
 
+    // 落库在后台进行，等它写完并移出内存表，再改库里的过期时间。
+    for _ in 0..100 {
+        let row = akhub
+            .state
+            .store
+            .response_state(&gateway_id, &akhub.group_id)
+            .await
+            .unwrap();
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     // 直接把过期时间拨到过去：模拟保留期流逝。
     sqlx::query("UPDATE response_states SET expires_at = 0")
         .execute(akhub.state.store.pool())
@@ -409,12 +428,8 @@ async fn streamed_responses_carry_gateway_ids_and_support_the_chain() {
             Some(id.to_string())
         })
         .expect("response.created 必须携带 id");
-    let row = akhub
-        .state
-        .store
-        .response_state(&created, &akhub.group_id)
+    let row = saved_state(&akhub, &created)
         .await
-        .unwrap()
         .expect("流式响应的状态必须已保存");
     assert!(row.sealed_body.is_some());
 
@@ -551,4 +566,24 @@ async fn cross_protocol_failover_rebuilds_the_history_into_the_other_protocol() 
         text.contains("第二轮问题"),
         "Chat 请求丢了第二轮输入：{text}"
     );
+}
+
+/// 状态记录在后台落库（§28）：轮询等它写进库里。
+async fn saved_state(
+    akhub: &Akhub,
+    gateway_id: &str,
+) -> Option<akhub::storage::store::ResponseStateRow> {
+    for _ in 0..100 {
+        let row = akhub
+            .state
+            .store
+            .response_state(gateway_id, &akhub.group_id)
+            .await
+            .unwrap();
+        if row.is_some() {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
 }

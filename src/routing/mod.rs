@@ -61,6 +61,7 @@ impl Ineligible {
                     health::Unavailable::Cooling => "冷却中",
                     health::Unavailable::ConcurrencyFull => "并发已满",
                     health::Unavailable::RateLimited => "限流中",
+                    health::Unavailable::ExceedsTokenLimit => "单次请求超过 TPM 上限",
                 };
                 match key {
                     // 归因到具体某把 Key 时把摘要前 8 位带上：够在后台对上号，

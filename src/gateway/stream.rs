@@ -73,6 +73,49 @@ pub fn first_content(clock: &FirstContentClock) -> Option<Duration> {
     clock.lock().ok().and_then(|slot| *slot)
 }
 
+/// 首个语义事件到达前的心跳，用于"响应体要等语义事件才造得出来"的路径
+/// （§13.4 修订）。
+///
+/// 跨协议转换流与 Responses 入口的 ID 改写流都要先等到上游的首个语义事件，
+/// 才能交出下游响应体。宽限期过后不能再攥着响应头不放（CDN 会回 524），于是
+/// 先交出响应头，由这里一边驱动 `ready`、一边每隔 `interval` 发一帧 SSE 注释：
+///
+/// - `ready` 成功：首个语义事件此刻到达，记首字时钟，之后原样转发它的响应体；
+/// - `ready` 失败：心跳已经让响应头发出去了，只能按流内错误帧收尾。
+///
+/// SSE 注释帧对三种下游协议都是合法的保活形式（客户端一律忽略），网关自己
+/// 的嗅探器也把它归入 `Verdict::Pending`。
+pub fn keep_alive_until_ready<F>(
+    ready: F,
+    interval: Duration,
+    clock: FirstContentClock,
+    elapsed_before: Duration,
+) -> axum::body::Body
+where
+    F: std::future::Future<Output = Result<axum::body::Body, Bytes>> + Send + 'static,
+{
+    let stream = async_stream::stream! {
+        let started = tokio::time::Instant::now();
+        let mut ready = std::pin::pin!(ready);
+        let body = loop {
+            match tokio::time::timeout(interval, ready.as_mut()).await {
+                Ok(Ok(body)) => break body,
+                Ok(Err(error_frame)) => {
+                    yield Ok::<Bytes, axum::Error>(error_frame);
+                    return;
+                }
+                Err(_) => yield Ok(keep_alive_frame()),
+            }
+        };
+        mark_first_content(&clock, elapsed_before + started.elapsed());
+        let mut inner = body.into_data_stream();
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+    };
+    axum::body::Body::from_stream(stream)
+}
+
 /// 嗅探结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {

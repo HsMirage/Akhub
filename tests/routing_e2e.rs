@@ -105,7 +105,11 @@ async fn a_busy_top_layer_queues_instead_of_sinking_to_the_next_layer() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -146,7 +150,11 @@ async fn queue_full_when_the_group_forbids_waiting() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -334,7 +342,11 @@ async fn queue_timeout_when_the_layer_stays_busy_past_the_deadline() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -375,7 +387,11 @@ async fn the_group_max_wait_caps_queue_waiting_before_the_request_timeout() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -1096,7 +1112,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
                 key_id: None,
                 target_id: &bound_wired.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -1119,7 +1139,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
                 key_id: None,
                 target_id: &bound_wired.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();

@@ -10,6 +10,8 @@
 //! 2. `store: false`：只保存最小定位映射，原生上游仍可续链。
 //! 3. 保留期为 0：同上，且没有跨上游重建能力——这是管理员的显式选择。
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -67,11 +69,14 @@ pub async fn lookup(
     reference: &str,
     protocol: Protocol,
 ) -> Result<ResponseStateRow, GatewayError> {
-    let record = state
-        .store
-        .response_state(reference, group_id)
-        .await
-        .map_err(AdminInternal)?;
+    let record = match pending_state(group_id, reference) {
+        Some(row) => Some(row),
+        None => state
+            .store
+            .response_state(reference, group_id)
+            .await
+            .map_err(AdminInternal)?,
+    };
     let now = crate::storage::now_unix();
     match record {
         Some(row) if row.expires_at >= now => Ok(row),
@@ -263,9 +268,15 @@ async fn native_target(
         .ok()?
         .into_iter()
         .find(|account| account.id == account_id)?;
-    let sealed = state.store.account_sealed_key(&account.id).await.ok()??;
-    let plaintext = state.cipher.open(&sealed).ok()?;
-    let api_key = String::from_utf8(plaintext.to_vec()).ok()?;
+    // 上游资源按凭据隔离：必须回到创建它的那把 Key（§15.1）。
+    let key_id = record.key_id.as_deref()?;
+    let api_key = state
+        .runtime
+        .credentials
+        .current()
+        .by_id(&account.id, key_id)?
+        .secret
+        .to_string();
     Some(NativeTarget {
         account,
         api_key,
@@ -541,6 +552,7 @@ pub async fn destroy(
             "上游删除响应失败，继续清理本地状态"
         );
     }
+    forget_pending(&group, &id);
     match state.store.delete_response_state(&id, &group).await {
         Ok(_) => {
             axum::Json(json!({"id": id, "object": "response", "deleted": true})).into_response()
@@ -664,6 +676,8 @@ pub struct ChainPlan {
 pub struct PinnedRef {
     pub account_id: String,
     pub upstream_id: String,
+    /// 创建这条响应的那把 Key。上游的响应 ID 按凭据隔离，续链要回到它（§15.1）。
+    pub key_digest: Option<String>,
 }
 
 impl ChainPlan {
@@ -675,11 +689,6 @@ impl ChainPlan {
             pinned: None,
             merged: None,
         }
-    }
-
-    /// 粘性键的引用锚点：有引用时粘性以引用为准（§10.1 的第 1 级）。
-    pub fn sticky_reference(&self) -> Option<&str> {
-        self.reference.as_deref()
     }
 
     /// 资格过滤与转换所依据的请求体：有可重放合并体时用它——引用不在里面，
@@ -707,9 +716,15 @@ pub async fn resolve_request(
 
     // 原生续链候选：原账号 + 上游 ID。
     if let (Some(account), Some(upstream)) = (&record.account_id, &record.upstream_id) {
+        let pool = state.runtime.credentials.current();
         plan.pinned = Some(PinnedRef {
             account_id: account.clone(),
             upstream_id: upstream.clone(),
+            key_digest: record
+                .key_id
+                .as_deref()
+                .and_then(|key_id| pool.by_id(account, key_id))
+                .map(|key| key.credential_digest.clone()),
         });
     }
 
@@ -822,7 +837,7 @@ pub struct PendingState {
 
 /// 把一次成功完成的 Responses 请求写入状态链（§15.2）。
 #[allow(clippy::too_many_arguments)]
-pub async fn record_state(
+pub fn record_state(
     state: &crate::app::SharedState,
     chain: &ChainPlan,
     pending: PendingState,
@@ -831,6 +846,7 @@ pub async fn record_state(
     output_items: Option<&Value>,
     final_response: Option<&Value>,
     retention_days: u32,
+    durability: Durability,
 ) {
     let stored = should_store(entry_body, retention_days);
     let sealed_body = stored.then(|| {
@@ -839,7 +855,7 @@ pub async fn record_state(
     });
     let now = crate::storage::now_unix();
     let expires_at = now + i64::from(retention_days) * 86_400;
-    let record = ResponseStateRow {
+    let record = Arc::new(ResponseStateRow {
         gateway_id: pending.gateway_id,
         group_id: chain.group_id.clone(),
         logical_model: chain.logical_model.clone(),
@@ -852,10 +868,80 @@ pub async fn record_state(
         protocol: Some(entry_protocol.as_str().to_string()),
         created_at: now,
         expires_at,
-    };
-    if let Err(error) = state.store.upsert_response_state(&record).await {
-        tracing::warn!(%error, "保存 Responses 状态失败");
+    });
+    let slot = (record.group_id.clone(), record.gateway_id.clone());
+    crate::sync::lock(&PENDING).insert(slot.clone(), Arc::clone(&record));
+    if durability == Durability::MemoryOnly {
+        return;
     }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("保存 Responses 状态时没有可用的异步运行时");
+        forget_pending(&slot.0, &slot.1);
+        return;
+    };
+    let state = state.clone();
+    handle.spawn(async move {
+        // 写之前已经被删（客户端先一步 DELETE）就不再写，免得把它复活。
+        if !is_pending(&slot, &record) {
+            return;
+        }
+        if let Err(error) = state.store.upsert_response_state(&record).await {
+            tracing::warn!(%error, "保存 Responses 状态失败");
+        }
+        let still_ours = {
+            let mut pending = crate::sync::lock(&PENDING);
+            match pending.get(&slot) {
+                Some(current) if Arc::ptr_eq(current, &record) => {
+                    pending.remove(&slot);
+                    true
+                }
+                Some(_) => true,
+                None => false,
+            }
+        };
+        // 写入期间被删掉了：删除已经先跑完，这里补删，保证"删了就是删了"。
+        if !still_ours && let Err(error) = state.store.delete_response_state(&slot.1, &slot.0).await
+        {
+            tracing::warn!(%error, "补删 Responses 状态失败");
+        }
+    });
+}
+
+/// 状态记录写到哪里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// 只放内存：流式响应的骨架。流结束时由结算改写成完整记录或删除。
+    MemoryOnly,
+    /// 内存立即可见，后台落库。
+    Persist,
+}
+
+type PendingTable =
+    std::sync::Mutex<std::collections::HashMap<(String, String), Arc<ResponseStateRow>>>;
+
+/// 尚未落库（或流式进行中）的状态记录，按（分组，网关 ID）索引。
+///
+/// 契约（§15.2）：客户端一拿到响应 ID 就可能引用它，记录必须在那一刻已经
+/// 查得到；但请求热路径绝不等 SQLite（§28）。所以写入分两步：先同步放进这张
+/// 表（查询优先看它），再在后台落库，落库完成后从表里移走。表的大小受在途
+/// 请求数与落库延迟约束，不会无界增长。
+static PENDING: std::sync::LazyLock<PendingTable> = std::sync::LazyLock::new(Default::default);
+
+fn is_pending(slot: &(String, String), record: &Arc<ResponseStateRow>) -> bool {
+    crate::sync::lock(&PENDING)
+        .get(slot)
+        .is_some_and(|current| Arc::ptr_eq(current, record))
+}
+
+fn pending_state(group_id: &str, gateway_id: &str) -> Option<ResponseStateRow> {
+    crate::sync::lock(&PENDING)
+        .get(&(group_id.to_string(), gateway_id.to_string()))
+        .map(|row| ResponseStateRow::clone(row))
+}
+
+/// 从内存表里撤掉一条记录；落库中的写入会在完成后补删。
+pub fn forget_pending(group_id: &str, gateway_id: &str) {
+    crate::sync::lock(&PENDING).remove(&(group_id.to_string(), gateway_id.to_string()));
 }
 
 /// 供测试与转发路径使用的辅助：中间格式请求里的最后一条用户消息文本。

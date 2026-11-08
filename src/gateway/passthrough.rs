@@ -103,7 +103,7 @@ const MAX_KEY_SWITCHES_PER_TARGET: usize = 3;
 /// 排队等待，与账号层的 §13.6 完全一致；只有一把可用的 Key 都没有时才算这个
 /// 候选不合格。
 enum Picked {
-    Ready(Option<Arc<crate::credential::Credential>>),
+    Ready(Arc<crate::credential::Credential>),
     /// 账号里所有 Key 都只是忙——等一会儿就有名额。
     Busy,
     /// 绑定/钉住的那把 Key 只是忙：应当**等它**，而不是换一把别的。
@@ -502,6 +502,53 @@ struct Prepared {
     degraded: Vec<String>,
 }
 
+/// 强绑定的目标不在计划的最高层里、但只是"忙"时，返回这一轮要等多久。
+///
+/// "忙"指 429 + `Retry-After` 的冷却或半开名额被占（§10.2"忙不属于失效"）。
+/// 只在三个条件同时成立时等待，否则返回 `None` 走原逻辑（清绑定、重新抽签）：
+///
+/// * 目标的优先级不低于当前最高合格层——粘性绝不跨层（§9.5）；
+/// * 剩余冷却在这次请求的粘性等待预算之内；
+/// * 截止时间之前还等得起。
+fn sticky_busy_wait(
+    forward: &Forward<'_>,
+    plan: &routing::Plan,
+    target_id: &str,
+    budget: Duration,
+    started: Instant,
+) -> Option<Duration> {
+    if routing::binding_target(plan, target_id, true).is_some() {
+        return None;
+    }
+    let target = forward
+        .group
+        .find_model(&forward.logical_model)?
+        .targets
+        .iter()
+        .find(|target| target.target.id == target_id)?;
+    if plan
+        .layers
+        .first()
+        .is_some_and(|layer| target.priority < layer.priority)
+    {
+        return None;
+    }
+    let remaining = forward
+        .state
+        .runtime
+        .health
+        .target(target_id)
+        .sticky_busy_wait(tokio::time::Instant::now())?;
+    let left = budget.saturating_sub(started.elapsed());
+    // 半开被占时没有确切时长，按限流同样的短间隔轮询试运行的结果。
+    let wait = if remaining.is_zero() {
+        RATE_POLL_INTERVAL.min(left)
+    } else {
+        remaining + RETRY_AFTER_MARGIN
+    };
+    (!left.is_zero() && wait <= left).then_some(wait)
+}
+
 /// 三级门限：账号总额度 → Key 覆盖 → 目标覆盖（§4.2.1）。
 fn admission_limits(
     candidate: &routing::Candidate,
@@ -711,34 +758,72 @@ async fn forward_inner<'a>(
     // 等冷却期间同样占一个分组排队名额：它也是"在等"，§13.6 的容量上限对
     // 它一样适用，否则容量收紧后这里会绕开闸门堆起无界的等待请求。
     let mut recovery_ticket: Option<queue::QueueTicket> = None;
+    // 强绑定的目标只是"忙"（429 冷却或半开被占）时，粘性请求按 §10.3 原地等，
+    // 而不是看它不在计划里就清绑定。预算与下面第一步的粘性等待同一口径。
+    let sticky_busy_budget = existing
+        .as_ref()
+        .filter(|_| !soft)
+        .map(|binding| sticky::wait_budget(forward.request_bytes, now_unix - binding.last_used_at))
+        .unwrap_or_default();
+    let sticky_busy_started = Instant::now();
     let plan = loop {
-        match routing::plan(
-            forward.group,
-            &forward.logical_model,
-            &context,
-            // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
-            soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
-                .flatten(),
-            &mut score::random_unit,
-        ) {
-            Ok(plan) => break plan,
-            Err(failure) => {
-                // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
-                // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
-                // 与"网关挂了"在事后看起来一模一样（§24.1）。
-                walk.telemetry.filter_summary = failure.filter_summary();
-                walk.telemetry.filter_details = failure.filter_details();
-                let Some(wait) = failure.wait else {
-                    return walk.fail(failure.code, failure.message);
-                };
-                if !walk.await_recovery(wait, &mut recovery_ticket).await {
-                    return walk.fail(failure.code, failure.message);
+        let plan = loop {
+            match routing::plan(
+                forward.group,
+                &forward.logical_model,
+                &context,
+                // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
+                soft.then(|| existing.as_ref().map(|binding| binding.target_id.as_str()))
+                    .flatten(),
+                &mut score::random_unit,
+            ) {
+                Ok(plan) => break plan,
+                Err(failure) => {
+                    // 这里没有 `Plan` 可读，但"为什么一个目标都不合格"恰恰是这次请求
+                    // 唯一有价值的诊断：不写下去，库里就只剩一句"没有可用的调度目标"，
+                    // 与"网关挂了"在事后看起来一模一样（§24.1）。
+                    walk.telemetry.filter_summary = failure.filter_summary();
+                    walk.telemetry.filter_details = failure.filter_details();
+                    let Some(wait) = failure.wait else {
+                        return walk.fail(failure.code, failure.message);
+                    };
+                    if !walk.await_recovery(wait, &mut recovery_ticket).await {
+                        return walk.fail(failure.code, failure.message);
+                    }
                 }
             }
+        };
+        let busy_wait = existing.as_ref().filter(|_| !soft).and_then(|binding| {
+            sticky_busy_wait(
+                &forward,
+                &plan,
+                &binding.target_id,
+                sticky_busy_budget,
+                sticky_busy_started,
+            )
+        });
+        let Some(wait) = busy_wait else {
+            break plan;
+        };
+        if !walk.await_sticky_busy(wait, &mut recovery_ticket).await {
+            break plan;
         }
     };
     // 计划成立，排队的名额立刻还回去：接下来的游走有自己的准入与排队路径。
     drop(recovery_ticket);
+    let mut plan = plan;
+    // 只能原生转发的端点：层内先试首选协议天然提供这条路由的账号，减少白撞
+    // 404。只在层内重排，绝不跨层（§9.2）。
+    if forward.endpoint.is_native_only() {
+        for layer in &mut plan.layers {
+            layer.candidates.sort_by_key(|candidate| {
+                !endpoints::serves_natively(
+                    candidate.target.account.preferred_protocol,
+                    forward.endpoint,
+                )
+            });
+        }
+    }
     walk.telemetry.cheapest = plan.cheapest;
     walk.telemetry.dearest = plan.dearest;
     walk.telemetry.filter_summary = Some(plan.filter_summary());
@@ -891,6 +976,44 @@ async fn forward_inner<'a>(
         }
     }
 
+    // 第一步（响应链）：上一轮落在哪个账号，这一轮就先争取它（§15.2）。
+    //
+    // 响应链的粘性键取自本轮的 `previous_response_id`，每一轮都换，绑定表永远
+    // 命中不了；同层权重相同时每轮都会随机落号——要么整段历史重放（缓存全丢），
+    // 要么 store:false 直接 `response_state_expired`。状态库里记着原账号，
+    // 这里把它当强绑定：只在当前最高合格层里找，绝不跨层（§9.5）。
+    if let Some(pin) = forward.chain.pinned.as_ref()
+        && let Some(candidate) = plan.layers.first().and_then(|layer| {
+            layer
+                .candidates
+                .iter()
+                .find(|candidate| candidate.target.account.id == pin.account_id)
+        })
+        && !walk.already_tried(candidate, None)
+    {
+        walk.telemetry.sticky_hit = true;
+        walk.telemetry.sticky_wait.get_or_insert(Duration::ZERO);
+        let budget = sticky::wait_budget(forward.request_bytes, 0).min(
+            walk.queue_deadline
+                .saturating_duration_since(Instant::now()),
+        );
+        match walk
+            .wait_and_run(
+                &[candidate],
+                budget,
+                &sticky_key,
+                true,
+                pin.key_digest.as_deref(),
+                None,
+            )
+            .await
+        {
+            Flow::Done(response) => return response,
+            Flow::QueueFull => return walk.queue_full(),
+            Flow::Continue | Flow::Exhausted => {}
+        }
+    }
+
     // 第二步：逐层游走。层内先耗尽，再降层；层内全忙则在本层排队（§13.6）。
     for layer in &plan.layers {
         if walk.attempted.len() >= routing::MAX_TARGET_ATTEMPTS {
@@ -1022,9 +1145,9 @@ impl Walk<'_> {
                 ));
             }
             match self.select_credential(candidate, None, None, None) {
-                Picked::Ready(credential) => match self.try_admit(candidate, credential.as_ref()) {
+                Picked::Ready(key) => match self.try_admit(candidate, Some(&key)) {
                     Ok(admission) => {
-                        match self.run(candidate, admission, sticky_key, credential).await {
+                        match self.run(candidate, admission, sticky_key, Some(key)).await {
                             Flow::Continue => {}
                             other => return Err(other),
                         }
@@ -1089,7 +1212,7 @@ impl Walk<'_> {
             while index < pending.len() {
                 let candidate = pending[index];
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
+                    Picked::Ready(key) => Some(key),
                     // 忙：留在 pending 里，稍后按信号量唤醒再试。绑定那把忙
                     // 同样留在这里——下面的名额计算会只为它等。
                     Picked::Busy | Picked::BoundBusy(_) => {
@@ -1155,81 +1278,58 @@ impl Walk<'_> {
 
             // 并发名额靠信号量唤醒；RPM / TPM 窗口只会随时间推移释放，没有可
             // 等的信号，只能按短间隔轮询。
-            let rate_limited = pending.iter().any(|candidate| {
-                let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
-                    // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
-                    // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
-                    // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
-                    Picked::BoundBusy(key) => Some(key),
-                    Picked::Busy | Picked::Unavailable(_) => None,
-                };
-                matches!(
-                    self.check(candidate, credential.as_ref()),
-                    Err(health::Unavailable::RateLimited)
-                )
-            });
-            let slice = if rate_limited {
+            //
+            // 限流中的候选**不进**信号量等待：它的并发名额多半是空的，`acquire`
+            // 立刻返回，重新准入又被限流拒绝，循环就成了不让出线程的忙等，把一个
+            // tokio worker 钉死到窗口释放或截止时间。没有任何可等信号量时同理，
+            // 只能睡一个轮询间隔。
+            let rate_limited: Vec<bool> = pending
+                .iter()
+                .map(|candidate| {
+                    let credential =
+                        match self.select_credential(candidate, pinned, preferred, None) {
+                            Picked::Ready(key) => Some(key),
+                            // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
+                            // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
+                            // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
+                            Picked::BoundBusy(key) => Some(key),
+                            Picked::Busy | Picked::Unavailable(_) => None,
+                        };
+                    matches!(
+                        self.check(candidate, credential.as_ref()),
+                        Err(health::Unavailable::RateLimited)
+                    )
+                })
+                .collect();
+            let slice = if rate_limited.iter().any(|limited| *limited) {
                 remaining.min(RATE_POLL_INTERVAL)
             } else {
                 remaining
             };
-            let capacities: Vec<_> = pending
-                .iter()
-                .map(|candidate| {
-                    let caller = health::Caller {
-                        account_id: &candidate.target.account.id,
-                        key_id: None,
-                        target_id: &candidate.target.target.id,
-                    };
-                    match self.select_credential(candidate, pinned, preferred, None) {
-                        Picked::Ready(credential) => {
-                            let caller = health::Caller {
-                                // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
-                                // 用 `credential_id(account_id, digest)` 归类 Key 状态，
-                                // 传行 ID 会另开一份永远匹配不上的"影子状态"——
-                                // 排队等的是影子，真正那把 Key 的名额照样被占着。
-                                key_id: credential
-                                    .as_ref()
-                                    .map(|key| key.credential_digest.as_str()),
-                                ..caller
-                            };
-                            self.forward
-                                .state
-                                .runtime
-                                .health
-                                .capacity(caller, admission_limits(candidate, credential.as_ref()))
-                        }
-                        // 绑定的那把忙：**只等它**。等"任意一把"会在唤醒后
-                        // 重新抽签落到别的 Key 上，上游按凭据隔离的前缀缓存
-                        // 照样作废——这正是要修的病（§2.2 的不变量 B）。
-                        Picked::BoundBusy(key) => {
-                            let caller = health::Caller {
-                                key_id: Some(key.credential_digest.as_str()),
-                                ..caller
-                            };
-                            self.forward
-                                .state
-                                .runtime
-                                .health
-                                .capacity(caller, admission_limits(candidate, Some(&key)))
-                        }
-                        // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
-                        // 否则"两把都满"会等一个永远不会到来的唤醒。
-                        Picked::Busy | Picked::Unavailable(_) => {
-                            let pool = self.forward.state.runtime.credentials.current();
-                            self.forward.state.runtime.health.capacity_any_key(
-                                caller,
-                                admission_limits(candidate, None),
-                                pool.keys_of(&candidate.target.account.id),
-                            )
-                        }
-                    }
-                })
-                .collect();
-
+            let mut waitable: Vec<usize> = Vec::new();
+            let mut capacities: Vec<health::Capacity> = Vec::new();
+            for (index, candidate) in pending.iter().enumerate() {
+                if rate_limited[index] {
+                    continue;
+                }
+                let capacity = self.wait_capacity(candidate, pinned, preferred);
+                if capacity.is_unbounded() {
+                    continue;
+                }
+                waitable.push(index);
+                capacities.push(capacity);
+            }
             let waited = Instant::now();
-            let outcome = queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await;
+            let outcome = if capacities.is_empty() {
+                queue::sleep_unless_shutdown(remaining.min(RATE_POLL_INTERVAL), &mut shutdown).await
+            } else {
+                match queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await {
+                    queue::CapacityWaitOutcome::Ready(index, permit) => {
+                        queue::CapacityWaitOutcome::Ready(waitable[index], permit)
+                    }
+                    other => other,
+                }
+            };
 
             let elapsed = waited.elapsed();
             // 粘性路径上的等待记到 sticky_wait，其余记到普通排队（§6.6、§24.1）。
@@ -1252,7 +1352,7 @@ impl Walk<'_> {
                 // 被唤醒后重新选一次 Key 并做完整终检：等待期间倍率、配置或
                 // Key 的健康状态都可能已经变了（§13.6）。
                 let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
+                    Picked::Ready(key) => Some(key),
                     // 忙：名额已经到手，先还回去，回到等待循环。绑定那把忙也
                     // 一样——唤醒的是**它的**名额，拿到手就能直接用它。
                     Picked::Busy | Picked::BoundBusy(_) => continue,
@@ -1299,6 +1399,57 @@ impl Walk<'_> {
         }
     }
 
+    /// 排队时这个候选要等的并发名额。
+    fn wait_capacity(
+        &self,
+        candidate: &routing::Candidate,
+        pinned: Option<&str>,
+        preferred: Option<&str>,
+    ) -> health::Capacity {
+        let caller = health::Caller {
+            account_id: &candidate.target.account.id,
+            key_id: None,
+            target_id: &candidate.target.target.id,
+        };
+        let health = &self.forward.state.runtime.health;
+        match self.select_credential(candidate, pinned, preferred, None) {
+            Picked::Ready(key) => {
+                let credential = Some(key);
+                let caller = health::Caller {
+                    // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
+                    // 用 `credential_id(account_id, digest)` 归类 Key 状态，
+                    // 传行 ID 会另开一份永远匹配不上的"影子状态"——
+                    // 排队等的是影子，真正那把 Key 的名额照样被占着。
+                    key_id: credential
+                        .as_ref()
+                        .map(|key| key.credential_digest.as_str()),
+                    ..caller
+                };
+                health.capacity(caller, admission_limits(candidate, credential.as_ref()))
+            }
+            // 绑定的那把忙：**只等它**。等"任意一把"会在唤醒后
+            // 重新抽签落到别的 Key 上，上游按凭据隔离的前缀缓存
+            // 照样作废——这正是要修的病（§2.2 的不变量 B）。
+            Picked::BoundBusy(key) => {
+                let caller = health::Caller {
+                    key_id: Some(key.credential_digest.as_str()),
+                    ..caller
+                };
+                health.capacity(caller, admission_limits(candidate, Some(&key)))
+            }
+            // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
+            // 否则"两把都满"会等一个永远不会到来的唤醒。
+            Picked::Busy | Picked::Unavailable(_) => {
+                let pool = self.forward.state.runtime.credentials.current();
+                health.capacity_any_key(
+                    caller,
+                    admission_limits(candidate, None),
+                    pool.keys_of(&candidate.target.account.id),
+                )
+            }
+        }
+    }
+
     /// 选出这次调用要用的 Key（§4.2.1）。
     ///
     /// `pinned` 是响应链钉住的凭据摘要（最强约束）；`sticky` 是"已经有并发名额、
@@ -1320,10 +1471,10 @@ impl Walk<'_> {
         // 失效了（§13.6、§17.1）。Key 级由下面的 reconcile_and_check 负责。
         health
             .account(&account.id)
-            .reconcile_capacity(account.limits.max_concurrency);
+            .apply_configured_concurrency(account.limits.max_concurrency);
         health
             .target(&candidate.target.target.id)
-            .reconcile_capacity(candidate.target.target.limits.max_concurrency);
+            .apply_configured_concurrency(candidate.target.target.limits.max_concurrency);
         // Key 状态的时钟是 tokio 的：测试用 `tokio::time::pause` 精确推进冷却。
         let now = tokio::time::Instant::now();
         // 软亲和在这里统一生效：调用方不必各自传递。它只是一条**偏好**，
@@ -1348,7 +1499,7 @@ impl Walk<'_> {
             &mut score::random_unit,
         );
         match choice {
-            crate::credential::KeyChoice::Ready(Some(key)) => Picked::Ready(Some(Arc::clone(key))),
+            crate::credential::KeyChoice::Ready(Some(key)) => Picked::Ready(Arc::clone(key)),
             crate::credential::KeyChoice::Ready(None) => Picked::Unavailable(format!(
                 "账号「{}」没有可用的 API Key（可能未配置、已停用或已全部失效）",
                 account.name
@@ -1465,7 +1616,7 @@ impl Walk<'_> {
         // 不构成 KeyInvalid），但这一次调用已经用它打失败过（§4.2.1）。
         let picked = self.select_credential(candidate, None, None, just_failed);
         match picked {
-            Picked::Ready(Some(next)) => Some(next),
+            Picked::Ready(next) => Some(next),
             _ => None,
         }
     }
@@ -2071,35 +2222,29 @@ impl Walk<'_> {
                             upstream_status = status.as_u16(),
                             "本次请求的端点被拒绝，尝试其他可表达的端点"
                         );
-                        // 辅助端点（count_tokens / compact / input_tokens）没有
-                        // 转换备胎：上游确实没有这条路由时，按 §15.4 明确告诉
-                        // 客户端不支持，而不是报一个可重试的 503 让它反复重试。
+                        // 辅助端点（count_tokens / compact / input_tokens / 图片）没有
+                        // 转换备胎：这个目标确实没有这条路由。只排除**这个候选**、
+                        // 换下一个——别的账号可能有（§15.4）。全部候选都没有时，
+                        // 最后一次失败的 unsupported_parameter 如实告诉客户端。
                         if self.forward.endpoint.is_native_only() {
-                            // 端点走错了是**本次尝试**的失败，不是请求本身的：
-                            // 但辅助端点没有转换备胎，只能如实告诉客户端。
-                            tracing::warn!(
+                            tracing::info!(
                                 request_id = self.forward.request_id,
                                 account = candidate.target.account.name,
                                 model = candidate.target.target.upstream_model,
                                 endpoint = self.forward.endpoint.path(),
                                 upstream_status = status.as_u16(),
-                                "辅助端点在当前目标上不存在，且没有可转换的备胎"
+                                "辅助端点在当前目标上不存在，换下一个候选"
                             );
-                            return Err(AttemptFailure::Terminal(
-                                Box::new(
-                                    GatewayError::new(
-                                        ErrorCode::UnsupportedParameter,
-                                        format!(
-                                            "当前模型不支持 /{} 端点",
-                                            self.forward.endpoint.path()
-                                        ),
-                                    )
-                                    .with_protocol(self.forward.endpoint.protocol())
-                                    .with_request_id(self.forward.request_id)
-                                    .into_response(),
+                            return Err(AttemptFailure::Switchable {
+                                code: ErrorCode::UnsupportedParameter,
+                                message: format!(
+                                    "当前模型不支持 /{} 端点",
+                                    self.forward.endpoint.path()
                                 ),
-                                Some(status),
-                            ));
+                                upstream_status: Some(status),
+                                retry_after: None,
+                                upstream_body: Some(body),
+                            });
                         }
                         let detail = upstream_error_message(&body)
                             .map(|message| format!("：{message}"))
@@ -2286,6 +2431,13 @@ impl Walk<'_> {
             degraded = emitted.degraded.clone();
             emitted.body.clone()
         };
+        // 同协议透传不经过转换器，别的渠道留下的不可重放状态要在这里摘掉。
+        if downstream == target_protocol && strip_foreign_replay_state(&mut body, downstream) {
+            let capability = "thinking".to_string();
+            if !degraded.contains(&capability) {
+                degraded.push(capability);
+            }
+        }
         rewrite_model(&mut body, &candidate.target.target.upstream_model);
         // 逻辑模型名常常只是一个别名，发射时按它猜出来的思考契约可能与真正要
         // 发出去的上游模型不一致。这里按上游模型名再对齐一次：新模型不接受
@@ -2370,6 +2522,34 @@ impl Walk<'_> {
         tokio::time::sleep(wait + RETRY_AFTER_MARGIN).await;
         self.telemetry.queued += waited.elapsed();
         true
+    }
+
+    /// 粘性绑定的目标只是"忙"时原地等一段（§10.3）。等待记到 sticky_wait。
+    ///
+    /// 与 `await_recovery` 一样占一个分组排队名额；容量为 0 或已满、或正在关闭
+    /// 时返回 false，调用方放弃等待、按原逻辑处理绑定。
+    async fn await_sticky_busy(
+        &mut self,
+        wait: Duration,
+        ticket: &mut Option<queue::QueueTicket>,
+    ) -> bool {
+        if self.forward.state.runtime.is_shutting_down()
+            || Instant::now() + wait > self.queue_deadline.min(self.deadline)
+        {
+            return false;
+        }
+        if ticket.is_none() {
+            match self.enter_queue() {
+                Some(entered) => *ticket = Some(entered),
+                None => return false,
+            }
+        }
+        let mut shutdown = self.forward.state.runtime.subscribe_shutdown();
+        let waited = Instant::now();
+        let outcome = queue::sleep_unless_shutdown(wait, &mut shutdown).await;
+        let total = self.telemetry.sticky_wait.unwrap_or_default() + waited.elapsed();
+        self.telemetry.sticky_wait = Some(total);
+        !matches!(outcome, queue::CapacityWaitOutcome::ShuttingDown)
     }
 
     /// 最后一次失败若是带 `Retry-After` 的 429，且等得起，就返回要等多久。
@@ -2846,6 +3026,9 @@ fn classify_outcome(
             // 目标本身不可用（熔断、限流）不该再算一次故障：状态机刚刚才因为
             // 它拒绝过这次请求，重复计数只会让冷却无谓地翻倍。
             ErrorCode::RateLimited | ErrorCode::MultiplierExceeded => health::Outcome::Neutral,
+            // 响应链落到了没有状态的目标上：是调度落点的问题，不是目标坏了，
+            // 扣它的可靠性只会冤枉一个健康账号（§15.2）。
+            ErrorCode::ResponseStateExpired => health::Outcome::Neutral,
             _ => health::Outcome::Fault,
         },
     }
@@ -2856,6 +3039,8 @@ pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
         health::Unavailable::RateLimited | health::Unavailable::ConcurrencyFull => {
             ErrorCode::RateLimited
         }
+        // 请求本身太大，换到哪个窗口都装不下：不可重试（§17.2）。
+        health::Unavailable::ExceedsTokenLimit => ErrorCode::RequestTooLarge,
         _ => ErrorCode::UpstreamExhausted,
     }
 }
@@ -2921,12 +3106,13 @@ async fn attempt_inner(
             )
         })?;
 
-    let api_key = match credential {
-        Some(credential) => credential.secret.to_string(),
-        None => load_api_key(forward.state, &account.id)
-            .await
-            .map_err(|message| AttemptFailure::switchable(ErrorCode::InternalError, message))?,
+    let Some(credential) = credential else {
+        return Err(AttemptFailure::switchable(
+            ErrorCode::InternalError,
+            format!("账号「{}」没有选定可用的 API Key", account.name),
+        ));
     };
+    let api_key = credential.secret.to_string();
     // 请求头按**上游端点**的协议构造，与下游用哪个协议进来无关（§14.7）。
     // 原始 multipart 路径必须保留客户端的 Content-Type（尤其是 boundary），
     // 不能让普通 JSON 头覆盖它。
@@ -3095,12 +3281,18 @@ async fn attempt_inner(
             status,
             headers_wait,
             crate::security::redact::ErrorRedactor::new(&account.name, &account.base_url, &api_key),
-            credential,
+            Some(credential),
         )
         .await
     } else {
         commit_body(
-            forward, target, prepared, response, status, sent_at, credential,
+            forward,
+            target,
+            prepared,
+            response,
+            status,
+            sent_at,
+            Some(credential),
         )
         .await
     }
@@ -3156,8 +3348,8 @@ async fn commit_stream(
                 None,
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::MemoryOnly,
+            );
             Some(StreamStateSeed {
                 gateway_id: gateway,
                 upstream_id: None,
@@ -3169,49 +3361,90 @@ async fn commit_stream(
         let responses_id = stream_state.as_ref().map(|seed| seed.gateway_id.clone());
         // 先建好收集器：它一路走到结算，记录里就能看见"这次流丢了什么"（§14.8）。
         let degraded = translate::degradation_sink();
-        return match translate::commit_stream(translate::StreamRequest {
-            upstream: upstream_protocol,
-            downstream,
-            include_usage: true,
-            account: &target.account.name,
-            response,
-            responses_id,
-            request_id: forward.request_id,
-            // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
-            degraded: degraded.clone(),
-            redactor: redactor.clone(),
-        })
-        .await
-        {
-            Ok(committed) => Ok(Success {
+        // 转换器要等到首个语义事件才交出响应体。宽限期内照旧等它（期内失败
+        // 仍可换号）；过了宽限期就先交出响应头、改发心跳，避免 CDN 524（§13.4）。
+        let started = Instant::now();
+        let account_name = target.account.name.clone();
+        let owned_request_id = forward.request_id.to_string();
+        let sink = degraded.clone();
+        let stream_redactor = redactor.clone();
+        let mut committing = Box::pin(async move {
+            translate::commit_stream(translate::StreamRequest {
+                upstream: upstream_protocol,
+                downstream,
+                include_usage: true,
+                account: &account_name,
+                response,
+                responses_id,
+                request_id: &owned_request_id,
+                // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
+                degraded: sink,
+                redactor: stream_redactor,
+            })
+            .await
+        });
+        let grace = tokio::time::Instant::now() + forward.state.settings.get().first_content_grace;
+        let (body, first_token, first_content) =
+            match tokio::time::timeout_at(grace, committing.as_mut()).await {
+                Ok(Ok(committed)) => (committed.body, Some(committed.first_token), None),
+                Ok(Err(failure)) => {
+                    // 这次尝试作废：骨架记录跟着撤掉，换号后会用新的网关 ID。
+                    if let Some(seed) = &stream_state {
+                        responses::forget_pending(&forward.chain.group_id, &seed.gateway_id);
+                    }
+                    return Err(AttemptFailure::switchable(failure.code, failure.message)
+                        .with_status(status));
+                }
+                Err(_elapsed) => {
+                    let request_id = forward.request_id.to_string();
+                    let ready = async move {
+                        committing
+                            .await
+                            .map(|committed| committed.body)
+                            .map_err(|failure| {
+                                crate::protocol::stream_error(
+                                    downstream,
+                                    failure.code,
+                                    &failure.message,
+                                    Some(&request_id),
+                                )
+                            })
+                    };
+                    let clock = stream::first_content_clock();
+                    let body = stream::keep_alive_until_ready(
+                        ready,
+                        forward.state.settings.get().keep_alive_interval,
+                        clock.clone(),
+                        headers_wait + started.elapsed(),
+                    );
+                    (body, None, Some(clock))
+                }
+            };
+        return Ok(Success {
+            status,
+            streamed: true,
+            response: build_response(
+                forward,
                 status,
-                streamed: true,
-                response: build_response(
-                    forward,
-                    status,
-                    &headers,
-                    prepared,
-                    crate::gateway::error::private_stream(
-                        committed.body,
-                        downstream,
-                        forward.request_id,
-                        redactor.clone(),
-                    ),
+                &headers,
+                prepared,
+                crate::gateway::error::private_stream(
+                    body,
+                    downstream,
+                    forward.request_id,
+                    redactor.clone(),
                 ),
-                first_token: Some(committed.first_token),
-                first_byte: Some(headers_wait + committed.first_token),
-                first_content: None,
-                output_tokens: None,
-                usage_tokens: None,
-                usage_parts: (None, None),
-                usage_detail: None,
-                stream_state,
-                degraded: Some(degraded),
-            }),
-            Err(failure) => {
-                Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
-            }
-        };
+            ),
+            first_token,
+            first_byte: Some(headers_wait + first_token.unwrap_or_else(|| started.elapsed())),
+            first_content,
+            output_tokens: None,
+            usage_tokens: None,
+            usage_parts: (None, None),
+            usage_detail: None,
+            stream_state,
+            degraded: Some(degraded),
+        });
     }
 
     // Responses 入口的流式响应：网关 ID 必须在第一个字节下发前就定下来，
@@ -3223,8 +3456,68 @@ async fn commit_stream(
         let mut sniffer = stream::Sniffer::new(downstream);
         let mut upstream_id: Option<String> = None;
         let gateway;
+        let grace = tokio::time::Instant::now() + forward.state.settings.get().first_content_grace;
         loop {
-            match response.chunk().await {
+            // 宽限期只在已经拿到上游 ID 之后生效：骨架记录与续链都要靠它。上游
+            // 的 `response.created` 总是第一帧，实际上不会卡在这一步。
+            let next = if upstream_id.is_some() {
+                match tokio::time::timeout_at(grace, response.chunk()).await {
+                    Ok(next) => next,
+                    Err(_elapsed) => {
+                        let gateway = responses::gateway_id();
+                        record_response_state(
+                            forward,
+                            target,
+                            prepared,
+                            &gateway,
+                            &serde_json::json!({"id": upstream_id}),
+                            None,
+                            upstream_protocol,
+                            credential,
+                            responses::Durability::MemoryOnly,
+                        );
+                        let clock = stream::first_content_clock();
+                        let body = stream::keep_alive_until_ready(
+                            responses_ready(
+                                response,
+                                sniffer,
+                                gateway.clone(),
+                                forward.request_id.to_string(),
+                            ),
+                            forward.state.settings.get().keep_alive_interval,
+                            clock.clone(),
+                            headers_wait + started.elapsed(),
+                        );
+                        let body = crate::gateway::error::private_stream(
+                            body,
+                            downstream,
+                            forward.request_id,
+                            redactor.clone(),
+                        );
+                        return Ok(Success {
+                            status,
+                            streamed: true,
+                            response: build_response(forward, status, &headers, prepared, body),
+                            first_token: None,
+                            first_byte: Some(headers_wait + started.elapsed()),
+                            first_content: Some(clock),
+                            output_tokens: None,
+                            usage_tokens: None,
+                            usage_parts: (None, None),
+                            usage_detail: None,
+                            stream_state: Some(StreamStateSeed {
+                                gateway_id: gateway,
+                                upstream_id,
+                                endpoint: prepared.endpoint.as_str().to_string(),
+                            }),
+                            degraded: None,
+                        });
+                    }
+                }
+            } else {
+                response.chunk().await
+            };
+            match next {
                 Ok(Some(chunk)) => {
                     if upstream_id.is_none() {
                         upstream_id = stream::first_response_id(&chunk);
@@ -3252,8 +3545,8 @@ async fn commit_stream(
                                 None,
                                 upstream_protocol,
                                 credential,
-                            )
-                            .await;
+                                responses::Durability::MemoryOnly,
+                            );
                             let body = translate::passthrough_responses_stream(
                                 prefix,
                                 response,
@@ -3453,6 +3746,47 @@ async fn commit_stream(
     }
 }
 
+/// 宽限期过后继续嗅探 Responses 上游，直到首个语义事件，再交出改写 ID 的
+/// 响应体；首个语义事件之前失败只能按流内错误帧收尾（响应头已经发出）。
+async fn responses_ready(
+    mut response: reqwest::Response,
+    mut sniffer: stream::Sniffer,
+    gateway: String,
+    request_id: String,
+) -> Result<Body, axum::body::Bytes> {
+    let failed = |code: ErrorCode, message: &str| {
+        crate::protocol::stream_error(Protocol::OpenAiResponses, code, message, Some(&request_id))
+    };
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => match sniffer.push(&chunk) {
+                stream::Verdict::Pending => continue,
+                stream::Verdict::Semantic => {
+                    return Ok(translate::passthrough_responses_stream(
+                        sniffer.take_buffer(),
+                        response,
+                        &gateway,
+                        &request_id,
+                    ));
+                }
+                stream::Verdict::Error(message) => {
+                    return Err(failed(
+                        ErrorCode::UpstreamProtocolError,
+                        &format!("上游流式响应报错：{message}"),
+                    ));
+                }
+            },
+            Ok(None) => {
+                return Err(failed(
+                    ErrorCode::UpstreamProtocolError,
+                    "上游流式响应在产生内容前就结束",
+                ));
+            }
+            Err(_) => return Err(failed(ErrorCode::UpstreamExhausted, "上游流式响应中断")),
+        }
+    }
+}
+
 /// 非流式响应整体缓冲。
 ///
 /// 非流式响应本来就是一个 JSON 对象，逐块转发没有意义；整体读回来反而能识别
@@ -3541,8 +3875,8 @@ async fn commit_body(
                 Some(&value),
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::Persist,
+            );
             Body::from(value.to_string())
         } else {
             Body::from(bytes)
@@ -3577,8 +3911,8 @@ async fn commit_body(
                 Some(&value),
                 upstream_protocol,
                 credential,
-            )
-            .await;
+                responses::Durability::Persist,
+            );
             Body::from(value.to_string())
         } else {
             Body::from(converted.to_string())
@@ -3610,11 +3944,12 @@ async fn commit_body(
 /// 保存一次 Responses 响应的状态链记录（§15.2）。
 ///
 /// `upstream_body` 是上游的原始响应：定位映射取它的 ID，可重放正文取入口
-/// 请求体加输出项。**在返回响应之前同步落库**：客户端拿到响应 ID 后可能
-/// 立刻引用它，晚一步写入就会出现竞态。写失败只记日志——状态链是增强
-/// 能力，不能让它影响主流程。
+/// 请求体加输出项。客户端拿到响应 ID 后可能立刻引用它，所以记录在返回响应
+/// 之前就**同步放进内存表**、查询优先看它；落库在后台进行，热路径不等
+/// SQLite（§28）。流式响应只放骨架（`MemoryOnly`），流结束时由结算改写成
+/// 完整记录落库或删除。写失败只记日志——状态链是增强能力，不能影响主流程。
 #[allow(clippy::too_many_arguments)]
-async fn record_response_state(
+fn record_response_state(
     forward: &Forward<'_>,
     target: &Arc<TargetView>,
     prepared: &Prepared,
@@ -3625,6 +3960,7 @@ async fn record_response_state(
     // 创建这条响应用的那把 Key（§4.2.1 的不变量 A、§15.1）。上游的
     // `resp_xxx` 按凭据隔离，续写与生命周期代理必须回到同一把 Key。
     credential: Option<&Arc<crate::credential::Credential>>,
+    durability: responses::Durability,
 ) {
     // 只有上游本身是 Responses 时才有可续链的上游 ID；跨协议转来的响应
     // 没有原生 Responses ID，续链只能靠保存的正文。
@@ -3662,8 +3998,8 @@ async fn record_response_state(
         output_items.as_ref(),
         final_response,
         state.settings.get().response_state_days,
-    )
-    .await;
+        durability,
+    );
 }
 
 /// 异步生图任务定位记录的有效期（秒）。
@@ -3950,7 +4286,7 @@ async fn classify_upstream_error(
     // \`signature\` in \`thinking\` block`；同一份请求体两秒后在别的渠道 200。
     // 签名是**渠道的事实**，不是客户端的参数错误；400 在开始生成之前、没消耗
     // token，所以换一个渠道重试几乎免费（与无法归因的 400 同处置）。
-    if is_foreign_thinking_signature(status, &message) {
+    if is_foreign_replayed_state(status, &message) {
         tracing::warn!(
             request_id = forward.request_id,
             account = target.account.name,
@@ -4069,25 +4405,105 @@ fn is_session_unroutable(message: &str) -> bool {
     UNROUTABLE.iter().any(|needle| lower.contains(needle))
 }
 
-/// 上游说"这段历史里的思考块签名验不过"（§13.7 现场，2026-10-26）。
+/// 上游说"这段历史里有别的渠道签发的状态，我验不过"（§13.7 现场，2026-10-26）。
+///
+/// 三种形状：Anthropic 的签名验不过；Anthropic 的无签名思考块（外部上游的思考
+/// 被回放过来，`thinking.signature: Field required`）；OpenAI 的
+/// `encrypted content … could not be verified/decrypted`。
 ///
 /// thinking 块的签名由签发它的渠道给出，换一条渠道（尤其是 Claude Code Max 这
 /// 类把会话绑在自家订阅上的渠道）就验不过。上游把这件事说成字段错误
 /// （`messages.8.content.0: Invalid \`signature\` in \`thinking\` block`），
 /// 但同一份请求体换一个目标就能过，所以既不能当客户端的参数错误，也不能停下。
-fn is_foreign_thinking_signature(status: StatusCode, message: &str) -> bool {
+fn is_foreign_replayed_state(status: StatusCode, message: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
     let lower = message.to_ascii_lowercase();
-    // 必须同时带 "thinking"：`thinking.signature: Field required` 这类形状错误
-    // 是客户端少传了字段，换渠道不会变好。
-    lower.contains("signature")
-        && lower.contains("thinking")
-        && (lower.contains("invalid")
-            || lower.contains("not valid")
-            || lower.contains("mismatch")
-            || lower.contains("does not match"))
+    let encrypted = (lower.contains("encrypted content") || lower.contains("encrypted_content"))
+        && (lower.contains("could not be verified")
+            || lower.contains("could not be decrypted")
+            || lower.contains("verification failed"));
+    // 必须同时带 "thinking"：别的字段的 signature 错误与思考块无关。
+    encrypted
+        || (lower.contains("signature")
+            && lower.contains("thinking")
+            && (lower.contains("invalid")
+                || lower.contains("not valid")
+                || lower.contains("mismatch")
+                || lower.contains("does not match")
+                || lower.contains("field required")))
+}
+
+/// 摘掉请求历史里上游必然拒绝的思考状态，返回是否摘过（§14.8）。
+///
+/// * Anthropic：没有签名的 thinking 块，来自外部上游或转换；
+/// * Responses：没有 `encrypted_content` 的 reasoning 项，以及网关合成的
+///   `rs_resp_akh_` 项。
+fn strip_foreign_replay_state(body: &mut serde_json::Value, protocol: Protocol) -> bool {
+    match protocol {
+        Protocol::AnthropicMessages => {
+            let Some(messages) = body
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                return false;
+            };
+            let mut stripped = false;
+            for message in messages.iter_mut() {
+                let Some(content) = message
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let before = content.len();
+                content.retain(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) != Some("thinking")
+                        || block
+                            .get("signature")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|signature| !signature.is_empty())
+                });
+                stripped |= content.len() != before;
+            }
+            // 只有思考块的消息摘空后是非法的，整条移除。
+            if stripped {
+                messages.retain(|message| {
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|content| !content.is_empty())
+                });
+            }
+            stripped
+        }
+        Protocol::OpenAiResponses => {
+            let Some(items) = body
+                .get_mut("input")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                return false;
+            };
+            let before = items.len();
+            items.retain(|item| {
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+                    return true;
+                }
+                let synthetic = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.starts_with("rs_resp_akh_"));
+                let encrypted = item
+                    .get("encrypted_content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content| !content.is_empty());
+                encrypted && !synthetic
+            });
+            items.len() != before
+        }
+        Protocol::OpenAiChat => false,
+    }
 }
 
 fn is_content_filtered(status: StatusCode, message: &str) -> bool {
@@ -4335,6 +4751,7 @@ fn estimate_tokens(
     };
     let output = body
         .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
         .or_else(|| body.get("max_output_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
@@ -4360,24 +4777,6 @@ fn image_text_bytes(body: &serde_json::Value, raw: Option<&RawBody>) -> usize {
         .filter(|text| !text.starts_with("data:") && text.len() <= MAX_TOKEN_TEXT_BYTES)
         .map(str::len)
         .sum()
-}
-
-/// 兜底凭据来源：数据库里账号凭据信封的第一把 Key。
-///
-/// 常规路径不用它——凭据由 [`crate::credential::CredentialPool`] 在内存里
-/// 提供，这里只覆盖"快照尚未重建"的短暂窗口。错误信息里不能出现任何密钥材料。
-async fn load_api_key(state: &SharedState, account_id: &str) -> Result<String, String> {
-    let sealed = state
-        .store
-        .account_sealed_key(account_id)
-        .await
-        .map_err(|error| format!("读取账号凭据失败：{error}"))?
-        .ok_or_else(|| "账号缺少凭据记录".to_string())?;
-    let plaintext = state
-        .cipher
-        .open(&sealed)
-        .map_err(|error| format!("解密账号凭据失败：{error}"))?;
-    String::from_utf8(plaintext.to_vec()).map_err(|_| "账号凭据不是合法的 UTF-8 文本".to_string())
 }
 
 /// 从 reqwest 错误中提取安全描述，绝不包含完整 URL 或凭据。
@@ -4938,9 +5337,12 @@ mod tests {
             "messages.8.content.0: Invalid `signature` in `thinking` block",
             "messages.0.content.0: Invalid signature in thinking block",
             "thinking block signature does not match",
+            "messages.0.content.0.thinking.signature: Field required",
+            "The encrypted content for item rs_1 could not be verified.",
+            "encrypted_content could not be decrypted",
         ] {
             assert!(
-                is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                is_foreign_replayed_state(StatusCode::BAD_REQUEST, message),
                 "应当判为换渠道可过：{message}"
             );
         }
@@ -4951,16 +5353,15 @@ mod tests {
     fn a_thinking_shape_error_is_not_a_signature_rejection() {
         for message in [
             "thinking.type: unknown variant `enabled`, expected `adaptive` or `disabled`",
-            "messages.0.content.0.thinking.signature: Field required",
             "max_tokens: must be greater than thinking.budget_tokens",
         ] {
             assert!(
-                !is_foreign_thinking_signature(StatusCode::BAD_REQUEST, message),
+                !is_foreign_replayed_state(StatusCode::BAD_REQUEST, message),
                 "不该判为签名问题：{message}"
             );
         }
         // 只有 400 走这条路：别的状态码各有自己的处置。
-        assert!(!is_foreign_thinking_signature(
+        assert!(!is_foreign_replayed_state(
             StatusCode::UNPROCESSABLE_ENTITY,
             "messages.8.content.0: Invalid `signature` in `thinking` block"
         ));

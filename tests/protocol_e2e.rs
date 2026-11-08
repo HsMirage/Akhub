@@ -445,7 +445,15 @@ async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
             .state
             .runtime
             .health
-            .try_admit(caller, one_slot, 0)
+            .try_admit(
+                caller,
+                akhub::health::AdmissionLimits {
+                    account: one_slot,
+                    key: Default::default(),
+                    target: Default::default(),
+                },
+                0,
+            )
             .unwrap()
             .cancel_before_upstream();
         held.push(
@@ -453,7 +461,15 @@ async fn a_busy_lossless_target_is_not_bypassed_by_degraded_traffic() {
                 .state
                 .runtime
                 .health
-                .try_admit(caller, one_slot, 0)
+                .try_admit(
+                    caller,
+                    akhub::health::AdmissionLimits {
+                        account: one_slot,
+                        key: Default::default(),
+                        target: Default::default(),
+                    },
+                    0,
+                )
                 .unwrap(),
         );
     }

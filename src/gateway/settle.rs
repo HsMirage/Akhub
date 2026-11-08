@@ -353,24 +353,17 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     match finished {
         Some(finished) => {
             let output_items = finished.get("output").cloned();
-            let state = completion.state.clone();
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                tracing::warn!("流式结算时没有可用的异步运行时，状态链未补写");
-                return;
-            };
-            handle.spawn(async move {
-                responses::record_state(
-                    &state,
-                    &completion.chain,
-                    completion.pending,
-                    &completion.entry_body,
-                    completion.entry_protocol,
-                    output_items.as_ref(),
-                    Some(&finished),
-                    completion.retention_days,
-                )
-                .await;
-            });
+            responses::record_state(
+                &completion.state,
+                &completion.chain,
+                completion.pending,
+                &completion.entry_body,
+                completion.entry_protocol,
+                output_items.as_ref(),
+                Some(&finished),
+                completion.retention_days,
+                responses::Durability::Persist,
+            );
         }
         // 流失败、或者断开时连最终对象都没等到：删除骨架状态，后续引用会得到
         // 明确的过期错误，而不是缺了助手轮次却继续发送（§15.2）。
@@ -383,6 +376,7 @@ fn delete_state(completion: ResponsesCompletion) {
     let state = completion.state.clone();
     let gateway_id = completion.pending.gateway_id.clone();
     let group_id = completion.chain.group_id.clone();
+    responses::forget_pending(&group_id, &gateway_id);
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
