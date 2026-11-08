@@ -31,10 +31,6 @@ const BACKOFF: [Duration; 6] = [
 const JITTER_RATIO: f64 = 0.25;
 /// 一轮里同时打向上游的探针上限（§22：有界并发）。
 pub const MAX_CONCURRENT_PROBES: usize = 4;
-/// 判定系统性故障所需的最少样本。只有一个账号时"全失败"说明不了什么。
-const SYSTEMIC_MIN_ACCOUNTS: usize = 2;
-/// 系统性故障保护的持续时间。
-const SYSTEMIC_WINDOW: Duration = Duration::from_secs(3600);
 
 /// 每个账号的下一次刷新时刻与连续失败次数。
 ///
@@ -62,13 +58,13 @@ impl Scheduler {
     /// 挑出这一轮该刷新的自动来源账号。
     ///
     /// 手动来源直接跳过：它的状态永远是"已知"，探它没有任何意义（§11.2）。
+    /// 第一次见到的账号（进程刚启动或刚建号）立即到期：重启前的快照未经
+    /// 确认，再等一个完整间隔就是拿旧值赌几分钟。并发仍受
+    /// [`MAX_CONCURRENT_PROBES`] 约束，成功后的下一次按间隔加抖动摊开。
     pub fn due<'a>(&mut self, accounts: &'a [Account], now: Instant) -> Vec<&'a Account> {
         let mut due = Vec::new();
         for account in accounts.iter().filter(|a| a.multiplier_mode.is_automatic()) {
-            let at = *self
-                .due
-                .entry(account.id.clone())
-                .or_insert_with(|| now + jitter(&account.id, self.interval));
+            let at = *self.due.entry(account.id.clone()).or_insert(now);
             if at <= now {
                 due.push(account);
             }
@@ -118,20 +114,14 @@ fn jitter(account_id: &str, base: Duration) -> Duration {
     base + base.mul_f64(fraction)
 }
 
-/// 一轮刷新的结果，用于判定探针侧系统性故障并安排下一次刷新。
+/// 一轮刷新的结果，用于安排下一次刷新。系统性故障不按批次判定，见
+/// [`Registry::record_outcome`]。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RoundStats {
     pub attempted: usize,
     pub failed: usize,
     /// 每个账号这一轮是否刷新成功。
     pub outcomes: Vec<(String, bool)>,
-}
-
-impl RoundStats {
-    /// 超过半数账号在同一轮里失败 → 判定为探针侧故障而非上游集体改价。
-    fn is_systemic(&self) -> bool {
-        self.attempted >= SYSTEMIC_MIN_ACCOUNTS && self.failed * 2 > self.attempted
-    }
 }
 
 /// 刷新任务需要的全部依赖。
@@ -169,19 +159,6 @@ pub async fn run_round(context: &Context, accounts: &[&Account], now_unix: i64) 
             }
         }
     }
-
-    if stats.is_systemic() {
-        tracing::error!(
-            attempted = stats.attempted,
-            failed = stats.failed,
-            "超过半数账号倍率刷新失败，判定为探针侧系统性故障，宽限期统一延长"
-        );
-        context
-            .registry
-            .set_systemic_failure(now_unix + SYSTEMIC_WINDOW.as_secs() as i64);
-    } else if stats.attempted > 0 && stats.failed == 0 {
-        context.registry.clear_systemic_failure();
-    }
     stats
 }
 
@@ -206,6 +183,7 @@ async fn refresh_one(
             };
             persist(context, account, &entry, Status::Known).await;
             context.registry.put(&account.id, entry);
+            context.registry.record_outcome(&account.id, true, now_unix);
             Ok(reading)
         }
         Err(error) => {
@@ -234,6 +212,9 @@ async fn refresh_one(
             };
             persist(context, account, &entry, Status::Stale).await;
             context.registry.put(&account.id, entry);
+            context
+                .registry
+                .record_outcome(&account.id, false, now_unix);
             Err(error)
         }
     }
@@ -426,15 +407,7 @@ mod tests {
             account("manual", MultiplierMode::Manual),
             account("auto", MultiplierMode::Sub2Api),
         ];
-        tokio::time::advance(Duration::from_secs(3600)).await;
-        let due: Vec<_> = scheduler
-            .due(&accounts, Instant::now())
-            .iter()
-            .map(|a| a.id.clone())
-            .collect();
-        assert_eq!(due, Vec::<String>::new(), "首轮要等抖动过去");
-
-        tokio::time::advance(Duration::from_secs(400)).await;
+        // 首次见到的自动账号立即到期：重启前的快照不能再等一个间隔才确认。
         let due: Vec<_> = scheduler
             .due(&accounts, Instant::now())
             .iter()
@@ -495,21 +468,6 @@ mod tests {
             offsets.windows(2).any(|pair| pair[0] != pair[1]),
             "不同账号必须错开，否则抖动没有意义"
         );
-    }
-
-    #[test]
-    fn a_systemic_failure_needs_more_than_half_and_more_than_one_account() {
-        let stats = |attempted, failed| RoundStats {
-            attempted,
-            failed,
-            outcomes: Vec::new(),
-        };
-        assert!(
-            !stats(1, 1).is_systemic(),
-            "只有一个账号时全失败说明不了是谁的问题"
-        );
-        assert!(!stats(4, 2).is_systemic());
-        assert!(stats(4, 3).is_systemic());
     }
 
     #[test]

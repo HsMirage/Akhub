@@ -163,6 +163,7 @@ async fn multiplier_refresh(state: Weak<AppState>, handle: RefreshHandle) {
                 return;
             };
             scheduler.set_interval(interval);
+            state.runtime.multipliers.set_refresh_interval(interval);
             scheduler.retain(&accounts);
             scheduler.due(&accounts, now).into_iter().cloned().collect()
         };

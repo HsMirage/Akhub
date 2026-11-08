@@ -1418,7 +1418,8 @@ fn snapshot(
         source: MultiplierMode::Sub2Api,
         status: status.as_str().into(),
         observed_at: None,
-        refreshed_at: 0,
+        // 刚刷新过：超过一个刷新间隔的快照重启后不再被当作新鲜（§11.4）。
+        refreshed_at: akhub::storage::now_unix(),
         stale_since,
         last_error: None,
     }

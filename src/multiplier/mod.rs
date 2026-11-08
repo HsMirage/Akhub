@@ -8,8 +8,9 @@ pub mod probe;
 pub mod refresh;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
@@ -19,11 +20,20 @@ use crate::storage::store::MultiplierSnapshotRow;
 /// 按风险余量决定的宽限期（§11.4）。
 const GRACE_LOW_RISK: i64 = 60 * 60;
 const GRACE_MEDIUM_RISK: i64 = 15 * 60;
-/// 风险余量的两个分界：最后已知有效倍率占分组上限的比例。
-const LOW_RISK_RATIO: f64 = 0.60;
-const MEDIUM_RISK_RATIO: f64 = 0.90;
+/// 风险余量的两个分界：最后已知有效倍率占分组上限的百分比。
+///
+/// 用整数百分比与定点原值比较（§11.1）：浮点下 0.54 / 0.6 = 0.9000000000000001，
+/// 会把恰好落在 90% 分界上的账号从 15 分钟宽限误判成立即硬停。
+const LOW_RISK_PERCENT: i128 = 60;
+const MEDIUM_RISK_PERCENT: i128 = 90;
 /// 判定为"探针侧系统性故障"后统一使用的宽限期。
 const SYSTEMIC_GRACE: i64 = 60 * 60;
+/// 判定系统性故障所需的最少自动来源账号。只有一个账号时"全失败"说明不了什么。
+const SYSTEMIC_MIN_ACCOUNTS: usize = 2;
+/// 系统性故障保护每次续期的时长。
+const SYSTEMIC_WINDOW: i64 = 60 * 60;
+/// 进程启动、后台设置尚未下发时使用的刷新间隔，与设置默认值一致。
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 倍率的可用状态（§12.2 中与倍率相关的三种）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +221,12 @@ fn grace_for(effective: Multiplier, limit: Multiplier) -> i64 {
     if limit <= Multiplier::ZERO {
         return 0;
     }
-    let ratio = effective.to_f64() / limit.to_f64();
-    if ratio <= LOW_RISK_RATIO {
+    // effective / limit ≤ p%  ⇔  effective × 100 ≤ limit × p；i128 防溢出。
+    let scaled = i128::from(effective.raw()) * 100;
+    let limit = i128::from(limit.raw());
+    if scaled <= limit * LOW_RISK_PERCENT {
         GRACE_LOW_RISK
-    } else if ratio <= MEDIUM_RISK_RATIO {
+    } else if scaled <= limit * MEDIUM_RISK_PERCENT {
         GRACE_MEDIUM_RISK
     } else {
         // 余量不足 10%：任何一点上调都会越过红线，只能立即硬停。
@@ -226,6 +238,15 @@ fn grace_for(effective: Multiplier, limit: Multiplier) -> i64 {
 pub struct Registry {
     current: ArcSwap<HashMap<String, Entry>>,
     systemic_until: AtomicI64,
+    /// 每个自动来源账号**最近一次**刷新是否成功。
+    ///
+    /// 系统性故障按全部自动账号的最新结果判定，而不是按刷新任务的单个批次：
+    /// 账号带抖动与各自退避，一个 10 秒 tick 里通常只有一个到期账号，按批次
+    /// 永远凑不够"过半"；而某个批次碰巧全成功又会立刻解除保护，把 15 分钟
+    /// 宽限早已用完的账号瞬间硬停——正是 §11.4 要防的"自己把自己打死"。
+    outcomes: Mutex<HashMap<String, bool>>,
+    /// 当前的刷新间隔（秒），用于判断重启前的快照是否还新鲜。
+    refresh_interval: AtomicI64,
 }
 
 impl Default for Registry {
@@ -239,7 +260,15 @@ impl Registry {
         Self {
             current: ArcSwap::from_pointee(HashMap::new()),
             systemic_until: AtomicI64::new(0),
+            outcomes: Mutex::new(HashMap::new()),
+            refresh_interval: AtomicI64::new(DEFAULT_REFRESH_INTERVAL.as_secs() as i64),
         }
+    }
+
+    /// 刷新任务每轮同步一次后台配置的刷新间隔。
+    pub fn set_refresh_interval(&self, interval: Duration) {
+        self.refresh_interval
+            .store(interval.as_secs() as i64, Ordering::Release);
     }
 
     /// 热路径读取：一次原子指针读取（§19.4）。
@@ -254,41 +283,55 @@ impl Registry {
     ///
     /// 账号被删除或改回手动来源时，对应条目一并消失——留着一条永远不会再被
     /// 刷新的旧记录只会让后台显示假状态。
+    ///
+    /// 内存里已有、且与快照是同一次刷新结果的条目原样保留：快照不含峰值时段
+    /// 与分组，改一次配置就把它们丢掉会让峰值时段按平峰计价。只有内存里没有
+    /// 的（即重启后）才从快照恢复，并按 [`restored`] 的规则判断新鲜度。
     pub fn seed(&self, accounts: &[Account], snapshots: &[MultiplierSnapshotRow], now: i64) {
         let persisted: HashMap<&str, &MultiplierSnapshotRow> = snapshots
             .iter()
             .map(|row| (row.account_id.as_str(), row))
             .collect();
+        let live = self.current.load_full();
+        let interval = self.refresh_interval.load(Ordering::Acquire);
 
         let mut entries = HashMap::with_capacity(accounts.len());
         for account in accounts {
             let entry = if account.multiplier_mode == MultiplierMode::Manual {
                 Entry::manual(account, now)
             } else {
-                match persisted.get(account.id.as_str()) {
-                    // 来源改过之后旧快照不再可信，按未刷新处理。
-                    Some(row) if row.source == account.multiplier_mode => Entry {
-                        upstream: row.multiplier,
-                        source: row.source,
-                        observed_at: row.observed_at,
-                        refreshed_at: row.refreshed_at,
-                        stale_since: row.stale_since.or_else(|| {
-                            // 重启后无法确认这个值还新不新，按"从重启那一刻
-                            // 开始过期"处理，而不是当作刚刷新过。
-                            (Status::parse(&row.status) != Status::Known).then_some(now)
-                        }),
-                        last_error: row.last_error.clone(),
-                        peak: None,
-                        // 分组不在快照里：重启后由下一轮刷新重新判定。
-                        group: None,
-                        group_source: None,
-                    },
-                    _ => Entry::pending(account, now),
+                // 来源改过之后旧快照与旧条目都不再可信，按未刷新处理。
+                let row = persisted
+                    .get(account.id.as_str())
+                    .filter(|row| row.source == account.multiplier_mode);
+                let live = live
+                    .get(&account.id)
+                    .filter(|entry| entry.source == account.multiplier_mode);
+                match (row, live) {
+                    (Some(row), Some(live))
+                        if live.refreshed_at == row.refreshed_at
+                            && live.stale_since == row.stale_since =>
+                    {
+                        live.clone()
+                    }
+                    (None, Some(live)) => live.clone(),
+                    (Some(row), _) => restored(row, interval, now),
+                    (None, None) => Entry::pending(account, now),
                 }
             };
             entries.insert(account.id.clone(), entry);
         }
         self.current.store(Arc::new(entries));
+
+        // 已删除或改回手动的账号不再计入系统性故障的分母。
+        if let Ok(mut outcomes) = self.outcomes.lock() {
+            outcomes.retain(|id, _| {
+                accounts
+                    .iter()
+                    .any(|a| &a.id == id && a.multiplier_mode.is_automatic())
+            });
+            self.judge_systemic(&outcomes, now);
+        }
     }
 
     /// 覆盖单个账号的状态。刷新任务每探完一个账号就调用一次。
@@ -321,13 +364,72 @@ impl Registry {
         self.current.load().get(account_id).cloned()
     }
 
-    /// 开启或续期"探针侧系统性故障"保护。
-    fn set_systemic_failure(&self, until: i64) {
-        self.systemic_until.fetch_max(until, Ordering::AcqRel);
+    /// 记录一个账号的最新刷新结果，并按全部自动账号的最新结果重新判定
+    /// 探针侧系统性故障。定时刷新与后台「立即刷新」都走这里。
+    pub fn record_outcome(&self, account_id: &str, ok: bool, now: i64) {
+        let Ok(mut outcomes) = self.outcomes.lock() else {
+            return;
+        };
+        outcomes.insert(account_id.to_string(), ok);
+        self.judge_systemic(&outcomes, now);
     }
 
-    fn clear_systemic_failure(&self) {
-        self.systemic_until.store(0, Ordering::Release);
+    /// 超过半数自动账号的最新刷新失败 → 判定为探针侧故障而非上游集体改价，
+    /// 开启或续期保护；回落到不超过半数才解除。
+    fn judge_systemic(&self, outcomes: &HashMap<String, bool>, now: i64) {
+        let total = outcomes.len();
+        let failed = outcomes.values().filter(|ok| !**ok).count();
+        if total >= SYSTEMIC_MIN_ACCOUNTS && failed * 2 > total {
+            if !self.view().systemic_failure(now) {
+                tracing::error!(
+                    total,
+                    failed,
+                    "超过半数账号倍率刷新失败，判定为探针侧系统性故障，宽限期统一延长"
+                );
+            }
+            self.systemic_until
+                .fetch_max(now + SYSTEMIC_WINDOW, Ordering::AcqRel);
+        } else {
+            self.systemic_until.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// 从持久化快照恢复一个条目（重启后内存里还没有它）。
+///
+/// 快照只代表"上次刷新时是这个值"，重启后不能直接当作新鲜：
+/// - 已超过一个刷新间隔：从"本该再次刷新"的时刻起算过期，宽限期按快照的
+///   实际年龄而不是重启时刻计算；
+/// - Sub2API 快照不含峰值时段（快照表没有这一列）：按平峰价计价会亏本，
+///   所以在重新刷新之前一律视为过期；
+/// - 本来就是过期/未知状态但没有记录起点的旧数据：从重启时刻起算。
+fn restored(row: &MultiplierSnapshotRow, interval: i64, now: i64) -> Entry {
+    let due_at = row.refreshed_at.saturating_add(interval);
+    let (stale_since, reason) = match row.stale_since {
+        Some(since) => (Some(since), None),
+        None if Status::parse(&row.status) != Status::Known => (Some(now), None),
+        None if due_at < now => (
+            Some(due_at),
+            Some("重启前的倍率快照已超过刷新间隔，等待重新刷新"),
+        ),
+        None if row.source == MultiplierMode::Sub2Api => {
+            (Some(now), Some("重启后峰值时段未知，等待重新刷新"))
+        }
+        None => (None, None),
+    };
+    Entry {
+        upstream: row.multiplier,
+        source: row.source,
+        observed_at: row.observed_at,
+        refreshed_at: row.refreshed_at,
+        stale_since,
+        last_error: reason
+            .map(str::to_string)
+            .or_else(|| row.last_error.clone()),
+        peak: None,
+        // 分组不在快照里：重启后由下一轮刷新重新判定。
+        group: None,
+        group_source: None,
     }
 }
 
@@ -463,6 +565,128 @@ mod tests {
         assert_eq!(grace_for(multiplier("0.9"), limit), GRACE_MEDIUM_RISK);
         // >90% → 立即硬停
         assert_eq!(grace_for(multiplier("0.95"), limit), 0);
+        // 分界两侧差一个最小单位。
+        assert_eq!(grace_for(multiplier("0.600001"), limit), GRACE_MEDIUM_RISK);
+        assert_eq!(grace_for(multiplier("0.900001"), limit), 0);
+    }
+
+    /// 0.54 / 0.6 恰好是 90%：浮点算出 0.9000000000000001 会误判成立即硬停。
+    #[test]
+    fn exact_ratio_boundaries_use_fixed_point_comparison() {
+        let limit = multiplier("0.6");
+        assert_eq!(grace_for(multiplier("0.54"), limit), GRACE_MEDIUM_RISK);
+        assert_eq!(grace_for(multiplier("0.36"), limit), GRACE_LOW_RISK);
+        assert_eq!(grace_for(multiplier("0.540001"), limit), 0);
+        // 极端定点值不溢出。
+        assert_eq!(
+            grace_for(
+                Multiplier::from_raw(i64::MAX),
+                Multiplier::from_raw(i64::MAX)
+            ),
+            0
+        );
+    }
+
+    fn known_row(source: MultiplierMode, refreshed_at: i64) -> MultiplierSnapshotRow {
+        MultiplierSnapshotRow {
+            account_id: "acc".into(),
+            multiplier: multiplier("0.5"),
+            source,
+            status: Status::Known.as_str().into(),
+            observed_at: None,
+            refreshed_at,
+            stale_since: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn an_old_snapshot_restored_after_a_restart_is_stale_from_its_age() {
+        let registry = Registry::new();
+        let account = account(MultiplierMode::NewApi, "1");
+        let now = 100_000;
+        // 快照 10 分钟前刷新、间隔 5 分钟：5 分钟前就该过期，而不是从重启起算。
+        registry.seed(
+            std::slice::from_ref(&account),
+            &[known_row(MultiplierMode::NewApi, now - 600)],
+            now,
+        );
+        let effective = registry.view().effective(&account, Multiplier::ONE, now);
+        assert_eq!(effective.status, Status::Stale);
+        assert_eq!(effective.stale_for, Some(300));
+
+        // 间隔内的 New API 快照仍可信。
+        registry.seed(
+            std::slice::from_ref(&account),
+            &[known_row(MultiplierMode::NewApi, now - 60)],
+            now,
+        );
+        assert_eq!(
+            registry
+                .view()
+                .effective(&account, Multiplier::ONE, now)
+                .status,
+            Status::Known
+        );
+    }
+
+    #[test]
+    fn a_restored_sub2api_snapshot_is_stale_until_its_peak_hours_are_known() {
+        let registry = Registry::new();
+        let account = account(MultiplierMode::Sub2Api, "1");
+        let now = 100_000;
+        registry.seed(
+            std::slice::from_ref(&account),
+            &[known_row(MultiplierMode::Sub2Api, now - 10)],
+            now,
+        );
+        let effective = registry.view().effective(&account, Multiplier::ONE, now);
+        assert_eq!(effective.status, Status::Stale, "快照不含峰值时段");
+    }
+
+    #[test]
+    fn reseeding_keeps_live_peak_hours_of_the_same_refresh() {
+        let registry = Registry::new();
+        let account = account(MultiplierMode::Sub2Api, "1");
+        let now = 100_000;
+        let row = known_row(MultiplierMode::Sub2Api, now);
+        registry.put(
+            "acc",
+            Entry {
+                stale_since: None,
+                refreshed_at: now,
+                ..stale_entry("0.5", now)
+            },
+        );
+        // 改配置触发的重建不能把同一次刷新结果降级成"峰值未知"。
+        registry.seed(std::slice::from_ref(&account), &[row], now);
+        assert_eq!(
+            registry
+                .view()
+                .effective(&account, Multiplier::ONE, now)
+                .status,
+            Status::Known
+        );
+    }
+
+    #[test]
+    fn systemic_failure_is_judged_over_every_accounts_latest_outcome() {
+        let registry = Registry::new();
+        // 账号逐个失败（每个 tick 只有一个到期）：第三个失败时 3/4 过半。
+        registry.record_outcome("a", false, 0);
+        assert!(!registry.view().systemic_failure(0), "单个账号说明不了什么");
+        registry.record_outcome("b", true, 10);
+        assert!(!registry.view().systemic_failure(10), "1/2 不过半");
+        registry.record_outcome("c", false, 20);
+        assert!(registry.view().systemic_failure(20), "2/3 过半");
+        registry.record_outcome("d", false, 30);
+        registry.record_outcome("e", false, 40);
+        // 一个账号恢复（单批全成功）不能解除保护：3/5 仍过半。
+        registry.record_outcome("a", true, 50);
+        assert!(registry.view().systemic_failure(50));
+        // 回落到不超过一半才解除。
+        registry.record_outcome("c", true, 60);
+        assert!(!registry.view().systemic_failure(60));
     }
 
     #[test]
