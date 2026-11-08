@@ -1155,81 +1155,58 @@ impl Walk<'_> {
 
             // 并发名额靠信号量唤醒；RPM / TPM 窗口只会随时间推移释放，没有可
             // 等的信号，只能按短间隔轮询。
-            let rate_limited = pending.iter().any(|candidate| {
-                let credential = match self.select_credential(candidate, pinned, preferred, None) {
-                    Picked::Ready(credential) => credential,
-                    // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
-                    // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
-                    // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
-                    Picked::BoundBusy(key) => Some(key),
-                    Picked::Busy | Picked::Unavailable(_) => None,
-                };
-                matches!(
-                    self.check(candidate, credential.as_ref()),
-                    Err(health::Unavailable::RateLimited)
-                )
-            });
-            let slice = if rate_limited {
+            //
+            // 限流中的候选**不进**信号量等待：它的并发名额多半是空的，`acquire`
+            // 立刻返回，重新准入又被限流拒绝，循环就成了不让出线程的忙等，把一个
+            // tokio worker 钉死到窗口释放或截止时间。没有任何可等信号量时同理，
+            // 只能睡一个轮询间隔。
+            let rate_limited: Vec<bool> = pending
+                .iter()
+                .map(|candidate| {
+                    let credential =
+                        match self.select_credential(candidate, pinned, preferred, None) {
+                            Picked::Ready(credential) => credential,
+                            // 选不出 Key 时按"限流"处理：RPM / TPM 窗口只会随时间释放，
+                            // 用短轮询比干等到底更早恢复。绑定的那把忙时它自己就是
+                            // 判断对象：它的窗口何时释放决定了要短轮询还是干等。
+                            Picked::BoundBusy(key) => Some(key),
+                            Picked::Busy | Picked::Unavailable(_) => None,
+                        };
+                    matches!(
+                        self.check(candidate, credential.as_ref()),
+                        Err(health::Unavailable::RateLimited)
+                    )
+                })
+                .collect();
+            let slice = if rate_limited.iter().any(|limited| *limited) {
                 remaining.min(RATE_POLL_INTERVAL)
             } else {
                 remaining
             };
-            let capacities: Vec<_> = pending
-                .iter()
-                .map(|candidate| {
-                    let caller = health::Caller {
-                        account_id: &candidate.target.account.id,
-                        key_id: None,
-                        target_id: &candidate.target.target.id,
-                    };
-                    match self.select_credential(candidate, pinned, preferred, None) {
-                        Picked::Ready(credential) => {
-                            let caller = health::Caller {
-                                // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
-                                // 用 `credential_id(account_id, digest)` 归类 Key 状态，
-                                // 传行 ID 会另开一份永远匹配不上的"影子状态"——
-                                // 排队等的是影子，真正那把 Key 的名额照样被占着。
-                                key_id: credential
-                                    .as_ref()
-                                    .map(|key| key.credential_digest.as_str()),
-                                ..caller
-                            };
-                            self.forward
-                                .state
-                                .runtime
-                                .health
-                                .capacity(caller, admission_limits(candidate, credential.as_ref()))
-                        }
-                        // 绑定的那把忙：**只等它**。等"任意一把"会在唤醒后
-                        // 重新抽签落到别的 Key 上，上游按凭据隔离的前缀缓存
-                        // 照样作废——这正是要修的病（§2.2 的不变量 B）。
-                        Picked::BoundBusy(key) => {
-                            let caller = health::Caller {
-                                key_id: Some(key.credential_digest.as_str()),
-                                ..caller
-                            };
-                            self.forward
-                                .state
-                                .runtime
-                                .health
-                                .capacity(caller, admission_limits(candidate, Some(&key)))
-                        }
-                        // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
-                        // 否则"两把都满"会等一个永远不会到来的唤醒。
-                        Picked::Busy | Picked::Unavailable(_) => {
-                            let pool = self.forward.state.runtime.credentials.current();
-                            self.forward.state.runtime.health.capacity_any_key(
-                                caller,
-                                admission_limits(candidate, None),
-                                pool.keys_of(&candidate.target.account.id),
-                            )
-                        }
-                    }
-                })
-                .collect();
-
+            let mut waitable: Vec<usize> = Vec::new();
+            let mut capacities: Vec<health::Capacity> = Vec::new();
+            for (index, candidate) in pending.iter().enumerate() {
+                if rate_limited[index] {
+                    continue;
+                }
+                let capacity = self.wait_capacity(candidate, pinned, preferred);
+                if capacity.is_unbounded() {
+                    continue;
+                }
+                waitable.push(index);
+                capacities.push(capacity);
+            }
             let waited = Instant::now();
-            let outcome = queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await;
+            let outcome = if capacities.is_empty() {
+                queue::sleep_unless_shutdown(remaining.min(RATE_POLL_INTERVAL), &mut shutdown).await
+            } else {
+                match queue::wait_for_any_capacity(capacities, slice, &mut shutdown).await {
+                    queue::CapacityWaitOutcome::Ready(index, permit) => {
+                        queue::CapacityWaitOutcome::Ready(waitable[index], permit)
+                    }
+                    other => other,
+                }
+            };
 
             let elapsed = waited.elapsed();
             // 粘性路径上的等待记到 sticky_wait，其余记到普通排队（§6.6、§24.1）。
@@ -1295,6 +1272,56 @@ impl Walk<'_> {
                         pending.remove(index);
                     }
                 }
+            }
+        }
+    }
+
+    /// 排队时这个候选要等的并发名额。
+    fn wait_capacity(
+        &self,
+        candidate: &routing::Candidate,
+        pinned: Option<&str>,
+        preferred: Option<&str>,
+    ) -> health::Capacity {
+        let caller = health::Caller {
+            account_id: &candidate.target.account.id,
+            key_id: None,
+            target_id: &candidate.target.target.id,
+        };
+        let health = &self.forward.state.runtime.health;
+        match self.select_credential(candidate, pinned, preferred, None) {
+            Picked::Ready(credential) => {
+                let caller = health::Caller {
+                    // 必须是**凭据摘要**，不是行 ID：`Registry::keyed`
+                    // 用 `credential_id(account_id, digest)` 归类 Key 状态，
+                    // 传行 ID 会另开一份永远匹配不上的"影子状态"——
+                    // 排队等的是影子，真正那把 Key 的名额照样被占着。
+                    key_id: credential
+                        .as_ref()
+                        .map(|key| key.credential_digest.as_str()),
+                    ..caller
+                };
+                health.capacity(caller, admission_limits(candidate, credential.as_ref()))
+            }
+            // 绑定的那把忙：**只等它**。等"任意一把"会在唤醒后
+            // 重新抽签落到别的 Key 上，上游按凭据隔离的前缀缓存
+            // 照样作废——这正是要修的病（§2.2 的不变量 B）。
+            Picked::BoundBusy(key) => {
+                let caller = health::Caller {
+                    key_id: Some(key.credential_digest.as_str()),
+                    ..caller
+                };
+                health.capacity(caller, admission_limits(candidate, Some(&key)))
+            }
+            // 还没选定 Key：必须能等到**任意一把** Key 的名额释放，
+            // 否则"两把都满"会等一个永远不会到来的唤醒。
+            Picked::Busy | Picked::Unavailable(_) => {
+                let pool = self.forward.state.runtime.credentials.current();
+                health.capacity_any_key(
+                    caller,
+                    admission_limits(candidate, None),
+                    pool.keys_of(&candidate.target.account.id),
+                )
             }
         }
     }
@@ -2856,6 +2883,8 @@ pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
         health::Unavailable::RateLimited | health::Unavailable::ConcurrencyFull => {
             ErrorCode::RateLimited
         }
+        // 请求本身太大，换到哪个窗口都装不下：不可重试（§17.2）。
+        health::Unavailable::ExceedsTokenLimit => ErrorCode::RequestTooLarge,
         _ => ErrorCode::UpstreamExhausted,
     }
 }
@@ -4335,6 +4364,7 @@ fn estimate_tokens(
     };
     let output = body
         .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
         .or_else(|| body.get("max_output_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);

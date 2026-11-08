@@ -194,6 +194,9 @@ pub enum Unavailable {
     ConcurrencyFull,
     /// RPM 或 TPM 已达上限。同样是"忙"。
     RateLimited,
+    /// 单条请求的 Token 估算就超过了 TPM 上限：窗口再怎么释放也装不下它，
+    /// 排队只会干等到超时，所以不可排队、直接换下一个候选（§17.2）。
+    ExceedsTokenLimit,
 }
 
 impl Unavailable {
@@ -210,6 +213,7 @@ impl Unavailable {
             Self::Cooling => "cooldown",
             Self::ConcurrencyFull => "concurrency_full",
             Self::RateLimited => "rate_limited",
+            Self::ExceedsTokenLimit => "exceeds_token_limit",
         }
     }
 }
@@ -1359,6 +1363,14 @@ fn consume_rate(
         && !crate::sync::lock(&target.rpm).try_consume(1, f64::from(rpm), now)
     {
         return Err(Unavailable::RateLimited);
+    }
+    if let Some(tpm) = limits.tpm
+        && estimated_tokens > u64::from(tpm)
+    {
+        if limits.rpm.is_some() {
+            crate::sync::lock(&target.rpm).refund(1, now);
+        }
+        return Err(Unavailable::ExceedsTokenLimit);
     }
     // TPM 未配置时完全跳过 Token 估算，避免无意义开销（§17.2）。
     if let Some(tpm) = limits.tpm
