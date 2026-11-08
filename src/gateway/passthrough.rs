@@ -3339,53 +3339,90 @@ async fn commit_stream(
         let responses_id = stream_state.as_ref().map(|seed| seed.gateway_id.clone());
         // 先建好收集器：它一路走到结算，记录里就能看见"这次流丢了什么"（§14.8）。
         let degraded = translate::degradation_sink();
-        return match translate::commit_stream(translate::StreamRequest {
-            upstream: upstream_protocol,
-            downstream,
-            include_usage: true,
-            account: &target.account.name,
-            response,
-            responses_id,
-            request_id: forward.request_id,
-            // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
-            degraded: degraded.clone(),
-            redactor: redactor.clone(),
-        })
-        .await
-        {
-            Ok(committed) => Ok(Success {
-                status,
-                streamed: true,
-                response: build_response(
-                    forward,
-                    status,
-                    &headers,
-                    prepared,
-                    crate::gateway::error::private_stream(
-                        committed.body,
-                        downstream,
-                        forward.request_id,
-                        redactor.clone(),
-                    ),
-                ),
-                first_token: Some(committed.first_token),
-                first_byte: Some(headers_wait + committed.first_token),
-                first_content: None,
-                output_tokens: None,
-                usage_tokens: None,
-                usage_parts: (None, None),
-                usage_detail: None,
-                stream_state,
-                degraded: Some(degraded),
-            }),
-            Err(failure) => {
-                // 这次尝试作废：骨架记录跟着撤掉，换号后会用新的网关 ID。
-                if let Some(seed) = &stream_state {
-                    responses::forget_pending(&forward.chain.group_id, &seed.gateway_id);
+        // 转换器要等到首个语义事件才交出响应体。宽限期内照旧等它（期内失败
+        // 仍可换号）；过了宽限期就先交出响应头、改发心跳，避免 CDN 524（§13.4）。
+        let started = Instant::now();
+        let account_name = target.account.name.clone();
+        let owned_request_id = forward.request_id.to_string();
+        let sink = degraded.clone();
+        let stream_redactor = redactor.clone();
+        let mut committing = Box::pin(async move {
+            translate::commit_stream(translate::StreamRequest {
+                upstream: upstream_protocol,
+                downstream,
+                include_usage: true,
+                account: &account_name,
+                response,
+                responses_id,
+                request_id: &owned_request_id,
+                // 解析阶段丢掉的能力（如 Anthropic 签名）通过它汇总到结算（§14.8）。
+                degraded: sink,
+                redactor: stream_redactor,
+            })
+            .await
+        });
+        let grace = tokio::time::Instant::now() + forward.state.settings.get().first_content_grace;
+        let (body, first_token, first_content) =
+            match tokio::time::timeout_at(grace, committing.as_mut()).await {
+                Ok(Ok(committed)) => (committed.body, Some(committed.first_token), None),
+                Ok(Err(failure)) => {
+                    // 这次尝试作废：骨架记录跟着撤掉，换号后会用新的网关 ID。
+                    if let Some(seed) = &stream_state {
+                        responses::forget_pending(&forward.chain.group_id, &seed.gateway_id);
+                    }
+                    return Err(AttemptFailure::switchable(failure.code, failure.message)
+                        .with_status(status));
                 }
-                Err(AttemptFailure::switchable(failure.code, failure.message).with_status(status))
-            }
-        };
+                Err(_elapsed) => {
+                    let request_id = forward.request_id.to_string();
+                    let ready = async move {
+                        committing
+                            .await
+                            .map(|committed| committed.body)
+                            .map_err(|failure| {
+                                crate::protocol::stream_error(
+                                    downstream,
+                                    failure.code,
+                                    &failure.message,
+                                    Some(&request_id),
+                                )
+                            })
+                    };
+                    let clock = stream::first_content_clock();
+                    let body = stream::keep_alive_until_ready(
+                        ready,
+                        forward.state.settings.get().keep_alive_interval,
+                        clock.clone(),
+                        headers_wait + started.elapsed(),
+                    );
+                    (body, None, Some(clock))
+                }
+            };
+        return Ok(Success {
+            status,
+            streamed: true,
+            response: build_response(
+                forward,
+                status,
+                &headers,
+                prepared,
+                crate::gateway::error::private_stream(
+                    body,
+                    downstream,
+                    forward.request_id,
+                    redactor.clone(),
+                ),
+            ),
+            first_token,
+            first_byte: Some(headers_wait + first_token.unwrap_or_else(|| started.elapsed())),
+            first_content,
+            output_tokens: None,
+            usage_tokens: None,
+            usage_parts: (None, None),
+            usage_detail: None,
+            stream_state,
+            degraded: Some(degraded),
+        });
     }
 
     // Responses 入口的流式响应：网关 ID 必须在第一个字节下发前就定下来，
@@ -3397,8 +3434,68 @@ async fn commit_stream(
         let mut sniffer = stream::Sniffer::new(downstream);
         let mut upstream_id: Option<String> = None;
         let gateway;
+        let grace = tokio::time::Instant::now() + forward.state.settings.get().first_content_grace;
         loop {
-            match response.chunk().await {
+            // 宽限期只在已经拿到上游 ID 之后生效：骨架记录与续链都要靠它。上游
+            // 的 `response.created` 总是第一帧，实际上不会卡在这一步。
+            let next = if upstream_id.is_some() {
+                match tokio::time::timeout_at(grace, response.chunk()).await {
+                    Ok(next) => next,
+                    Err(_elapsed) => {
+                        let gateway = responses::gateway_id();
+                        record_response_state(
+                            forward,
+                            target,
+                            prepared,
+                            &gateway,
+                            &serde_json::json!({"id": upstream_id}),
+                            None,
+                            upstream_protocol,
+                            credential,
+                            responses::Durability::MemoryOnly,
+                        );
+                        let clock = stream::first_content_clock();
+                        let body = stream::keep_alive_until_ready(
+                            responses_ready(
+                                response,
+                                sniffer,
+                                gateway.clone(),
+                                forward.request_id.to_string(),
+                            ),
+                            forward.state.settings.get().keep_alive_interval,
+                            clock.clone(),
+                            headers_wait + started.elapsed(),
+                        );
+                        let body = crate::gateway::error::private_stream(
+                            body,
+                            downstream,
+                            forward.request_id,
+                            redactor.clone(),
+                        );
+                        return Ok(Success {
+                            status,
+                            streamed: true,
+                            response: build_response(forward, status, &headers, prepared, body),
+                            first_token: None,
+                            first_byte: Some(headers_wait + started.elapsed()),
+                            first_content: Some(clock),
+                            output_tokens: None,
+                            usage_tokens: None,
+                            usage_parts: (None, None),
+                            usage_detail: None,
+                            stream_state: Some(StreamStateSeed {
+                                gateway_id: gateway,
+                                upstream_id,
+                                endpoint: prepared.endpoint.as_str().to_string(),
+                            }),
+                            degraded: None,
+                        });
+                    }
+                }
+            } else {
+                response.chunk().await
+            };
+            match next {
                 Ok(Some(chunk)) => {
                     if upstream_id.is_none() {
                         upstream_id = stream::first_response_id(&chunk);
@@ -3623,6 +3720,47 @@ async fn commit_stream(
                 )
                 .with_status(status));
             }
+        }
+    }
+}
+
+/// 宽限期过后继续嗅探 Responses 上游，直到首个语义事件，再交出改写 ID 的
+/// 响应体；首个语义事件之前失败只能按流内错误帧收尾（响应头已经发出）。
+async fn responses_ready(
+    mut response: reqwest::Response,
+    mut sniffer: stream::Sniffer,
+    gateway: String,
+    request_id: String,
+) -> Result<Body, axum::body::Bytes> {
+    let failed = |code: ErrorCode, message: &str| {
+        crate::protocol::stream_error(Protocol::OpenAiResponses, code, message, Some(&request_id))
+    };
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => match sniffer.push(&chunk) {
+                stream::Verdict::Pending => continue,
+                stream::Verdict::Semantic => {
+                    return Ok(translate::passthrough_responses_stream(
+                        sniffer.take_buffer(),
+                        response,
+                        &gateway,
+                        &request_id,
+                    ));
+                }
+                stream::Verdict::Error(message) => {
+                    return Err(failed(
+                        ErrorCode::UpstreamProtocolError,
+                        &format!("上游流式响应报错：{message}"),
+                    ));
+                }
+            },
+            Ok(None) => {
+                return Err(failed(
+                    ErrorCode::UpstreamProtocolError,
+                    "上游流式响应在产生内容前就结束",
+                ));
+            }
+            Err(_) => return Err(failed(ErrorCode::UpstreamExhausted, "上游流式响应中断")),
         }
     }
 }
