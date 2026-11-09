@@ -128,13 +128,13 @@ async fn a_v25_database_upgrades_without_losing_configuration() {
     assert_eq!(count("SELECT COUNT(*) FROM logical_models").await, 2);
     // 老库不知道谁被亲手停用过，一律算"没碰过"。
     assert_eq!(count("SELECT SUM(excluded) FROM account_models").await, 0);
-    // 被 v25 改成不限的分组回到默认 100，管理员设的值不动。
+    // 队列容量是管理员的设置，迁移一律不动：不限仍是不限，显式值原样保留。
     let capacities: Vec<i64> =
         sqlx::query_scalar("SELECT queue_capacity FROM groups ORDER BY created_at")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(capacities, vec![100, 7]);
+    assert_eq!(capacities, vec![4294967295, 7]);
 
     // 外键动作已是 SET NULL：删分组，账号回到未分配，Key 池还在。
     sqlx::query("DELETE FROM groups WHERE id = 'g1'")

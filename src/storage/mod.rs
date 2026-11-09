@@ -228,12 +228,6 @@ const V26_STATEMENTS: &[(&str, &str)] = &[
             ON upstream_accounts(group_id, name) WHERE group_id IS NOT NULL",
         "重建账号重名索引",
     ),
-    // v25 把"默认 100"的分组全部改成了不限；默认值已恢复有界（§13.6、§28），
-    // 那批分组一起改回来。
-    (
-        "UPDATE groups SET queue_capacity = 100 WHERE queue_capacity = 4294967295",
-        "恢复分组队列默认容量",
-    ),
     // Key 池早已是唯一真相；镜像列在池被清空时也不会跟着清，留着只会让
     // "拉取模型"之类的旁路读到一把已经删掉的 Key。
     (

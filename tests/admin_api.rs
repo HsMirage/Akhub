@@ -313,8 +313,8 @@ async fn the_full_configuration_path_works_end_to_end() {
         created["group"]["weights"]["cache_hit"], 15,
         "缓存命中率是第五个维度，默认 15"
     );
-    // 队列总容量默认有界（§13.6、§28）。
-    assert_eq!(created["group"]["queue_capacity"], 100);
+    // 队列总容量默认不限（v1.1.37 的产品决定，哨兵值 u32::MAX）。
+    assert_eq!(created["group"]["queue_capacity"], u64::from(u32::MAX));
 
     // 列表接口只返回前缀，绝不返回完整 Key。
     let groups: Value = client
