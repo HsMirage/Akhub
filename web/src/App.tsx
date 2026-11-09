@@ -127,7 +127,7 @@ const NAV_HINTS: Partial<Record<Route, string>> = {
   accounts: "上游凭据、模型命名与限制",
   targets: "按模型查看账号评分与可用性",
   requests: "请求元数据与调度诊断",
-  cost: "按逻辑模型查看倍率与用量",
+  cost: "按下游模型名查看倍率与用量",
   settings: "系统口径、管理员与备份",
 };
 

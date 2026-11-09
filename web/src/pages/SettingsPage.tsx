@@ -364,7 +364,7 @@ export function Settings({
       const content = await importFile.text();
       const result = await api.importBackup(importPassword, content);
       toast.success(
-        `已恢复 ${result.groups} 个分组、${result.accounts} 个账号、${result.logical_models} 个逻辑模型`,
+        `已恢复 ${result.groups} 个分组、${result.accounts} 个账号、${result.logical_models} 个下游模型`,
       );
       setImportPassword("");
       setImportFile(null);
@@ -877,7 +877,7 @@ export function Settings({
         requireLabel="请输入「恢复」以确认整体替换"
         message={
           <>
-            恢复会<b>整体替换</b>当前全部分组、账号、逻辑模型与调度目标，现有配置不可找回。
+            恢复会<b>整体替换</b>当前全部分组、账号、下游模型与调度目标，现有配置不可找回。
             恢复成功后当前页面的其它管理员会话依然有效。
             <br />
             <br />

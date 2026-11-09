@@ -20,7 +20,7 @@ const CODES: Record<string, ErrorCodeInfo> = {
   },
   model_not_found: {
     label: "模型不存在",
-    hint: "请求的模型名在该分组内没有对应的模型。检查拼写，或到「上游账号 → 模型管理」确认该模型已启用且对外名正确。",
+    hint: "请求的模型名在该分组内没有对应的模型。检查拼写，或到「上游账号 → 模型管理」确认该模型已启用、下游模型名填写正确。",
     retryable: false,
   },
   no_eligible_target: {

@@ -555,8 +555,8 @@ export function Accounts({
         requireLabel={`请输入账号名「${confirm?.name ?? ""}」以确认删除`}
         message={
           <>
-            删除「{confirm?.name}」会同时移除它承担的全部调度目标。
-            正在使用这些目标的逻辑模型可能因此没有可用目标。
+            删除「{confirm?.name}」会同时移除它承担的全部调度目标；
+            只由它提供的下游模型名会随之下架，下游再请求这些模型会失败。
           </>
         }
         onClose={() => setConfirm(null)}
@@ -1055,7 +1055,7 @@ function AccountDrawer({
           moving
             ? form.group_id === ""
               ? "账号已取消分配，调度目标已全部撤下；模型目录与凭据保留"
-              : `账号已迁入「${groupName(form.group_id)}」，模型已按对外名一并迁移`
+              : `账号已迁入「${groupName(form.group_id)}」，模型已按下游模型名一并迁移`
             : "账号已更新",
         );
         await onSaved();
@@ -1130,7 +1130,7 @@ function AccountDrawer({
             form.group_id === ""
               ? "未分配：可正常配置凭据与模型，但不参与调度。之后再选分组即可启用。"
               : editing
-                ? "改分组会把模型按对外名一起迁过去；改成「未分配」则撤下全部调度目标，目录与凭据保留。"
+                ? "改分组会把模型按下游模型名一起迁过去；改成「未分配」则撤下全部调度目标，目录与凭据保留。"
                 : "决定它能被哪把下游 Key 使用；先留「未分配」也可以。"
           }
         >
@@ -1514,11 +1514,11 @@ function AccountDrawer({
         <Switch
           checked={form.hide_original}
           onChange={(value) => set("hide_original", value)}
-          label="隐藏原始模型名"
+          label="隐藏上游模型名"
           hint={
             form.hide_original
-              ? "只暴露填了下游模型名的模型"
-              : "下游既可用了下游名，也可用上游原名"
+              ? "只有填了下游模型名的模型对下游可用"
+              : "下游既可用下游模型名，也可用上游模型名"
           }
         />
         {editing && form.auto_sync && account?.model_synced_at != null && (
@@ -1550,8 +1550,8 @@ function AccountDrawer({
               保存后「{account.name}」会从「{groupName(account.group_id)}」迁到「
               {groupName(form.group_id)}」。
               <br />
-              模型目录按对外名一起迁过去：新分组缺同名逻辑模型会自动建好；旧分组里
-              只靠这台账号提供的自动逻辑模型会随最后一个目标消失，旧分组的下游 Key
+              模型目录按下游模型名一起迁过去：新分组里还没有的下游模型名会自动建好；
+              旧分组里只由这个账号提供的下游模型名会随之消失，旧分组的下游 Key
               可能因此取不到这些模型。
               {moveEligibilityNotice && (
                 <>

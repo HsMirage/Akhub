@@ -128,7 +128,7 @@ export function useData(active: boolean, onUnauthorized: () => void): DataStore 
           [
             ["分组", groups],
             ["账号", accounts],
-            ["逻辑模型", models],
+            ["下游模型", models],
             ["调度目标", targets],
           ] as const
         )

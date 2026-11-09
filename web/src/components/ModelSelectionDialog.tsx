@@ -474,7 +474,7 @@ export function ModelSelectionDialog({
     setNotice(
       alias
         ? `已把「${editing}」的下游模型名设为「${alias}」，点「保存」后生效。`
-        : `已清空「${editing}」的下游模型名，这个模型会使用上游原名；点「保存」后生效。`,
+        : `已清空「${editing}」的下游模型名，这个模型会使用上游模型名；点「保存」后生效。`,
     );
   }, [account, editing, editAlias, hideOriginal, queueDraft, cancelEdit]);
 
@@ -488,7 +488,7 @@ export function ModelSelectionDialog({
       await api.updateAccount(account.id, { hide_original: next });
       setHideOriginal(next);
       await load();
-      toast.success(next ? "已打开：只暴露设置了下游模型名的模型" : "已关闭：允许下游使用原模型名");
+      toast.success(next ? "已打开：只有设置了下游模型名的模型对下游可用" : "已关闭：下游也可以用上游模型名调用");
       await onChanged();
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "保存失败");
@@ -810,18 +810,18 @@ export function ModelSelectionDialog({
           <div className="model-help">
             <strong>下游模型名</strong>
             <span>
-              留空用上游原名；多个账号填同一个名字会自动合并成一个模型。
+              留空用上游模型名；多个账号填同一个下游模型名，会作为同一个模型一起调度。
             </span>
           </div>
 
           <Switch
             checked={hideOriginal}
             onChange={(next) => void saveHideOriginal(next)}
-            label="隐藏原始模型名（整个账号）"
+            label="隐藏上游模型名（整个账号）"
             hint={
               hideOriginal
-                ? "已打开：只暴露填写了下游模型名的模型；没填的模型下游无法获取。"
-                : "关闭时：下游既能用下游模型名，也能用上游原模型名。"
+                ? "已打开：只有填写了下游模型名的模型对下游可用；没填的模型下游无法调用。"
+                : "关闭时：下游既能用下游模型名，也能用上游模型名。"
             }
           />
 
@@ -1313,7 +1313,7 @@ const ModelRow = memo(function ModelRow({
               {row.public_name}
             </div>
           ) : (
-            <span className="text-faint">未设置（使用上游原名）</span>
+            <span className="text-faint">未设置（使用上游模型名）</span>
           )}
         </td>
         <td>
@@ -1330,12 +1330,12 @@ const ModelRow = memo(function ModelRow({
           )}
           <div className="field-hint" style={{ marginTop: 4 }}>
             {hiddenWithoutName
-              ? "没有填写下游模型名，且账号已打开“隐藏原始模型名”。"
+              ? "没有填写下游模型名，且账号已打开“隐藏上游模型名”。"
               : hideOriginal
-                ? "只暴露下游模型名。"
+                ? "下游只能用下游模型名。"
                 : renamed
-                  ? "下游模型名 + 上游原名都能用。"
-                  : "下游使用上游原名。"}
+                  ? "下游模型名 + 上游模型名都能用。"
+                  : "下游使用上游模型名。"}
           </div>
         </td>
         <td>
@@ -1426,12 +1426,12 @@ const ModelRow = memo(function ModelRow({
                   <select
                     className="select"
                     value=""
-                    aria-label="合并到已有模型"
+                    aria-label="选用已有的下游模型名"
                     onChange={(event) => {
                       if (event.target.value) onAliasChange(event.target.value);
                     }}
                   >
-                    <option value="">合并到已有模型…</option>
+                    <option value="">选用已有的下游模型名…</option>
                     {existingNames
                       .filter((name) => name !== row.public_name)
                       .map((name) => (
@@ -1442,7 +1442,7 @@ const ModelRow = memo(function ModelRow({
                   </select>
                 )}
                 <span className="field-hint">
-                  留空用上游原名；多个账号填同名会自动合并
+                  留空用上游模型名；多个账号填同一个下游模型名会一起调度
                 </span>
               </div>
               <div className="model-edit-actions">
@@ -1462,7 +1462,7 @@ const ModelRow = memo(function ModelRow({
             </div>
             {mergeSuggestions.length > 0 && (
               <div className="model-merge-suggestions">
-                <span className="text-faint">可以合并到已有模型：</span>
+                <span className="text-faint">看起来是同一个模型，可直接选用：</span>
                 {mergeSuggestions.map((name) => (
                   <button
                     key={name}

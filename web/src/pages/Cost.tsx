@@ -64,7 +64,7 @@ export function Cost({
       <header className="section-head">
         <h2 className="section-title">成本视图</h2>
         <span className="section-desc">
-          倍率 × 用量只在同一个逻辑模型内部与真实花销成正比，这里不做跨模型加总。
+          倍率 × 用量只在同一个下游模型名内部与真实花销成正比，这里不做跨模型加总。
         </span>
         <div className="section-actions">
           <Segmented
