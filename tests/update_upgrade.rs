@@ -188,6 +188,11 @@ async fn one_click_appears_when_an_update_is_available_and_supported() {
     state.runtime.update.set_api_base(github.base_url.clone());
     // 扮演原生二进制部署：这条路上"一键"是有意义的。
     state.runtime.update.set_deploy_for_tests(Deploy::Binary);
+    // "能不能替换自己"也要显式给：生产读 AKHUB_ALLOW_RESTART（部署方声明），
+    // 不覆盖就取决于跑测试的机器上有没有这个变量。CI 的 runner 自己就在
+    // systemd 里，早先版本靠 INVOCATION_ID 侥幸为真，那条捷径按"systemd 部署
+    // 一键升级必然失败"（2bd414e）删掉后，这里就再也拿不到 true 了。
+    state.runtime.update.set_can_self_replace_for_tests(true);
     setup_admin(&base, &client).await;
 
     let status = status_of(&base, &client).await;
