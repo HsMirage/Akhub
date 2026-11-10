@@ -2,7 +2,6 @@
 
 export type Protocol = "openai_chat" | "openai_responses" | "anthropic_messages";
 
-export type ModelOrigin = "auto" | "manual";
 
 /** 倍率来源：手动，或由后台探针周期刷新的两种自动来源（§11.2）。 */
 export type MultiplierMode = "manual" | "sub2api" | "new_api";
@@ -16,7 +15,13 @@ export type TargetStatus =
   | "cooldown"
   | "half_open"
   | "quota_exhausted"
-  | "key_invalid";
+  | "key_invalid"
+  | "no_key"
+  | "disabled"
+  | "missing_model"
+  | "multiplier_unknown"
+  | "multiplier_exceeded"
+  | "multiplier_stale";
 
 /** RPM / TPM / 最大并发；null 表示不限（§17.1）。 */
 export interface Limits {
@@ -176,10 +181,8 @@ export interface AccountModel {
   upstream_model: string;
   /** 下游模型名；未设置时等于上游模型名。 */
   public_name: string;
-  /** 所属账号的"隐藏原始模型名"开关当前值。 */
-  hide_original: boolean;
-  /** 该行对应的下游模型名（等于 public_name）。 */
-  logical_model_name: string;
+  /** 第一次出现在这个账号目录里的时间（unix 秒），按"最近新增"筛选时用。 */
+  discovered_at: number;
   /** 下游实际可用的全部名称；账号隐藏原始名且未设下游模型名时为空。 */
   exposed_names: string[];
   selected: boolean;
@@ -206,11 +209,6 @@ export interface AvailableModel {
 }
 
 /** 兼容旧接口：上游模型名 → 下游模型名（§16.4）。 */
-export interface Alias {
-  upstream_model: string;
-  public_name: string;
-}
-
 /** 取消勾选前的二次确认行（§16.3）：最近 24 小时的调用次数。 */
 export interface SelectionWarning {
   public_name: string;
@@ -221,7 +219,6 @@ export interface LogicalModel {
   id: string;
   group_id: string;
   name: string;
-  origin: ModelOrigin;
   enabled: boolean;
   dispatch_targets: number;
   /** 是否会出现在 /v1/models 中。 */
@@ -287,10 +284,10 @@ export interface DispatchTarget {
   logical_model_id: string;
   account_id: string;
   upstream_model: string;
-  /** 是否隐藏上游原始模型名。 */
-  hide_original: boolean;
-  /** 历史字段，恒为 null；调度目标不再支持独立优先级覆盖。 */
-  priority_override: number | null;
+  /** 层内预计分配比例（0-1），后端与调度器同一公式。 */
+  share: number;
+  /** 原始缓存命中率（0-1）；从没采到过时为 null。 */
+  cache_hit_rate: number | null;
   /** 实际生效的优先级：统一来自账号默认人工优先级。 */
   priority: number;
   limits: Limits;
@@ -631,10 +628,13 @@ export interface CostView {
 export interface CalibrationResult {
   calibration: string;
   reported: string;
-  group_avg_multiplier: string;
+  /** 校准前的系数。新系数 = 它 × 站点报值 ÷ 本账号加权均倍率。 */
+  previous_calibration: string;
+  /** 本账号在该模型上的 Token 加权均倍率（已含校准前系数）。 */
+  own_avg_multiplier: string;
   gateway_requests: number;
-  model_requests: number;
-  exclusive: boolean;
+  input_tokens: number;
+  output_tokens: number;
   notice: string;
 }
 
@@ -706,6 +706,12 @@ export const TARGET_STATUS_LABELS: Record<TargetStatus, string> = {
   half_open: "半开试运行",
   quota_exhausted: "额度耗尽",
   key_invalid: "Key 失效",
+  no_key: "没有可用 Key",
+  disabled: "账号已停用",
+  missing_model: "上游已下架",
+  multiplier_unknown: "倍率未知",
+  multiplier_exceeded: "倍率超限",
+  multiplier_stale: "倍率过期",
 };
 
 /** 上游端点的展示名。请求记录里用它说明这次实际打到了哪条路由。 */

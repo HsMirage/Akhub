@@ -194,6 +194,9 @@ pub enum Unavailable {
     ConcurrencyFull,
     /// RPM 或 TPM 已达上限。同样是"忙"。
     RateLimited,
+    /// 单条请求的 Token 估算就超过了 TPM 上限：窗口再怎么释放也装不下它，
+    /// 排队只会干等到超时，所以不可排队、直接换下一个候选（§17.2）。
+    ExceedsTokenLimit,
 }
 
 impl Unavailable {
@@ -210,6 +213,7 @@ impl Unavailable {
             Self::Cooling => "cooldown",
             Self::ConcurrencyFull => "concurrency_full",
             Self::RateLimited => "rate_limited",
+            Self::ExceedsTokenLimit => "exceeds_token_limit",
         }
     }
 }
@@ -448,6 +452,11 @@ impl AccountState {
         self.budget.reconcile_capacity(configured);
     }
 
+    /// 按管理员当前配置校准并发上限，`None` 即不限（§17.1）。
+    pub fn apply_configured_concurrency(&self, configured: Option<u32>) {
+        self.budget.apply_configured(configured);
+    }
+
     /// 账号级并发额度（`None` 表示不限），供后台与诊断使用。
     pub fn concurrency_limit(&self) -> Option<u32> {
         (self.budget.capacity() != UNLIMITED).then(|| self.budget.capacity())
@@ -588,7 +597,7 @@ impl KeyState {
     /// 准入路径上校准的，而选 Key 发生在准入之前，不校准就会拿着"1<<20 个名额"
     /// 的信号量做判断，把配了上限的 Key 当成永远有空（§17.1）。
     pub fn reconcile_and_check(&self, budget: Limits, now: Instant) -> Result<(), Unavailable> {
-        self.budget.reconcile_capacity(budget.max_concurrency);
+        self.budget.apply_configured(budget.max_concurrency);
         self.check(budget, now)
     }
 
@@ -661,6 +670,11 @@ impl TargetState {
         self.budget.reconcile_capacity(configured);
     }
 
+    /// 按管理员当前配置校准并发上限，`None` 即不限（§17.1）。
+    pub fn apply_configured_concurrency(&self, configured: Option<u32>) {
+        self.budget.apply_configured(configured);
+    }
+
     /// 用于后台展示的运行状态。
     ///
     /// 严重程度按"最影响可用性的先说"排序：凭据失效 > 凭据额度 > 账号额度 >
@@ -690,6 +704,11 @@ impl TargetState {
     /// 冷却剩余秒数，供后台展示与 `Retry-After`。
     pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
         crate::sync::lock(&self.circuit).cooldown_remaining(now)
+    }
+
+    /// 粘性请求眼里这个目标是不是只是"忙"（429 冷却或半开被占），要等多久。
+    pub fn sticky_busy_wait(&self, now: Instant) -> Option<Duration> {
+        crate::sync::lock(&self.circuit).sticky_busy_wait(now)
     }
 
     /// 不消耗任何额度的资格检查，用于 §9.1 的硬性过滤。
@@ -779,10 +798,20 @@ impl Budget {
     /// 此时保持现状。把它当成"重置为不限"会抹掉已经校准好的上限，满载就会
     /// 被看成有空位（§13.6、§17.1）。
     fn reconcile_capacity(&self, wanted: Option<u32>) {
-        let Some(wanted) = wanted else {
-            return;
-        };
-        let wanted = wanted.max(1);
+        if let Some(wanted) = wanted {
+            self.resize(wanted.max(1));
+        }
+    }
+
+    /// 配置路径用：值就是管理员此刻的配置，`None` 明确表示**不限**。
+    ///
+    /// 与 [`Self::reconcile_capacity`] 的区别正在这里：清除并发上限后，只有配置
+    /// 路径能说"改回不限"，否则旧上限会一直留到重启。
+    fn apply_configured(&self, configured: Option<u32>) {
+        self.resize(configured.map_or(UNLIMITED, |value| value.max(1)));
+    }
+
+    fn resize(&self, wanted: u32) {
         let _guard = crate::sync::lock(&self.capacity_lock);
         let current = self.capacity.load(Ordering::Acquire);
         if wanted == current {
@@ -877,6 +906,10 @@ pub struct Admission {
     key_half_open: bool,
     /// 本次是否占用了目标半开试运行名额。
     half_open: bool,
+    /// 准入那一刻三级熔断各自的代（见 `Circuit::generation`）。
+    account_generation: u64,
+    key_generation: u64,
+    target_generation: u64,
     reservations: RateReservations,
     /// 本次准入用的三级额度。取消时据此把并发容量补回配置值。
     limits: AdmissionLimits,
@@ -984,10 +1017,26 @@ impl Admission {
                 // "好"的唯一路径。
                 if let Some(key) = &self.key {
                     key.note_success();
-                    crate::sync::lock(&key.quota).on_success(now);
+                    let mut quota = crate::sync::lock(&key.quota);
+                    if quota.generation == self.key_generation {
+                        quota.on_success(now);
+                    } else {
+                        quota.undo_half_open(self.key_half_open);
+                    }
                 }
-                crate::sync::lock(&self.account.quota).on_success(now);
-                crate::sync::lock(&self.target.circuit).on_success(now);
+                let mut quota = crate::sync::lock(&self.account.quota);
+                if quota.generation == self.account_generation {
+                    quota.on_success(now);
+                } else {
+                    quota.undo_half_open(self.account_half_open);
+                }
+                drop(quota);
+                let mut circuit = crate::sync::lock(&self.target.circuit);
+                if circuit.generation == self.target_generation {
+                    circuit.on_success(now);
+                } else {
+                    circuit.undo_half_open(self.half_open);
+                }
             }
             Outcome::KeyInvalid => {
                 // 三层半开名额都要还回去，否则这个目标会一直卡在"有人正在
@@ -1003,9 +1052,24 @@ impl Admission {
             }
             Outcome::QuotaExhausted { retry_after } => {
                 // `trip` 自己会把半开状态清成"冷却中"，不需要再 release。
+                // 只认当前代：熔断之前放进来的在途请求不再推高退避等级。
                 match &self.key {
-                    Some(key) => crate::sync::lock(&key.quota).trip(now, retry_after),
-                    None => crate::sync::lock(&self.account.quota).trip(now, retry_after),
+                    Some(key) => {
+                        let mut quota = crate::sync::lock(&key.quota);
+                        if quota.generation == self.key_generation {
+                            quota.trip(now, retry_after);
+                        } else {
+                            quota.undo_half_open(self.key_half_open);
+                        }
+                    }
+                    None => {
+                        let mut quota = crate::sync::lock(&self.account.quota);
+                        if quota.generation == self.account_generation {
+                            quota.trip(now, retry_after);
+                        } else {
+                            quota.undo_half_open(self.account_half_open);
+                        }
+                    }
                 }
                 crate::sync::lock(&self.target.circuit).undo_half_open(self.half_open);
             }
@@ -1016,11 +1080,15 @@ impl Admission {
                 // 限流最常见的粒度——同一个模型的配额被别的调用方占满时，
                 // 换一把 Key 或换一个账号都救不了这个模型（§12.3）。
                 let mut circuit = crate::sync::lock(&self.target.circuit);
-                match retry_after {
-                    // 上游明确说了多久，就照做，不叠加自己的指数退避。
-                    Some(wait) => circuit.trip(now, Some(wait)),
-                    // 没给恢复时间的孤立 429 只触发本次切换，够多够密才熔断。
-                    None => circuit.on_fault(now),
+                if circuit.generation != self.target_generation {
+                    circuit.undo_half_open(self.half_open);
+                } else {
+                    match retry_after {
+                        // 上游明确说了多久，就照做，不叠加自己的指数退避。
+                        Some(wait) => circuit.trip_rate_limited(now, wait),
+                        // 没给恢复时间的孤立 429 只触发本次切换，够多够密才熔断。
+                        None => circuit.on_fault(now),
+                    }
                 }
                 drop(circuit);
                 // 额外记一笔在**这把 Key** 上：上游的限流也可能是按凭据计的，
@@ -1036,16 +1104,23 @@ impl Admission {
                 {
                     // 与目标同样的判据：给了恢复时间就照做，孤立 429 走故障计数。
                     let mut quota = crate::sync::lock(&key.quota);
-                    match retry_after {
-                        Some(wait) => quota.trip(now, Some(wait)),
-                        None => quota.on_fault(now),
+                    if quota.generation == self.key_generation {
+                        match retry_after {
+                            Some(wait) => quota.trip(now, Some(wait)),
+                            None => quota.on_fault(now),
+                        }
                     }
                 }
             }
             Outcome::Fault => {
                 self.release_account_half_open();
                 self.release_key_half_open();
-                crate::sync::lock(&self.target.circuit).on_fault(now);
+                let mut circuit = crate::sync::lock(&self.target.circuit);
+                if circuit.generation == self.target_generation {
+                    circuit.on_fault(now);
+                } else {
+                    circuit.undo_half_open(self.half_open);
+                }
             }
         }
     }
@@ -1231,6 +1306,11 @@ impl Registry {
         if let Some(key) = &key {
             key.budget.inflight.fetch_add(1, Ordering::Relaxed);
         }
+        let account_generation = crate::sync::lock(&account.quota).generation;
+        let key_generation = key
+            .as_ref()
+            .map_or(0, |key| crate::sync::lock(&key.quota).generation);
+        let target_generation = crate::sync::lock(&target.circuit).generation;
         Ok(Admission {
             account,
             key,
@@ -1239,6 +1319,9 @@ impl Registry {
             account_half_open,
             key_half_open,
             half_open,
+            account_generation,
+            key_generation,
+            target_generation,
             reservations,
             limits,
             shared_key: false,
@@ -1360,6 +1443,14 @@ fn consume_rate(
     {
         return Err(Unavailable::RateLimited);
     }
+    if let Some(tpm) = limits.tpm
+        && estimated_tokens > u64::from(tpm)
+    {
+        if limits.rpm.is_some() {
+            crate::sync::lock(&target.rpm).refund(1, now);
+        }
+        return Err(Unavailable::ExceedsTokenLimit);
+    }
     // TPM 未配置时完全跳过 Token 估算，避免无意义开销（§17.2）。
     if let Some(tpm) = limits.tpm
         && !crate::sync::lock(&target.tpm).try_consume(estimated_tokens, f64::from(tpm), now)
@@ -1394,6 +1485,17 @@ struct Circuit {
     /// 指数冷却的级别。成功一次即清零。
     level: u32,
     half_open_taken: bool,
+    /// 当前这段冷却是不是上游 429 + `Retry-After` 造成的。
+    ///
+    /// 这种冷却是"忙"，不是"坏"：上游明说了几秒后就好。粘性请求据此原地等待
+    /// 而不是清掉绑定（§10.2"忙不属于失效"、§10.3）。
+    rate_limited: bool,
+    /// 每进入一次冷却（或被重置）加一。
+    ///
+    /// 准入时记下当时的代，结算时代不同就说明这个请求是熔断**之前**放进来的：
+    /// 它的结果不再说明现状。否则一次故障里在途请求的失败会反复抬高退避等级
+    /// （一次事故直接冷却 300 秒），而任意一个在途成功又会把冷却整个清掉（§12.3）。
+    generation: u64,
     consecutive: u32,
     failures: SlidingWindow,
     totals: SlidingWindow,
@@ -1405,6 +1507,8 @@ impl Default for Circuit {
             cooldown_until: None,
             level: 0,
             half_open_taken: false,
+            rate_limited: false,
+            generation: 0,
             consecutive: 0,
             failures: SlidingWindow::new(FAULT_WINDOW),
             totals: SlidingWindow::new(FAULT_WINDOW),
@@ -1472,6 +1576,28 @@ impl Circuit {
         }
         self.cooldown_until = Some(now + wait);
         self.half_open_taken = false;
+        self.rate_limited = false;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 上游 429 带了 `Retry-After`：按它冷却，并记下这段冷却只是"忙"。
+    fn trip_rate_limited(&mut self, now: Instant, wait: Duration) {
+        self.trip(now, Some(wait));
+        self.rate_limited = true;
+    }
+
+    /// 对粘性请求而言这个目标是不是只是"忙"：返回还要等多久。
+    ///
+    /// * 429 + `Retry-After` 的冷却：等剩余时间；
+    /// * 半开名额已被别的请求占走：试运行的结果马上就到，返回零表示"短轮询"。
+    ///
+    /// 其余冷却（故障熔断）是"坏"，返回 `None`。
+    fn sticky_busy_wait(&self, now: Instant) -> Option<Duration> {
+        match self.phase(now) {
+            Phase::Cooling if self.rate_limited => self.cooldown_remaining(now),
+            Phase::HalfOpenTaken => Some(Duration::ZERO),
+            _ => None,
+        }
     }
 
     /// 记一次故障。半开试运行失败会直接延长冷却；否则按 §12.3 的阈值判定。
@@ -1484,6 +1610,8 @@ impl Circuit {
             self.half_open_taken = false;
             self.level = self.level.saturating_add(1);
             self.cooldown_until = Some(now + self.backoff_for(self.level));
+            self.rate_limited = false;
+            self.generation = self.generation.wrapping_add(1);
             return;
         }
 
@@ -1495,6 +1623,8 @@ impl Circuit {
             self.level = self.level.saturating_add(1);
             self.cooldown_until = Some(now + self.backoff_for(self.level));
             self.consecutive = 0;
+            self.rate_limited = false;
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
@@ -1509,7 +1639,12 @@ impl Circuit {
     }
 
     fn reset(&mut self) {
-        *self = Self::default();
+        // 代不归零：重置前放进来的在途请求同样不该再影响新状态。
+        let generation = self.generation.wrapping_add(1);
+        *self = Self {
+            generation,
+            ..Self::default()
+        };
     }
 }
 
@@ -1602,6 +1737,53 @@ impl SlidingWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 清除并发上限必须立刻生效，不能留到重启（§17.1）。
+    #[test]
+    fn clearing_a_concurrency_limit_takes_effect() {
+        let budget = Budget::new();
+        budget.apply_configured(Some(1));
+        assert_eq!(budget.configured(), Some(1));
+        budget.apply_configured(None);
+        assert_eq!(budget.configured(), None);
+        assert_eq!(budget.available(), UNLIMITED as usize);
+    }
+
+    /// 熔断之前放进来的在途请求，结算时既不能抬高退避也不能清掉冷却（§12.3）。
+    #[test]
+    fn results_from_before_the_trip_do_not_touch_the_breaker() {
+        let registry = Registry::default();
+        let who = Caller {
+            account_id: "acc",
+            key_id: None,
+            target_id: "tgt",
+        };
+        let admit = || registry.try_admit(who, Limits::default(), 0).unwrap();
+        let stale_failures: Vec<_> = (0..4).map(|_| admit()).collect();
+        let stale_success = admit();
+        for _ in 0..CONSECUTIVE_TRIP {
+            admit().settle(Outcome::Fault, None);
+        }
+        let target = registry.target("tgt");
+        let tripped = target.cooldown_remaining(Instant::now()).unwrap();
+        let level = crate::sync::lock(&target.circuit).level;
+
+        for admission in stale_failures {
+            admission.settle(Outcome::Fault, None);
+        }
+        assert_eq!(
+            crate::sync::lock(&target.circuit).level,
+            level,
+            "同一次事故的在途失败不能反复抬高退避等级"
+        );
+        assert!(target.cooldown_remaining(Instant::now()).unwrap() <= tripped);
+
+        stale_success.settle(Outcome::Success, None);
+        assert!(
+            target.cooldown_remaining(Instant::now()).is_some(),
+            "熔断之前放进来的成功不能清掉冷却"
+        );
+    }
 
     fn limits(concurrency: Option<u32>) -> Limits {
         Limits {

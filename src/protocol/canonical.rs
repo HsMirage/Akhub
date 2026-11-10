@@ -3,7 +3,7 @@
 //! 这不是"三个协议的公共最小字段"，而是三个协议的**并集**：角色语义、有序
 //! 内容块、工具定义与调用、结构化输出、思考配置与思考块、生成参数、细分
 //! usage，外加两块"不能表达就必须报错"的记录区——未识别字段与供应商专有
-//! 能力。同协议透传永远不经过这里；只有跨协议转换才需要它。
+//! 能力。同协议透传不经过这里；只有跨协议转换才需要它。
 
 use std::collections::BTreeMap;
 
@@ -58,17 +58,46 @@ impl MediaSource {
     }
 }
 
-/// 思考块：可见文本、签名、加密内容与来源协议的条目 ID。
+/// 思考块：可见文本，加上只有产生它的供应商才认的不透明载荷。
 ///
-/// 签名与加密内容只对产生它们的供应商有意义，跨协议一律无法沿用——这正是
-/// 思考被列入降级白名单的原因（§14.8）。
+/// 签名、`redacted_thinking.data` 与 `encrypted_content` 都是供应商签过名或
+/// 加过密的东西，送到另一家只会换回一个 400（v1.1.40 的跨渠道签名 400 就是
+/// 这一类）。所以载荷带着来源协议，发射器只把它还给同一个协议；其余情况只
+/// 丢载荷、保留可见文本，并记一次 `thinking` 降级（§14.8）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThinkingBlock {
     pub text: String,
-    pub signature: Option<String>,
-    pub encrypted: Option<String>,
-    pub id: Option<String>,
-    pub redacted: bool,
+    pub opaque: Option<Opaque>,
+}
+
+/// 思考块的不透明载荷。每种载荷只属于一个协议，见 [`Opaque::origin`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opaque {
+    /// Anthropic `thinking.signature`。
+    Signature(String),
+    /// Anthropic `redacted_thinking.data`：整块思考都被加密，没有可见文本。
+    Redacted(String),
+    /// Responses `reasoning.encrypted_content` 与它的条目 ID。
+    Encrypted { id: Option<String>, content: String },
+}
+
+impl Opaque {
+    /// 产生这份载荷的协议。只有它能原样收回去。
+    pub fn origin(&self) -> Protocol {
+        match self {
+            Self::Signature(_) | Self::Redacted(_) => Protocol::AnthropicMessages,
+            Self::Encrypted { .. } => Protocol::OpenAiResponses,
+        }
+    }
+}
+
+impl ThinkingBlock {
+    /// 发往 `target` 时还能沿用的载荷；来源不同就是 `None`。
+    pub fn opaque_for(&self, target: Protocol) -> Option<&Opaque> {
+        self.opaque
+            .as_ref()
+            .filter(|opaque| opaque.origin() == target)
+    }
 }
 
 /// 有顺序的内容块。
@@ -127,7 +156,7 @@ pub enum Effort {
     Low,
     Medium,
     High,
-    /// 4.7 起在 high 与 max 之间新增的一档（自适应契约专有，OpenAI 两个协议没有）。
+    /// 4.7 起在 high 与 max 之间新增的一档（OpenAI 两个协议也认）。
     XHigh,
     /// 自适应契约的最高一档。
     Max,
@@ -157,12 +186,22 @@ impl Effort {
         }
     }
 
-    /// OpenAI 两个协议只认 minimal/low/medium/high。把 Anthropic 专有的两档
-    /// 折到最接近的 high，而不是把一个上游从不认识的取值发过去换一个 400。
-    pub fn as_openai_level(self) -> &'static str {
+    /// OpenAI 两个协议的档位：minimal/low/medium/high/xhigh 原样，只有 Anthropic
+    /// 独有的 `max` 没有对应档位，折到最接近的 xhigh。第二个值表示是否发生了
+    /// 折叠——折叠就是降级，调用方必须把它记进 `X-Akhub-Degraded`（§14.8）。
+    pub fn to_openai(self) -> (&'static str, bool) {
         match self {
-            Self::XHigh | Self::Max => "high",
-            other => other.as_str(),
+            Self::Max => (Self::XHigh.as_str(), true),
+            other => (other.as_str(), false),
+        }
+    }
+
+    /// Anthropic 的档位：它没有 `minimal`，往上取最近的 `low`。这是升档而不是
+    /// 削弱，不算降级。
+    pub fn to_anthropic(self) -> Self {
+        match self {
+            Self::Minimal => Self::Low,
+            other => other,
         }
     }
 
@@ -297,6 +336,9 @@ pub struct Request {
     /// 能表达就原样带过去，不能表达时按白名单降级并逐项标记（§14.8）。
     pub sampling: BTreeMap<String, Value>,
     pub user: Option<String>,
+    /// OpenAI 的 `prompt_cache_key`。只是缓存路由提示，不改变输出语义：两个
+    /// OpenAI 协议之间原样带过去，Anthropic 没有对应字段时直接不发。
+    pub prompt_cache_key: Option<String>,
     /// 任何其他协议都表达不了的能力（供应商内置工具、MCP、`n > 1`……）。
     /// 跨协议时整个请求对该目标不合格（§14.6 "供应商专有工具"）。
     pub inexpressible: Vec<String>,
@@ -323,6 +365,7 @@ impl Request {
             stop: Vec::new(),
             sampling: BTreeMap::new(),
             user: None,
+            prompt_cache_key: None,
             inexpressible: Vec::new(),
             unknown: Vec::new(),
         }
@@ -579,8 +622,10 @@ mod tests {
         assert_eq!(Effort::parse("xhigh"), Some(Effort::XHigh));
         assert_eq!(Effort::parse("max"), Some(Effort::Max));
         assert_eq!(Effort::Max.as_str(), "max");
-        assert_eq!(Effort::Max.as_openai_level(), "high");
-        assert_eq!(Effort::Low.as_openai_level(), "low");
+        assert_eq!(Effort::Max.to_openai(), ("xhigh", true));
+        assert_eq!(Effort::XHigh.to_openai(), ("xhigh", false));
+        assert_eq!(Effort::Low.to_openai(), ("low", false));
+        assert_eq!(Effort::Minimal.to_anthropic(), Effort::Low);
         assert_eq!(
             ThinkingDisplay::parse("summarized"),
             Some(ThinkingDisplay::Summarized)

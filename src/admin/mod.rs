@@ -4,6 +4,8 @@ pub mod resources;
 pub mod system;
 pub mod ui;
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::Router;
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
@@ -14,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::app::SharedState;
-use crate::auth::session;
+use crate::auth::{session, setup_token};
 
 /// 二进制版本号，取自 Cargo.toml。
 ///
@@ -73,6 +75,19 @@ impl AdminError {
     }
 }
 
+impl From<crate::config::ConfigWriteError> for AdminError {
+    fn from(error: crate::config::ConfigWriteError) -> Self {
+        match error {
+            crate::config::ConfigWriteError::Conflict { .. } => {
+                Self::new(StatusCode::CONFLICT, error.to_string())
+            }
+            crate::config::ConfigWriteError::Internal(error) => {
+                Self::internal(format!("{error:#}"))
+            }
+        }
+    }
+}
+
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         (self.status, axum::Json(json!({ "error": self.message }))).into_response()
@@ -95,6 +110,8 @@ pub const CONFIG_VERSION_HEADER: &str = "x-akhub-config-version";
 #[derive(Debug, Clone)]
 pub struct Admin {
     pub username: String,
+    /// 这次写操作声明的配置修订号（§7.4）。GET 恒为 `Any`，不会用到它。
+    pub revision: crate::config::Revision,
 }
 
 impl FromRequestParts<SharedState> for Admin {
@@ -119,32 +136,33 @@ impl FromRequestParts<SharedState> for Admin {
             ));
         }
 
-        // 乐观锁（§7.4）：写操作带上它读到的配置版本，与当前版本不一致说明
-        // 别人已经改过配置，返回 409 让用户重新加载，而不是静默覆盖。
-        // 不带头部表示"我知道自己在做什么"（例如脚本初始化），保持兼容。
-        if parts.method != axum::http::Method::GET
-            && let Some(raw) = parts.headers.get(CONFIG_VERSION_HEADER)
-        {
-            let expected = raw
-                .to_str()
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
+        // 乐观锁（§7.4）：写操作必须声明它读到的修订号，比较发生在写事务内部，
+        // 见 `AppState::write_config`。`*` 是显式的"无条件写入"（同 HTTP
+        // `If-Match: *`），给脚本用；没有头不再等于跳过检查。
+        let revision = if parts.method == axum::http::Method::GET {
+            crate::config::Revision::Any
+        } else {
+            let raw = parts
+                .headers
+                .get(CONFIG_VERSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
                 .ok_or_else(|| {
                     AdminError::bad_request(format!(
-                        "{CONFIG_VERSION_HEADER} 必须是配置版本号（整数）"
+                        "写操作必须携带 {CONFIG_VERSION_HEADER} 请求头"
                     ))
                 })?;
-            let current = state.config.current().version;
-            if expected != current {
-                return Err(AdminError::new(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "config_conflict: 配置已被其他修改更新（你的版本 {expected}，当前 {current}），                         请重新加载后再保存，避免覆盖别人的修改。"
-                    ),
-                ));
+            if raw == "*" {
+                crate::config::Revision::Any
+            } else {
+                crate::config::Revision::Expect(raw.parse::<u64>().map_err(|_| {
+                    AdminError::bad_request(format!(
+                        "{CONFIG_VERSION_HEADER} 必须是配置版本号（整数）或 *"
+                    ))
+                })?)
             }
-        }
-        Ok(Admin { username })
+        };
+        Ok(Admin { username, revision })
     }
 }
 
@@ -174,6 +192,36 @@ fn cleared_cookie_header() -> String {
     format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
 }
 
+/// 登录限速用的客户端地址（§23.2）。
+///
+/// 默认用 TCP 对端地址。只有对端本身是环回或内网地址（即本机 / 同一私网里的
+/// 反向代理）时才采信 `X-Forwarded-For`，并取**最右边**那一项——那是离我们
+/// 最近的代理亲眼看到的地址，更左边的都可能是客户端自己伪造的。公网对端带来
+/// 的转发头一律忽略，否则攻击者每次换个头就能绕过限速。
+fn client_ip(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    let Some(peer) = peer else {
+        return "unknown".to_string();
+    };
+    let ip = peer.ip().to_canonical();
+    if is_local_proxy(ip)
+        && let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok())
+    {
+        return forwarded.to_canonical().to_string();
+    }
+    ip.to_string()
+}
+
+fn is_local_proxy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 /// 这个请求是不是走 HTTPS 进来的（§23.2）。
 ///
 /// 只认反向代理的 `X-Forwarded-Proto`：Akhub 监听的是明文 HTTP，直连时
@@ -197,6 +245,8 @@ pub struct Credentials {
 struct SetupStatus {
     needs_setup: bool,
     master_key_from_env: bool,
+    /// 数据目录：首次设置口令文件就在这里（`setup-token`）。
+    data_dir: String,
 }
 
 /// 组装 `/admin` 下的全部接口与静态页面。
@@ -234,7 +284,9 @@ pub fn router() -> Router<SharedState> {
         )
         .route(
             "/admin/api/accounts/{id}",
-            patch_or_delete(r::update_account, r::delete_account),
+            get(r::get_account)
+                .patch(r::update_account)
+                .delete(r::delete_account),
         )
         .route(
             "/admin/api/accounts/refresh-multipliers",
@@ -283,27 +335,11 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/refresh",
             post(r::refresh_account_models),
         )
-        .route(
-            "/admin/api/accounts/{id}/models/select",
-            post(r::select_account_models),
-        )
         // 写路径的唯一入口：勾选、改名、批量操作都走它，一次请求只调和一遍
         // 目标、只重载一遍配置（逐行接口在几百个模型上会卡住界面）。
         .route(
             "/admin/api/accounts/{id}/models/apply",
             post(r::apply_account_models),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/update",
-            post(r::update_account_model),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/delete",
-            post(r::delete_account_model),
-        )
-        .route(
-            "/admin/api/accounts/{id}/models/merge",
-            post(r::merge_account_models),
         )
         .route(
             "/admin/api/accounts/{id}/models/sync",
@@ -314,28 +350,9 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/models/remove-missing",
             post(r::remove_missing_account_models),
         )
-        .route(
-            "/admin/api/accounts/{id}/aliases",
-            get(r::list_aliases).put(r::update_aliases),
-        )
-        .route(
-            "/admin/api/logical-models",
-            get(r::list_logical_models).post(r::create_logical_model),
-        )
-        .route(
-            "/admin/api/logical-models/{id}",
-            patch_or_delete(r::update_logical_model, r::delete_logical_model),
-        )
-        .route(
-            "/admin/api/targets",
-            get(r::list_targets).post(r::create_target),
-        )
-        .route(
-            "/admin/api/targets/{id}",
-            patch_or_delete(r::update_target, r::delete_target),
-        )
+        .route("/admin/api/logical-models", get(r::list_logical_models))
+        .route("/admin/api/targets", get(r::list_targets))
         .route("/admin/api/requests", get(r::list_requests))
-        .route("/admin/api/metrics", get(r::metrics))
         // 版本检查与自更新（顶部版本号点开的面板）。
         .route(
             "/admin/api/system/update",
@@ -382,17 +399,6 @@ pub async fn attach_config_version(
     response
 }
 
-/// 把 PATCH 与 DELETE 装配到同一路径上。
-fn patch_or_delete<P, D, TP, TD>(patch: P, delete: D) -> axum::routing::MethodRouter<SharedState>
-where
-    P: axum::handler::Handler<TP, SharedState>,
-    D: axum::handler::Handler<TD, SharedState>,
-    TP: 'static,
-    TD: 'static,
-{
-    axum::routing::patch(patch).delete(delete)
-}
-
 /// 判断是否需要首次设置。无需登录。
 async fn setup_status(State(state): State<SharedState>) -> AdminResult<axum::Json<SetupStatus>> {
     let needs_setup = state
@@ -403,10 +409,11 @@ async fn setup_status(State(state): State<SharedState>) -> AdminResult<axum::Jso
     Ok(axum::Json(SetupStatus {
         needs_setup,
         master_key_from_env: state.master_key_from_env,
+        data_dir: state.data_dir.display().to_string(),
     }))
 }
 
-/// 创建首个管理员。只能成功一次。
+/// 创建首个管理员。只能成功一次，且必须带上首次设置口令（§23.2）。
 async fn setup(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -426,13 +433,29 @@ async fn setup(
     {
         return Err(AdminError::conflict("管理员已存在，首次设置只能执行一次"));
     }
+    let presented = headers
+        .get(setup_token::HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !setup_token::verify(&state.data_dir, presented) {
+        return Err(AdminError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "首次设置口令不正确。口令打印在服务启动日志里，也保存在 {}",
+                setup_token::path(&state.data_dir).display()
+            ),
+        ));
+    }
 
-    let hash = session::hash_password(&credentials.password).map_err(AdminError::internal)?;
+    let hash = session::hash_password_blocking(&credentials.password)
+        .await
+        .map_err(AdminError::internal)?;
     state
         .store
         .create_admin(credentials.username.trim(), &hash)
         .await
         .map_err(|_| AdminError::conflict("管理员已存在，首次设置只能执行一次"))?;
+    setup_token::remove(&state.data_dir);
 
     issue_session(
         &state,
@@ -441,14 +464,16 @@ async fn setup(
     )
 }
 
-/// 管理员登录。
+/// 管理员登录。限速按客户端地址（§23.2）。
 async fn login(
     State(state): State<SharedState>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     axum::Json(credentials): axum::Json<Credentials>,
 ) -> AdminResult<Response> {
     let username = credentials.username.trim();
-    if state.sessions.is_locked(username) {
+    let client = client_ip(peer.map(|info| info.0.0), &headers);
+    if state.sessions.is_locked(&client) {
         return Err(AdminError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "登录失败次数过多，请稍后再试",
@@ -460,15 +485,12 @@ async fn login(
         .admin_password_hash(username)
         .await
         .map_err(AdminError::internal)?;
-    // 用户名不存在与密码错误返回同一句话，不泄漏哪个环节出错。
-    let valid = stored
-        .as_deref()
-        .map(|hash| session::verify_password(&credentials.password, hash))
-        .unwrap_or(false);
-    if !valid {
-        state.sessions.record_failure(username);
+    // 用户名不存在与密码错误返回同一句话、耗时相同，不泄漏哪个环节出错。
+    if !session::verify_password_blocking(&credentials.password, stored).await {
+        state.sessions.record_failure(&client);
         return Err(AdminError::unauthorized("用户名或密码错误"));
     }
+    state.sessions.clear_failures(&client);
 
     issue_session(&state, username, request_is_https(&headers))
 }
@@ -554,6 +576,29 @@ mod tests {
         assert!(proto("https, http"), "取最初那一跳");
         assert!(!proto("http"), "明文反代不能加 Secure");
         assert!(!proto("http, https"));
+    }
+
+    /// 只有本机 / 内网代理转来的请求才采信 X-Forwarded-For，且取最右一项。
+    #[test]
+    fn forwarded_for_is_trusted_only_from_a_local_proxy() {
+        let forwarded = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let public: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        assert_eq!(
+            client_ip(Some(local), &forwarded("1.1.1.1, 198.51.100.4")),
+            "198.51.100.4"
+        );
+        assert_eq!(
+            client_ip(Some(public), &forwarded("198.51.100.4")),
+            "203.0.113.7",
+            "公网对端伪造的转发头不能换掉限速键"
+        );
+        assert_eq!(client_ip(Some(local), &HeaderMap::new()), "127.0.0.1");
+        assert_eq!(client_ip(None, &HeaderMap::new()), "unknown");
     }
 
     #[test]

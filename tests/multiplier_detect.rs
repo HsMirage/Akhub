@@ -30,6 +30,16 @@ async fn spawn_with_akhub() -> (String, reqwest::Client, common::Akhub) {
 
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        // 首次设置必须带口令（§23.2）：测试直接读数据目录里的口令文件。
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-akhub-setup-token"),
+            reqwest::header::HeaderValue::from_str(
+                std::fs::read_to_string(dir.path().join("setup-token"))
+                    .unwrap_or_default()
+                    .trim(),
+            )
+            .unwrap(),
+        )]))
         .build()
         .unwrap();
     // 复用 common 的 harness：它自己也会起一台服务，这里只要它的 state 与
@@ -44,7 +54,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -105,14 +118,11 @@ async fn give_new_api_credentials(akhub: &common::Akhub, account_id: &str) {
         .find(|account| account.id == account_id)
         .unwrap();
     account.new_api_user_id = Some("42".into());
-    let secrets = akhub::storage::store::AccountSecrets {
-        api_key: None,
-        new_api_token: Some(akhub.state.cipher.seal(b"tok-detect").unwrap()),
-    };
+    let token = akhub.state.cipher.seal(b"tok-detect").unwrap();
     akhub
         .state
         .store
-        .update_account(&account, &secrets)
+        .update_account(&account, Some(&token))
         .await
         .unwrap();
     akhub.state.reload_config().await.unwrap();
@@ -123,7 +133,7 @@ fn account_body(group_id: &str, base_url: &str) -> Value {
         "group_id": group_id,
         "name": "待识别",
         "base_url": base_url,
-        "api_key": "sk-detect",
+        "keys": [{"api_key": "sk-detect"}],
         "preferred_protocol": "openai_chat",
         "manual_multiplier": "1",
         "allow_private_network": true,

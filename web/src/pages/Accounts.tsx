@@ -871,12 +871,15 @@ function AccountDrawer({
   };
 
   const [form, setForm] = useState({
-    // 新建时默认"未分配"：账号建好之后再决定进哪个分组，是一条更常见的
-    // 顺序（先连上、试通、再决定流量归属）。空串在提交时转成 null（§4.2.3）。
-    group_id: account ? (account.group_id ?? "") : "",
+    // 只有一个分组时新账号默认放进去；多个分组时默认"未分配"，建好再决定流量
+    // 归属。空串在提交时转成 null（§4.2.3）。
+    group_id: account
+      ? (account.group_id ?? "")
+      : data.groups.length === 1
+        ? data.groups[0]!.id
+        : "",
     name: account?.name ?? "",
     base_url: account?.base_url ?? "",
-    api_key: "",
     preferred_protocol: account?.preferred_protocol ?? ("openai_chat" as Protocol),
     default_priority: String(account?.default_priority ?? 0),
     // 不预填 1：手动倍率会直接参与"有效倍率 ≤ 分组上限"的门控（§11.1），
@@ -1081,8 +1084,10 @@ function AccountDrawer({
       multiplier_mode: form.multiplier_mode,
       manual_multiplier: form.manual_multiplier.trim() || "1",
       calibration: form.calibration.trim(),
-      new_api_user_id: form.new_api_user_id.trim() || undefined,
-      new_api_group: form.new_api_group.trim() || undefined,
+      // 空串就是清空：分组回到"自动识别"，用户 ID 回到继承站点级。写成
+      // undefined 会被后端读成"不改"，清不掉。
+      new_api_user_id: form.new_api_user_id.trim(),
+      new_api_group: form.new_api_group.trim(),
       limits,
       allow_private_network: form.allow_private_network,
       auto_sync: form.auto_sync,

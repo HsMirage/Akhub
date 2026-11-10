@@ -105,7 +105,11 @@ async fn a_busy_top_layer_queues_instead_of_sinking_to_the_next_layer() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -146,7 +150,11 @@ async fn queue_full_when_the_group_forbids_waiting() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -334,7 +342,11 @@ async fn queue_timeout_when_the_layer_stays_busy_past_the_deadline() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -375,7 +387,11 @@ async fn the_group_max_wait_caps_queue_waiting_before_the_request_timeout() {
                 key_id: None,
                 target_id: &a.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -1096,7 +1112,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
                 key_id: None,
                 target_id: &bound_wired.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -1119,7 +1139,11 @@ async fn a_sticky_request_waits_for_a_busy_target_according_to_its_budget() {
                 key_id: None,
                 target_id: &bound_wired.target_id,
             },
-            one_slot(),
+            akhub::health::AdmissionLimits {
+                account: one_slot(),
+                key: Limits::default(),
+                target: Limits::default(),
+            },
             0,
         )
         .unwrap();
@@ -1418,7 +1442,8 @@ fn snapshot(
         source: MultiplierMode::Sub2Api,
         status: status.as_str().into(),
         observed_at: None,
-        refreshed_at: 0,
+        // 刚刷新过：超过一个刷新间隔的快照重启后不再被当作新鲜（§11.4）。
+        refreshed_at: akhub::storage::now_unix(),
         stale_since,
         last_error: None,
     }
@@ -1903,7 +1928,7 @@ async fn a_rejected_request_records_why_every_target_was_filtered() {
                 enabled: false,
                 ..account
             },
-            &akhub::storage::store::AccountSecrets::default(),
+            None,
         )
         .await
         .unwrap();
@@ -2115,32 +2140,19 @@ async fn the_recorded_config_version_is_the_one_the_request_started_with() {
     ));
     upstream.wait_for_requests(1).await;
 
-    // 请求在途：新增一个分组让配置**内容**真的变（版本号只在内容变化时前进），
-    // 把版本推到入口版本之后。用 app_settings 造不出这个效果：它不进配置快照。
-    let (_, prefix) = akhub::security::generate_group_key().unwrap();
+    // 请求在途：一次管理端写入把修订号推到入口版本之后。
     akhub
         .state
-        .store
-        .insert_group(&akhub::domain::Group {
-            id: akhub::storage::store::ids::group(),
-            name: "在途新增".into(),
-            key_prefix: prefix,
-            key_digest_hex: "0".repeat(64),
-            multiplier_limit: Multiplier::ONE,
-            weights: Default::default(),
-            queue_capacity: 1,
-            max_wait_secs: 60,
-            allow_managed_background: false,
-            allow_degrade: true,
-            created_at: time::OffsetDateTime::now_utc(),
-        })
+        .write_config(
+            akhub::config::Revision::Any,
+            async |_| -> anyhow::Result<()> { Ok(()) },
+        )
         .await
         .unwrap();
-    akhub.state.config.reload().await.unwrap();
     let after_reload = akhub.state.config.version();
     assert!(
         after_reload > entered,
-        "配置内容变了，版本必须前进：{entered} → {after_reload}"
+        "管理端写入后版本必须前进：{entered} → {after_reload}"
     );
 
     upstream.release();

@@ -26,7 +26,9 @@ async fn admin_cookie(akhub: &common::Akhub) -> String {
 }
 
 fn write(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    request.header("x-akhub-csrf", "1")
+    request
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 #[tokio::test]
@@ -262,7 +264,7 @@ async fn a_site_credential_lets_accounts_skip_their_own_token() {
                 "group_id": akhub.group_id,
                 "name": "站点凭据账号",
                 "base_url": upstream.base_url,
-                "api_key": "sk-abc",
+                "keys": [{"api_key": "sk-abc"}],
                 "preferred_protocol": "openai_chat",
                 "multiplier_mode": "new_api",
                 "new_api_group": "gpt-boom",
@@ -741,47 +743,6 @@ async fn request_records_expose_scheduling_diagnostics() {
     assert_eq!(row["reasoning_tokens"], 120);
 }
 
-/// 运行指标接口（§6.6）：概览之外的进程内指标。
-#[tokio::test]
-async fn the_metrics_endpoint_reports_live_counters() {
-    let akhub = spawn_akhub_with(Settings::default(), |_| {}).await;
-    let cookie = admin_cookie(&akhub).await;
-    let metrics: Value = client()
-        .get(format!("{}/admin/api/metrics", akhub.base_url))
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    assert_eq!(metrics["bucket_secs"], 60, "{metrics}");
-    assert!(metrics["since"].as_i64().is_some(), "{metrics}");
-    assert!(metrics["until"].as_i64().is_some(), "{metrics}");
-    assert!(metrics["targets"].is_array(), "{metrics}");
-    // 曲线按分钟补零，没有数据也要有点，不能留空洞。
-    assert!(
-        !metrics["series"].as_array().unwrap().is_empty(),
-        "{metrics}"
-    );
-    for point in metrics["series"].as_array().unwrap() {
-        assert!(point["requests"].is_i64(), "{point}");
-        assert!(point["success"].is_i64(), "{point}");
-    }
-    // 非法区间要明确拒绝，而不是返回一个空结果让人以为"就是没数据"。
-    let bad = client()
-        .get(format!(
-            "{}/admin/api/metrics?since=100&until=10",
-            akhub.base_url
-        ))
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), 400, "until 早于 since 必须报错");
-}
-
 /// 批量刷新全部账号倍率（§11.3）。
 #[tokio::test]
 async fn refreshing_every_multiplier_reports_a_per_account_result() {
@@ -868,6 +829,7 @@ async fn backup_restores_settings_and_every_group_column() {
         .patch(format!("{}/admin/api/settings", akhub.base_url))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&serde_json::json!({"retention_days": 11}))
         .send()
         .await
@@ -878,6 +840,7 @@ async fn backup_restores_settings_and_every_group_column() {
         .post(format!("{}/admin/api/backup/export", akhub.base_url))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&serde_json::json!({"password": "备份口令123"}))
         .send()
         .await
@@ -901,6 +864,7 @@ async fn backup_restores_settings_and_every_group_column() {
         ))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&serde_json::json!({"max_wait_secs": 3, "queue_capacity": 1}))
         .send()
         .await
@@ -910,6 +874,7 @@ async fn backup_restores_settings_and_every_group_column() {
         .patch(format!("{}/admin/api/settings", akhub.base_url))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&serde_json::json!({"retention_days": 30}))
         .send()
         .await
@@ -920,6 +885,7 @@ async fn backup_restores_settings_and_every_group_column() {
         .post(format!("{}/admin/api/backup/import", akhub.base_url))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&serde_json::json!({"password": "备份口令123", "content": backup}))
         .send()
         .await

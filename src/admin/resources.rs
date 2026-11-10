@@ -16,14 +16,14 @@ use time::OffsetDateTime;
 use super::{Admin, AdminError, AdminResult};
 use crate::app::SharedState;
 use crate::auth::session;
+use crate::config::Revision;
 use crate::discovery;
 use crate::domain::{
-    Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, Multiplier, MultiplierMode,
-    Protocol, SchedulingWeights,
+    Account, DispatchTarget, Group, Limits, Multiplier, MultiplierMode, Protocol, SchedulingWeights,
 };
 use crate::routing::score::{Dimension, Stats};
 use crate::security::url_guard;
-use crate::storage::store::{AccountSecrets, ids};
+use crate::storage::store::ids;
 
 // ------------------------------------------------------------------ 概览
 
@@ -336,10 +336,12 @@ pub async fn update_settings(
     let stored = serde_json::to_string(&crate::app::PersistedSettings::from_settings(&next))
         .map_err(AdminError::internal)?;
     state
-        .store
-        .set_app_setting(crate::app::SETTINGS_KEY, &stored)
-        .await
-        .map_err(AdminError::internal)?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.set_app_setting(crate::app::SETTINGS_KEY, &stored)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     let applied = state.settings.replace(next);
     audit(&state, &admin, "update_settings", "system").await;
     Ok(Json(settings_json(&applied)))
@@ -358,7 +360,8 @@ pub async fn change_password(
         .await
         .map_err(AdminError::internal)?
         .ok_or_else(|| AdminError::unauthorized("管理员账号不存在"))?;
-    if !session::verify_password(&payload.current_password, &hash) {
+    // Argon2 是有意设计的慢计算，放到阻塞线程池，别占住异步工作线程。
+    if !session::verify_password_blocking(&payload.current_password, Some(hash)).await {
         return Err(AdminError::unauthorized("当前密码不正确"));
     }
     if payload.new_password.chars().count() < 12 {
@@ -367,7 +370,9 @@ pub async fn change_password(
     if payload.new_password == payload.current_password {
         return Err(AdminError::bad_request("新密码不能与当前密码相同"));
     }
-    let new_hash = session::hash_password(&payload.new_password).map_err(AdminError::internal)?;
+    let new_hash = session::hash_password_blocking(&payload.new_password)
+        .await
+        .map_err(AdminError::internal)?;
     if !state
         .store
         .update_admin_password(&admin.username, &new_hash)
@@ -679,11 +684,12 @@ pub async fn create_group(
     };
 
     state
-        .store
-        .insert_group(&group)
-        .await
-        .map_err(|e| conflict_or_internal(e, "分组名称已存在"))?;
-    reload(&state).await?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.insert_group(&group)
+                .await
+                .map_err(|e| conflict_or_internal(e, "分组名称已存在"))
+        })
+        .await?;
     audit(&state, &admin, "create_group", &group.id).await;
 
     Ok((
@@ -726,11 +732,12 @@ pub async fn update_group(
     }
 
     state
-        .store
-        .update_group(&group)
-        .await
-        .map_err(|e| conflict_or_internal(e, "分组名称已存在"))?;
-    reload(&state).await?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.update_group(&group)
+                .await
+                .map_err(|e| conflict_or_internal(e, "分组名称已存在"))
+        })
+        .await?;
     audit(&state, &admin, "update_group", &group.id).await;
     Ok(Json(group_dto(&state, &group)))
 }
@@ -740,15 +747,16 @@ pub async fn delete_group(
     admin: Admin,
     Path(id): Path<String>,
 ) -> AdminResult<StatusCode> {
-    if !state
-        .store
-        .delete_group(&id)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        return Err(AdminError::not_found("分组不存在"));
-    }
-    reload(&state).await?;
+    // 账号经外键 SET NULL 回到未分配（§4.2.3）；逻辑模型与目标随分组级联删除。
+    state
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            if tx.delete_group(&id).await.map_err(AdminError::internal)? {
+                Ok(())
+            } else {
+                Err(AdminError::not_found("分组不存在"))
+            }
+        })
+        .await?;
     audit(&state, &admin, "delete_group", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -765,11 +773,10 @@ pub async fn regenerate_key(
     group.key_digest_hex = state.key_digest.digest_hex(&key);
 
     state
-        .store
-        .update_group(&group)
-        .await
-        .map_err(AdminError::internal)?;
-    reload(&state).await?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.update_group(&group).await.map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "regenerate_group_key", &group.id).await;
 
     Ok(Json(json!({
@@ -805,17 +812,15 @@ pub struct AccountKeyInput {
 
 #[derive(Deserialize)]
 pub struct AccountPayload {
-    /// 所属分组。留空 / `null` 表示"未分配"：先把账号建好，之后再分配进
-    /// 分组（§4.2.3）。未分配账号不参与任何调度。
-    #[serde(default)]
-    pub group_id: Option<String>,
+    /// 所属分组。显式传 `null` / 空串表示"未分配"（§4.2.3）；字段缺省时，
+    /// 只有一个分组就放进去，否则未分配。
+    #[serde(default, deserialize_with = "double_option")]
+    pub group_id: Option<Option<String>>,
     pub name: String,
     pub base_url: String,
     /// Key 池。为空数组表示"这个账号暂时没有凭据"，是合法状态（§4.2.1）。
     #[serde(default)]
     pub keys: Vec<AccountKeyInput>,
-    /// 旧版单 Key 字段。单独给出时等价于"一把 Key 的池"，向后兼容。
-    pub api_key: Option<String>,
     pub preferred_protocol: Protocol,
     pub adaptive_protocol: Option<bool>,
     pub default_priority: Option<i32>,
@@ -847,9 +852,6 @@ pub struct AccountPatch {
     pub base_url: Option<String>,
     /// Key 池整体替换（§4.2.1）。缺省表示"不动 Key 池"。
     pub keys: Option<Vec<AccountKeyInput>>,
-    /// 旧版单 Key 字段。给出且 `keys` 缺省时，等价于"把池换成这一把"。
-    /// 只允许覆盖写入，后台不提供读取完整 Key 的接口（§23.2）。
-    pub api_key: Option<String>,
     pub preferred_protocol: Option<Protocol>,
     pub adaptive_protocol: Option<bool>,
     pub default_priority: Option<i32>,
@@ -1037,17 +1039,6 @@ fn resolve_keys(
         });
     }
     Ok(out)
-}
-
-/// 旧的单 Key 字段转成"一把 Key 的池"，供向后兼容使用。
-fn single_key_input(api_key: &str) -> AccountKeyInput {
-    AccountKeyInput {
-        id: None,
-        api_key: Some(api_key.to_string()),
-        label: None,
-        limits: None,
-        enabled: None,
-    }
 }
 
 async fn account_dto(state: &SharedState, account: &Account, has_token: bool) -> AccountDto {
@@ -1324,8 +1315,13 @@ pub fn effective_target_status(
     multiplier_limit: crate::domain::Multiplier,
     target: &crate::config::TargetView,
 ) -> &'static str {
-    if !target.target.enabled || !target.account.enabled {
+    if !target.account.enabled {
         return "disabled";
+    }
+    // 目标停用只有一个来源：调和发现上游不再提供这个模型（§16.5）。
+    // 管理员"停用"一个模型是把目标撤下，不会留下停用的目标。
+    if !target.target.enabled {
+        return "missing_model";
     }
     let now = crate::storage::now_unix();
     let effective =
@@ -1421,31 +1417,49 @@ pub async fn list_accounts(
     Ok(paged(dtos, &page))
 }
 
+pub async fn get_account(
+    State(state): State<SharedState>,
+    _: Admin,
+    Path(id): Path<String>,
+) -> AdminResult<Json<AccountDto>> {
+    let account = find_account(&state, &id).await?;
+    let has_token = state
+        .store
+        .account_sealed_new_api_token(&id)
+        .await
+        .map_err(AdminError::internal)?
+        .is_some();
+    Ok(Json(account_dto(&state, &account, has_token).await))
+}
+
 pub async fn create_account(
     State(state): State<SharedState>,
     admin: Admin,
     Json(payload): Json<AccountPayload>,
 ) -> AdminResult<(StatusCode, Json<AccountDto>)> {
     // 分组是可选的：留空就是"未分配"，账号先建好、以后再分配进分组（§4.2.3）。
-    let group_id = trimmed(payload.group_id);
+    let group_id = match payload.group_id {
+        Some(requested) => trimmed(requested),
+        // 没说放哪儿、又只有一个分组：不用选（§4.2.3）。
+        None => {
+            let groups = state
+                .store
+                .list_groups()
+                .await
+                .map_err(AdminError::internal)?;
+            match groups.as_slice() {
+                [only] => Some(only.id.clone()),
+                _ => None,
+            }
+        }
+    };
     if let Some(group_id) = group_id.as_deref() {
         find_group(&state, group_id).await?;
     }
     let name = require_name(&payload.name, "账号名称")?;
     ensure_account_name_free(&state, None, group_id.as_deref(), &name).await?;
-    // Key 池：新格式用 `keys`，只给了旧的 `api_key` 时等价于"一把 Key 的池"
-    // （§4.2.1）。Key 池为空是合法状态——管理员可以先建账号再填凭据。
-    let mut inputs = payload.keys;
-    if inputs.is_empty()
-        && let Some(legacy) = payload
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-    {
-        inputs.push(single_key_input(legacy));
-    }
-    let key_writes = resolve_keys(&state, &inputs, &[])?;
+    // Key 池为空是合法状态——管理员可以先建账号再填凭据（§4.2.1）。
+    let key_writes = resolve_keys(&state, &payload.keys, &[])?;
     let allow_private = payload.allow_private_network.unwrap_or(false);
     let base_url = validate_base_url(&payload.base_url, allow_private)?;
     // 人工优先级默认 0：默认所有账号同层，由综合评分决定分配；只有在
@@ -1492,30 +1506,17 @@ pub async fn create_account(
         created_at: OffsetDateTime::now_utc(),
     };
 
-    // 凭据镜像取第一把 Key：旧二进制与旧恢复路径仍能读到它（§4.2.1）。
-    let secrets = AccountSecrets::new(
-        key_writes
-            .first()
-            .map(|key| key.sealed_key.clone())
-            .unwrap_or_default(),
-        token.map(|t| seal(&state, t)).transpose()?,
-    );
+    let sealed_token = token.map(|t| seal(&state, t)).transpose()?;
     state
-        .store
-        .insert_account(&account, &secrets)
-        .await
-        .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
-    // 未分配账号在配置装配里根本不会出现（§4.2.3），但配置版本仍要推进一次：
-    // 让它立刻出现在管理端的账号列表与倍率表里。
-    //
-    // 建账号与写 Key 池分两步：账号行必须先存在（外键）。两步之间失败只会留下
-    // 一个"没有凭据"的账号，后台如实显示，管理员补一次即可。
-    state
-        .store
-        .replace_account_keys(&account.id, &key_writes)
-        .await
-        .map_err(AdminError::internal)?;
-    reload(&state).await?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.insert_account(&account, sealed_token.as_deref())
+                .await
+                .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+            tx.replace_account_keys(&account.id, &key_writes)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "create_account", &account.id).await;
     kick_multiplier_refresh(&state, &account);
 
@@ -1552,10 +1553,7 @@ pub async fn update_account(
     //
     // 传 `null` / 空串表示取消分配：账号留在列表里，模型目录与凭据原封不动，
     // 只是不再属于任何分组，名下的调度目标随之全部撤下（见下面的 `unassigned`）。
-    let mut previous_group: Option<String> = None;
-    let mut unassigned = false;
-    // 从"未分配"进入分组：没有旧分组可搬，但目标必须按目录重建出来。
-    let mut assigned = false;
+    let mut group_changed = false;
     if let Some(requested) = patch.group_id {
         let group_id = requested
             .as_deref()
@@ -1574,20 +1572,12 @@ pub async fn update_account(
                         &account.name,
                     )
                     .await?;
-                    // 从"未分配"进来时 previous_group 是 None，但它一样要
-                    // 走下面的调和（这一段就是"目标从哪来"的唯一入口）。
-                    assigned = account.group_id.is_none();
-                    previous_group = account.group_id.take();
                     account.group_id = Some(group_id.to_string());
                 }
-                None => {
-                    // 撤销分配不是"搬家"：账号的目标要**撤下**而不是搬走，
-                    // 所以这里不留 from_group，交给 detach 分支处理。
-                    previous_group = None;
-                    account.group_id = None;
-                    unassigned = true;
-                }
+                // 取消分配：目标由下面的调和撤下，目录与凭据原封不动。
+                None => account.group_id = None,
             }
+            group_changed = true;
         }
     }
     // 只改名、不改分组时也要重查一次：同一分组内的重名同样要被拦下。
@@ -1622,6 +1612,7 @@ pub async fn update_account(
     if let Some(multiplier) = patch.manual_multiplier {
         account.manual_multiplier = multiplier;
     }
+    // 空串就是清空：New API 分组回到"自动"，用户 ID 回到继承站点级（§6.4）。
     if let Some(user_id) = patch.new_api_user_id {
         account.new_api_user_id = trimmed(Some(user_id));
     }
@@ -1634,9 +1625,6 @@ pub async fn update_account(
     if let Some(enabled) = patch.enabled {
         account.enabled = enabled;
     }
-    // 关闭托管要收回全量目标（§16.2）：托管期间选择集标记原封未动，
-    // 所以按标记调和就能回到之前勾选的模型。
-    let was_managed = account.auto_sync;
     if let Some(auto_sync) = patch.auto_sync {
         account.auto_sync = auto_sync;
     }
@@ -1663,102 +1651,57 @@ pub async fn update_account(
         site_available,
     )?;
 
-    // Key 池：新格式用 `keys`（整体替换），只给了旧的 `api_key` 时换成
-    // "一把 Key 的池"。两者都没给就是"不动 Key 池"（§4.2.1）。
-    let mut inputs = patch.keys;
-    if inputs.is_none()
-        && let Some(legacy) = patch
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-    {
-        inputs = Some(vec![single_key_input(legacy)]);
-    }
     let current_keys = state
         .store
         .list_account_key_rows(&account.id)
         .await
         .map_err(AdminError::internal)?;
-    let key_writes = inputs
+    let key_writes = patch
+        .keys
         .as_deref()
         .map(|inputs| resolve_keys(&state, inputs, &current_keys))
         .transpose()?;
 
-    let secrets = AccountSecrets {
-        // 镜像列由 `replace_account_keys` 统一维护，这里不再单独写它。
-        api_key: None,
-        new_api_token: token.map(|t| seal(&state, t)).transpose()?,
-    };
-    state
-        .store
-        .update_account(&account, &secrets)
-        .await
-        .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
-    if let Some(keys) = key_writes {
-        // 凭据换过就清掉"Key 失效"的硬停：这正是 §12.3 允许的恢复途径。
-        // 没换的那些 Key 的熔断状态保留——按凭据摘要归类本来就该认得出是同一把
-        // （§4.2.1）。
-        let replaced = keys.iter().any(|key| {
+    // 凭据换过就清掉"Key 失效"的硬停：这正是 §12.3 允许的恢复途径。没换的那些
+    // Key 的熔断状态保留——按凭据摘要归类本来就认得出是同一把（§4.2.1）。
+    let credentials_replaced = key_writes.as_ref().is_some_and(|keys| {
+        keys.iter().any(|key| {
             current_keys
                 .iter()
                 .find(|row| row.id == key.id)
                 .is_none_or(|row| row.sealed_key != key.sealed_key)
-        });
-        state
-            .store
-            .upsert_account_keys(&account.id, &keys)
-            .await
-            .map_err(AdminError::internal)?;
-        if replaced {
-            state.runtime.health.clear_account_faults(&account.id);
-        }
-    }
-    // 取消分配（§4.2.3）：账号不再属于任何分组，它名下的调度目标全部撤下。
-    // 模型目录、选择集与凭据都留着——重新分配时按目录整体调和，勾过的模型
-    // 会自动回到调度里。
-    if unassigned {
-        let removed = discovery::detach_account_targets(&state, &account)
-            .await
-            .map_err(AdminError::internal)?;
-        audit(&state, &admin, "move_account", &account.id).await;
-        tracing::info!(account = %account.id, removed, "账号已取消分配");
-    }
-    // 搬家 / 分配：账号行已经落库，接着把目标按对外名搬到新分组，再按目录整体
-    // 调和一遍（§4.2.2）。顺序不能反——先搬目标再改账号行的话，中间那一刻的
-    // 快照里目标与账号不同组，会被配置装配整批丢掉。
-    if assigned || previous_group.is_some() {
-        let from_group = previous_group.clone().unwrap_or_default();
-        let moved = if previous_group.is_some() && account.group_id.is_some() {
-            discovery::move_account_targets(&state, &account, &from_group)
+        })
+    });
+    let sealed_token = token.map(|t| seal(&state, t)).transpose()?;
+    // 改行、Key 池、默认勾选、目标调和在同一个事务里：分组是调度硬边界，中途
+    // 失败留下"账号搬了、目标没搬"的状态，这些目标就会被配置装配整批丢掉。
+    // 调和本身就会把目标按对外名平移到新分组（§4.2.2）、在取消分配时撤下
+    // （§4.2.3）、在关闭托管时收回选择集（§16.2）。
+    state
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.update_account(&account, sealed_token.as_deref())
                 .await
-                .map_err(AdminError::internal)?
-        } else {
-            // 只有"改分组"才搬家；取消分配那条路径已经在上面的 detach 分支里
-            // 把目标撤下了，这里不能重复动作（§4.2.3）。
-            0
-        };
-        // 目录调和兜底：迁移只搬"已经存在的目标"，"哪些目录行该有目标"仍然
-        // 由目录说了算（托管开关、上游已消失的行都在这一步收敛）。
-        discovery::reconcile_account(&state, &account, account.auto_sync)
-            .await
-            .map_err(AdminError::internal)?;
-        tracing::info!(
-            account = %account.id,
-            from = %from_group,
-            to = %account.group_id.as_deref().unwrap_or("未分配"),
-            moved,
-            "账号分组已变更"
-        );
-        audit(&state, &admin, "move_account", &account.id).await;
+                .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+            if let Some(keys) = &key_writes {
+                tx.replace_account_keys(&account.id, keys)
+                    .await
+                    .map_err(AdminError::internal)?;
+            }
+            if group_changed {
+                discovery::default_select_in_tx(tx, &account)
+                    .await
+                    .map_err(AdminError::internal)?;
+            }
+            discovery::reconcile_in_tx(tx, &account, account.auto_sync)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
+    if credentials_replaced {
+        state.runtime.health.clear_account_faults(&account.id);
     }
-    // 先落库再调和：配置装配要求"账号行与目标行一致"（见上面的注释）。
-    // `reconcile_account` 内部会 reload_config，这里统一放在最后兜一次底。
-    reload(&state).await?;
-    if was_managed && !account.auto_sync {
-        discovery::unhost(&state, &account)
-            .await
-            .map_err(AdminError::internal)?;
+    if group_changed {
+        audit(&state, &admin, "move_account", &account.id).await;
     }
     audit(&state, &admin, "update_account", &account.id).await;
     // 改过凭据/分组/来源之后立刻插队探一次：否则列表上会继续显示旧的占位值，
@@ -1786,17 +1729,17 @@ pub async fn refresh_account_multiplier(
     }
     // 与后台定时任务共用同一条探测与落库路径，但同步等待结果：按钮点下去
     // 就是一次真实探测，而不是"排进下一轮"。
-    let reading = crate::multiplier::refresh::refresh_account_now(&state, &account)
-        .await
-        .map_err(|error| {
-            AdminError::new(
+    let reading = match crate::multiplier::refresh::refresh_account_now(&state, &account).await {
+        Ok(reading) => reading,
+        Err(error) => {
+            let text = crate::security::redact::text(&error.to_string());
+            audit_result(&state, &admin, "refresh_multiplier", &account.id, "failed").await;
+            return Err(AdminError::new(
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "倍率探测失败：{}",
-                    crate::security::redact::text(&error.to_string())
-                ),
-            )
-        })?;
+                format!("倍率探测失败：{text}"),
+            ));
+        }
+    };
     audit(&state, &admin, "refresh_multiplier", &account.id).await;
     Ok(Json(json!({
         "refreshed": true,
@@ -1823,7 +1766,7 @@ pub async fn detect_account_multiplier_source(
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
     // 端口放在这里而不是原函数上：让同一段逻辑也能被测试直接调用。
-    let payload = detect_account_source(&state, &id).await?;
+    let payload = detect_account_source(&state, &id, admin.revision).await?;
     let mode = payload
         .0
         .get("multiplier_mode")
@@ -1841,7 +1784,11 @@ pub async fn detect_account_multiplier_source(
 }
 
 /// 识别并写回来源，返回识别结论。错误一律由调用方转成对外的 502。
-async fn detect_account_source(state: &SharedState, id: &str) -> AdminResult<Json<Value>> {
+async fn detect_account_source(
+    state: &SharedState,
+    id: &str,
+    revision: Revision,
+) -> AdminResult<Json<Value>> {
     let mut account = find_account(state, id).await?;
     let context = crate::multiplier::refresh::Context {
         store: state.store.clone(),
@@ -1887,11 +1834,12 @@ async fn detect_account_source(state: &SharedState, id: &str) -> AdminResult<Jso
     // 写回明确的来源。识别成功却只存在内存里，等于让管理员每重启一次再点一次。
     account.multiplier_mode = detected.mode();
     state
-        .store
-        .update_account(&account, &AccountSecrets::default())
-        .await
-        .map_err(AdminError::internal)?;
-    reload(state).await?;
+        .write_config(revision, async |tx| -> AdminResult<()> {
+            tx.update_account(&account, None)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
 
     // 来源变了就立刻探测一次：识别的用处是拿到倍率，而不是停在"知道它是什么站"。
     // 这次刷新失败不回滚来源——识别本身已经成功，倍率失败按 §11.4 的宽限期处理。
@@ -2224,10 +2172,12 @@ pub async fn save_new_api_site(
             .ok_or_else(|| AdminError::bad_request("首次配置必须提供 New API 访问令牌"))?,
     };
     state
-        .store
-        .upsert_new_api_site(&base_url, &user_id, &sealed)
-        .await
-        .map_err(AdminError::internal)?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.upsert_new_api_site(&base_url, &user_id, &sealed)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "save_new_api_site", &base_url).await;
     Ok(Json(json!({"base_url": base_url, "user_id": user_id})))
 }
@@ -2240,10 +2190,12 @@ pub async fn delete_new_api_site(
 ) -> AdminResult<StatusCode> {
     let base_url = query.base_url.trim().trim_end_matches('/').to_string();
     state
-        .store
-        .delete_new_api_site(&base_url)
-        .await
-        .map_err(AdminError::internal)?;
+        .write_config(admin.revision, async |tx| -> AdminResult<bool> {
+            tx.delete_new_api_site(&base_url)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "delete_new_api_site", &base_url).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2316,40 +2268,28 @@ pub async fn delete_account(
     admin: Admin,
     Path(id): Path<String>,
 ) -> AdminResult<StatusCode> {
-    if !state
-        .store
-        .delete_account(&id)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        return Err(AdminError::not_found("账号不存在"));
-    }
-    reload(&state).await?;
+    // 目标随账号级联删除；空出来的逻辑模型要在同一事务里清掉（§16.3）。
+    state
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            if !tx.delete_account(&id).await.map_err(AdminError::internal)? {
+                return Err(AdminError::not_found("账号不存在"));
+            }
+            tx.delete_orphan_logical_models()
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "delete_account", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 // -------------------------------------------------------------- 逻辑模型
 
-#[derive(Deserialize)]
-pub struct LogicalModelPayload {
-    pub group_id: String,
-    pub name: String,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Deserialize)]
-pub struct LogicalModelPatch {
-    pub name: Option<String>,
-    pub enabled: Option<bool>,
-}
-
 #[derive(Serialize)]
 pub struct LogicalModelDto {
     pub id: String,
     pub group_id: String,
     pub name: String,
-    pub origin: ModelOrigin,
     pub enabled: bool,
     pub dispatch_targets: usize,
     /// 是否会出现在 `/v1/models` 中。
@@ -2405,7 +2345,6 @@ pub async fn list_logical_models(
                 id: model.id.clone(),
                 group_id: model.group_id.clone(),
                 name: model.name.clone(),
-                origin: model.origin,
                 enabled: model.enabled,
                 dispatch_targets: view.map(|v| v.targets.len()).unwrap_or(0),
                 listed: view.map(|v| v.is_listable()).unwrap_or(false),
@@ -2415,120 +2354,7 @@ pub async fn list_logical_models(
     Ok(paged(dtos, &page))
 }
 
-pub async fn create_logical_model(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Json(payload): Json<LogicalModelPayload>,
-) -> AdminResult<(StatusCode, Json<LogicalModelDto>)> {
-    find_group(&state, &payload.group_id).await?;
-    let name = require_name(&payload.name, "逻辑模型名称")?;
-
-    let model = LogicalModel {
-        id: ids::logical_model(),
-        group_id: payload.group_id,
-        name,
-        // 后台显式创建的一律是手工模型：零目标时保留记录（§4.4）。
-        origin: ModelOrigin::Manual,
-        enabled: payload.enabled.unwrap_or(true),
-        created_at: OffsetDateTime::now_utc(),
-    };
-    state
-        .store
-        .insert_logical_model(&model)
-        .await
-        .map_err(|e| conflict_or_internal(e, "同一分组内逻辑模型名称已存在"))?;
-    reload(&state).await?;
-    audit(&state, &admin, "create_logical_model", &model.id).await;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(LogicalModelDto {
-            id: model.id,
-            group_id: model.group_id,
-            name: model.name,
-            origin: model.origin,
-            enabled: model.enabled,
-            dispatch_targets: 0,
-            listed: false,
-        }),
-    ))
-}
-
-pub async fn update_logical_model(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(patch): Json<LogicalModelPatch>,
-) -> AdminResult<StatusCode> {
-    let mut model = state
-        .store
-        .list_logical_models()
-        .await
-        .map_err(AdminError::internal)?
-        .into_iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| AdminError::not_found("逻辑模型不存在"))?;
-
-    if let Some(name) = patch.name {
-        model.name = require_name(&name, "逻辑模型名称")?;
-    }
-    if let Some(enabled) = patch.enabled {
-        model.enabled = enabled;
-    }
-    state
-        .store
-        .update_logical_model(&model)
-        .await
-        .map_err(|e| conflict_or_internal(e, "同一分组内逻辑模型名称已存在"))?;
-    reload(&state).await?;
-    audit(&state, &admin, "update_logical_model", &model.id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn delete_logical_model(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-) -> AdminResult<StatusCode> {
-    if !state
-        .store
-        .delete_logical_model(&id)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        return Err(AdminError::not_found("逻辑模型不存在"));
-    }
-    reload(&state).await?;
-    audit(&state, &admin, "delete_logical_model", &id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 // -------------------------------------------------------------- 调度目标
-
-#[derive(Deserialize)]
-pub struct TargetPayload {
-    pub logical_model_id: String,
-    pub account_id: String,
-    pub upstream_model: String,
-    /// 历史字段：配置装配时忽略；保留以便旧客户端不报错。
-    pub priority_override: Option<i32>,
-    #[serde(default)]
-    pub hide_original: Option<bool>,
-    #[serde(default)]
-    pub limits: Limits,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Deserialize)]
-pub struct TargetPatch {
-    pub upstream_model: Option<String>,
-    /// 历史字段：配置装配时忽略。
-    pub priority_override: Option<Option<i32>>,
-    #[serde(default)]
-    pub hide_original: Option<bool>,
-    pub limits: Option<Limits>,
-    pub enabled: Option<bool>,
-}
 
 #[derive(Serialize)]
 pub struct TargetDto {
@@ -2536,10 +2362,6 @@ pub struct TargetDto {
     pub logical_model_id: String,
     pub account_id: String,
     pub upstream_model: String,
-    /// 是否隐藏上游原始模型名。
-    pub hide_original: bool,
-    /// 历史字段，恒为 null；调度目标不再支持独立优先级覆盖。
-    pub priority_override: Option<i32>,
     /// 实际生效的优先级：统一来自账号默认人工优先级（§9.2 修订）。
     pub priority: i32,
     pub limits: Limits,
@@ -2566,6 +2388,10 @@ pub struct TargetDto {
     pub stats: Option<TargetStatsDto>,
     /// 暂停原因：有则给出可读原因，正常参与调度时为 None（§6.5）。
     pub pause_reason: Option<String>,
+    /// 层内预计分配比例（0-1），与调度器同一公式（§9.4）。
+    pub share: f64,
+    /// 原始缓存命中率 EWMA（0-1）；从没采到过时为 None。0 是真实取值，不是没数据。
+    pub cache_hit_rate: Option<f64>,
 }
 
 /// 分维得分。流式与非流式分开统计，这里给出该模型下样本更多的那一份。
@@ -2587,6 +2413,9 @@ pub struct ScoreDto {
     /// 它解释了"为什么一个分数不高的目标还在拿流量"：不是因为分高，而是因为
     /// 它的分数已经旧到不足为凭，需要重新采样。
     pub exploration: f64,
+    /// 层内抽签权重，与调度器同一公式（`score::base_weight`）。
+    #[serde(skip)]
+    pub draw_weight: f64,
     pub samples: u64,
     /// 有效样本不足门槛时性能各维用的是保守中性分（§9.4）。
     pub warm: bool,
@@ -2652,10 +2481,6 @@ fn target_dto(
         logical_model_id: target.logical_model_id.clone(),
         account_id: target.account_id.clone(),
         upstream_model: target.upstream_model.clone(),
-        hide_original: view
-            .map(|view| view.account.hide_original)
-            .unwrap_or(target.hide_original),
-        priority_override: target.priority_override,
         priority,
         limits: target.limits,
         effective_limits,
@@ -2694,6 +2519,8 @@ fn target_dto(
                 streaming: dimension.streaming,
             }),
         pause_reason: pause_reason(state, target, view),
+        share: row.map_or(0.0, |row| round4(row.share)),
+        cache_hit_rate: (stats.cache_samples > 0).then_some(stats.cache_hit),
     }
 }
 
@@ -2716,14 +2543,14 @@ fn pause_reason(
     target: &DispatchTarget,
     view: Option<&std::sync::Arc<crate::config::TargetView>>,
 ) -> Option<String> {
-    if !target.enabled {
-        return Some("管理员已停用".to_string());
-    }
     // 账号是否停用看配置（健康注册表只管熔断与额度）。
     if let Some(view) = view
         && !view.account.enabled
     {
         return Some("所属账号已停用".to_string());
+    }
+    if !target.enabled {
+        return Some("上游已不再提供该模型".to_string());
     }
     let account = state.runtime.health.account(&target.account_id);
     let health = state.runtime.health.target(&target.id);
@@ -2998,6 +2825,7 @@ fn model_scores(
                 throughput: round4(score.throughput),
                 cache_hit: round4(score.cache_hit),
                 exploration: round4(score.exploration),
+                draw_weight: crate::routing::score::base_weight(&score),
                 samples: stats.samples,
                 effective_samples: round4(stats.effective_samples(now)),
                 warm_threshold: crate::routing::score::MIN_SAMPLES as f64,
@@ -3029,6 +2857,8 @@ struct TargetRow<'a> {
     /// 这些样本对应的维度；一个样本都没有时为 None。
     stats_dimension: Option<Dimension>,
     score: Option<ScoreDto>,
+    /// 这个目标此刻在所在优先级层内预计拿到的流量比例（0-1）。
+    share: f64,
 }
 
 /// 一次性把全部目标行的预计算结果建好，键是目标 ID。
@@ -3044,6 +2874,20 @@ fn target_rows<'a>(
         for model in group.models.values() {
             let dimension = model_dimension(state, model);
             let scores = model_scores(state, group, model, dimension);
+            // 预计分配：同优先级即同层（§9.2），只有此刻真能被选中的目标才分流量。
+            let weights: Vec<f64> = model
+                .targets
+                .iter()
+                .zip(&scores)
+                .map(|(target, score)| {
+                    let schedulable = pause_reason(state, &target.target, Some(target)).is_none();
+                    if schedulable { score.draw_weight } else { 0.0 }
+                })
+                .collect();
+            let mut layer_totals: HashMap<i32, f64> = HashMap::new();
+            for (target, weight) in model.targets.iter().zip(&weights) {
+                *layer_totals.entry(target.priority).or_default() += weight;
+            }
             for (index, target) in model.targets.iter().enumerate() {
                 let (stats_dimension, stats) =
                     target_display_stats(state, &target.target.id, dimension);
@@ -3054,22 +2898,20 @@ fn target_rows<'a>(
                         stats,
                         stats_dimension,
                         score: scores.get(index).cloned(),
+                        share: {
+                            let total = layer_totals[&target.priority];
+                            if total > 0.0 {
+                                weights[index] / total
+                            } else {
+                                0.0
+                            }
+                        },
                     },
                 );
             }
         }
     }
     rows
-}
-
-/// 单个目标的 DTO，供写接口回吐刚写入的那一行。
-fn target_dto_by_id(
-    state: &SharedState,
-    config: &crate::config::RuntimeConfig,
-    target: &DispatchTarget,
-) -> TargetDto {
-    let rows = target_rows(state, config);
-    target_dto(state, config, &rows, target)
 }
 
 pub async fn list_targets(
@@ -3097,130 +2939,6 @@ pub async fn list_targets(
     Ok(paged(dtos, &page))
 }
 
-pub async fn create_target(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Json(payload): Json<TargetPayload>,
-) -> AdminResult<(StatusCode, Json<TargetDto>)> {
-    let model = state
-        .store
-        .list_logical_models()
-        .await
-        .map_err(AdminError::internal)?
-        .into_iter()
-        .find(|m| m.id == payload.logical_model_id)
-        .ok_or_else(|| AdminError::not_found("逻辑模型不存在"))?;
-    let account = find_account(&state, &payload.account_id).await?;
-
-    // 分组是调度硬边界：跨组绑定必须在写入时就被拒绝（§4.1）。未分配账号
-    // 不属于任何分组，也就不能直接绑目标——先把账号分配进分组（§4.2.3）。
-    let Some(account_group) = account.group_id.as_deref() else {
-        return Err(AdminError::bad_request(
-            "该账号还没有分配到分组，无法绑定调度目标",
-        ));
-    };
-    if account_group != model.group_id {
-        return Err(AdminError::bad_request(
-            "账号与逻辑模型不在同一分组，不允许跨分组绑定",
-        ));
-    }
-    if payload.upstream_model.trim().is_empty() {
-        return Err(AdminError::bad_request("上游模型名不能为空"));
-    }
-
-    let target = DispatchTarget {
-        id: ids::target(),
-        logical_model_id: model.id,
-        account_id: account.id,
-        upstream_model: payload.upstream_model.trim().to_string(),
-        hide_original: payload.hide_original.unwrap_or(false),
-        // 调度目标不再有独立优先级：统一继承账号默认人工优先级（§9.2 修订）。
-        priority_override: None,
-        limits: validate_limits(payload.limits)?,
-        enabled: payload.enabled.unwrap_or(true),
-        created_at: OffsetDateTime::now_utc(),
-    };
-    state
-        .store
-        .insert_target(&target)
-        .await
-        .map_err(|e| conflict_or_internal(e, "该账号与模型的组合已经是调度目标"))?;
-    reload(&state).await?;
-    audit(&state, &admin, "create_target", &target.id).await;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(target_dto_by_id(&state, &state.config.current(), &target)),
-    ))
-}
-
-pub async fn update_target(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(patch): Json<TargetPatch>,
-) -> AdminResult<Json<TargetDto>> {
-    let mut target = state
-        .store
-        .list_targets()
-        .await
-        .map_err(AdminError::internal)?
-        .into_iter()
-        .find(|t| t.id == id)
-        .ok_or_else(|| AdminError::not_found("调度目标不存在"))?;
-
-    if let Some(model) = patch.upstream_model {
-        if model.trim().is_empty() {
-            return Err(AdminError::bad_request("上游模型名不能为空"));
-        }
-        target.upstream_model = model.trim().to_string();
-    }
-    if let Some(hide) = patch.hide_original {
-        target.hide_original = hide;
-    }
-    // 历史字段：接受但忽略，保持旧客户端兼容（§9.2 修订）。
-    if patch.priority_override.is_some() {
-        target.priority_override = None;
-    }
-    if let Some(limits) = patch.limits {
-        target.limits = validate_limits(limits)?;
-    }
-    if let Some(enabled) = patch.enabled {
-        target.enabled = enabled;
-    }
-
-    state
-        .store
-        .update_target(&target)
-        .await
-        .map_err(AdminError::internal)?;
-    reload(&state).await?;
-    audit(&state, &admin, "update_target", &target.id).await;
-    Ok(Json(target_dto_by_id(
-        &state,
-        &state.config.current(),
-        &target,
-    )))
-}
-
-pub async fn delete_target(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-) -> AdminResult<StatusCode> {
-    if !state
-        .store
-        .delete_target(&id)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        return Err(AdminError::not_found("调度目标不存在"));
-    }
-    reload(&state).await?;
-    audit(&state, &admin, "delete_target", &id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 // ------------------------------------------------- 模型目录与选择集（§16）
 
 /// 账号模型目录里的一行，供模型管理对话框展示。
@@ -3229,17 +2947,16 @@ pub struct AccountModelDto {
     pub upstream_model: String,
     /// 下游模型名；未设置时等于上游真名。
     pub public_name: String,
-    /// 账号级"隐藏原始模型"开关的当前值。
-    pub hide_original: bool,
-    /// 该行对应的下游模型名（等于 public_name，显式列出便于前端解释）。
-    pub logical_model_name: String,
     /// 该行最终对下游暴露的全部名字；账号隐藏原始名且未设下游模型名时为空。
     pub exposed_names: Vec<String>,
     pub selected: bool,
     pub missing: bool,
     /// 仅"获取模型"响应里有意义：本次拉取新出现的模型。
     pub is_new: bool,
-    /// 管理员明确停用过的模型。与"从没出现过"分开。
+    /// 第一次出现在这个账号目录里的时间（unix 秒）。列表接口没有"本次拉取"的
+    /// 上下文，界面要按"最近新增"筛选时用它。
+    pub discovered_at: i64,
+    /// 管理员亲手停用过的模型（§16.2）。从没碰过的未启用行为 false。
     pub excluded: bool,
     /// 该账号是否处于"模型自动同步"（托管）状态（§16.2）。
     ///
@@ -3276,43 +2993,34 @@ fn effective_selected(selected: bool, missing: bool, managed: bool) -> bool {
     if managed { !missing } else { selected }
 }
 
-fn row_account_model_dto(
+fn account_model_dto(
     row: &crate::storage::store::AccountModelRow,
+    is_new: bool,
     hide_original: bool,
     managed: bool,
 ) -> AccountModelDto {
     AccountModelDto {
         upstream_model: row.upstream_model.clone(),
         public_name: row.public_name.clone(),
-        hide_original,
-        logical_model_name: row.public_name.clone(),
         exposed_names: exposed_names(&row.upstream_model, &row.public_name, hide_original),
         selected: effective_selected(row.selected, row.missing, managed),
         missing: row.missing,
-        is_new: false,
-        // 这个接口不带"本次新增"的上下文，但"排除过"是持久状态，照样给。
+        is_new,
+        discovered_at: row.discovered_at,
         // 托管下没有"排除"这回事：所有模型都在调度。
-        excluded: !managed && !row.selected && !row.missing,
+        excluded: !managed && row.excluded,
         managed,
     }
 }
 
-fn catalog_entry_dto(
-    entry: &discovery::CatalogEntry,
-    hide_original: bool,
-    managed: bool,
-) -> AccountModelDto {
-    AccountModelDto {
-        upstream_model: entry.upstream_model.clone(),
-        public_name: entry.public_name.clone(),
-        hide_original,
-        logical_model_name: entry.public_name.clone(),
-        exposed_names: exposed_names(&entry.upstream_model, &entry.public_name, hide_original),
-        selected: effective_selected(entry.selected, entry.missing, managed),
-        missing: entry.missing,
-        is_new: entry.is_new,
-        excluded: !managed && entry.excluded,
-        managed,
+/// 把一次发现层调用的错误译成后台响应：版本冲突永远是 409，其余按 `fallback`。
+fn discovery_error(
+    error: anyhow::Error,
+    fallback: impl FnOnce(String) -> AdminError,
+) -> AdminError {
+    match error.downcast::<crate::config::ConfigWriteError>() {
+        Ok(error) => error.into(),
+        Err(error) => fallback(format!("{error:#}")),
     }
 }
 
@@ -3328,7 +3036,7 @@ async fn account_models_json(
         .map_err(AdminError::internal)?;
     Ok(Json(
         rows.iter()
-            .map(|row| row_account_model_dto(row, account.hide_original, account.auto_sync))
+            .map(|row| account_model_dto(row, false, account.hide_original, account.auto_sync))
             .collect(),
     ))
 }
@@ -3353,35 +3061,29 @@ pub async fn refresh_account_models(
     Path(id): Path<String>,
 ) -> AdminResult<Json<Vec<AccountModelDto>>> {
     let account = find_account(&state, &id).await?;
-    let entries = discovery::refresh_catalog(&state, &account)
-        .await
-        .map_err(|error| {
-            AdminError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("拉取模型列表失败：{error:#}"),
-            )
-        })?;
+    let entries = match discovery::refresh_catalog(&state, &account, admin.revision).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            audit_result(&state, &admin, "refresh_account_models", &id, "failed").await;
+            return Err(discovery_error(error, |text| {
+                AdminError::new(StatusCode::BAD_GATEWAY, format!("拉取模型列表失败：{text}"))
+            }));
+        }
+    };
     audit(&state, &admin, "refresh_account_models", &id).await;
     Ok(Json(
         entries
             .iter()
-            .map(|entry| catalog_entry_dto(entry, account.hide_original, account.auto_sync))
+            .map(|entry| {
+                account_model_dto(
+                    &entry.row,
+                    entry.is_new,
+                    account.hide_original,
+                    account.auto_sync,
+                )
+            })
             .collect(),
     ))
-}
-
-#[derive(Deserialize)]
-pub struct UpdateAccountModelPayload {
-    pub upstream_model: String,
-    /// 下游模型名。`null` 表示不改；空字符串表示清空、回到上游原名。
-    #[serde(default)]
-    pub alias: Option<String>,
-    /// 启用 / 停用该模型。
-    #[serde(default)]
-    pub selected: Option<bool>,
-    /// 停用最近 24 小时有流量的模型需要它二次确认（§16.3）。
-    #[serde(default)]
-    pub force: bool,
 }
 
 /// 一次批量应用里的单行改动（§16.3）。
@@ -3409,55 +3111,6 @@ pub struct ApplyAccountModelsPayload {
     /// 最近 24 小时有流量的模型被停用/删除时需要二次确认（§16.3）。
     #[serde(default)]
     pub force: bool,
-}
-
-/// 修改一行目录的下游模型名与启用状态，并立即调和目标（§16.3）。
-pub async fn update_account_model(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(payload): Json<UpdateAccountModelPayload>,
-) -> AdminResult<Json<Vec<AccountModelDto>>> {
-    let account = find_account(&state, &id).await?;
-    // 托管下启用 / 停用由后台接管：写进去只会造成"库里标记改了、实际调度没变"
-    // 的错觉。改名照旧放行——别名是管理员的本地意图，不因托管失效
-    // （2026-10-15 修订）。
-    if account.auto_sync && payload.selected.is_some() {
-        return Err(AdminError::conflict(
-            "该账号已开启模型自动同步，启用 / 停用由后台托管；如需手动选择请先关闭自动同步",
-        ));
-    }
-    let outcome = discovery::apply_changes(
-        &state,
-        &account,
-        &[discovery::ModelChange {
-            upstream_model: payload.upstream_model.clone(),
-            alias: payload.alias.clone(),
-            selected: payload.selected,
-            delete: false,
-        }],
-        payload.force,
-    )
-    .await
-    .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
-    if let discovery::Changes::NeedsConfirm(warnings) = outcome {
-        return Err(AdminError::conflict(format!(
-            "以下模型最近 24 小时有流量，停用前请确认：{}",
-            warnings
-                .iter()
-                .map(|warning| warning.public_name.clone())
-                .collect::<Vec<_>>()
-                .join("、")
-        )));
-    }
-    audit(
-        &state,
-        &admin,
-        "update_account_model",
-        &format!("{id}/{}", payload.upstream_model),
-    )
-    .await;
-    account_models_json(&state, &id).await
 }
 
 /// 批量应用勾选 / 改名 / 删除，只调和一次目标（§16.3）。
@@ -3495,54 +3148,29 @@ pub async fn apply_account_models(
             "该账号已开启模型自动同步，模型的{action}由后台托管；如需手动修改请先关闭自动同步"
         )));
     }
-    match discovery::apply_changes(&state, &account, &changes, payload.force)
-        .await
-        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?
+    match discovery::apply_changes(&state, &account, &changes, payload.force, admin.revision).await
     {
-        discovery::Changes::NeedsConfirm(warnings) => Ok((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "以下模型最近 24 小时有流量，停用前请确认",
-                "warnings": warnings
-                    .iter()
-                    .map(|w| json!({"public_name": w.public_name, "calls": w.calls}))
-                    .collect::<Vec<_>>(),
-            })),
-        )
-            .into_response()),
-        discovery::Changes::Applied { .. } => {
+        Ok(_) => {
             audit(&state, &admin, "apply_account_models", &id).await;
             Ok(account_models_json(&state, &id).await?.into_response())
         }
+        Err(error) => {
+            if let Some(discovery::NeedsConfirm(warnings)) = error.downcast_ref() {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "以下模型最近 24 小时有流量，停用前请确认",
+                        "warnings": warnings
+                            .iter()
+                            .map(|w| json!({"public_name": w.public_name, "calls": w.calls}))
+                            .collect::<Vec<_>>(),
+                    })),
+                )
+                    .into_response());
+            }
+            Err(discovery_error(error, AdminError::bad_request))
+        }
     }
-}
-
-#[derive(Deserialize)]
-pub struct DeleteAccountModelPayload {
-    pub upstream_model: String,
-}
-
-/// 从账号目录永久删除一行，同时移除它的调度目标（§16.5）。
-pub async fn delete_account_model(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(payload): Json<DeleteAccountModelPayload>,
-) -> AdminResult<StatusCode> {
-    let account = find_account(&state, &id).await?;
-    if account.auto_sync {
-        return Err(AdminError::conflict(
-            "该账号已开启模型自动同步，不能单独删除模型；请先关闭自动同步",
-        ));
-    }
-    let removed = discovery::delete_model(&state, &account, &payload.upstream_model)
-        .await
-        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
-    if !removed {
-        return Err(AdminError::not_found("模型不在当前目录里"));
-    }
-    audit(&state, &admin, "delete_account_model", &id).await;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 一键移除目录里所有"上游已消失"的模型（§16.5，2026-10-15 修订）。
@@ -3556,95 +3184,11 @@ pub async fn remove_missing_account_models(
     Path(id): Path<String>,
 ) -> AdminResult<Json<serde_json::Value>> {
     let account = find_account(&state, &id).await?;
-    let removed = discovery::remove_missing(&state, &account)
+    let removed = discovery::remove_missing(&state, &account, admin.revision)
         .await
-        .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+        .map_err(|error| discovery_error(error, AdminError::bad_request))?;
     audit(&state, &admin, "remove_missing_account_models", &id).await;
     Ok(Json(json!({ "removed": removed })))
-}
-
-#[derive(Deserialize)]
-pub struct MergeAccountModelsPayload {
-    /// 要合并到一起的上游模型名集合。
-    pub upstream_models: Vec<String>,
-    /// 合并后的下游模型名；可从同组已有模型名里直接选。
-    pub public_name: String,
-}
-
-/// 把多行快速合并到同一个下游模型名，解决"同一模型在不同上游叫不同名字"（§16.4）。
-pub async fn merge_account_models(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(payload): Json<MergeAccountModelsPayload>,
-) -> AdminResult<Json<Vec<AccountModelDto>>> {
-    let account = find_account(&state, &id).await?;
-    discovery::merge_models(
-        &state,
-        &account,
-        &payload.upstream_models,
-        &payload.public_name,
-    )
-    .await
-    .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
-    audit(&state, &admin, "merge_account_models", &id).await;
-    account_models_json(&state, &id).await
-}
-
-#[derive(Deserialize)]
-pub struct SelectionPayload {
-    /// 期望处于启用状态的模型名全集；同时接受上游真名与对外名（兼容旧前端）。
-    pub selected: Vec<String>,
-    /// 最近 24 小时有流量的模型被停用时需要二次确认（§16.3）。
-    #[serde(default)]
-    pub force: bool,
-}
-
-/// 批量应用选择集：启用自动生成/归并调度目标，停用移除目标（§16.3）。
-pub async fn select_account_models(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(payload): Json<SelectionPayload>,
-) -> AdminResult<Response> {
-    let account = find_account(&state, &id).await?;
-    // 托管中全部模型已在调度，选择集被忽略（§16.2）；改勾选只会误导管理员。
-    if account.auto_sync {
-        return Err(AdminError::conflict(
-            "该账号已开启模型自动同步，勾选对话框不可用；如需手动选择请先关闭自动同步",
-        ));
-    }
-    let desired: HashSet<String> = payload
-        .selected
-        .into_iter()
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect();
-
-    match discovery::apply_selection(&state, &account, &desired, payload.force)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        discovery::Selection::NeedsConfirm(warnings) => Ok((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "以下模型最近 24 小时有流量，停用前请确认",
-                "warnings": warnings
-                    .iter()
-                    .map(|w| json!({"public_name": w.public_name, "calls": w.calls}))
-                    .collect::<Vec<_>>(),
-            })),
-        )
-            .into_response()),
-        discovery::Selection::Applied(outcome) => {
-            audit(&state, &admin, "select_account_models", &id).await;
-            Ok(Json(json!({
-                "created_targets": outcome.created,
-                "removed_targets": outcome.removed,
-            }))
-            .into_response())
-        }
-    }
 }
 
 /// 立即执行一轮托管同步（§16.2）：全部上游模型纳入调度，忽略选择集。
@@ -3689,87 +3233,11 @@ pub async fn add_manual_model(
         &account,
         &payload.upstream_model,
         payload.public_name.as_deref(),
+        admin.revision,
     )
     .await
-    .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
+    .map_err(|error| discovery_error(error, AdminError::bad_request))?;
     audit(&state, &admin, "add_manual_model", &id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AliasDto {
-    pub upstream_model: String,
-    pub public_name: String,
-}
-
-#[derive(Deserialize)]
-pub struct AliasPayload {
-    pub aliases: Vec<AliasDto>,
-}
-
-pub async fn list_aliases(
-    State(state): State<SharedState>,
-    _: Admin,
-    Path(id): Path<String>,
-) -> AdminResult<Json<Vec<AliasDto>>> {
-    find_account(&state, &id).await?;
-    let rows = state
-        .store
-        .list_account_models(&id)
-        .await
-        .map_err(AdminError::internal)?;
-    Ok(Json(
-        rows.into_iter()
-            .filter(|row| row.public_name != row.upstream_model)
-            .map(|row| AliasDto {
-                upstream_model: row.upstream_model,
-                public_name: row.public_name,
-            })
-            .collect(),
-    ))
-}
-
-/// 兼容旧接口：把一批"上游真名 → 对外名"写进目录行并调和目标。
-///
-/// v8 起别名直接落在 `account_models`，不再有独立的别名表；新前端使用
-/// `update_account_model` / `merge_account_models`。
-pub async fn update_aliases(
-    State(state): State<SharedState>,
-    admin: Admin,
-    Path(id): Path<String>,
-    Json(payload): Json<AliasPayload>,
-) -> AdminResult<StatusCode> {
-    let account = find_account(&state, &id).await?;
-    let mut seen = HashSet::new();
-    for alias in payload.aliases {
-        let upstream = alias.upstream_model.trim();
-        let public = alias.public_name.trim();
-        if upstream.is_empty() || public.is_empty() {
-            return Err(AdminError::bad_request("别名两端都不能为空"));
-        }
-        if !seen.insert(upstream.to_string()) {
-            return Err(AdminError::bad_request(format!(
-                "上游模型 {upstream} 出现了重复别名"
-            )));
-        }
-        discovery::set_alias(&state, &account, upstream, public)
-            .await
-            .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
-    }
-    // 旧接口语义是"覆盖写入"：本次 payload 里没出现的别名应当被清掉。
-    for row in state
-        .store
-        .list_account_models(&id)
-        .await
-        .map_err(AdminError::internal)?
-    {
-        if row.public_name != row.upstream_model && !seen.contains(&row.upstream_model) {
-            discovery::update_model(&state, &account, &row.upstream_model, Some(""), None)
-                .await
-                .map_err(|error| AdminError::bad_request(format!("{error:#}")))?;
-        }
-    }
-    audit(&state, &admin, "update_aliases", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3849,79 +3317,34 @@ pub async fn copy_account(
         None => None,
     };
     let has_token = token.is_some();
-    let secrets = AccountSecrets::new(
-        copy_keys
-            .first()
-            .map(|key| key.sealed_key.clone())
-            .unwrap_or_default(),
-        token
-            .map(|t| state.cipher.seal(t.as_ref()))
-            .transpose()
-            .map_err(AdminError::internal)?,
-    );
+    let sealed_token = token
+        .map(|t| state.cipher.seal(t.as_ref()))
+        .transpose()
+        .map_err(AdminError::internal)?;
 
-    // 副本名带" - 副本"后缀，但同组里可能已经存在同名副本：先查一次，把
-    // 冲突说清楚（v18 起不再有数据库唯一约束兜底）。
+    // 副本名带" - 副本"后缀，但同组里可能已经存在同名副本：先查一次，把冲突说清楚。
     ensure_account_name_free(&state, None, copy.group_id.as_deref(), &copy.name).await?;
+    // 选择集与调度目标随账号独立一份（§6.4：所有配置独立，Key 和状态不共享）。
     state
-        .store
-        .insert_account(&copy, &secrets)
-        .await
-        .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
-    state
-        .store
-        .replace_account_keys(&copy.id, &copy_keys)
-        .await
-        .map_err(AdminError::internal)?;
-
-    // 选择集、别名与调度目标随账号独立一份（§6.4：所有配置独立，Key 和状态
-    // 不共享）。
-    let catalog = state
-        .store
-        .list_account_models(&id)
-        .await
-        .map_err(AdminError::internal)?;
-    if !catalog.is_empty() {
-        state
-            .store
-            .replace_account_models(&copy.id, &catalog)
-            .await
-            .map_err(AdminError::internal)?;
-    }
-    let aliases = state
-        .store
-        .list_account_aliases(&id)
-        .await
-        .map_err(AdminError::internal)?;
-    if !aliases.is_empty() {
-        state
-            .store
-            .replace_account_aliases(&copy.id, &aliases)
-            .await
-            .map_err(AdminError::internal)?;
-    }
-    let targets: Vec<DispatchTarget> = state
-        .store
-        .list_targets()
-        .await
-        .map_err(AdminError::internal)?
-        .into_iter()
-        .filter(|t| t.account_id == id)
-        .map(|t| DispatchTarget {
-            id: ids::target(),
-            account_id: copy.id.clone(),
-            ..t
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.insert_account(&copy, sealed_token.as_deref())
+                .await
+                .map_err(|e| conflict_or_internal(e, "同一分组内账号名称已存在"))?;
+            tx.replace_account_keys(&copy.id, &copy_keys)
+                .await
+                .map_err(AdminError::internal)?;
+            let catalog = tx
+                .list_account_models(&id)
+                .await
+                .map_err(AdminError::internal)?;
+            tx.replace_account_models(&copy.id, &catalog)
+                .await
+                .map_err(AdminError::internal)?;
+            discovery::reconcile_in_tx(tx, &copy, copy.auto_sync)
+                .await
+                .map_err(AdminError::internal)
         })
-        .collect();
-    for target in &targets {
-        state
-            .store
-            .insert_target(target)
-            .await
-            .map_err(AdminError::internal)?;
-    }
-
-    reload(&state).await?;
+        .await?;
     audit(&state, &admin, "copy_account", &copy.id).await;
     Ok((
         StatusCode::CREATED,
@@ -4051,7 +3474,8 @@ pub async fn test_account(
         "key_total": keys.len(),
     });
 
-    audit(&state, &admin, "test_account", &id).await;
+    let outcome = if healthy > 0 { "ok" } else { "failed" };
+    audit_result(&state, &admin, "test_account", &id, outcome).await;
     Ok(Json(result))
 }
 
@@ -4448,65 +3872,25 @@ pub async fn calibrate_account(
         return Err(AdminError::bad_request("对账区间起点必须在过去"));
     }
 
-    let samples = state
-        .store
-        .cost_multiplier_samples(since)
-        .await
-        .map_err(AdminError::internal)?;
-    // 只取该账号所在分组、该逻辑模型的样本；这些样本是"账号全组"的，还要
-    // 按该账号的流量占比折算。样本表没有账号维度，所以这里再查 usage。
+    let model = &payload.logical_model;
     let usage = state
         .store
-        .cost_usage(since)
+        .calibration_usage(&id, model, since)
         .await
         .map_err(AdminError::internal)?;
-
-    // 未分配账号没有分组，它也不可能有任何流量样本，直接按空结果报错。
-    let Some(group_id) = account.group_id.as_deref() else {
-        return Err(AdminError::bad_request(
-            "账号还没有分配到分组，分组均倍率无从计算，无法校准",
-        ));
-    };
-    let model = &payload.logical_model;
-    let model_samples: Vec<_> = samples
-        .iter()
-        .filter(|s| s.group_id == group_id && &s.logical_model == model)
-        .collect();
-    let model_requests: i64 = model_samples.iter().map(|s| s.requests).sum();
-    let account_requests: i64 = usage
-        .iter()
-        .filter(|u| u.group_id == group_id && &u.logical_model == model && u.account_id == id)
-        .map(|u| u.requests)
-        .sum();
-    let total_requests: i64 = usage
-        .iter()
-        .filter(|u| u.group_id == group_id && &u.logical_model == model)
-        .map(|u| u.requests)
-        .sum();
-
-    if model_requests == 0 {
+    let Some(own_avg) = usage.weighted_multiplier() else {
         return Err(AdminError::bad_request(format!(
-            "模型 {model} 在对账区间内没有成功请求，无法校准"
+            "这个账号的模型 {model} 在对账区间内没有成功请求，无法校准"
         )));
-    }
-
-    // 全组加权均倍率。校准系数是账号级属性，但请求级样本不带账号维度；
-    // 单账号独占模型时就是精确值，多账号共享时给出近似并明确提示。
-    let weighted_sum: i128 = model_samples
-        .iter()
-        .map(|s| s.effective_multiplier.raw() as i128 * s.requests as i128)
-        .sum();
-    let group_avg = Multiplier::from_raw(
-        ((weighted_sum + model_requests as i128 / 2) / model_requests as i128) as i64,
-    );
-    let exclusive = account_requests == total_requests;
-
-    // 校准系数 = 站点报的倍率 ÷ 全组加权均倍率。
-    if group_avg.raw() == 0 {
+    };
+    if own_avg.raw() == 0 {
         return Err(AdminError::bad_request("加权均倍率为 0，无法反算"));
     }
+    // 新系数 = 当前系数 × 站点报的倍率 ÷ 本账号的加权均倍率。网关记下的有效倍率
+    // 已经乘过当前系数，直接拿它当分母并写成绝对值，系数不为 1 时每校准一次就
+    // 漂移一次。只看本账号自己的样本：分组里其他账号的倍率与这笔账无关。
     let calibration = Multiplier::from_raw(
-        ((payload.reported.raw() as i128 * 1_000_000) / group_avg.raw() as i128)
+        (account.calibration.raw() as i128 * payload.reported.raw() as i128 / own_avg.raw() as i128)
             .min(i64::MAX as i128) as i64,
     );
     if calibration.raw() <= 0 || calibration.to_f64() > 100.0 {
@@ -4522,31 +3906,28 @@ pub async fn calibrate_account(
         logical_model: model.clone(),
         period_start: since,
         period_end: now,
-        gateway_requests: account_requests,
+        gateway_requests: usage.requests,
         reported: payload.reported.to_string(),
         calibration: calibration.to_string(),
         created_at: now,
     };
     state
-        .store
-        .insert_calibration_record(&record)
-        .await
-        .map_err(AdminError::internal)?;
+        .write_config(admin.revision, async |tx| -> AdminResult<()> {
+            tx.insert_calibration_record(&record)
+                .await
+                .map_err(AdminError::internal)
+        })
+        .await?;
     audit(&state, &admin, "calibrate_account", &id).await;
 
     Ok(Json(json!({
         "calibration": calibration.to_string(),
         "reported": payload.reported.to_string(),
-        "group_avg_multiplier": group_avg.to_string(),
-        "gateway_requests": account_requests,
-        "model_requests": model_requests,
-        // 多账号共享模型时全组均倍率 ≠ 本账号真实倍率，提醒人工判断。
-        "exclusive": exclusive,
-        "notice": if exclusive {
-            "该模型对账区间内只有这个账号有流量，系数是精确值"
-        } else {
-            "该模型对账区间内有多个账号分担流量，系数是按全组均倍率的近似值"
-        },
+        "previous_calibration": account.calibration.to_string(),
+        "own_avg_multiplier": own_avg.to_string(),
+        "gateway_requests": usage.requests,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
     })))
 }
 
@@ -4719,7 +4100,11 @@ pub async fn import_backup(
     // 了一批。不清的话成本页还会按恢复前的账号显示当日用量与倍率样本——管理员
     // 看到的会是「恢复成功、数字对不上」。
     state.runtime.live.clear();
-    reload(&state).await?;
+    // 恢复自己开事务写库；这里只推进修订号并切换快照。写入已成事实，不能再因
+    // 版本冲突报失败。
+    state
+        .write_config(Revision::Any, async |_| -> AdminResult<()> { Ok(()) })
+        .await?;
     // 设置是内存快照：只写库不刷新的话，运行中的进程会继续用旧设置，
     // 直到下一次重启——那正好是"看起来恢复成功、实际没生效"（§23.5）。
     if let Some(raw) = state
@@ -4933,161 +4318,6 @@ pub async fn list_requests(
     Ok(Json(json!({ "data": items, "total": total })))
 }
 
-// ---------------------------------------------------------------- 指标
-
-#[derive(Deserialize)]
-pub struct MetricsQuery {
-    /// 起始时间（unix 秒，含）；默认最近 24 小时。
-    pub since: Option<i64>,
-    /// 结束时间（unix 秒，不含）；默认到当前。
-    pub until: Option<i64>,
-    /// 只看某个调度目标。
-    pub target_id: Option<String>,
-}
-
-/// 分钟聚合与目标性能（§7.4、§20.1）。
-///
-/// 数据来自 `performance_buckets`：后台任务每分钟把请求明细滚进去，所以这个
-/// 接口不扫描明细表，历史趋势在明细被保留期清掉之后仍然可用。
-pub async fn metrics(
-    State(state): State<SharedState>,
-    _: Admin,
-    Query(query): Query<MetricsQuery>,
-) -> AdminResult<Json<Value>> {
-    let now = crate::storage::now_unix();
-    let since = query.since.unwrap_or(now - 86_400);
-    let until = query.until.unwrap_or(now + 1);
-    if until <= since {
-        return Err(AdminError::bad_request("until 必须晚于 since"));
-    }
-
-    let buckets = state
-        .store
-        .list_performance_buckets(since, until, trimmed_opt(&query.target_id))
-        .await
-        .map_err(AdminError::internal)?;
-
-    // 按目标汇总整个区间的分维表现（§9.3 的信号维度）。
-    #[derive(Default)]
-    struct TargetAggregate {
-        protocol: String,
-        streaming: bool,
-        requests: i64,
-        success: i64,
-        total_ms_sum: i64,
-        first_token_sum: i64,
-        first_token_count: i64,
-        output_tokens_sum: i64,
-        rate_limited: i64,
-        server_errors: i64,
-        protocol_errors: i64,
-    }
-    let mut per_target: std::collections::BTreeMap<String, TargetAggregate> =
-        std::collections::BTreeMap::new();
-    for bucket in &buckets {
-        let entry = per_target.entry(bucket.target_id.clone()).or_default();
-        entry.protocol = bucket.protocol.as_str().to_string();
-        entry.streaming = bucket.streaming;
-        entry.requests += bucket.requests;
-        entry.success += bucket.success;
-        entry.total_ms_sum += bucket.total_ms_sum;
-        entry.first_token_sum += bucket.first_token_sum;
-        entry.first_token_count += bucket.first_token_count;
-        entry.output_tokens_sum += bucket.output_tokens_sum;
-        entry.rate_limited += bucket.rate_limited;
-        entry.server_errors += bucket.server_errors;
-        entry.protocol_errors += bucket.protocol_errors;
-    }
-
-    // 目标 ID → 可读名字，取自当前配置；已删除的目标标出来而不是隐藏。
-    let config = state.config.current();
-    let mut names: std::collections::HashMap<String, (String, String, String)> =
-        std::collections::HashMap::new();
-    for group in &config.groups {
-        for model in group.models.values() {
-            for target in &model.targets {
-                names.insert(
-                    target.target.id.clone(),
-                    (
-                        group.group.name.clone(),
-                        target.account.name.clone(),
-                        target.target.upstream_model.clone(),
-                    ),
-                );
-            }
-        }
-    }
-
-    let targets: Vec<Value> = per_target
-        .iter()
-        .map(|(target_id, agg)| {
-            let (group_name, account_name, upstream_model) = names
-                .get(target_id)
-                .map(|(g, a, m)| (Some(g.clone()), Some(a.clone()), Some(m.clone())))
-                .unwrap_or((None, None, None));
-            // 均值为 0 时给 null，绝不虚构数字（§6.8 的同一口径）。
-            let avg_total_ms = (agg.requests > 0).then(|| agg.total_ms_sum / agg.requests);
-            let avg_first_token_ms =
-                (agg.first_token_count > 0).then(|| agg.first_token_sum / agg.first_token_count);
-            // 输出速度要按总耗时算，不能用首字均值。
-            let output_tps = (agg.total_ms_sum > 0)
-                .then(|| agg.output_tokens_sum as f64 / (agg.total_ms_sum as f64 / 1000.0));
-            json!({
-                "target_id": target_id,
-                "group_name": group_name,
-                "account_name": account_name,
-                "upstream_model": upstream_model,
-                "protocol": agg.protocol,
-                "streaming": agg.streaming,
-                "requests": agg.requests,
-                "success": agg.success,
-                "success_rate": (agg.requests > 0)
-                    .then(|| round4(agg.success as f64 / agg.requests as f64)),
-                "avg_total_ms": avg_total_ms,
-                "avg_first_token_ms": avg_first_token_ms,
-                "output_tps": output_tps.map(round4),
-                "total_tokens": agg.output_tokens_sum,
-                "rate_limited": agg.rate_limited,
-                "server_errors": agg.server_errors,
-                "protocol_errors": agg.protocol_errors,
-            })
-        })
-        .collect();
-
-    // 按分钟展开的曲线，供概览/指标页画趋势；缺桶补 0，不跳点。
-    let mut by_bucket: std::collections::BTreeMap<i64, (i64, i64)> =
-        std::collections::BTreeMap::new();
-    for bucket in &buckets {
-        let entry = by_bucket.entry(bucket.bucket_start).or_insert((0, 0));
-        entry.0 += bucket.requests;
-        entry.1 += bucket.success;
-    }
-    let mut series = Vec::new();
-    let mut cursor = (since / 60) * 60;
-    let last = (until / 60) * 60;
-    // 上限保护：最多回 24 小时（1440 个点），避免一次请求拉出巨量数据。
-    if cursor < last - 86_400 {
-        cursor = last - 86_400;
-    }
-    while cursor < last {
-        let (requests, success) = by_bucket.get(&cursor).copied().unwrap_or((0, 0));
-        series.push(json!({
-            "bucket_start": cursor,
-            "requests": requests,
-            "success": success,
-        }));
-        cursor += 60;
-    }
-
-    Ok(Json(json!({
-        "since": since,
-        "until": until,
-        "bucket_secs": 60,
-        "targets": targets,
-        "series": series,
-    })))
-}
-
 // ---------------------------------------------------------------- 辅助
 
 async fn find_group(state: &SharedState, id: &str) -> AdminResult<Group> {
@@ -5227,14 +4457,6 @@ fn conflict_or_internal(error: anyhow::Error, message: &str) -> AdminError {
     }
 }
 
-/// 写操作完成后原子切换配置快照（§21）。
-async fn reload(state: &SharedState) -> AdminResult<()> {
-    // 同时刷新动态状态表：删掉的账号/目标不该继续占着熔断与评分条目，
-    // 新增的自动倍率账号也要立刻进入刷新轮次（§21）。
-    state.reload_config().await.map_err(AdminError::internal)?;
-    Ok(())
-}
-
 /// 把账号插队到下一轮倍率刷新。
 ///
 /// 建号/改号之后必须做这一步。定时刷新是 5 分钟一轮、再叠加 0–25% 的稳定抖动
@@ -5250,9 +4472,20 @@ fn kick_multiplier_refresh(state: &SharedState, account: &Account) {
 }
 
 async fn audit(state: &SharedState, admin: &Admin, action: &str, object: &str) {
+    audit_result(state, admin, action, object, "ok").await;
+}
+
+/// 带结果的审计：测试连接、刷新倍率这类动作可能失败，失败也要留痕（§7.4）。
+async fn audit_result(
+    state: &SharedState,
+    admin: &Admin,
+    action: &str,
+    object: &str,
+    result: &str,
+) {
     if let Err(error) = state
         .store
-        .record_audit(&admin.username, action, object, "ok")
+        .record_audit(&admin.username, action, object, result)
         .await
     {
         tracing::warn!(%error, action, "写入审计日志失败");

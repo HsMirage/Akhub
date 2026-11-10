@@ -36,6 +36,16 @@ async fn spawn_with_akhub() -> (String, reqwest::Client, common::Akhub) {
 
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        // 首次设置必须带口令（§23.2）：测试直接读数据目录里的口令文件。
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-akhub-setup-token"),
+            reqwest::header::HeaderValue::from_str(
+                std::fs::read_to_string(dir.path().join("setup-token"))
+                    .unwrap_or_default()
+                    .trim(),
+            )
+            .unwrap(),
+        )]))
         .build()
         .unwrap();
     let akhub = common::spawn_akhub_on(state, dir).await;
@@ -47,7 +57,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -109,7 +122,7 @@ async fn create_new_api_account(
         "group_id": group_id,
         "name": "冰峰-ccmax",
         "base_url": upstream.base_url,
-        "api_key": "sk-ccmax-key",
+        "keys": [{"api_key": "sk-ccmax-key"}],
         "preferred_protocol": "openai_chat",
         "multiplier_mode": "new_api",
         "manual_multiplier": "1",

@@ -10,8 +10,10 @@
 //! Responses┘            └── Responses
 //! ```
 //!
-//! 同协议路径**永远不经过这里**：透传只改鉴权头、Base URL 和模型名，未知字段
-//! 因此天然保留（§14.1）。中间��式只在跨协议时使用。
+//! 同协议路径不经过中间格式：透传只改鉴权头、Base URL 和模型名，未知字段
+//! 因此天然保留（§14.1）。唯一的例外是 Anthropic 上游：同协议透传也会按真正
+//! 的上游模型名调用 [`anthropic::align_thinking`] 对齐思考契约，它只动
+//! `thinking` 与 `output_config.effort`，其余字段原样保留。
 
 pub mod anthropic;
 pub mod canonical;
@@ -176,7 +178,7 @@ pub struct StreamParser {
     /// 解析阶段被丢弃的能力（§14.8、§16.6）。
     ///
     /// 上游协议里有些东西在中间格式里没有位置，只能丢。丢可以，但必须记下来：
-    /// 静默丢失正是 §14.8 要避免的。目前只有 Anthropic 的 `signature_delta`。
+    /// 静默丢失正是 §14.8 要避免的。目前是两家的不透明思考载荷。
     degraded: Vec<&'static str>,
 }
 
@@ -226,12 +228,18 @@ impl StreamParser {
         };
         let events = match &mut self.inner {
             Inner::Chat(parser) => parser.push(&data),
-            Inner::Responses => openai_responses::parse_event(frame.event.as_deref(), &data),
+            Inner::Responses => {
+                // `encrypted_content` 只有 OpenAI 自己解得开，跨协议无处安放。
+                if carries_encrypted_reasoning(&data) {
+                    self.note_degraded("thinking");
+                }
+                openai_responses::parse_event(frame.event.as_deref(), &data)
+            }
             Inner::Anthropic => {
-                // 签名增量只对 Anthropic 自己有意义（§14.6：思考在白名单内，
-                // 但签名是 Anthropic 独有的生命周期元数据）。跨协议时它无处
-                // 安放——丢掉是允许的，但必须记成降级，不能静默丢。
-                if is_signature_delta(&data) {
+                // 签名与 redacted_thinking 的密文只对 Anthropic 自己有意义
+                // （§14.6：思考在白名单内，但这些是 Anthropic 独有的不透明
+                // 载荷）。跨协议时无处安放——丢掉是允许的，但必须记成降级。
+                if carries_anthropic_opaque_thinking(&data) {
                     self.note_degraded("thinking");
                 }
                 anthropic::parse_event(frame.event.as_deref(), &data)
@@ -285,17 +293,33 @@ impl StreamParser {
     }
 }
 
-/// 这一帧是不是 Anthropic 的 `signature_delta`（§14.6）。
+/// 这一帧是否带着 Anthropic 的不透明思考载荷：`signature_delta`，或者
+/// `redacted_thinking` 块的开头（§14.6）。
 ///
 /// 判断放在管道层而不是协议解析器里：解析器是纯函数（帧进事件出），没有地方
 /// 记录"我丢了什么"；而"丢了什么"必须在同一条链路上被累计。
-fn is_signature_delta(data: &serde_json::Value) -> bool {
-    data.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta")
-        && data
-            .get("delta")
-            .and_then(|delta| delta.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("signature_delta")
+fn carries_anthropic_opaque_thinking(data: &Value) -> bool {
+    let nested_type = |key: &str| {
+        data.get(key)
+            .and_then(|inner| inner.get("type"))
+            .and_then(Value::as_str)
+    };
+    match data.get("type").and_then(Value::as_str) {
+        Some("content_block_delta") => nested_type("delta") == Some("signature_delta"),
+        Some("content_block_start") => nested_type("content_block") == Some("redacted_thinking"),
+        _ => false,
+    }
+}
+
+/// 这一帧是否是带 `encrypted_content` 的 Responses reasoning 项。
+fn carries_encrypted_reasoning(data: &Value) -> bool {
+    data.get("item").is_some_and(|item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+    })
 }
 
 /// 中间事件 → 下游 SSE 帧。
@@ -406,7 +430,7 @@ pub fn frame_error(frame: &sse::Frame) -> Option<String> {
 /// 能力证据的失效条件之一是"适配器版本变化"（§16.7）——转换规则改了之后，
 /// 之前学到的"这个模型不支持某能力"未必还成立。所以这个号要显式存在，并在
 /// 后台可见，改了它就该让证据失效。
-pub const ADAPTER_VERSION: &str = "2026-09-17.1";
+pub const ADAPTER_VERSION: &str = "2026-11-08.1";
 
 /// 按协议构造一个可直接写进流的错误帧（§18.2）。
 ///
@@ -465,6 +489,9 @@ fn sampling_key(field: &str, target: Protocol) -> Option<&'static str> {
         ("logprobs", Protocol::OpenAiChat) => Some("logprobs"),
         ("top_logprobs", Protocol::OpenAiChat | Protocol::OpenAiResponses) => Some("top_logprobs"),
         ("truncation", Protocol::OpenAiResponses) => Some("truncation"),
+        ("max_tool_calls", Protocol::OpenAiResponses) => Some("max_tool_calls"),
+        // Responses 的 `verbosity` 在 `text` 对象里，由它的发射器单独处理。
+        ("verbosity", Protocol::OpenAiChat) => Some("verbosity"),
         _ => None,
     }
 }

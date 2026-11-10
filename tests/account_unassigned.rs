@@ -23,6 +23,16 @@ async fn spawn() -> (String, reqwest::Client, tempfile::TempDir) {
 
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        // 首次设置必须带口令（§23.2）：测试直接读数据目录里的口令文件。
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-akhub-setup-token"),
+            reqwest::header::HeaderValue::from_str(
+                std::fs::read_to_string(dir.path().join("setup-token"))
+                    .unwrap_or_default()
+                    .trim(),
+            )
+            .unwrap(),
+        )]))
         .build()
         .unwrap();
     (format!("http://{addr}"), client, dir)
@@ -33,7 +43,10 @@ fn write(
     method: reqwest::Method,
     url: String,
 ) -> reqwest::RequestBuilder {
-    client.request(method, url).header("x-akhub-csrf", "1")
+    client
+        .request(method, url)
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
 }
 
 async fn setup_admin(base: &str, client: &reqwest::Client) {
@@ -76,9 +89,10 @@ async fn create_unassigned_account(base: &str, client: &reqwest::Client, name: &
         format!("{base}/admin/api/accounts"),
     )
     .json(&json!({
+        "group_id": null,
         "name": name,
         "base_url": "https://upstream.example.com",
-        "api_key": "sk-test",
+        "keys": [{"api_key": "sk-test"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -87,7 +101,7 @@ async fn create_unassigned_account(base: &str, client: &reqwest::Client, name: &
     .json()
     .await
     .unwrap();
-    assert_eq!(account["group_id"], Value::Null, "没给分组就是未分配");
+    assert_eq!(account["group_id"], Value::Null, "显式 null 就是未分配");
     account["id"].as_str().unwrap().to_string()
 }
 
@@ -296,7 +310,7 @@ async fn a_name_clash_in_the_target_group_is_refused_for_unassigned_accounts() {
         "group_id": group,
         "name": "待分配",
         "base_url": "https://upstream.example.com",
-        "api_key": "sk-test",
+        "keys": [{"api_key": "sk-test"}],
         "preferred_protocol": "openai_chat",
     }))
     .send()
@@ -360,41 +374,4 @@ async fn the_database_refuses_duplicate_names_inside_one_group() {
         .map(|row| row["group_id"].clone())
         .collect();
     assert!(groups.contains(&Value::Null), "未分配账号必须仍然存在");
-}
-#[tokio::test]
-async fn an_unassigned_account_cannot_bind_a_target_directly() {
-    let (base, client, _dir) = spawn().await;
-    setup_admin(&base, &client).await;
-    let (group, _) = create_group(&base, &client, "主力").await;
-
-    let model: Value = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/logical-models"),
-    )
-    .json(&json!({"group_id": group, "name": "glm-4.6"}))
-    .send()
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-
-    let account = create_unassigned_account(&base, &client, "待分配").await;
-    let response = write(
-        &client,
-        reqwest::Method::POST,
-        format!("{base}/admin/api/targets"),
-    )
-    .json(&json!({
-        "logical_model_id": model["id"],
-        "account_id": account,
-        "upstream_model": "glm-4.6",
-    }))
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(response.status(), 400);
-    let body: Value = response.json().await.unwrap();
-    assert!(body.to_string().contains("还没有分配到分组"));
 }

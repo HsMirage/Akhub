@@ -61,6 +61,7 @@ impl Ineligible {
                     health::Unavailable::Cooling => "冷却中",
                     health::Unavailable::ConcurrencyFull => "并发已满",
                     health::Unavailable::RateLimited => "限流中",
+                    health::Unavailable::ExceedsTokenLimit => "单次请求超过 TPM 上限",
                 };
                 match key {
                     // 归因到具体某把 Key 时把摘要前 8 位带上：够在后台对上号，
@@ -1021,8 +1022,8 @@ mod tests {
     use super::*;
     use crate::config::LogicalModelView;
     use crate::domain::{
-        Account, DispatchTarget, Group, Limits, LogicalModel, ModelOrigin, MultiplierMode,
-        Protocol, SchedulingWeights,
+        Account, DispatchTarget, Group, Limits, LogicalModel, MultiplierMode, Protocol,
+        SchedulingWeights,
     };
 
     /// 会自己好的原因排在纯配置问题前面：客户端重试才有意义。
@@ -1074,8 +1075,6 @@ mod tests {
                 logical_model_id: "m1".into(),
                 account_id: account.id.clone(),
                 upstream_model: "glm-4.6".into(),
-                hide_original: false,
-                priority_override: Some(priority),
                 limits: Limits::default(),
                 enabled: true,
                 created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1117,7 +1116,6 @@ mod tests {
                     id: "m1".into(),
                     group_id: "g1".into(),
                     name: "glm-4.6".into(),
-                    origin: ModelOrigin::Auto,
                     enabled: true,
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },

@@ -288,8 +288,8 @@ export function Groups({
         requireLabel={`请输入分组名「${confirm?.group.name ?? ""}」以确认删除`}
         message={
           <>
-            删除「{confirm?.group.name}」会连带删除它的全部账号、逻辑模型与调度目标，
-            并使其下游 Key 立即失效。此操作不可撤销。
+            删除「{confirm?.group.name}」后，它的账号会回到「未分配」（凭据与模型目录保留），
+            逻辑模型与调度目标被移除，下游 Key 立即失效。此操作不可撤销。
           </>
         }
         onClose={() => setConfirm(null)}

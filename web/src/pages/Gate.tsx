@@ -1,5 +1,5 @@
 /** 首次设置与登录。两者共用一套表单，只有文案和目标接口不同。 */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, api } from "../lib/api";
 import { MIN_PASSWORD_LENGTH, USERNAME_STORAGE_KEY } from "../lib/policy";
 import { Button, Field } from "../components/ui";
@@ -21,6 +21,16 @@ export function Gate({
   const [showPassword, setShowPassword] = useState(false);
   const [capsLock, setCapsLock] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
+  // 口令文件所在的数据目录，用来告诉管理员去哪里找口令。
+  const [dataDir, setDataDir] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!needsSetup) return;
+    api
+      .setupStatus()
+      .then((status) => setDataDir(status.data_dir))
+      .catch(() => setDataDir(null));
+  }, [needsSetup]);
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -29,6 +39,7 @@ export function Gate({
     const data = new FormData(event.currentTarget);
     const username = String(data.get("username") ?? "").trim();
     const password = String(data.get("password") ?? "");
+    const setupToken = String(data.get("setup_token") ?? "").trim();
 
     if (needsSetup && password.length < MIN_PASSWORD_LENGTH) {
       setFieldError(`密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
@@ -42,7 +53,7 @@ export function Gate({
     setFieldError(null);
     try {
       if (needsSetup) {
-        await api.setup(username, password);
+        await api.setup(username, password, setupToken);
       } else {
         await api.login(username, password);
       }
@@ -94,6 +105,32 @@ export function Gate({
         )}
 
         <div className="stack">
+          {needsSetup && (
+            <Field
+              label="首次设置口令"
+              hint={
+                <>
+                  服务首次启动时打印在日志里（Docker 用 <code>docker logs akhub</code>，
+                  systemd 用 <code>journalctl -u akhub</code>），同时保存在{" "}
+                  <code>{dataDir ? `${dataDir}/setup-token` : "数据目录/setup-token"}</code>
+                  。设置完成后自动失效。
+                </>
+              }
+            >
+              {(id) => (
+                <input
+                  id={id}
+                  name="setup_token"
+                  className="input"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  required
+                />
+              )}
+            </Field>
+          )}
+
           <Field
             label="用户名"
             hint={needsSetup ? "创建后不可修改，建议保留 admin。" : undefined}

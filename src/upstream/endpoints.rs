@@ -40,6 +40,26 @@ impl Choice {
     }
 }
 
+/// 首选这种协议的账号是否天然提供这个只能原生转发的端点。
+///
+/// 只用于层内排序：自适应账号也可能有这条路由，所以它不是资格判定。
+pub fn serves_natively(protocol: Protocol, endpoint: Endpoint) -> bool {
+    match endpoint {
+        Endpoint::CountTokens => protocol == Protocol::AnthropicMessages,
+        Endpoint::ResponsesCompact | Endpoint::ResponsesInputTokens => {
+            protocol == Protocol::OpenAiResponses
+        }
+        Endpoint::ImagesGenerations
+        | Endpoint::ImagesEdits
+        | Endpoint::ImagesVariations
+        | Endpoint::ImagesGenerationsAsync
+        | Endpoint::ImagesEditsAsync => {
+            matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+        }
+        _ => false,
+    }
+}
+
 /// 一次尝试最多试几个端点。
 ///
 /// 每轮最多试原生端点和一个可转换端点，同一端点不重复尝试，

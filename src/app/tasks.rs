@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::supervisor::supervise;
 use super::{AppState, SharedState};
 use crate::multiplier::refresh;
 
@@ -23,14 +24,12 @@ const REFRESH_TICK: Duration = Duration::from_secs(10);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 /// 模型自动同步的检查周期。真正的同步时刻由每个账号自己的间隔决定（§16.2）。
 const MODEL_SYNC_TICK: Duration = Duration::from_secs(30);
-/// 分钟桶聚合的检查周期（§22）。每分钟滚一次上一个完整分钟的明细。
-const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
-/// 性能桶的桶宽（秒）。
-const BUCKET_SECS: i64 = 60;
 /// 性能快照的保鲜期：超过就宁可丢弃（§20.1）。
 const SNAPSHOT_HORIZON: i64 = 24 * 3600;
 /// 单次清理的删除批量，避免长事务阻塞写入。
 const PRUNE_BATCH: i64 = 5_000;
+/// 每轮清理最多归还多少个空闲页（4 KiB 一页，约 40 MB）。
+const VACUUM_PAGES: i64 = 10_000;
 
 /// 手动刷新按钮用的句柄：让某个账号在下一轮立即进入刷新（§11.3）。
 #[derive(Clone, Default)]
@@ -56,46 +55,25 @@ impl RefreshHandle {
 ///
 /// 句柄取自 `state.refresh`：后台接口拿到的是同一个对象，因此"立即刷新"按钮
 /// 在任务启动后自然生效，启动前按下也只是静默忽略。
-pub fn spawn(state: &SharedState) {
-    tokio::spawn(snapshots(Arc::downgrade(state)));
-    tokio::spawn(multiplier_refresh(
-        Arc::downgrade(state),
-        state.refresh.clone(),
-    ));
-    tokio::spawn(model_sync(Arc::downgrade(state)));
-    tokio::spawn(cleanup(Arc::downgrade(state)));
-    tokio::spawn(rollup(Arc::downgrade(state)));
-}
-
-/// 把请求明细滚进分钟桶（§22 的"性能分钟桶聚合"）。
 ///
-/// 只聚合**已经结束**的分钟，避免把正在进行中的那一分钟反复重算。聚合本身是
-/// 幂等的（先删后建），所以 tick 抖动或重复执行都不会重复计数。
-async fn rollup(state: Weak<AppState>) {
-    let mut ticker = tokio::time::interval(ROLLUP_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // 第一次 tick 立即触发，跳过它，从下一个完整周期开始。
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let Some(state) = state.upgrade() else {
-            return;
-        };
-        let now = crate::storage::now_unix();
-        // 上一分钟的边界；只滚 [last_minute, this_minute) 这一段。
-        let until = (now / BUCKET_SECS) * BUCKET_SECS;
-        let since = until - BUCKET_SECS;
-        match state
-            .store
-            .rollup_performance_buckets(since, until, BUCKET_SECS)
-            .await
-        {
-            Ok(0) => {}
-            Ok(rows) => tracing::debug!(rows, since, until, "性能分钟桶聚合完成"),
-            // 聚合失败只记日志：它不参与推理热路径，不能因此影响服务（§22）。
-            Err(error) => tracing::warn!(%error, "性能分钟桶聚合失败"),
-        }
-    }
+/// 周期任务都在 [`supervise`] 下运行：一次 panic 只会让它稍后重启，不会让
+/// 清理、快照或刷新从此停掉。
+pub fn spawn(state: &SharedState) {
+    let weak = Arc::downgrade(state);
+    supervise("快照落盘", {
+        let weak = weak.clone();
+        move || snapshots(weak.clone())
+    });
+    supervise("倍率刷新", {
+        let weak = weak.clone();
+        let handle = state.refresh.clone();
+        move || multiplier_refresh(weak.clone(), handle.clone())
+    });
+    supervise("模型同步", {
+        let weak = weak.clone();
+        move || model_sync(weak.clone())
+    });
+    supervise("过期清理", move || cleanup(weak.clone()));
 }
 
 /// 每 60 秒把粘性绑定与性能 EWMA 批量写盘。
@@ -163,6 +141,7 @@ async fn multiplier_refresh(state: Weak<AppState>, handle: RefreshHandle) {
                 return;
             };
             scheduler.set_interval(interval);
+            state.runtime.multipliers.set_refresh_interval(interval);
             scheduler.retain(&accounts);
             scheduler.due(&accounts, now).into_iter().cloned().collect()
         };
@@ -267,67 +246,85 @@ async fn cleanup(state: Weak<AppState>) {
         let Some(state) = state.upgrade() else {
             return;
         };
-        let now = crate::storage::now_unix();
+        cleanup_once(&state, crate::storage::now_unix()).await;
+    }
+}
 
-        if state.settings.get().retention_days > 0 {
-            let cutoff = now - i64::from(state.settings.get().retention_days) * 86_400;
-            match state.store.prune_request_records(cutoff, PRUNE_BATCH).await {
-                Ok(removed) if removed > 0 => {
-                    tracing::info!(removed, "已清理过期请求记录");
+/// 一轮清理。每类过期数据都**分批**删到删完：一次删几十万行会长时间占着
+/// 写锁，而只删一批又会让积压永远追不上。
+pub(crate) async fn cleanup_once(state: &AppState, now: i64) {
+    // 保留期为 0 表示"不保留历史明细"：记录器已经不再落库，但调成 0 之前
+    // 攒下的历史也必须清掉，而不是永远留在库里（§24.2）。
+    let retention_days = state.settings.get().retention_days;
+    let history_cutoff = now - i64::from(retention_days) * 86_400;
+
+    let store = &state.store;
+    prune_all("过期请求记录", || {
+        store.prune_request_records(history_cutoff, PRUNE_BATCH)
+    })
+    .await;
+
+    state.sessions.purge_expired();
+
+    let config = state.config.current();
+    let (_, targets) = config.live_ids();
+    state.runtime.sticky.prune(&targets, now);
+    drop(config);
+
+    let sticky_cutoff = now - crate::routing::sticky::TTL.as_secs() as i64;
+    if let Err(error) = store.prune_sticky_bindings(sticky_cutoff).await {
+        tracing::warn!(%error, "清理粘性绑定失败");
+    }
+    if let Err(error) = store.prune_perf_snapshots(now - SNAPSHOT_HORIZON).await {
+        tracing::warn!(%error, "清理性能快照失败");
+    }
+    prune_all("过期 Responses 状态", || {
+        store.prune_response_states(now, PRUNE_BATCH)
+    })
+    .await;
+    // 生图任务的定位记录按自己的到期时间清理（§14.9）：它不是保留期
+    // 概念，而是"这个任务 ID 还能不能问"。
+    prune_all("过期异步生图任务定位", || {
+        store.prune_image_tasks(now, PRUNE_BATCH)
+    })
+    .await;
+    // 托管后台任务与响应状态共用保留期（计划 §29.1）。
+    prune_all("过期托管后台任务", || {
+        store.prune_background_tasks(now, PRUNE_BATCH)
+    })
+    .await;
+
+    match store.incremental_vacuum(VACUUM_PAGES).await {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "增量回收空闲页失败"),
+    }
+}
+
+/// 反复执行一批删除，直到某一批不满。批与批之间让出调度，给热路径的写入
+/// 插队的机会。
+async fn prune_all<F, Fut>(what: &str, mut batch: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<u64>>,
+{
+    let mut total = 0u64;
+    loop {
+        match batch().await {
+            Ok(removed) => {
+                total += removed;
+                if removed < PRUNE_BATCH as u64 {
+                    break;
                 }
-                Err(error) => tracing::warn!(%error, "清理请求记录失败"),
-                _ => {}
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "清理{what}失败");
+                break;
             }
         }
-
-        let config = state.config.current();
-        let (_, targets) = config.live_ids();
-        state.runtime.sticky.prune(&targets, now);
-        drop(config);
-
-        let sticky_cutoff = now - crate::routing::sticky::TTL.as_secs() as i64;
-        if let Err(error) = state.store.prune_sticky_bindings(sticky_cutoff).await {
-            tracing::warn!(%error, "清理粘性绑定失败");
-        }
-        if let Err(error) = state
-            .store
-            .prune_perf_snapshots(now - SNAPSHOT_HORIZON)
-            .await
-        {
-            tracing::warn!(%error, "清理性能快照失败");
-        }
-        match state.store.prune_response_states(now).await {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "已清理过期 Responses 状态");
-            }
-            Err(error) => tracing::warn!(%error, "清理 Responses 状态失败"),
-            _ => {}
-        }
-        // 生图任务的定位记录按自己的到期时间清理（§14.9）：它不是保留期
-        // 概念，而是"这个任务 ID 还能不能问"。
-        match state.store.prune_image_tasks(now).await {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "已清理过期异步生图任务定位");
-            }
-            Err(error) => tracing::warn!(%error, "清理异步生图任务定位失败"),
-            _ => {}
-        }
-        // 托管后台任务与响应状态共用保留期（计划 §29.1）。
-        match state.store.prune_background_tasks(now, 500).await {
-            Ok(removed) if removed > 0 => {
-                tracing::info!(removed, "已清理过期托管后台任务");
-            }
-            Err(error) => tracing::warn!(%error, "清理托管后台任务失败"),
-            _ => {}
-        }
-        // 性能桶与请求明细同一保留期（§24.2），否则明细删了、聚合还在。
-        let retention_days = state.settings.get().retention_days;
-        if retention_days > 0 {
-            let bucket_cutoff = now - i64::from(retention_days) * 86_400;
-            if let Err(error) = state.store.prune_performance_buckets(bucket_cutoff).await {
-                tracing::warn!(%error, "清理性能桶失败");
-            }
-        }
+    }
+    if total > 0 {
+        tracing::info!(removed = total, "已清理{what}");
     }
 }
 
@@ -433,6 +430,29 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// 保留期设成 0 之后，之前攒下的请求明细也要清掉（§24.2）。
+    #[tokio::test]
+    async fn zero_retention_still_purges_existing_history() {
+        let state = state().await;
+        let mut settings = (*state.settings.get()).clone();
+        settings.retention_days = 0;
+        state.settings.replace(settings);
+        let now = crate::storage::now_unix();
+        let mut old = crate::app::recorder::tests::record("old");
+        old.started_at = now - 3600;
+        state.store.insert_request_records(&[old]).await.unwrap();
+        cleanup_once(&state, now).await;
+        assert!(
+            state
+                .store
+                .list_request_records(10, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "保留期 0 时历史明细必须被清掉"
         );
     }
 

@@ -425,3 +425,92 @@ async fn spawn_split_frame_upstream() -> String {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{address}")
 }
+
+/// 收流直到看到 `needle`；断言在它之前先收到过心跳，且心跳时还没有语义内容。
+async fn assert_keepalive_before(response: reqwest::Response, semantic: &str, needle: &str) {
+    assert_eq!(response.status(), 200);
+    let mut stream = response.bytes_stream();
+    let mut seen = String::new();
+    let mut before_content: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        seen.push_str(&String::from_utf8_lossy(&item.expect("流不应该报错")));
+        if before_content.is_none() && seen.contains("keep-alive") {
+            before_content = Some(seen.clone());
+        }
+        if seen.contains(needle) {
+            break;
+        }
+    }
+    let before = before_content.unwrap_or_else(|| panic!("首字之前必须收到心跳：{seen:?}"));
+    assert!(
+        !before.contains(semantic),
+        "心跳必须在语义内容之前：{before:?}"
+    );
+    assert!(seen.contains(needle), "语义内容不能丢：{seen:?}");
+}
+
+fn keepalive_settings() -> Settings {
+    Settings {
+        first_content_grace: Duration::from_millis(300),
+        keep_alive_interval: Duration::from_millis(200),
+        ..Settings::default()
+    }
+}
+
+/// 跨协议转换流同样要有首字前心跳：Chat 入口、Anthropic 上游沉默 2 秒。
+#[tokio::test]
+async fn a_cross_protocol_stream_also_sends_heartbeats() {
+    let url = spawn_upstream(Duration::from_millis(2000)).await;
+    let akhub = spawn_akhub_with(keepalive_settings(), |_| {}).await;
+    wire(&akhub, &url, Protocol::AnthropicMessages).await;
+
+    let response = request(&akhub, Protocol::OpenAiChat, body(Protocol::OpenAiChat)).await;
+    assert_keepalive_before(response, "hello", "[DONE]").await;
+}
+
+/// Responses 上游：先 `response.created`，沉默 `silence` 后才吐正文。
+async fn slow_responses_upstream(State(slow): State<Slow>) -> impl IntoResponse {
+    let stream = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(Bytes::from(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up_1\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        ));
+        tokio::time::sleep(slow.silence).await;
+        yield Ok::<_, std::io::Error>(Bytes::from(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        ));
+        yield Ok::<_, std::io::Error>(Bytes::from(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}\n\n",
+        ));
+    };
+    (
+        [("content-type", "text/event-stream")],
+        Body::from_stream(stream),
+    )
+}
+
+/// Responses 入口（同协议、改写网关 ID 的那条路）同样要有首字前心跳，且
+/// 客户端看到的仍然只有网关 ID。
+#[tokio::test]
+async fn a_responses_stream_also_sends_heartbeats() {
+    let app = Router::new()
+        .route("/v1/responses", post(slow_responses_upstream))
+        .with_state(Slow {
+            silence: Duration::from_millis(2000),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{address}");
+
+    let akhub = spawn_akhub_with(keepalive_settings(), |_| {}).await;
+    wire(&akhub, &url, Protocol::OpenAiResponses).await;
+
+    let response = request(
+        &akhub,
+        Protocol::OpenAiResponses,
+        body(Protocol::OpenAiResponses),
+    )
+    .await;
+    assert_keepalive_before(response, "output_text.delta", "response.completed").await;
+}

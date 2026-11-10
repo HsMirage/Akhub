@@ -160,6 +160,7 @@ async fn a_successful_manual_test_clears_the_hard_stop() {
         ))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .json(&json!({"model": MODEL}))
         .send()
         .await
@@ -203,6 +204,7 @@ async fn clearing_the_marker_by_hand_releases_the_key() {
         ))
         .header("cookie", &cookie)
         .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
         .send()
         .await
         .unwrap()

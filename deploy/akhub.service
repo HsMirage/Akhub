@@ -1,9 +1,17 @@
-# Linux 原生部署示例（§25.2）。
-# 安装：
+# Linux 原生部署（§25.2）。推荐用 `install.sh --service` 一步装好；手工安装：
 #   sudo install -m755 akhub /usr/local/bin/akhub
 #   sudo useradd --system --home-dir /var/lib/akhub --create-home akhub
 #   sudo install -m644 deploy/akhub.service /etc/systemd/system/akhub.service
 #   sudo systemctl enable --now akhub
+#
+# 运行布局与容器一致（deploy/docker-entrypoint.sh）：/usr/local/bin/akhub 是"安装版"，
+# 属主 root；启动前 ExecStartPre 把它复制到 akhub 用户自己可写的
+# /var/lib/akhub/runtime/akhub 再运行。后台"一键升级"替换的是运行目录里那一份，
+# 所以 ProtectSystem=strict 下也能升级。
+#
+# 复制规则：运行目录里没有二进制，或安装版的版本号与上次复制时不同（重新跑过
+# install.sh / sudo akhub --update）才复制；一键升级过的那份在重启后保留，不会被
+# 旧的安装版顶回去。
 
 [Unit]
 Description=Akhub AI 协议网关
@@ -17,7 +25,11 @@ Group=akhub
 Environment=AKHUB_DATA_DIR=/var/lib/akhub
 Environment=AKHUB_LISTEN=0.0.0.0:8080
 Environment=RUST_LOG=akhub=info,warn
-ExecStart=/usr/local/bin/akhub
+# 声明"二进制可替换、退出后会被拉起"（Restart=always），后台才提供一键升级。
+Environment=AKHUB_ALLOW_RESTART=1
+# systemd 会展开 $ 与 %，脚本里的字面量因此写成 $$ 与 %%。
+ExecStartPre=/bin/sh -c 'set -eu; src=/usr/local/bin/akhub; dir=/var/lib/akhub/runtime; mkdir -p "$$dir"; ver="$$("$$src" --version)"; if [ ! -x "$$dir/akhub" ] || [ "$$(cat "$$dir/installed-version" 2>/dev/null || true)" != "$$ver" ]; then cp "$$src" "$$dir/.akhub-incoming"; chmod 755 "$$dir/.akhub-incoming"; mv -f "$$dir/.akhub-incoming" "$$dir/akhub"; printf "%%s" "$$ver" > "$$dir/installed-version"; echo "akhub: 运行目录已更新为 $$ver"; fi'
+ExecStart=/var/lib/akhub/runtime/akhub
 Restart=always
 RestartSec=2
 
