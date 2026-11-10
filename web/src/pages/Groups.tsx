@@ -289,7 +289,7 @@ export function Groups({
         message={
           <>
             删除「{confirm?.group.name}」后，它的账号会回到「未分配」（凭据与模型目录保留），
-            逻辑模型与调度目标被移除，下游 Key 立即失效。此操作不可撤销。
+            分组里的下游模型与调度目标随之移除，下游 Key 立即失效。此操作不可撤销。
           </>
         }
         onClose={() => setConfirm(null)}

@@ -148,12 +148,12 @@ export function Overview({
             />
             <Stat
               icon={<IconCube size={13} />}
-              label="对外可用模型"
+              label="下游可用模型名"
               value={overview.listable_models}
               hint={
                 overview.unlisted_models > 0
-                  ? `${overview.unlisted_models} 个逻辑模型因零目标未上架`
-                  : `${overview.logical_models} 个逻辑模型全部已上架`
+                  ? `${overview.unlisted_models} 个下游模型没有可用目标，未上架`
+                  : `${overview.logical_models} 个下游模型全部已上架`
               }
               onClick={() => navigate("targets")}
             />
@@ -338,7 +338,7 @@ export function Overview({
                   <tr>
                     <th>时间</th>
                     <th>请求 ID</th>
-                    <th>模型</th>
+                    <th>下游模型名</th>
                     <th>状态码</th>
                     <th>错误码</th>
                   </tr>
@@ -477,7 +477,7 @@ export function Overview({
               <thead>
                 <tr>
                   <th>时间</th>
-                  <th>逻辑模型</th>
+                  <th>下游模型名</th>
                   <th>协议</th>
                   <th>耗时</th>
                   <th>状态</th>
@@ -587,7 +587,7 @@ function ReadyPanel({
   const sample = data.models.find((model) => model.listed);
   const origin = window.location.origin;
   const keyPlaceholder = "<YOUR_GROUP_KEY>";
-  const modelName = sample?.name ?? "你的逻辑模型";
+  const modelName = sample?.name ?? "你的下游模型名";
   const anthropicCmd = [
     "# Claude Code / Anthropic SDK",
     `export ANTHROPIC_BASE_URL=${origin}`,
@@ -604,7 +604,7 @@ function ReadyPanel({
     <section className="section">
       <header className="section-head">
         <h2 className="section-title">接入方式</h2>
-        <span className="section-desc">下游只需要分组 Key 与逻辑模型名</span>
+        <span className="section-desc">下游只需要分组 Key 与下游模型名</span>
       </header>
       <div className="section-body">
         <div className="callout callout-info">

@@ -60,7 +60,7 @@ export function CommandPalette({
       list.push({
         id: `model-${model.id}`,
         label: model.name,
-        hint: "对外可用模型",
+        hint: "下游模型名",
         group: "模型",
         run: () => navigate("targets"),
       }),

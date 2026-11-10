@@ -361,11 +361,11 @@ export function Requests({
     const header = [
       "时间",
       "请求ID",
-      "逻辑模型",
+      "下游模型名",
       "协议",
       "流式",
       "上游账号",
-      "上游模型",
+      "上游模型名",
       "请求体积",
       "输入Token",
       "输出Token",
@@ -426,7 +426,7 @@ export function Requests({
   }
   if (appliedFilters.logical_model) {
     chips.push({
-      label: `模型：${appliedFilters.logical_model}`,
+      label: `下游模型名：${appliedFilters.logical_model}`,
       clear: () => removeFilter("logicalModel"),
     });
   }
@@ -438,7 +438,7 @@ export function Requests({
   }
   if (appliedFilters.target_id) {
     chips.push({
-      label: `上游模型：${appliedFilters.target_id}`,
+      label: `上游模型名：${appliedFilters.target_id}`,
       clear: () => removeFilter("upstreamModel"),
     });
   }
@@ -513,7 +513,7 @@ export function Requests({
               </select>
             )}
           </Field>
-          <Field label="逻辑模型">
+          <Field label="下游模型名">
             {(id) => (
               <select
                 id={id}
@@ -547,7 +547,7 @@ export function Requests({
               </select>
             )}
           </Field>
-          <Field label="上游模型">
+          <Field label="上游模型名">
             {(id) => (
               <>
                 <input
@@ -678,7 +678,7 @@ export function Requests({
             <thead>
               <tr>
                 <th>时间 / 请求 ID</th>
-                <th>逻辑模型</th>
+                <th>下游模型名</th>
                 <th>实际目标</th>
                 <th>体积</th>
                 <th title="输入 / 输出；下面一行是缓存读 / 写（上游没上报就留空）">Token</th>
