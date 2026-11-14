@@ -321,7 +321,9 @@ impl TaskRunner {
             tracing::warn!(%error, task = %task_id, "托管任务进入 running 失败");
         }
 
-        let mut body = request.body.clone();
+        // 托管任务要改写正文（去掉 background/stream），必须先脱离共享。
+        // 这份剥离后的正文就是接下来实际发出去的那一份，不能再拿原请求的。
+        let mut body = (*request.body).clone();
         if let Some(object) = body.as_object_mut() {
             // 内部调用必须是一次普通的非流式请求：托管任务自己管生命周期。
             object.remove("background");
@@ -342,7 +344,7 @@ impl TaskRunner {
                     endpoint: crate::upstream::Endpoint::Responses,
                     request_id: &request.request_id,
                     downstream_headers: &request.downstream_headers,
-                    body,
+                    body: std::sync::Arc::new(body),
                     raw: request.raw.clone(),
                     logical_model: request.logical_model.clone(),
                     request_bytes: request.request_bytes,
@@ -572,7 +574,7 @@ pub struct ManagedRequest {
     pub group: Arc<crate::config::GroupView>,
     pub request_id: String,
     pub downstream_headers: axum::http::HeaderMap,
-    pub body: serde_json::Value,
+    pub body: std::sync::Arc<serde_json::Value>,
     pub raw: Option<crate::gateway::passthrough::RawBody>,
     pub logical_model: String,
     pub request_bytes: usize,
@@ -652,7 +654,7 @@ pub async fn maybe_start_managed(
         group: Arc::clone(forward.group),
         request_id: forward.request_id.to_string(),
         downstream_headers: forward.downstream_headers.clone(),
-        body: forward.body.clone(),
+        body: std::sync::Arc::clone(&forward.body),
         raw: forward.raw.clone(),
         logical_model: forward.logical_model.clone(),
         request_bytes: forward.request_bytes,

@@ -198,7 +198,13 @@ pub struct Forward<'a> {
     pub request_id: &'a str,
     pub downstream_headers: &'a HeaderMap,
     /// 已解析的请求体。模型名会被逐目标改写。
-    pub body: serde_json::Value,
+    ///
+    /// `Arc` 而不是裸 `Value`：流式请求的结算器要把它一直持有到流结束（可能
+    /// 几分钟），而 Responses 的正文还要在结算时整份序列化。裸 `Value` 每多
+    /// 一个持有人就多一份深拷贝——2026-11-13 的 OOM 就是用这种方式把几十 MB
+    /// 的请求体放大成几百 MB。逐目标改写处用 `Arc::make_mut`，只在真有改写
+    /// 时才复制。
+    pub body: std::sync::Arc<serde_json::Value>,
     /// 可选的原始请求体（目前用于 multipart 图片编辑）。
     pub raw: Option<RawBody>,
     pub logical_model: String,
@@ -1697,7 +1703,7 @@ impl Walk<'_> {
                                 key_id: credential.as_ref().map(|key| key.id.clone()),
                                 endpoint: Some(seed.endpoint),
                             },
-                            entry_body: self.forward.body.clone(),
+                            entry_body: std::sync::Arc::clone(&self.forward.body),
                             entry_protocol: self.forward.endpoint.protocol(),
                             retention_days: self.forward.state.settings.get().response_state_days,
                         });
@@ -2379,7 +2385,7 @@ impl Walk<'_> {
                     })?;
             return Ok(Prepared {
                 endpoint: choice.endpoint,
-                body: self.forward.body.clone(),
+                body: (*self.forward.body).clone(),
                 raw: Some(rewritten),
                 degraded: Vec::new(),
             });
@@ -2401,8 +2407,10 @@ impl Walk<'_> {
 
         let mut body = if native_continuation {
             let pinned = chain.pinned.as_ref().expect("native_continuation 已判定");
-            let mut body = self.forward.body.clone();
-            responses::rewrite_reference(&mut body, &pinned.upstream_id);
+            // 要改写引用，必须脱离共享（`Arc::make_mut` 只在还有别人持有时
+            // 才复制，正常情况下这份会被原地改）。
+            let mut body = std::sync::Arc::clone(&self.forward.body);
+            responses::rewrite_reference(std::sync::Arc::make_mut(&mut body), &pinned.upstream_id);
             body
         } else if chain.reference.is_some() && chain.merged.is_none() {
             // 带着引用却既不能原生续链也没有正文：不能装作新对话。
@@ -2429,16 +2437,19 @@ impl Walk<'_> {
                 )
             })?;
             degraded = emitted.degraded.clone();
-            emitted.body.clone()
+            std::sync::Arc::new(emitted.body.clone())
         };
+        // 从这里开始这份正文一定要被改写（摘状态、换模型名、对齐思考契约），
+        // 所以脱离共享：独占时 `make_mut` 原地改，只有仍被别人持有时才复制。
+        let body = std::sync::Arc::make_mut(&mut body);
         // 同协议透传不经过转换器，别的渠道留下的不可重放状态要在这里摘掉。
-        if downstream == target_protocol && strip_foreign_replay_state(&mut body, downstream) {
+        if downstream == target_protocol && strip_foreign_replay_state(body, downstream) {
             let capability = "thinking".to_string();
             if !degraded.contains(&capability) {
                 degraded.push(capability);
             }
         }
-        rewrite_model(&mut body, &candidate.target.target.upstream_model);
+        rewrite_model(body, &candidate.target.target.upstream_model);
         // 逻辑模型名常常只是一个别名，发射时按它猜出来的思考契约可能与真正要
         // 发出去的上游模型不一致。这里按上游模型名再对齐一次：新模型不接受
         // 手工预算形状，老模型也不认识 adaptive（§14.6）。
@@ -2470,11 +2481,12 @@ impl Walk<'_> {
             && target_protocol == Protocol::OpenAiChat
             && !self.forward.endpoint.is_image()
         {
-            ensure_upstream_usage(&mut body);
+            ensure_upstream_usage(body);
         }
         Ok(Prepared {
             endpoint: choice.endpoint,
-            body,
+            // `body` 是这次尝试独占的一份（`make_mut` 已确保），直接交出所有权。
+            body: std::mem::take(body),
             raw: None,
             degraded,
         })
@@ -3967,7 +3979,7 @@ fn record_response_state(
         .flatten();
     let output_items = responses::output_items_of(upstream_body);
     // 保存正文用入口请求体的形状：跨协议进入时按入口协议解析重建。
-    let entry_body = forward.body.clone();
+    let entry_body = std::sync::Arc::clone(&forward.body);
     let entry_protocol = forward.endpoint.protocol();
     let state = forward.state.clone();
     let chain = forward.chain.clone();

@@ -835,6 +835,20 @@ pub struct PendingState {
     pub endpoint: Option<String>,
 }
 
+/// 这次记录要不要加密正文。
+///
+/// 两条都是省内存的硬约束（2026-11-13 OOM 的直接来源）：
+///
+/// 1. **流式骨架（`MemoryOnly`）不加密。** 它从不落库、从不被回放，只是
+///    客户端拿到 ID 到流结束之间的一层占位；正文会在结算那次 `Persist`
+///    写入。加密它等于每个几十 MB 的请求在流式期间白算一份密文并驻留。
+/// 2. 其余情况按 `store` 字段与保留期决定，且**正文上限在加密前判**：
+///    超限的密文随后会被 `upsert_response_state` 丢掉，先加密只是多一次
+///    全文拷贝。
+fn sealable_body(entry_body: &Value, retention_days: u32, durability: Durability) -> bool {
+    should_store(entry_body, retention_days) && durability == Durability::Persist
+}
+
 /// 把一次成功完成的 Responses 请求写入状态链（§15.2）。
 #[allow(clippy::too_many_arguments)]
 pub fn record_state(
@@ -848,10 +862,23 @@ pub fn record_state(
     retention_days: u32,
     durability: Durability,
 ) {
-    let stored = should_store(entry_body, retention_days);
-    let sealed_body = stored.then(|| {
+    // 流式骨架（MemoryOnly）只是流结束前的占位：它从不落库、从不被回放，
+    // 正文会被结算那次 Persist 写入覆盖。所以这里**不加密正文**——否则每个
+    // 几十 MB 的请求都要在流式期间多算一份密文并驻留，纯属浪费。
+    //
+    // 现场（2026-11-13）：45 MB 请求体让单请求峰值 RSS 涨 7 倍，8 并发把
+    // 3 GiB 上限顶爆，进程被内核连杀 14 次，正在输出的流全部中断
+    // （下游看到的就是 New API 的 scanner_error / unexpected EOF）。
+    // 上限必须在加密前判：加密只是把正文搬到另一个 Vec，超限的密文随后仍会
+    // 被 upsert 丢掉——先加密再丢弃，峰值白白多一份全文拷贝。
+    let sealed_body = sealable_body(entry_body, retention_days, durability).then(|| {
         let body = stored_body(entry_body, output_items, final_response);
-        state.cipher.seal(body.to_string().as_bytes())
+        let plaintext = body.to_string();
+        if plaintext.len() <= crate::storage::store::MAX_RESPONSE_STATE_BODY {
+            state.cipher.seal(plaintext.as_bytes()).ok()
+        } else {
+            None
+        }
     });
     let now = crate::storage::now_unix();
     let expires_at = now + i64::from(retention_days) * 86_400;
@@ -864,7 +891,7 @@ pub fn record_state(
         key_id: pending.key_id,
         endpoint: pending.endpoint,
         upstream_id: pending.upstream_id,
-        sealed_body: sealed_body.transpose().ok().flatten(),
+        sealed_body: sealed_body.flatten(),
         protocol: Some(entry_protocol.as_str().to_string()),
         created_at: now,
         expires_at,
@@ -969,6 +996,24 @@ mod tests {
         assert!(!should_store(&json!({"model": "m", "store": false}), 30));
         // 保留期为 0 时不保存正文，无论请求怎么写（§15.2）。
         assert!(!should_store(&json!({"model": "m"}), 0));
+    }
+
+    /// 流式骨架绝不加密正文：这是 2026-11-13 OOM 的直接来源（§15.2）。
+    #[test]
+    fn streaming_skeletons_never_seal_their_body() {
+        let body = json!({"model": "m"});
+        assert!(
+            !sealable_body(&body, 30, Durability::MemoryOnly),
+            "流式骨架加密正文等于每个大请求白算一份密文，必须在结算时再算"
+        );
+        // Persist 才按 store 字段与保留期决定。
+        assert!(sealable_body(&body, 30, Durability::Persist));
+        assert!(!sealable_body(&body, 0, Durability::Persist));
+        assert!(!sealable_body(
+            &json!({"store": false}),
+            30,
+            Durability::Persist
+        ));
     }
 
     #[test]

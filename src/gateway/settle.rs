@@ -77,7 +77,7 @@ pub struct ResponsesCompletion {
     pub state: SharedState,
     pub chain: ChainPlan,
     pub pending: PendingState,
-    pub entry_body: Value,
+    pub entry_body: std::sync::Arc<Value>,
     pub entry_protocol: Protocol,
     pub retention_days: u32,
 }

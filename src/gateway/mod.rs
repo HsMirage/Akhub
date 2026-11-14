@@ -263,7 +263,7 @@ async fn handle(
         endpoint,
         request_id: &request_id,
         downstream_headers: &headers,
-        body,
+        body: std::sync::Arc::new(body),
         raw,
         logical_model,
         request_bytes,
