@@ -335,7 +335,10 @@ mod tests {
             store.try_begin_attempt("203.0.113.9");
         }
         store.clear_failures("203.0.113.9");
-        assert!(store.try_begin_attempt("203.0.113.9"), "成功登录后计数应当归零");
+        assert!(
+            store.try_begin_attempt("203.0.113.9"),
+            "成功登录后计数应当归零"
+        );
     }
 
     /// 2026-11-11 的 OOM 根因：'查锁定'和'记失败'分成两步、中间隔着 Argon2。
