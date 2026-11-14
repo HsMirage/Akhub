@@ -467,7 +467,7 @@ async fn saved_keys_are_masked_by_default_and_revealed_on_demand() {
     );
     assert_eq!(
         listed["keys"][0]["masked"].as_str().unwrap(),
-        "sk-l****cdef",
+        "sk-liv****cdef",
         "默认展示首尾可见、中间打星"
     );
 

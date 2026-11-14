@@ -40,21 +40,21 @@ pub fn secret(value: &str) -> String {
 /// 长度不外泄：星号数量固定，短 Key 也只会露出更少。
 pub fn mask(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
-    match chars.len() {
-        // 够长才够放下首尾各 4 位；12 是"漏掉 8 位后仍看不出原值"的下限。
-        n if n >= 12 => format!(
-            "{}****{}",
-            chars[..4].iter().collect::<String>(),
-            chars[n - 4..].iter().collect::<String>()
-        ),
-        n if n >= 6 => format!(
-            "{}****{}",
-            chars[..2].iter().collect::<String>(),
-            chars[n - 2..].iter().collect::<String>()
-        ),
+    let len = chars.len();
+    // 首部 6 位（`sk-live` 这种前缀能一眼看出是哪把、哪个站），尾部 4 位
+    // 用来对号。短 Key 按比例退让：中间至少要还藏着 4 位，露掉大半就等于没打码。
+    let (head, tail) = match len {
+        n if n >= 14 => (6, 4),
+        n if n >= 10 => (3, 3),
+        n if n >= 6 => (2, 2),
         // 再短就一个字符都别露：首尾各留一位也等于给出大半个 Key。
-        _ => "****".to_string(),
-    }
+        _ => return "****".to_string(),
+    };
+    format!(
+        "{}****{}",
+        chars[..head].iter().collect::<String>(),
+        chars[len - tail..].iter().collect::<String>()
+    )
 }
 
 /// 脱敏单个请求头值。
@@ -327,22 +327,25 @@ mod tests {
 
     #[test]
     fn mask_keeps_head_and_tail_but_hides_the_middle() {
-        let masked = mask("sk-1234567890abcdef");
-        assert_eq!(masked, "sk-1****cdef", "{masked}");
-        // 管理员要能凭首尾认出"这是哪一把"，中间必须看不出来。
-        assert!(!masked.contains("234567890abc"), "{masked}");
+        // 首部 6 位（`sk-live` 这种前缀一眼能认出是哪个站、哪把 Key），尾部 4 位对号。
+        let masked = mask("sk-live-0123456789abcdef");
+        assert_eq!(masked, "sk-liv****cdef", "{masked}");
+        // 中间那一段绝不能出现在掩码里。
+        assert!(!masked.contains("0123456789ab"), "{masked}");
     }
 
     /// 短 Key 露出得更少，而且星号数量固定：别让人从掩码长度反推真实长度。
     #[test]
     fn mask_reveals_less_for_short_values_and_never_leaks_the_length() {
+        // 10–13 位退到首尾各 3 位：中间还能藏住至少 4 位。
+        assert_eq!(mask("sk-1234567"), "sk-****567");
         assert_eq!(mask("sk-abcd"), "sk****cd");
         assert_eq!(mask("sk-12345"), "sk****45");
         assert_eq!(mask("short"), "****");
         assert_eq!(mask(""), "****");
         assert_eq!(mask("a"), "****");
-        // 11 位与 40 位的星号个数一致：长度不是可读信息。
-        let shorter = mask("sk-12345678");
+        // 13 位与 40 位的星号个数一致：长度不是可读信息。
+        let shorter = mask("sk-1234567890");
         let longer = mask("sk-1234567890abcdefghijklmnopqrstuvwxyzABCD");
         assert_eq!(
             shorter.matches('*').count(),
