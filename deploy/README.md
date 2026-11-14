@@ -432,6 +432,65 @@ sudo certbot --nginx -d akhub.example.com       # 它会自动填入证书路径
 Nginx 的 `client_max_body_size` 必须 ≥ `AKHUB_MAX_REQUEST_BYTES`（默认 64 MiB），
 否则大图请求会在到达网关前就被 413 掉，错误信息也指不到真正的原因。示例里已配 64m。
 
+#### 5.3.1 登录接口必须限流（2026-11-11 事故）
+
+**线上真实发生过**：攻击者对 `/admin/api/auth/login` 发了 4.8 万次请求，
+akhub 每次失败都要跑一遍 Argon2id（19 MiB + 满核几十毫秒），
+`spawn_blocking` 默认 512 线程并发把内存堆到 7.5 GB，触发内核 OOM，
+进程被杀了 7 次，整台 4 核 8 GB 机器 CPU 打满、swap 占满。
+
+应用层已经修了（登录入口加了 4 并发闸门 + 原子的失败预扣），
+但**反代上再加一道仍然值得**——它连数据库查询都省了：
+
+```nginx
+# http{} 层
+limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+
+# server{} 里
+location = /admin/api/auth/login {
+    limit_req zone=login burst=3 nodelay;
+    limit_req_status 429;
+    # ... 其余 proxy 指令同 location /
+}
+```
+
+真人一分钟登录不了 5 次，`burst=3` 只留给手抖。
+
+再加 fail2ban 兜底（`deploy/fail2ban/jail.d/akhub.local`，装到 `/etc/fail2ban/jail.d/`）：
+
+```ini
+[akhub-login]
+enabled  = true
+filter   = akhub-login
+logpath  = /var/log/nginx/access.log
+maxretry = 10
+findtime = 300
+bantime  = 3600
+```
+
+`deploy/fail2ban/filter.d/akhub-login.conf` 有个容易踩的坑：**failregex 里不要用
+`\[[^\]]+\]` 这类方括号字符类**，fail2ban 的配置解析会把方括号当语法，
+导致正则恒不命中（实测 3 行真实样本 0 matched，排查了很久）。
+用 `.*` 跳过 `[time_local]` 即可：
+
+```ini
+[Definition]
+failregex = <HOST> .*"POST /admin/api/auth/login HTTP/[0-9.]+" (?:401|429)
+```
+
+另外 `<HOST>` 自带行首锚定，前面不要再写 `^`。
+
+**容器一定要设内存上限**。不设的话 OOM 会挑整台机器上内存占用最大的进程杀，
+可能连带干掉邻居服务：
+
+```yaml
+mem_limit: 3g
+memswap_limit: 3g
+cpus: 2.0
+environment:
+  MALLOC_ARENA_MAX: "2"   # glibc 默认 8x 核数 arena，RSS 会虚高
+```
+
 ---
 
 ## 6. 环境变量

@@ -473,7 +473,13 @@ async fn login(
 ) -> AdminResult<Response> {
     let username = credentials.username.trim();
     let client = client_ip(peer.map(|info| info.0.0), &headers);
-    if state.sessions.is_locked(&client) {
+
+    // 先原子地"查锁定 + 预扣一次失败计数"，再进任何 await。
+    // 这两步分开做过（2026-11-11）：并发突发时全部在计数为 0 的瞬间通过检查，
+    // 结果 4,351 个请求真的跑到了 Argon2，内存被打爆。
+    //
+    // 成功登录会由下面的 clear_failures 抹掉这一笔，所以预扣不会误伤。
+    if !state.sessions.try_begin_attempt(&client) {
         return Err(AdminError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "登录失败次数过多，请稍后再试",
@@ -485,9 +491,20 @@ async fn login(
         .admin_password_hash(username)
         .await
         .map_err(AdminError::internal)?;
+
+    // 并发闸门：Argon2 一次吃 19 MiB，不做限制就是 2026-11-11 的 OOM。
+    // 满员时直接拒绝，不让请求堆积——攻击者不配排队，管理员重试即可。
+    // 放在数据库查询之后：只有 Argon2 吃内存，别让慢查询白占名额。
+    let Some(_permit) = state.sessions.try_begin_verification() else {
+        state.sessions.clear_failures(&client);
+        return Err(AdminError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录请求过于频繁，请稍后再试",
+        ));
+    };
+
     // 用户名不存在与密码错误返回同一句话、耗时相同，不泄漏哪个环节出错。
     if !session::verify_password_blocking(&credentials.password, stored).await {
-        state.sessions.record_failure(&client);
         return Err(AdminError::unauthorized("用户名或密码错误"));
     }
     state.sessions.clear_failures(&client);

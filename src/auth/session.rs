@@ -25,6 +25,41 @@ const LOCKOUT: Duration = Duration::from_secs(60);
 /// 地址来自未认证的连接，不设上限就是一个可以被匿名撑大的内存表。
 const MAX_TRACKED_CLIENTS: usize = 4096;
 
+/// 同时进行的 Argon2 校验上限。
+///
+/// 每一次校验按当前参数（m=19456）要吃 19 MiB 并占满一个核几十毫秒。
+/// 2026-11-11 的事件正是这么炸的：`spawn_blocking` 默认允许 512 个线程，
+/// 突发几百个并发登录时 `512 x 19 MiB` 直接把 8 GB 机器打到内核 OOM。
+/// 4 个并发足够两个人同时登录还不排队，最坏内存增量约 76 MiB。
+const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+/// Argon2 校验的并发闸门。
+///
+/// 超出的请求**不排队**，直接当作"稍后再试"——攻击者本来就不该占用名额，
+/// 而真管理员手抖多点几次也能立刻得到明确反馈。
+pub struct VerificationGate {
+    permits: tokio::sync::Semaphore,
+}
+
+impl Default for VerificationGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VerificationGate {
+    pub fn new() -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
+        }
+    }
+
+    /// 拿一个校验名额；当前已满则返回 None。
+    pub fn try_acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.permits.try_acquire().ok()
+    }
+}
+
 /// 用 Argon2id 哈希管理员密码。
 pub fn hash_password(password: &str) -> Result<String> {
     // 盐由 password-hash 自动生成，长度取该库的推荐值。
@@ -91,6 +126,8 @@ struct FailureState {
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     failures: Mutex<HashMap<String, FailureState>>,
+    /// Argon2 校验的并发闸门，防止登录突发把内存打爆。
+    gate: VerificationGate,
 }
 
 impl Default for SessionStore {
@@ -104,21 +141,41 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            gate: VerificationGate::new(),
         }
     }
 
-    /// 该客户端当前是否处于登录锁定中。
-    pub fn is_locked(&self, client: &str) -> bool {
+    /// 拿一个 Argon2 校验名额；并发已满返回 None，调用方应当直接拒绝这次登录。
+    ///
+    /// 返回的 permit 必须活到校验结束——它一释放就代表那个 19 MiB 已经还回去了。
+    pub fn try_begin_verification(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.gate.try_acquire()
+    }
+
+    /// 占用一次登录尝试的名额：已被锁定则返回 false。
+    ///
+    /// **必须在 `await` 之前调用**。历史上这里是 `is_locked()` 先查、等
+    /// Argon2 校验完再 `record_failure()` 记账，两次加锁之间隔着几十毫秒的
+    /// 校验窗口；攻击者一秒并发几百个请求时全部在"计数还是 0"的瞬间通过检查，
+    /// 锁定形同虚设（2026-11-11 事件：单 IP 6,923 次请求里 4,351 次真的跑到
+    /// 了 Argon2，把 19 MiB x 数百并发堆到 OOM）。
+    ///
+    /// 这里把"查锁定"和"先记一笔"合成一次加锁，并发请求必然互相看见。
+    /// 校验成功时由 `clear_failures()` 把这一笔抹掉，失败则保留——所以名额
+    /// 是"预扣"而不是"事后记账"。
+    pub fn try_begin_attempt(&self, client: &str) -> bool {
         let mut failures = crate::sync::lock(&self.failures);
-        match failures.get(client).and_then(|f| f.locked_until) {
-            Some(until) if until > Instant::now() => true,
-            Some(_) => {
-                // 锁定已过期，顺手清空计数，给一次干净的重试机会。
-                failures.remove(client);
-                false
+        let now = Instant::now();
+        if let Some(locked_until) = failures.get(client).and_then(|f| f.locked_until) {
+            if locked_until > now {
+                return false;
             }
-            None => false,
+            // 锁定已过期，清掉旧账，给一次干净的重试机会。
+            failures.remove(client);
         }
+        drop(failures);
+        self.record_failure(client);
+        true
     }
 
     /// 记录该客户端的一次登录失败，必要时锁定**这个客户端**。
@@ -261,24 +318,66 @@ mod tests {
     #[test]
     fn repeated_failures_lock_only_that_client() {
         let store = SessionStore::new();
-        for _ in 0..MAX_FAILURES - 1 {
-            store.record_failure("203.0.113.9");
+        for _ in 0..MAX_FAILURES {
+            assert!(store.try_begin_attempt("203.0.113.9"));
         }
-        assert!(!store.is_locked("203.0.113.9"));
-        store.record_failure("203.0.113.9");
-        assert!(store.is_locked("203.0.113.9"));
-        assert!(!store.is_locked("198.51.100.1"), "别的客户端不受牵连");
+        assert!(!store.try_begin_attempt("203.0.113.9"), "打满就该锁定");
+        assert!(
+            store.try_begin_attempt("198.51.100.1"),
+            "别的客户端不受牵连"
+        );
     }
 
     #[test]
     fn a_successful_login_clears_the_failure_counter() {
         let store = SessionStore::new();
-        for _ in 0..MAX_FAILURES - 1 {
-            store.record_failure("203.0.113.9");
+        for _ in 0..MAX_FAILURES {
+            store.try_begin_attempt("203.0.113.9");
         }
         store.clear_failures("203.0.113.9");
-        store.record_failure("203.0.113.9");
-        assert!(!store.is_locked("203.0.113.9"), "成功登录后计数应当归零");
+        assert!(store.try_begin_attempt("203.0.113.9"), "成功登录后计数应当归零");
+    }
+
+    /// 2026-11-11 的 OOM 根因：'查锁定'和'记失败'分成两步、中间隔着 Argon2。
+    ///
+    /// 并发突发时所有请求都在计数为 0 的瞬间通过检查，于是全部跑到 Argon2。
+    /// 这个测试锁住修复后的行为：计数必须在校验**之前**就预扣掉。
+    #[test]
+    fn concurrent_bursts_cannot_all_pass_the_lockout_check() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                store.try_begin_attempt("203.0.113.9")
+            }));
+        }
+        let passed = handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .filter(|passed| *passed)
+            .count();
+        // record_failure 在计数触顶时把 count 归零并加锁，所以恰好触顶的那一次
+        // 仍算放行：最多 MAX_FAILURES 次放行 + 1 次"触发锁定的那一次"。
+        assert!(
+            passed <= MAX_FAILURES as usize + 1,
+            "并发突发最多只能放行 {} 个，实际放行 {passed} 个——锁定又漏了",
+            MAX_FAILURES + 1
+        );
+    }
+
+    /// 并发闸门：同时最多 4 个 Argon2 在校验，超出的必须被拒。
+    #[test]
+    fn verification_gate_caps_concurrent_argon2() {
+        let store = SessionStore::new();
+        let permits: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS)
+            .map(|_| store.try_begin_verification())
+            .collect();
+        assert!(permits.iter().all(|p| p.is_some()), "上限内应当全部放行");
+        assert!(
+            store.try_begin_verification().is_none(),
+            "满了必须拒绝，否则 512 个并发 x 19 MiB 会把内存打爆"
+        );
     }
 
     #[test]

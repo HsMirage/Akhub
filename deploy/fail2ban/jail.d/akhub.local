@@ -1,0 +1,14 @@
+[akhub-login]
+enabled  = true
+port     = http,https
+filter   = akhub-login
+logpath  = /var/log/nginx/access.log
+
+# 事件复盘：单 IP 一分钟发 195 次登录请求，全部 401；10 个 IP 合计 4.8 万次。
+# 正常管理员不会 5 分钟内连续失败 10 次。
+maxretry = 10
+findtime = 300
+bantime  = 3600
+
+# 只封 http/https，别把 SSH 也一起封了。
+action   = nftables-multiport[name=akhub-login, port="http,https"]
