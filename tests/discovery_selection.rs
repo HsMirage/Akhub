@@ -1244,7 +1244,7 @@ async fn managed_sync_hosts_everything_without_touching_the_selection_set() {
 }
 
 #[tokio::test]
-async fn managed_sync_drops_orphans_and_disables_vanished_models() {
+async fn managed_sync_drops_vanished_models_and_their_targets() {
     let (akhub, client) = spawn_admin().await;
     let upstream = FakeUpstream::spawn().await;
     upstream.set_models(Some(json!({
@@ -1257,7 +1257,9 @@ async fn managed_sync_drops_orphans_and_disables_vanished_models() {
         .unwrap();
     assert_eq!(logical_models(&akhub).await.len(), 3);
 
-    // m3 从上游消失：托管把它移出调度；选择集里勾过的 m1 保留 missing 标记。
+    // m3 从上游消失：托管把它移出调度，并直接移出目录（2026-11-14 修订）。
+    // 托管是"上游有什么就调度什么"，没有选择集，所以没有理由留一条永远不会
+    // 自己消失的占位——那正是"开了自动同步却只增不删"的现场。
     upstream.set_models(Some(json!({"data": [{"id": "m1"}, {"id": "m2"}]})));
     akhub::discovery::sync_managed(&akhub.state, &account)
         .await
@@ -1273,7 +1275,22 @@ async fn managed_sync_drops_orphans_and_disables_vanished_models() {
         .unwrap();
     assert!(
         catalog.iter().all(|r| r.upstream_model != "m3"),
-        "未勾选的消失模型移出目录"
+        "托管下消失的模型要移出目录，而不是留成 missing 占位"
+    );
+    let listed: Value = client
+        .get(format!("{}/v1/models", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listed["data"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().all(|row| row["id"] != "m3")),
+        "消失的模型不能继续出现在下游 /v1/models 里：{listed}"
     );
 
     // m3 重现后自动恢复托管。
@@ -1287,6 +1304,94 @@ async fn managed_sync_drops_orphans_and_disables_vanished_models() {
         logical_models(&akhub).await.get("m3").map(Vec::len),
         Some(1)
     );
+}
+
+/// 托管下消失的模型：自己改过下游模型名的保留占位，其余直接清掉。
+///
+/// 现场症状（2026-11-14）：打开模型自动同步后，模型只会越加越多，上游已经下架的
+/// 那些一条也不会自己消失，只能在列表里一直挂着等人点「移除消失模型」。
+///
+/// 直接删有两处不能碰：改过的下游模型名是管理员亲手录的本地意图，跟着行一起没了
+/// 就再也找不回来；所以这类行保留成"上游已消失"占位，由管理员决定何时清。
+#[tokio::test]
+async fn managed_sync_deletes_vanished_models_but_keeps_renamed_ones() {
+    let (akhub, client) = spawn_admin().await;
+    let upstream = FakeUpstream::spawn().await;
+    upstream.set_models(Some(json!({
+        "data": [{"id": "plain"}, {"id": "renamed"}, {"id": "live"}]
+    })));
+    let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
+        )
+        .header("x-akhub-csrf", "1")
+        .header("x-akhub-config-version", "*")
+        .json(&json!({"auto_sync": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let account = find_account(&akhub, &account_id).await;
+    akhub::discovery::sync_managed(&akhub.state, &account)
+        .await
+        .unwrap();
+    assert_eq!(logical_models(&akhub).await.len(), 3);
+
+    // 给 renamed 这一行填一个下游模型名（托管下改名是放行的）。
+    let response = apply_changes(
+        &client,
+        &akhub,
+        &account_id,
+        json!([{"upstream_model": "renamed", "alias": "mine-renamed"}]),
+        false,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "托管下改名应放行：{}",
+        response.text().await.unwrap()
+    );
+
+    // 上游把两个都下架了。
+    upstream.set_models(Some(json!({"data": [{"id": "live"}]})));
+    akhub::discovery::sync_managed(&akhub.state, &account)
+        .await
+        .unwrap();
+
+    let catalog = akhub
+        .state
+        .store
+        .list_account_models(&account_id)
+        .await
+        .unwrap();
+    assert!(
+        catalog.iter().all(|row| row.upstream_model != "plain"),
+        "没改过名的消失模型要直接移出目录：{catalog:?}"
+    );
+    let renamed = catalog
+        .iter()
+        .find(|row| row.upstream_model == "renamed")
+        .expect("改过下游模型名的行必须保留，SQL 里没有第二份这个名字");
+    assert!(renamed.missing, "保留下来的行要标记成上游已消失");
+    assert_eq!(
+        renamed.public_name, "mine-renamed",
+        "管理员填的下游模型名必须原样保住"
+    );
+    // 保留下来的那一行停止承接新请求：目标被停用，只剩占位。
+    let targets = akhub.state.store.list_targets().await.unwrap();
+    let renamed_target = targets
+        .iter()
+        .find(|target| target.upstream_model == "renamed")
+        .expect("占位行仍然有目标，否则它连恢复的落点都没了");
+    assert!(!renamed_target.enabled, "上游已消失的模型不能再被调度");
+    let live_target = targets
+        .iter()
+        .find(|target| target.upstream_model == "live")
+        .unwrap();
+    assert!(live_target.enabled, "在售模型照常调度");
 }
 
 #[tokio::test]
@@ -1360,28 +1465,16 @@ async fn managed_rename_is_allowed_but_toggling_is_not() {
 async fn one_click_removes_vanished_models_and_their_targets() {
     // §16.5（2026-10-15 修订）：上游下架的模型会以"上游已消失"长期占位，它们的
     // 调度目标虽然停用、名字却仍然留在下游 /v1/models 里。一键清理把目录行与
-    // 目标一起收走，托管账号同样可用。
+    // 目标一起收走。托管账号不靠这个：它在每轮同步里自己清（见下一条用例）。
     let (akhub, client) = spawn_admin().await;
     let upstream = FakeUpstream::spawn().await;
     upstream.set_models(Some(json!({
         "data": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
     })));
     let account_id = create_account(&akhub, &client, &upstream, "站点A").await;
-    // 先手动勾上三个（"上游已消失"的标记只留给曾经启用过的行），再开托管。
+    // 手动勾上三个：只有选择集里的行才会留下"上游已消失"占位。
     refresh(&client, &akhub, &account_id).await;
     let response = select(&client, &akhub, &account_id, &["m1", "m2", "m3"], false).await;
-    assert_eq!(response.status(), 200);
-    let response = client
-        .request(
-            reqwest::Method::PATCH,
-            format!("{}/admin/api/accounts/{account_id}", akhub.base_url),
-        )
-        .header("x-akhub-csrf", "1")
-        .header("x-akhub-config-version", "*")
-        .json(&json!({"auto_sync": true}))
-        .send()
-        .await
-        .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(logical_models(&akhub).await.len(), 3);
 
@@ -1391,7 +1484,7 @@ async fn one_click_removes_vanished_models_and_their_targets() {
         .request(
             reqwest::Method::POST,
             format!(
-                "{}/admin/api/accounts/{account_id}/models/sync",
+                "{}/admin/api/accounts/{account_id}/models/refresh",
                 akhub.base_url
             ),
         )

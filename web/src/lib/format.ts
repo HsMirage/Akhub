@@ -139,6 +139,8 @@ const CHANGE_ACTION_LABELS: Record<string, string> = {
   refresh_account_models: "刷新模型目录",
   select_account_models: "更新模型选择集",
   sync_account_models: "执行托管同步",
+  reveal_account_key: "查看 Key 明文",
+  clear_key_faults: "清除 Key 失效标记",
   add_manual_model: "手动添加模型",
   update_aliases: "更新下游模型名",
   calibrate_account: "校准倍率",

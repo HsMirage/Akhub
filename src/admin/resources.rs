@@ -915,7 +915,11 @@ pub struct AccountDto {
     pub keys: Vec<AccountKeyDto>,
 }
 
-/// 一把 Key 的元数据。绝不包含明文凭据（§23.2）。
+/// 一把 Key 的元数据。
+///
+/// **默认不含明文**：`masked` 是给界面直接展示的脱敏值（首尾可见、中间打星），
+/// 管理员点「显示」时才走单独的 reveal 接口取真值（§23.2，2026-11-14 修订）。
+/// 这样列表接口即便被日志、缓存、截图带走，带走的也只是掩码。
 #[derive(Serialize)]
 pub struct AccountKeyDto {
     pub id: String,
@@ -924,6 +928,8 @@ pub struct AccountKeyDto {
     pub limits: Limits,
     /// 凭据摘要前 8 位，用于在同一账号的多把 Key 之间对号。
     pub digest_prefix: String,
+    /// 脱敏后的凭据：首尾各留几位，中间固定打星。**不可提交回后端**。
+    pub masked: String,
     /// 与 [`AccountHealthDto::keys`] 里同 id 的那条对应。
     pub health: AccountKeyHealthDto,
 }
@@ -1109,6 +1115,8 @@ async fn account_dto(state: &SharedState, account: &Account, has_token: bool) ->
             enabled: key.enabled,
             limits: key.limits,
             digest_prefix: key.credential_digest.chars().take(8).collect(),
+            // 掩码由明文现算：库里那一列只是给日志看的副本，不参与展示。
+            masked: crate::security::redact::mask(&key.secret),
             health: account_key_health_of(state, key),
         })
         .collect();
@@ -3524,6 +3532,37 @@ async fn test_one_key(
         }
         Err(error) => (false, 0, latency_ms, format!("连接失败：{error}")),
     }
+}
+
+/// 读出某一把 Key 的完整明文（§23.2，2026-11-14 修订）。
+///
+/// 这是后台唯一一个会回吐上游凭据的接口，所以每一条限制都是为了收窄它的爆炸半径：
+///   * 只认**已登录的管理员会话**（`Admin` 提取器），走不到网关那套 Key 鉴权；
+///   * 作用域精确到一把 Key，不提供"列出整池明文"，界面一次只点一把；
+///   * 每次调用都写审计（`reveal_account_key`），谁在什么时候看过哪把 Key 有据可查；
+///   * POST 而不是 GET：不落浏览器历史、不落任何中间层缓存，也顺带被 CSRF 头护住。
+///
+/// 明文取自内存凭据池而不是现解密数据库：池里的那份就是网关正在用的，两边不会分叉。
+pub async fn reveal_account_key(
+    State(state): State<SharedState>,
+    admin: Admin,
+    Path((id, key_id)): Path<(String, String)>,
+) -> AdminResult<Json<Value>> {
+    let account = find_account(&state, &id).await?;
+    let credential = state
+        .runtime
+        .credentials
+        .current()
+        .by_id(&account.id, &key_id)
+        .cloned()
+        .ok_or_else(|| AdminError::not_found("这个账号下没有这把 Key"))?;
+    // 先留痕再回吐：审计写失败不该挡住管理员，但也绝不能因此少记一笔。
+    audit(&state, &admin, "reveal_account_key", &id).await;
+    Ok(Json(json!({
+        "key_id": credential.id,
+        "label": credential.label,
+        "api_key": credential.secret.as_ref(),
+    })))
 }
 
 /// 清除某一把 Key 的失效标记与熔断（§12.3）。

@@ -67,7 +67,7 @@ const RANGE_SECONDS: Record<Exclude<TimeRange, "all">, number> = {
   "7d": 7 * 24 * 60 * 60,
 };
 
-const REQUEST_COLUMN_COUNT = 10;
+const REQUEST_COLUMN_COUNT = 11;
 
 function toRequestFilters(form: RequestFilterForm): RequestFilters {
   const filters: RequestFilters = {};
@@ -328,6 +328,10 @@ export function Requests({
   const accountName = (id: string | null) =>
     id ? (data.accounts.find((account) => account.id === id)?.name ?? id) : "—";
 
+  /** 分组名。记录只带 group_id，认人要靠 data.groups；分组已删就退回 id。 */
+  const groupName = (id: string | null) =>
+    id ? (data.groups.find((group) => group.id === id)?.name ?? id) : "—";
+
   /**
    * 尝试明细里的「目标」：显示上游账号名，不是内部 ULID。
    *
@@ -362,6 +366,7 @@ export function Requests({
       "时间",
       "请求ID",
       "下游模型名",
+      "分组",
       "协议",
       "流式",
       "上游账号",
@@ -383,6 +388,7 @@ export function Requests({
       formatTime(record.started_at),
       record.request_id,
       record.logical_model ?? "",
+      groupName(record.group_id),
       PROTOCOL_LABELS[record.protocol],
       record.streaming ? "是" : "否",
       accountName(record.account_id),
@@ -679,6 +685,7 @@ export function Requests({
               <tr>
                 <th>时间 / 请求 ID</th>
                 <th>下游模型名</th>
+                <th>分组</th>
                 <th>实际目标</th>
                 <th>体积</th>
                 <th title="输入 / 输出；下面一行是缓存读 / 写（上游没上报就留空）">Token</th>
@@ -777,6 +784,7 @@ export function Requests({
                           )}
                         </div>
                       </td>
+                      <td className="cell-dim">{groupName(record.group_id)}</td>
                       <td>
                         <span className="chain">
                           {record.account_id ? (

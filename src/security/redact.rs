@@ -30,6 +30,33 @@ pub fn secret(value: &str) -> String {
     format!("{visible}…({} 字符)", value.chars().count())
 }
 
+/// 后台展示用的掩码：保留首尾、中间一律打星。
+///
+/// 与 [`secret`] 的区别是**用途**：那个是给日志的，宁可只留前缀也不要让人拼出
+/// 全貌；这个是给管理员的，得让他一眼认出"这是哪一把 Key"，所以尾部也要留。
+/// 但它**绝不能**被当成可提交的值写回库里——前端只拿它当占位提示，真值要经
+/// `POST /accounts/{id}/keys/{key_id}/reveal` 单独取（会留审计）。
+///
+/// 长度不外泄：星号数量固定，短 Key 也只会露出更少。
+pub fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    match chars.len() {
+        // 够长才够放下首尾各 4 位；12 是"漏掉 8 位后仍看不出原值"的下限。
+        n if n >= 12 => format!(
+            "{}****{}",
+            chars[..4].iter().collect::<String>(),
+            chars[n - 4..].iter().collect::<String>()
+        ),
+        n if n >= 6 => format!(
+            "{}****{}",
+            chars[..2].iter().collect::<String>(),
+            chars[n - 2..].iter().collect::<String>()
+        ),
+        // 再短就一个字符都别露：首尾各留一位也等于给出大半个 Key。
+        _ => "****".to_string(),
+    }
+}
+
 /// 脱敏单个请求头值。
 pub fn header_value(name: &str, value: &str) -> String {
     if is_sensitive_header(name) {
@@ -296,6 +323,32 @@ mod tests {
         assert!(is_sensitive_header("Authorization"));
         assert!(is_sensitive_header("X-Api-Key"));
         assert!(!is_sensitive_header("content-type"));
+    }
+
+    #[test]
+    fn mask_keeps_head_and_tail_but_hides_the_middle() {
+        let masked = mask("sk-1234567890abcdef");
+        assert_eq!(masked, "sk-1****cdef", "{masked}");
+        // 管理员要能凭首尾认出"这是哪一把"，中间必须看不出来。
+        assert!(!masked.contains("234567890abc"), "{masked}");
+    }
+
+    /// 短 Key 露出得更少，而且星号数量固定：别让人从掩码长度反推真实长度。
+    #[test]
+    fn mask_reveals_less_for_short_values_and_never_leaks_the_length() {
+        assert_eq!(mask("sk-abcd"), "sk****cd");
+        assert_eq!(mask("sk-12345"), "sk****45");
+        assert_eq!(mask("short"), "****");
+        assert_eq!(mask(""), "****");
+        assert_eq!(mask("a"), "****");
+        // 11 位与 40 位的星号个数一致：长度不是可读信息。
+        let shorter = mask("sk-12345678");
+        let longer = mask("sk-1234567890abcdefghijklmnopqrstuvwxyzABCD");
+        assert_eq!(
+            shorter.matches('*').count(),
+            longer.matches('*').count(),
+            "星号数量必须固定"
+        );
     }
 
     #[test]

@@ -13,13 +13,15 @@
  *
  * 切分规则本身是产品行为，完整定义与理由见 `lib/key-paste.ts`（那里有测试）。
  *
- * **后台从不回吐明文**（§23.2），所以已保存的 Key 在界面上只有标签、摘要前缀与
- * 状态；要换就整把重新粘贴。提交时"有 id、没明文"就是"这一把没动"。
+ * **明文默认不出现**（§23.2，2026-11-14 修订）：已保存的 Key 平时显示掩码
+ * （首尾可见、中间打星），点「显示」才向后台要一次真值，回来后就一直显示到
+ * 收起为止。提交时"有 id、没明文"仍然是"这一把没动"——**掩码绝不回传**，
+ * 否则会把星号写进库，把真 Key 弄坏。
  */
 import { useState } from "react";
 import type { AccountKey, AccountKeyInput, Limits } from "../lib/types";
 import { splitPastedKeys } from "../lib/key-paste";
-import { Badge, Button, Field, InfoTip } from "./ui";
+import { Badge, Button, Field, InfoTip, useToast } from "./ui";
 import { IconPlus, IconTrash } from "./Icons";
 
 /** 编辑器里的一行：已保存的（有 id）或正在新增的（无 id）。 */
@@ -152,6 +154,7 @@ export function KeyPoolEditor({
   clearingKeyId,
   onChange,
   onClearFaults,
+  onReveal,
 }: {
   drafts: KeyDraft[];
   /** 正在清除哪一把 Key 的失效标记；null 表示没有进行中的清除。 */
@@ -159,14 +162,57 @@ export function KeyPoolEditor({
   onChange: (next: KeyDraft[]) => void;
   /** 清除某一把 Key 的失效标记与熔断（§12.3）。 */
   onClearFaults?: (keyId: string) => void;
+  /**
+   * 取一把已保存 Key 的完整明文（§23.2，2026-11-14 修订）。
+   *
+   * 由调用方注入而不是这里直接调 api：新建账号时还没有账号 ID，而组件同时
+   * 服务两种形态；调用方手里才有那个 ID。
+   */
+  onReveal?: (keyId: string) => Promise<string>;
 }) {
   const [showKey, setShowKey] = useState<Record<number, boolean>>({});
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  /** 已拉到的完整明文，按行 ID 存；收起后立刻丢掉，不留在内存里。 */
+  const [revealed, setRevealed] = useState<Record<string, string>>({});
+  /** 正在拉明文的那一行（行 ID）；防止连点发出多次带审计的请求。 */
+  const [revealing, setRevealing] = useState<string | null>(null);
   /** 批量粘贴框的内容。粘完就清空，它只是一条批量入口，不是状态的一部分。 */
   const [bulk, setBulk] = useState("");
+  const toast = useToast();
 
   const update = (index: number, patch: Partial<KeyDraft>) => {
     onChange(drafts.map((draft, i) => (i === index ? { ...draft, ...patch } : draft)));
+  };
+
+  /**
+   * 切换一行的显示状态。已保存的行第一次点「显示」时才去后台要真值。
+   *
+   * 收起时把明文一并丢掉：留在 state 里等于页面一旦离开视线就长期挂着一把
+   * Key 明文，而它开着的时候本来就能被看到，没有留存的必要。
+   */
+  const toggleShown = async (index: number, draft: KeyDraft) => {
+    const next = !showKey[index];
+    setShowKey((current) => ({ ...current, [index]: next }));
+    if (!draft.id) return;
+    if (!next) {
+      setRevealed((current) => {
+        const copy = { ...current };
+        delete copy[draft.id!];
+        return copy;
+      });
+      return;
+    }
+    if (revealed[draft.id] || !onReveal || revealing) return;
+    setRevealing(draft.id);
+    try {
+      const value = await onReveal(draft.id);
+      setRevealed((current) => ({ ...current, [draft.id!]: value }));
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "读取 Key 失败");
+      setShowKey((current) => ({ ...current, [index]: false }));
+    } finally {
+      setRevealing(null);
+    }
   };
 
   const error = validateDrafts(drafts);
@@ -252,6 +298,19 @@ export function KeyPoolEditor({
                       aria-label={`${position}的标签`}
                     />
                     <div className="input-affix key-pool-secret">
+                      {/* 已保存的行**默认就是可编辑的**（粘贴新值即覆盖这条主路径不能
+                          断），只是空着时把掩码当占位符显示出来——一眼能认出是哪把 Key，
+                          又不会把明文摆在页面上。点了「显示」才切成只读的明文展示：
+                          那时框里是真值，允许编辑等于允许把真值改坏。 */}
+                      {draft.id && showKey[index] ? (
+                        <input
+                          className="input mono"
+                          readOnly
+                          value={revealed[draft.id] ?? "读取中…"}
+                          aria-label={`${position}的 API Key（完整值）`}
+                          title="完整 Key；点「隐藏」回到掩码"
+                        />
+                      ) : (
                       <input
                         className="input mono"
                         type={showKey[index] ? "text" : "password"}
@@ -285,25 +344,33 @@ export function KeyPoolEditor({
                           update(index, { api_key: text });
                         }}
                         placeholder={
-                          draft.id ? "留空则不变（已保存）" : "sk-…（可整批粘贴）"
+                          draft.id
+                            ? `${draft.health?.masked ?? "****"}（粘贴新值即覆盖）`
+                            : "sk-…（可整批粘贴）"
                         }
                         autoComplete="new-password"
                         aria-label={`${position}的 API Key`}
                       />
-                      <button
-                        type="button"
-                        className="input-affix-button"
-                        aria-label={showKey[index] ? "隐藏" : "显示"}
-                        aria-pressed={!!showKey[index]}
-                        onClick={() =>
-                          setShowKey((current) => ({
-                            ...current,
-                            [index]: !current[index],
-                          }))
-                        }
-                      >
-                        {showKey[index] ? "隐藏" : "显示"}
-                      </button>
+                      )}
+                      {/* 两种行都要能切换查看：已保存的去后台取真值（留审计），
+                          正在输入的本就在页面上。没有 onReveal 时不给按钮，
+                          免得出现一个点了没反应的假按钮。 */}
+                      {(draft.id ? !!onReveal : draft.api_key !== "") && (
+                        <button
+                          type="button"
+                          className="input-affix-button"
+                          aria-label={showKey[index] ? "隐藏" : "显示"}
+                          aria-pressed={!!showKey[index]}
+                          disabled={revealing === draft.id}
+                          onClick={() => void toggleShown(index, draft)}
+                        >
+                          {revealing === draft.id
+                            ? "读取中"
+                            : showKey[index]
+                              ? "隐藏"
+                              : "显示"}
+                        </button>
+                      )}
                     </div>
                     {health && (
                       <Badge tone={keyStatusTone(health.status)}>
@@ -346,7 +413,11 @@ export function KeyPoolEditor({
                   {draft.id && health && (
                     <div className="key-pool-meta">
                       <span className="mono">{draft.health?.digest_prefix}</span>
-                      <span className="muted">已保存的凭据无法回显；粘贴新值即覆盖</span>
+                      {/* 点「显示」会去后台取真值并留审计，得先说清楚，
+                          免得管理员以为这是纯前端的事儿。 */}
+                      <span className="muted">
+                        点「显示」查看完整值（会记一次审计）；粘贴新值即覆盖
+                      </span>
                       {health.inflight > 0 && <span>在途 {health.inflight}</span>}
                     </div>
                   )}

@@ -340,6 +340,16 @@ export const api = {
     post<{ ok: boolean; notice: string }>(
       `/accounts/${id}/keys/${keyId}/clear-faults`,
     ),
+  /**
+   * 取一把已保存 Key 的完整明文（§23.2，2026-11-14 修订）。
+   *
+   * 只在管理员点「显示」时调用，一次一把；服务端每次都写审计，所以别拿它
+   * 做列表预取——那会把审计日志刷成一屏噪音，也把明文摊在页面上。
+   */
+  revealKey: (id: string, keyId: string) =>
+    post<{ key_id: string; label: string; api_key: string }>(
+      `/accounts/${id}/keys/${keyId}/reveal`,
+    ),
   /** 校准助手：按单模型对账反算校准系数（§6.8）。 */
   calibrate: (id: string, logicalModel: string, reported: string, periodStart?: number) =>
     post<CalibrationResult>(`/accounts/${id}/calibrate`, {

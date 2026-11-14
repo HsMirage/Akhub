@@ -118,7 +118,7 @@ export interface Account {
   keys: AccountKey[];
 }
 
-/// 账号内的一把 Key。**绝不包含明文凭据**（§23.2）。
+/// 账号内的一把 Key。**默认不含明文**（§23.2）。
 export interface AccountKey {
   id: string;
   label: string;
@@ -126,6 +126,8 @@ export interface AccountKey {
   limits: Limits;
   /// 凭据摘要前 8 位，用于在同一账号的多把 Key 之间对号。
   digest_prefix: string;
+  /// 脱敏后的凭据：首尾可见、中间打星。可直接展示，**不可提交回后端**。
+  masked: string;
   health: AccountKeyHealth;
 }
 

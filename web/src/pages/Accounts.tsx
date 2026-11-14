@@ -1045,6 +1045,17 @@ function AccountDrawer({
     }
   };
 
+  /**
+   * 取一把已保存 Key 的完整明文（§23.2，2026-11-14 修订）。
+   *
+   * 每次都会写审计，所以只在管理员点了「显示」时调用，绝不预取。
+   */
+  const revealKey = async (keyId: string): Promise<string> => {
+    if (!account) throw new Error("还没有保存的 Key 可查看");
+    const result = await api.revealKey(account.id, keyId);
+    return result.api_key;
+  };
+
   /** 真正落库。编辑态下 keys 是整体替换：带 id 的沿用原密文、带明文的轮换、没出现的删除。 */
   const save = async (payload: AccountInput, moving: boolean) => {
     setBusy(true);
@@ -1201,6 +1212,8 @@ function AccountDrawer({
           clearingKeyId={clearingKeyId}
           onChange={setKeyDrafts}
           onClearFaults={(keyId) => void clearKeyFaults(keyId)}
+          // 新建时还没有账号 ID，取不到已保存的 Key；编辑态才有可回显的东西。
+          onReveal={account ? revealKey : undefined}
         />
 
         <Field

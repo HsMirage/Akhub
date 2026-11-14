@@ -174,8 +174,24 @@ async fn merge_catalog_in_tx(
         });
     }
     // 消失的模型（§16.5）：已启用的保留记录并标记 missing；停用的移出目录。
+    //
+    // 托管（`auto_sync`）换一套口径：它的定义就是"上游有什么就调度什么"，没有
+    // 选择集概念，所以消失的行直接移出目录。留成 missing 占位既不会被调度、
+    // 也不会自己消失，只能一直挂在那里等人点「移除消失模型」——那正是"开了自动
+    // 同步却只增不删"的现场（2026-11-14）。
+    //
+    // 但改过下游模型名的行必须留：那个名字是管理员亲手敲的，目录行是它唯一的
+    // 家，删掉就再也找不回来。
     for prev in &previous {
-        if upstream_set.contains(prev.upstream_model.as_str()) || !prev.selected {
+        if upstream_set.contains(prev.upstream_model.as_str()) {
+            continue;
+        }
+        let keep = if account.auto_sync {
+            prev.public_name != prev.upstream_model
+        } else {
+            prev.selected
+        };
+        if !keep {
             continue;
         }
         entries.push(CatalogEntry {

@@ -350,7 +350,8 @@ async fn the_full_configuration_path_works_end_to_end() {
     let account_id = account["id"].as_str().unwrap().to_string();
     assert_eq!(account["effective_multiplier"], "0.5");
 
-    // 账号接口在任何形态下都不能回吐上游 Key（§23.2）。
+    // 账号接口在任何形态下都不能回吐上游 Key（§23.2，2026-11-14 修订后
+    // 仍然成立：列表里给的是掩码，真值只走单独的 reveal 接口）。
     let accounts: Value = client
         .get(format!("{base}/admin/api/accounts"))
         .send()
@@ -360,6 +361,13 @@ async fn the_full_configuration_path_works_end_to_end() {
         .await
         .unwrap();
     assert!(!accounts.to_string().contains("sk-上游真Key"));
+    let masked = accounts["data"][0]["keys"][0]["masked"]
+        .as_str()
+        .expect("列表必须给出可展示的掩码");
+    // 这把 Key 只有 8 个字符：短 Key 露得更少（首尾各 2 位），
+    // 中间那一段绝不能出现在掩码里。
+    assert_eq!(masked, "sk****ey", "默认展示首尾可见、中间打星：{masked}");
+    assert!(!masked.contains("游真K"), "掩码不能露出中间：{masked}");
 
     // 3. 在账号目录里纳入一个上游模型：逻辑模型与调度目标由调和自动生成。
     let target = bind_model_raw(
@@ -396,6 +404,114 @@ async fn the_full_configuration_path_works_end_to_end() {
         .await
         .unwrap();
     assert_eq!(listed["data"][0]["id"], "claude-sonnet-4-5");
+}
+
+/// 已保存 Key 的明文：默认只给掩码，点「显示」才经 reveal 接口取真值（§23.2）。
+///
+/// 2026-11-14 修订：管理员要看得到完整 Key（核对、抄到别处），但列表接口不该
+/// 顺手把整池明文铺出去。所以拆成两半：列表给"首尾可见、中间打星"的掩码，
+/// 真值要单独 POST 一次，而且每次都写审计。
+#[tokio::test]
+async fn saved_keys_are_masked_by_default_and_revealed_on_demand() {
+    let (base, client, _dir, state) = spawn_with_state().await;
+    setup_admin(&base, &client).await;
+    let created: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/groups"),
+    )
+    .json(&json!({"name": "分组", "multiplier_limit": "1"}))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let group_id = created["group"]["id"].as_str().unwrap().to_string();
+    let secret = "sk-live-0123456789abcdef";
+    let account: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts"),
+    )
+    .json(&json!({
+        "group_id": group_id,
+        "name": "账号A",
+        "base_url": "https://api.example.com",
+        "keys": [{"api_key": secret, "label": "主号"}],
+        "preferred_protocol": "openai_chat",
+        "multiplier_mode": "manual",
+        "manual_multiplier": "1",
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let account_id = account["id"].as_str().unwrap().to_string();
+    let key_id = account["keys"][0]["id"].as_str().unwrap().to_string();
+
+    // 列表：有掩码、没有明文。
+    let listed: Value = client
+        .get(format!("{base}/admin/api/accounts/{account_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains(secret),
+        "列表接口不能回吐明文：{listed}"
+    );
+    assert_eq!(
+        listed["keys"][0]["masked"].as_str().unwrap(),
+        "sk-l****cdef",
+        "默认展示首尾可见、中间打星"
+    );
+
+    // reveal：拿得到真值，且写了一条审计。
+    let revealed: Value = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts/{account_id}/keys/{key_id}/reveal"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(revealed["api_key"], secret, "点了「显示」必须给完整 Key");
+    assert_eq!(revealed["label"], "主号");
+    // 审计表里必须有一条；而"最近配置变化"不该被它挤占。
+    let logged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM admin_audit_log WHERE action = 'reveal_account_key'",
+    )
+    .fetch_one(state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(logged, 1, "每次查看明文都必须留痕");
+    let changes = state.store.recent_audit(20).await.unwrap();
+    assert!(
+        !changes.iter().any(|row| row.action == "reveal_account_key"),
+        "查看明文不是配置变更，不能混进概览那 5 行"
+    );
+
+    // 别的账号的 Key ID 取不到：作用域精确到这把 Key。
+    let other = "sk-not-in-this-account";
+    let response = write(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/admin/api/accounts/{account_id}/keys/kl_missing/reveal"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 404);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(other));
 }
 
 #[tokio::test]

@@ -316,6 +316,12 @@ pub fn router() -> Router<SharedState> {
             "/admin/api/accounts/{id}/keys/{key_id}/clear-faults",
             post(r::clear_key_faults),
         )
+        // 读出完整 Key（§23.2，2026-11-14 修订）：管理员点了「显示」才回调，
+        // 每次都进审计。用 POST 是为了不落历史、不落缓存。
+        .route(
+            "/admin/api/accounts/{id}/keys/{key_id}/reveal",
+            post(r::reveal_account_key),
+        )
         .route(
             "/admin/api/accounts/{id}/calibrate",
             post(r::calibrate_account),

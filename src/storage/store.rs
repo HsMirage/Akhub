@@ -785,13 +785,16 @@ impl Store {
     ///
     /// 只算真正改配置的动作：测试连接、刷新倍率与拉模型列表也进审计，但它们不是
     /// "最近的配置变更"，混进去会把真正的改动挤出这个只有几行的列表。
+    ///
+    /// 查看 Key 明文（`reveal_account_key`）同样不算变更，而且要按"谁在什么时候
+    /// 看过哪把 Key"单独去查——把它混进这个列表只会把它埋掉。
     pub async fn recent_audit(&self, limit: i64) -> Result<Vec<AuditEntry>> {
         let rows = sqlx::query(
             "SELECT occurred_at, actor, action, object, result
              FROM admin_audit_log
              WHERE action NOT IN ('test_account', 'refresh_multiplier',
                                   'refresh_all_multipliers', 'refresh_account_models',
-                                  'sync_account_models')
+                                  'sync_account_models', 'reveal_account_key')
              ORDER BY occurred_at DESC LIMIT ?",
         )
         .bind(limit.clamp(1, 50))
