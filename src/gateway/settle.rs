@@ -226,6 +226,13 @@ impl SettlementGuard {
             Ending::Completed if self.accounting.error().is_some() => {
                 Ending::Failed("upstream_protocol_error")
             }
+            // 终止信号已经转发、下游读到收尾就关连接（sub2api / New API 的常态）：
+            // 回答是完整送达的，不是掉线。现场 DeepSeek 流 93% 被记成 client_gone。
+            Ending::Aborted
+                if self.accounting.error().is_none() && self.accounting.answer_completed() =>
+            {
+                Ending::Completed
+            }
             other => other,
         };
         settle_one(settlement, ending, &self.accounting);
@@ -253,28 +260,9 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
         admission.settle(outcome, usage);
     }
 
-    // 断开的请求要分两种（§9.3 修订）。
-    //
-    // 客户端提前断开本身不是上游的质量信号，可靠性不能动——这一点原来的注释
-    // 说对了。但原先把整条观测都丢掉，于是低流量模型永远攒不够样本：
-    // `deepseek-v4.1-flash` 近 7 天 1848 条请求里 96.8% 属于"上游其实写完了、
-    // 只是下游没等到收尾就关了连接"，全部被丢弃，真实生效的只剩 62 条。五个
-    // 目标的有效样本量因此全在 0.1~6.6 之间，谁都不是"热"目标——参照系不成立、
-    // 性能各维一律退化成中性分，冷目标的口粮占了抽签权重 84%~97%，评分形同虚设，
-    // 抽签接近均匀随机，前缀缓存每轮重建一次。
-    //
-    // 判据是协议自己的**终止信号**，不是"有没有出现过用量"：Anthropic 的
-    // `message_start` 就带 `input_tokens` 与占位的 `output_tokens: 1`，那时回答
-    // 一个字都没写（见 `StreamAccounting::answer_completed`）。
-    //
-    // 认到终止信号就说明上游把这次回答真的写完了：首字与吞吐都是**真实测到的**，
-    // 记进权重与采样时刻，但不动成功率。
-    // 流里出现过错误事件时不认这份时间证据：即使拿到了终止信号，这次回答的
-    // 质量也是可疑的，不能拿它去证明目标健康。保持原有口径（不计入）。
+    // 写完才断开的已在 `SettlementGuard::settle` 归为 Completed（§9.3 修订），
+    // 走到这里的 Aborted 都是真的中途断流：没有可用证据，也不动可靠性。
     let kind = match ending {
-        Ending::Aborted if accounting.error().is_none() && accounting.answer_completed() => {
-            score::SampleKind::TimingOnly
-        }
         Ending::Aborted => score::SampleKind::Excluded,
         Ending::Completed | Ending::Failed(_) => score::SampleKind::Rated,
     };
@@ -283,8 +271,6 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
         settlement.dimension,
         &score::Sample {
             kind,
-            // `TimingOnly` 的上游确实产出了回答，按成功记账——它只是不参与
-            // 成功率 EWMA（见 `SampleKind`）。
             success: kind != score::SampleKind::Rated || ending == Ending::Completed,
             // 样本用首字节而不是首字：评分要反映用户实际等了多久（§9.3）。
             // 走心跳的尝试例外——那里的首字节是第一个注释帧，用真实首字。

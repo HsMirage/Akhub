@@ -497,7 +497,8 @@ async fn a_disconnect_after_the_answer_finished_still_feeds_the_evidence() {
     drop(response);
 
     let record = wait_for_record(&akhub, 1).await;
-    assert_eq!(record.error_code.as_deref(), Some("client_gone"));
+    // 终止信号已送达：这是一次完整的回答，不是掉线（2026-11-19 修订）。
+    assert_eq!(record.error_code, None, "{record:?}");
     // 夹具确实走了"上游写完、下游才断开"那条路：用量被记录下来了。
     // 注意判据本身是终止信号，不是这里的 output_tokens（见 stream.rs 的
     // `answer_completed`：Anthropic 开头就有 output_tokens 占位值）。
