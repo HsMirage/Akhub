@@ -257,6 +257,47 @@ fn codex_hint_fields_do_not_block_cross_protocol_targets() {
     assert_eq!(responses.fidelity, Fidelity::Lossless);
 }
 
+/// Claude Code 的会话标识是 `metadata.user_id`，跨协议时必须继续往上走。
+///
+/// 它同时是"这条会话是谁"和"上游该把前缀缓存路由到哪个分片"：丢掉它以后，
+/// 网关自己虽然还记得粘性绑定，上游那一侧却把每一轮都当成一条新会话，
+/// 前端缓存命中率直接掉下来（现场：Messages 转 OpenAI 后缓存读归零）。
+#[test]
+fn the_anthropic_session_id_carries_over_as_an_openai_cache_hint() {
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "metadata": {"user_id": "user_abc_account_def_session_0123"},
+        "messages": [{"role": "user", "content": "你好"}],
+    });
+
+    let chat = convert_request(MESSAGES, CHAT, &body).unwrap();
+    assert_eq!(chat.body["user"], "user_abc_account_def_session_0123");
+    assert_eq!(
+        chat.body["prompt_cache_key"], "user_abc_account_def_session_0123",
+        "会话标识必须作为缓存路由提示原样带过去"
+    );
+    assert_eq!(
+        chat.fidelity,
+        Fidelity::Lossless,
+        "只是路由提示，不改变输出语义，不算降级"
+    );
+
+    let responses = convert_request(MESSAGES, RESPONSES, &body).unwrap();
+    assert_eq!(
+        responses.body["prompt_cache_key"],
+        "user_abc_account_def_session_0123"
+    );
+
+    // 反向：OpenAI 的会话提示回到 Anthropic 时仍落在 metadata.user_id。
+    let back = convert_request(CHAT, MESSAGES, &chat.body).unwrap();
+    assert_eq!(
+        back.body["metadata"]["user_id"],
+        "user_abc_account_def_session_0123"
+    );
+    assert!(back.body.get("prompt_cache_key").is_none());
+}
+
 // ------------------------------------------------ 4. 表达不了就拒绝
 
 #[test]

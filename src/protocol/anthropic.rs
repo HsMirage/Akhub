@@ -75,11 +75,23 @@ pub fn parse_request(body: &Value) -> Result<Request, Unsupported> {
     request.temperature = object.get("temperature").and_then(Value::as_f64);
     request.top_p = object.get("top_p").and_then(Value::as_f64);
     request.stop = string_list(object.get("stop_sequences"));
-    request.user = object
+    // Claude Code 把整条会话的标识放在 `metadata.user_id`（`user_<device>_account_
+    // <uuid>_session_<uuid>`）。它同时是两件事：
+    // * OpenAI 的 `user` 字段（老字段，语义最接近）；
+    // * **上游前缀缓存的会话路由提示**。转成 OpenAI 协议时必须跟着带过去，
+    //   否则上游既不知道这是同一轮会话，也无从把同一前缀路由到同一个缓存分片——
+    //   这正是"Claude Messages 转 OpenAI 兼容上游以后好像没有缓存"的那一半原因
+    //   （另一半是粘性键，见 `routing::sticky`）。`prompt_cache_key` 按定义只是
+    //   路由提示、不改变输出语义，所以带过去是安全的（§14.6）。
+    if let Some(session) = object
         .get("metadata")
         .and_then(|m| m.get("user_id"))
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .filter(|value| !value.trim().is_empty())
+    {
+        request.user = Some(session.to_string());
+        request.prompt_cache_key = Some(session.to_string());
+    }
 
     if let Some(system) = object.get("system") {
         let parts = parse_content(system, &mut request.inexpressible);

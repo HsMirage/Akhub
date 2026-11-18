@@ -123,10 +123,21 @@ pub fn derive(
     }
 
     // 3. 协议中的稳定用户/会话字段。
+    //
+    // Anthropic 的会话标识在 `metadata.user_id`（Claude Code 每轮都带，且整条
+    // 会话不变）。以前这里只认 `prompt_cache_key` 与 `user`，于是整条 Claude
+    // Code 流量掉到第 4 级"稳定前缀"：同一个项目里并行的几条会话共用一个前缀，
+    // 谁都能被抽到别的账号上，上游按凭据隔离的前缀缓存跟着每轮重建——这正是
+    // "Claude Messages 转 OpenAI 之后好像没有缓存"的直接原因（§10.1）。
     if let Some(value) = body
         .get("prompt_cache_key")
         .and_then(serde_json::Value::as_str)
         .or_else(|| body.get("user").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            body.get("metadata")
+                .and_then(|metadata| metadata.get("user_id"))
+                .and_then(serde_json::Value::as_str)
+        })
         .filter(|value| !value.trim().is_empty())
     {
         return Some((key(&scope, "cache", value.as_bytes()), Origin::CacheKey));
@@ -747,6 +758,33 @@ mod tests {
             derive(&digest(), "g", "m", &empty, &body).unwrap().1,
             Origin::StablePrefix
         );
+    }
+
+    /// Claude Code 把整条会话的标识放在 `metadata.user_id`，不是 `user`。
+    ///
+    /// 认不到它，整条 Messages 流量就会掉到第 4 级"稳定前缀"：同一个项目里并行
+    /// 的几条会话共用一个前缀，绑定互相顶掉，上游按凭据隔离的前缀缓存每轮重建。
+    /// 这正是"Messages 转 OpenAI 之后好像没有缓存"的直接原因（§10.1）。
+    #[test]
+    fn anthropic_metadata_session_id_is_a_strong_identity() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "metadata": {"user_id": "user_abc_account_def_session_0123"},
+            "system": "说明",
+            "messages": [{"role": "user", "content": "你好"}],
+        });
+        let derived = derive_prefix(&body).expect("metadata.user_id 必须能推导出粘性键");
+        assert_eq!(derived.1, Origin::CacheKey, "它是强身份，不是稳定前缀");
+
+        // 同一条会话换一条用户消息：绑定必须不变（缓存亲和对的是会话，不是内容）。
+        let mut next = body.clone();
+        next["messages"][0]["content"] = json!("接着说");
+        assert_eq!(derive_prefix(&next).as_ref(), Some(&derived));
+
+        // 换一条会话就必须换一个键，否则两条会话会互相把对方踢出账号。
+        let mut other = body.clone();
+        other["metadata"]["user_id"] = json!("user_abc_account_def_session_9999");
+        assert_ne!(derive_prefix(&other).as_ref(), Some(&derived));
     }
 
     #[test]
