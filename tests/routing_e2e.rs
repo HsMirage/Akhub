@@ -676,6 +676,53 @@ async fn stable_prefix_stickiness_is_soft_and_still_allows_redistribution() {
     );
 }
 
+/// 同一项目里的**一条**会话（第一轮输入不变）在缓存热的时候不许换号。
+///
+/// 只认前缀时它和项目里其他会话共用绑定、走软亲和抽签，现场约 10% 的请求在
+/// 缓存仍热时被抽到别的账号，缓存读比腰斩（§10.1 修订）。
+#[tokio::test]
+async fn one_conversation_stays_on_one_target_while_the_project_still_spreads() {
+    let x = FakeUpstream::spawn().await;
+    let y = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("X", &x.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new("Y", &y.base_url, CHAT, MODEL, MODEL, 50),
+    )
+    .await;
+
+    let system = "你是项目 Delta 的编码助手";
+    let mut messages = vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": "第一轮"}),
+    ];
+    for round in 0..40 {
+        let body = json!({"model": MODEL, "messages": messages.clone()});
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+        messages.push(json!({"role": "assistant", "content": "好"}));
+        messages.push(json!({"role": "user", "content": format!("第 {round} 次追问")}));
+    }
+    let (nx, ny) = (x.requests(), y.requests());
+    assert!(nx == 0 || ny == 0, "同一条会话不该换号（X={nx} Y={ny}）");
+
+    // 新会话各自抽签：两个账号都拿得到流量。
+    for round in 0..60 {
+        let body = small_body(system, &format!("新会话 {round}"));
+        assert_eq!(chat(&akhub, body).await.status(), 200);
+    }
+    assert!(
+        x.requests() > nx && y.requests() > ny,
+        "新会话仍应分摊（X={} Y={}）",
+        x.requests(),
+        y.requests()
+    );
+}
+
 /// 把一个 `prompt_cache_key` 直接绑到某个目标上，绑定时间由调用方指定。
 ///
 /// 用来制造"绑定还在（没到 TTL）、但上游缓存已经凉了"的现场：真实时间没法在

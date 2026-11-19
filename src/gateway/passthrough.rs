@@ -494,6 +494,9 @@ struct Walk<'a> {
     /// 用来回答"绑定目标有没有真的被用上"——与 `soft_affinity`（偏的是 Key）
     /// 分开：目标是抽签决定的，Key 是绑定保住的，两者不是同一件事。
     bound_target_id: Option<String>,
+    /// 会话键（第 4 级）对应的"同一项目"前缀键：会话键成功时一并绑定，
+    /// 下一条新会话没有自己的绑定时，靠它软亲和到项目常用的账号上。
+    project_key: Option<sticky::Key>,
 }
 
 /// 一次请求里"用过哪把 Key"的记录（§4.2.1）。
@@ -694,6 +697,7 @@ async fn forward_inner<'a>(
         soft_affinity: None,
         // 绑定指向哪个目标同样在下面填充，用于判断"到底粘住了没有"（§24.1）。
         bound_target_id: None,
+        project_key: None,
     };
 
     // 粘性键必须在**抽签之前**推导出来：弱身份（稳定前缀）的绑定要作为抽签的
@@ -719,12 +723,32 @@ async fn forward_inner<'a>(
     // 短路抽签。这既保住"同一个项目倾向于落在同一个账号"（前缀缓存的价值），
     // 又让每个前缀在每次请求都有一次重新分配的机会（负载均衡的价值）。
     walk.telemetry.sticky_origin = sticky_key.as_ref().map(|(_, origin)| origin.as_str());
-    let soft = sticky_key
-        .as_ref()
-        .is_some_and(|(_, origin)| *origin == sticky::Origin::StablePrefix);
-    let existing = sticky_key
+    let origin = sticky_key.as_ref().map(|(_, origin)| *origin);
+    if origin == Some(sticky::Origin::Conversation) {
+        walk.project_key = sticky::stable_prefix_key(
+            &forward.state.key_digest,
+            &forward.group.group.id,
+            &forward.logical_model,
+            &forward.body,
+        );
+    }
+    let mut existing = sticky_key
         .as_ref()
         .and_then(|(key, _)| forward.state.runtime.sticky.get(key, now_unix));
+    // 会话键（第 4 级）已有绑定就按强身份守门钉住：一条会话是顺序的，钉住它
+    // 不会像"整个项目钉一个账号"那样集中流量。新会话还没绑定时，退回项目前缀
+    // 的软亲和，负载均衡仍由抽签负责。
+    let soft = match origin {
+        Some(sticky::Origin::StablePrefix) => true,
+        Some(sticky::Origin::Conversation) if existing.is_none() => {
+            existing = walk
+                .project_key
+                .as_ref()
+                .and_then(|key| forward.state.runtime.sticky.get(key, now_unix));
+            true
+        }
+        _ => false,
+    };
     // 绑定指向哪个目标：供 `run()` 判断这次到底粘住了没有（§24.1）。
     walk.bound_target_id = existing.as_ref().map(|binding| binding.target_id.clone());
 
@@ -1663,9 +1687,13 @@ impl Walk<'_> {
         };
         match result {
             Ok(success) => {
-                if let Some((key, _)) = sticky_key {
-                    // 绑定记的是"目标 + Key"：只绑目标会在下次请求时重新抽签，
-                    // 把上游按凭据隔离的前缀缓存打碎（§4.2.1 的不变量 B）。
+                // 绑定记的是"目标 + Key"：只绑目标会在下次请求时重新抽签，
+                // 把上游按凭据隔离的前缀缓存打碎（§4.2.1 的不变量 B）。
+                for key in sticky_key
+                    .iter()
+                    .map(|(key, _)| key)
+                    .chain(self.project_key.iter())
+                {
                     self.forward.state.runtime.sticky.bind(
                         key.clone(),
                         &self.forward.group.group.id,
@@ -1847,7 +1875,11 @@ impl Walk<'_> {
                     return Attempted::Done(Flow::Done(self.filtered_response()));
                 }
                 self.content_filtered = true;
-                if let Some((key, _)) = sticky_key {
+                for key in sticky_key
+                    .iter()
+                    .map(|(key, _)| key)
+                    .chain(self.project_key.iter())
+                {
                     self.forward.state.runtime.sticky.clear(key);
                 }
                 tracing::warn!(
@@ -1895,7 +1927,11 @@ impl Walk<'_> {
                 // 反而会在换渠道后残留、干扰后续判定。
                 self.last_public = public;
                 // 清掉绑定：留着只会让下一跳又回到这个账号（§10.2）。
-                if let Some((key, _)) = sticky_key {
+                for key in sticky_key
+                    .iter()
+                    .map(|(key, _)| key)
+                    .chain(self.project_key.iter())
+                {
                     self.forward.state.runtime.sticky.clear(key);
                 }
                 tracing::warn!(

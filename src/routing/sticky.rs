@@ -72,6 +72,8 @@ pub enum Origin {
     SessionHeader,
     /// `prompt_cache_key` 等协议内稳定字段。
     CacheKey,
+    /// 稳定前缀 + 第一轮输入：同一项目里的**一条**会话。
+    Conversation,
     /// 稳定前缀摘要（system prompt + 工具定义）。
     StablePrefix,
 }
@@ -82,6 +84,7 @@ impl Origin {
             Self::ResponseChain => "chain",
             Self::SessionHeader => "session_header",
             Self::CacheKey => "cache_key",
+            Self::Conversation => "conversation",
             Self::StablePrefix => "stable_prefix",
         }
     }
@@ -143,17 +146,91 @@ pub fn derive(
         return Some((key(&scope, "cache", value.as_bytes()), Origin::CacheKey));
     }
 
-    // 4. 稳定前缀摘要。
+    // 4. 稳定前缀 + 第一轮输入 = 一条会话；没有第一轮输入时退回只认前缀。
+    //
+    // 只认前缀时，同一项目里并行的几条会话共用一个绑定，谁成功谁改写它，
+    // 每条会话都会被别人拖到别的账号上（现场：cursor反代 / AwsClaude 的稳定前缀
+    // 请求约 10% 在缓存仍热时换了号，缓存读比从 0.57~0.93 掉到 0.07~0.50）。
+    // 第一轮输入在会话内不变（变了上游前缀缓存本身也失效），正好区分会话。
     let prefix = stable_prefix(body);
     if prefix.is_empty() {
         // 没有 system prompt 也没有工具定义时前缀是空的，粘上去毫无意义：
         // 一次性的短请求本来就不需要缓存亲和。
         return None;
     }
+    let first = first_turn_text(body);
+    if !first.is_empty() {
+        let mut material = prefix;
+        material.push(1);
+        material.extend_from_slice(first.as_bytes());
+        return Some((
+            key_with(digest, &scope, "conversation", &material),
+            Origin::Conversation,
+        ));
+    }
     Some((
         key_with(digest, &scope, "prefix", &prefix),
         Origin::StablePrefix,
     ))
+}
+
+/// 第 4 级只认前缀的那把键：会话键还没有绑定时，拿它做"同一项目"的软亲和。
+pub fn stable_prefix_key(
+    digest: &KeyDigest,
+    group_id: &str,
+    logical_model: &str,
+    body: &serde_json::Value,
+) -> Option<Key> {
+    let prefix = stable_prefix(body);
+    (!prefix.is_empty()).then(|| {
+        key_with(
+            digest,
+            &format!("{group_id}\u{1}{logical_model}"),
+            "prefix",
+            &prefix,
+        )
+    })
+}
+
+/// 第一条非系统消息里的文本（Chat/Messages 的 `messages`、Responses 的 `input`）。
+///
+/// 只取 `text`：`cache_control` 之类的标记会随轮次挪位置，进键就会每轮换键。
+fn first_turn_text(body: &serde_json::Value) -> String {
+    let first = match body.get("input") {
+        Some(serde_json::Value::String(text)) => return text.clone(),
+        Some(serde_json::Value::Array(items)) => items.iter().find(|item| !is_system(item)),
+        _ => body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| messages.iter().find(|message| !is_system(message))),
+    };
+    let mut out = String::new();
+    if let Some(message) = first {
+        collect_text(message.get("content").unwrap_or(message), &mut out);
+    }
+    out
+}
+
+fn is_system(message: &serde_json::Value) -> bool {
+    matches!(
+        message.get("role").and_then(serde_json::Value::as_str),
+        Some("system") | Some("developer")
+    )
+}
+
+fn collect_text(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(text) => out.push_str(text),
+        serde_json::Value::Array(items) => items.iter().for_each(|item| collect_text(item, out)),
+        serde_json::Value::Object(map) => {
+            for (field, inner) in map {
+                if matches!(field.as_str(), "text" | "content") {
+                    collect_text(inner, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 取出参与稳定前缀哈希的部分：system prompt 与工具定义，外加分组与模型。
@@ -606,11 +683,13 @@ mod tests {
         assert_eq!(Origin::SessionHeader.as_str(), "session_header");
         assert_eq!(Origin::CacheKey.as_str(), "cache_key");
         assert_eq!(Origin::StablePrefix.as_str(), "stable_prefix");
-        // 四个标签互不相同，否则按级统计会把两级混在一起。
+        assert_eq!(Origin::Conversation.as_str(), "conversation");
+        // 五个标签互不相同，否则按级统计会把两级混在一起。
         let mut labels = vec![
             Origin::ResponseChain.as_str(),
             Origin::SessionHeader.as_str(),
             Origin::CacheKey.as_str(),
+            Origin::Conversation.as_str(),
             Origin::StablePrefix.as_str(),
         ];
         labels.sort_unstable();
@@ -664,10 +743,14 @@ mod tests {
         const _: () = assert!(SETTLE_MARGIN_FACTOR > 1.0);
     }
 
+    fn project_key(body: &serde_json::Value) -> Option<Key> {
+        stable_prefix_key(&digest(), "g1", "claude-sonnet-4-5", body)
+    }
+
     #[test]
-    fn compacting_the_conversation_does_not_break_the_binding() {
-        // agent 客户端 /compact 后第一条用户消息被换成摘要——这恰好发生在
-        // 上下文最大、缓存最值钱的时刻，粘性绝不能因此断链（§10.1）。
+    fn compacting_the_conversation_keeps_the_project_affinity() {
+        // /compact 把第一条用户消息换成摘要：会话键随之换新（上游缓存本来也
+        // 整段失效），但项目前缀键不变，新会话键仍能软亲和到原账号（§10.1）。
         let before = json!({
             "system": "你是一个编码助手",
             "tools": [{"name": "bash"}],
@@ -678,22 +761,57 @@ mod tests {
             "tools": [{"name": "bash"}],
             "messages": [{"role": "user", "content": "【上下文摘要】之前我们在读 main.rs…"}],
         });
-        assert_eq!(derive_prefix(&before), derive_prefix(&after));
+        assert_ne!(derive_prefix(&before), derive_prefix(&after));
+        assert_eq!(project_key(&before), project_key(&after));
     }
 
     #[test]
-    fn injected_timestamps_in_the_first_user_message_do_not_reset_stickiness() {
-        // 客户端常在第一条消息里注入当前时间、git 状态、目录快照。
+    fn parallel_conversations_share_the_project_but_not_the_binding() {
+        // 客户端常在第一条消息里注入当前时间、git 状态、目录快照：两条会话。
         let make = |injected: &str| {
             json!({
                 "system": "你是一个编码助手",
                 "messages": [{"role": "user", "content": format!("当前时间 {injected}")}],
             })
         };
+        let (a, origin) = derive_prefix(&make("10:00:00")).unwrap();
+        assert_eq!(origin, Origin::Conversation);
+        assert_ne!(Some((a, origin)), derive_prefix(&make("10:00:01")));
         assert_eq!(
-            derive_prefix(&make("10:00:00")),
-            derive_prefix(&make("10:00:01"))
+            project_key(&make("10:00:00")),
+            project_key(&make("10:00:01"))
         );
+        // 没有第一轮输入时，第 4 级退回到项目前缀键本身。
+        let bare = json!({"system": "你是一个编码助手"});
+        assert_eq!(derive_prefix(&bare).map(|(key, _)| key), project_key(&bare));
+    }
+
+    /// 同一条会话往后续轮次走：键不变；`cache_control` 挪位置也不影响。
+    #[test]
+    fn later_turns_of_one_conversation_keep_the_conversation_key() {
+        let turn1 = json!({
+            "system": "说明",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "读一下 main.rs", "cache_control": {"type": "ephemeral"}}
+            ]}],
+        });
+        let turn2 = json!({
+            "system": "说明",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "读一下 main.rs"}]},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": "继续"},
+            ],
+        });
+        assert_eq!(derive_prefix(&turn1), derive_prefix(&turn2));
+        // Responses 的 input 同理。
+        let r1 = json!({"instructions": "说明", "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]});
+        let r2 = json!({"instructions": "说明", "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"role": "user", "content": "再来"},
+        ]});
+        assert_eq!(derive_prefix(&r1).unwrap().1, Origin::Conversation);
+        assert_eq!(derive_prefix(&r1), derive_prefix(&r2));
     }
 
     #[test]
