@@ -844,7 +844,12 @@ export function Requests({
                       <td className="cell-dim">{formatDuration(record.duration_ms)}</td>
                       <td className="cell-dim" style={{ fontSize: 12 }}>
                         <span className="row" style={{ gap: 6 }}>
-                          {record.sticky_hit && <Badge tone="accent">粘性</Badge>}
+                          {record.sticky_hit &&
+                            (record.sticky_kept === false ? (
+                              <Badge tone="warn">粘性未保持</Badge>
+                            ) : (
+                              <Badge tone="accent">粘性</Badge>
+                            ))}
                           {record.attempts > 1 && (
                             <Badge tone="warn">切换 {record.attempts - 1} 次</Badge>
                           )}

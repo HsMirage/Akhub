@@ -342,6 +342,8 @@ export interface RequestRecord {
   attempts: number;
   queued_ms: number;
   sticky_hit: boolean;
+  /** 绑定目标是否真的被用上；hit=true 且 kept=false 是"有绑定但被抽走了"（§24.1）。 */
+  sticky_kept: boolean | null;
   /** 首个语义块到达耗时（毫秒）；非流式或上游未给时为 null（§6.6）。 */
   first_token_ms: number | null;
   /** 上游上报的输入/输出 Token；没上报就是 null，不做估算（§6.8）。 */
