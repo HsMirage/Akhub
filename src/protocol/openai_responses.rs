@@ -878,7 +878,7 @@ fn incomplete_reason(stop: StopReason) -> Option<&'static str> {
     }
 }
 
-fn emit_usage(usage: &Usage) -> Value {
+pub(crate) fn emit_usage(usage: &Usage) -> Value {
     let mut object = Map::new();
     if let Some(input) = usage.input {
         object.insert("input_tokens".into(), json!(input));

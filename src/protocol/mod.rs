@@ -428,6 +428,75 @@ pub fn terminal_usage_frames(
     frames
 }
 
+/// 错误帧之前补的一帧「只有 usage、没有终止信号」的用量帧。
+///
+/// sub2api / newapi 把错误事件当终止信号，读到它就停止解析后续帧，但对任何带
+/// usage 的帧都会先累计用量。所以这帧不能带 finish_reason / message_stop /
+/// response.completed 之类的终止信号——否则下游提前收尾、看不到后面的错误，错误
+/// 就丢了。只带用量本身，让下游先记到量再看到错误。用量为空时返回 None。
+pub fn usage_only_frame(
+    protocol: Protocol,
+    usage: canonical::Usage,
+    responses_id: Option<String>,
+) -> Option<axum::body::Bytes> {
+    if usage.is_empty() {
+        return None;
+    }
+    let usage = canonical::Usage {
+        cache_read: None,
+        cache_write: None,
+        ..usage
+    };
+    match protocol {
+        // Chat 的用量收尾块：choices 为空数组即「只有用量」。
+        Protocol::OpenAiChat => {
+            let value = serde_json::json!({
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "",
+                "choices": [],
+                "usage": openai_chat::emit_usage(&usage),
+            });
+            Some(sse::format_frame(None, &value.to_string()))
+        }
+        // Anthropic 的 message_start 自带 usage、且没有 stop_reason：下游当开头。
+        Protocol::AnthropicMessages => {
+            let value = serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "",
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "usage": anthropic::emit_usage(&usage),
+                },
+            });
+            Some(sse::format_frame(Some("message_start"), &value.to_string()))
+        }
+        // Responses 没有独立 usage 事件：response.in_progress 带 usage 最贴近，
+        // 它不是终止事件，下游只累计用量。
+        Protocol::OpenAiResponses => {
+            let value = serde_json::json!({
+                "type": "response.in_progress",
+                "response": {
+                    "id": responses_id.unwrap_or_default(),
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                    "usage": openai_responses::emit_usage(&usage),
+                },
+            });
+            Some(sse::format_frame(
+                Some("response.in_progress"),
+                &value.to_string(),
+            ))
+        }
+    }
+}
+
 /// 一帧是否是上游的错误事件；是则给出截断后的安全消息。
 ///
 /// 三个协议的错误帧形状不同，但都能由这三个信号之一识别：`event: error`、
@@ -1130,6 +1199,64 @@ mod tests {
         assert!(!resp_text.contains("cached_tokens"), "{resp_text}");
     }
 
+    /// 错误帧之前的用量帧必须「只带用量、不带终止信号」：下游读到错误就停止解析，
+    /// 若这帧带 finish_reason / message_stop / response.completed，下游会提前收尾、
+    /// 看不到后面的错误。
+    #[test]
+    fn usage_only_frame_has_no_terminal_signal() {
+        let usage = canonical::Usage {
+            input: Some(1000),
+            output: Some(50),
+            cache_read: Some(768),
+            cache_write: Some(100),
+            reasoning: None,
+        };
+
+        let chat = usage_only_frame(Protocol::OpenAiChat, usage, None).expect("chat 用量帧");
+        let chat_text = String::from_utf8_lossy(&chat);
+        assert!(chat_text.contains(r#""prompt_tokens":1000"#), "{chat_text}");
+        assert!(
+            chat_text.contains(r#""choices":[]"#),
+            "只有用量：{chat_text}"
+        );
+        assert!(
+            !chat_text.contains("finish_reason"),
+            "不得带终止信号：{chat_text}"
+        );
+        assert!(!chat_text.contains("[DONE]"), "不得带 [DONE]：{chat_text}");
+        assert!(
+            !chat_text.contains("cached_tokens"),
+            "缓存并入输入：{chat_text}"
+        );
+
+        let anth =
+            usage_only_frame(Protocol::AnthropicMessages, usage, None).expect("anthropic 用量帧");
+        let anth_text = String::from_utf8_lossy(&anth);
+        assert!(anth_text.contains("message_start"), "{anth_text}");
+        assert!(
+            !anth_text.contains("message_stop"),
+            "不得带终止信号：{anth_text}"
+        );
+        assert!(
+            !anth_text.contains("stop_reason\":\"") || anth_text.contains("stop_reason\":null"),
+            "{anth_text}"
+        );
+
+        let resp = usage_only_frame(Protocol::OpenAiResponses, usage, Some("resp_akh_x".into()))
+            .expect("responses 用量帧");
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(resp_text.contains("response.in_progress"), "{resp_text}");
+        assert!(resp_text.contains("resp_akh_x"), "{resp_text}");
+        assert!(
+            !resp_text.contains("response.completed"),
+            "不得带终止信号：{resp_text}"
+        );
+
+        // 没有用量可报时不补帧。
+        assert!(
+            usage_only_frame(Protocol::OpenAiChat, canonical::Usage::default(), None).is_none()
+        );
+    }
     /// 没有可计费的用量时不补帧——补一帧 0 用量是伪造，不如让下游按失败处理。
     #[test]
     fn terminal_usage_frames_skip_empty_usage() {

@@ -191,6 +191,7 @@ pub fn settle_stream(
         //  accounting 不一定看得到错误。这里自己探一遍错误帧，收尾时据此补计费终止帧。
         let mut error_probe = crate::protocol::sse::FrameReader::new();
         let mut saw_error_frame = false;
+        let mut usage_injected = false;
         loop {
             let next = if let Some(timeout) = idle_timeout {
                 match tokio::time::timeout(timeout, upstream.next()).await {
@@ -221,18 +222,53 @@ pub fn settle_stream(
             match next {
                 Some(Ok(chunk)) => {
                     guard.accounting.push(&chunk);
-                    for frame in error_probe.push(&chunk) {
-                        if crate::protocol::frame_error(&frame).is_some() {
+                    // 错误帧之前先补一帧「只有 usage、没有终止信号」的用量帧。
+                    // sub2api / newapi 把错误事件当终止信号，读到它就停止解析后续帧，
+                    // 但对任何带 usage 的帧都会先累计用量。把用量帧排在错误帧前面，
+                    // 下游先记到用量、再看到错误（现场 cyber-policy 拒绝：记录在、
+                    // 用量 0、计费 0，就是因为用量帧排在了错误帧后面）。
+                    //
+                    // 按帧边界切块转发：error_probe 与游标同步消费同一份字节，跨块
+                    // 半帧由 error_probe 内部缓冲拼回，游标只在完整帧处推进。
+                    let frames = error_probe.push(&chunk);
+                    let mut cursor = 0usize;
+                    for frame in &frames {
+                        let Some(end) = crate::protocol::sse::find_frame_end(&chunk, cursor) else {
+                            break;
+                        };
+                        if crate::protocol::frame_error(frame).is_some() {
                             saw_error_frame = true;
+                            // 客户端没索取 usage 时不额外塞用量帧（§26.3 的契约）；
+                            // 计费型下游（sub2api / newapi）都会强制打开 include_usage。
+                            if !usage_injected && !strip_unrequested_usage {
+                                if let Some(usage_frame) = guard.usage_only_frame() {
+                                    yield Ok::<_, axum::Error>(usage_frame);
+                                }
+                                usage_injected = true;
+                            }
                         }
+                        let piece = &chunk[cursor..end];
+                        if strip_unrequested_usage {
+                            let bytes = filter.push(piece);
+                            if !bytes.is_empty() {
+                                yield Ok::<_, axum::Error>(bytes);
+                            }
+                        } else {
+                            yield Ok::<_, axum::Error>(axum::body::Bytes::copy_from_slice(piece));
+                        }
+                        cursor = end;
                     }
-                    if strip_unrequested_usage {
-                        let bytes = filter.push(&chunk);
-                        if !bytes.is_empty() {
-                            yield Ok::<_, axum::Error>(bytes);
+                    // 完整帧之外的残留字节（半帧）原样放行，留给下一块拼。
+                    if cursor < chunk.len() {
+                        let rest = &chunk[cursor..];
+                        if strip_unrequested_usage {
+                            let bytes = filter.push(rest);
+                            if !bytes.is_empty() {
+                                yield Ok::<_, axum::Error>(bytes);
+                            }
+                        } else {
+                            yield Ok::<_, axum::Error>(axum::body::Bytes::copy_from_slice(rest));
                         }
-                    } else {
-                        yield Ok::<_, axum::Error>(chunk);
                     }
                 }
                 Some(Err(error)) => {
@@ -260,8 +296,10 @@ pub fn settle_stream(
         {
             saw_error_frame = true;
         }
-        // 流里出现过错误帧（上游断流被内层改写成错误事件）：按失败结算并补计费
-        // 终止帧；否则才是正常收尾。
+        // 流里出现过错误帧（上游断流被内层改写成错误事件）：按失败结算，并照
+        // 上游 newapi 的做法在错误之后补协议终止帧。下游（sub2api 的 raw 路径）
+        // 正是靠错误之后的收尾帧把"这条流算非计费错误"的标记清掉、按真实用量计费；
+        // 错误本身已经先一步送达，客户端看得到这次是中断的。
         let ending = if saw_error_frame {
             Ending::Failed("upstream_protocol_error")
         } else {
@@ -284,6 +322,38 @@ struct SettlementGuard {
 }
 
 impl SettlementGuard {
+    /// 异常结束时交给下游计费的用量（上游 newapi 口径：缓存并入输入、不带缓存细分）。
+    ///
+    /// 上游没报输入时退回请求体估算（与 TPM 预留同一口径）；拿不到任何输入时
+    /// 返回 None——没有可计费的量，补 0 反而是伪造。
+    fn billed_usage(&self) -> Option<crate::protocol::canonical::Usage> {
+        let (_, input_estimate) = self.billing.as_ref()?;
+        let breakdown = crate::gateway::stream::billing_usage(
+            self.accounting.usage_breakdown(),
+            *input_estimate,
+        );
+        Some(crate::protocol::canonical::Usage {
+            input: breakdown.input,
+            output: breakdown.output,
+            cache_read: None,
+            cache_write: None,
+            reasoning: breakdown.reasoning,
+        })
+        .filter(|usage| !usage.is_empty())
+    }
+
+    /// 错误帧之前补的一帧「只有 usage、没有终止信号」的用量帧。
+    ///
+    /// sub2api / newapi 读到错误事件就停止解析后续帧，但对任何带 usage 的帧都会
+    /// 先累计用量。所以这帧不能带 finish_reason / message_stop / response.completed
+    /// 之类的终止信号（否则下游提前收尾、看不到后面的错误），只带用量本身。
+    fn usage_only_frame(&self) -> Option<axum::body::Bytes> {
+        let settlement = self.settlement.as_ref()?;
+        let (responses_id, _) = self.billing.as_ref()?;
+        let usage = self.billed_usage()?;
+        crate::protocol::usage_only_frame(settlement.protocol, usage, responses_id.clone())
+    }
+
     /// 结算并返回异常结束时要补发给下游的计费终止帧（正常结束返回空）。
     ///
     /// 上游 newapi 流没正常收尾也会补一帧 usage 再结束，下游据此记账；akhub 此前
@@ -310,35 +380,19 @@ impl SettlementGuard {
             }
             other => other,
         };
-        // 协议先取出来：settlement 马上要被 move 进 settle_one。
+        // 协议与网关 ID 先取出来：settlement 马上要被 move 进 settle_one。
         let protocol = settlement.protocol;
-        let frames = match ending {
-            // 正常收尾的流上游已经发过 usage，再补一帧会重复计费。
-            Ending::Completed => Vec::new(),
-            Ending::Failed(_) | Ending::Aborted => self
-                .billing
-                .as_ref()
-                .map(|(responses_id, input_estimate)| {
-                    let breakdown = crate::gateway::stream::billing_usage(
-                        self.accounting.usage_breakdown(),
-                        *input_estimate,
-                    );
-                    crate::protocol::terminal_usage_frames(
-                        protocol,
-                        crate::protocol::canonical::Usage {
-                            input: breakdown.input,
-                            output: breakdown.output,
-                            cache_read: None,
-                            cache_write: None,
-                            reasoning: breakdown.reasoning,
-                        },
-                        responses_id.clone(),
-                    )
-                })
-                .unwrap_or_default(),
-        };
-        settle_one(settlement, ending, &self.accounting);
-        frames
+        let responses_id = self.billing.as_ref().and_then(|(id, _)| id.clone());
+        let usage = self.billed_usage();
+        let input_estimate = self.billing.as_ref().map(|(_, estimate)| *estimate);
+        settle_one(settlement, ending, &self.accounting, input_estimate);
+        // 异常结束才补终止帧：正常收尾的流上游已经发过 usage，再补一帧会重复计费。
+        match (ending, usage) {
+            (Ending::Completed, _) | (_, None) => Vec::new(),
+            (Ending::Failed(_) | Ending::Aborted, Some(usage)) => {
+                crate::protocol::terminal_usage_frames(protocol, usage, responses_id)
+            }
+        }
     }
 }
 
@@ -350,7 +404,12 @@ impl Drop for SettlementGuard {
     }
 }
 
-fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamAccounting) {
+fn settle_one(
+    settlement: StreamSettlement,
+    ending: Ending,
+    accounting: &StreamAccounting,
+    input_estimate: Option<u64>,
+) {
     // 先把"用户等到内容"的时刻取出来：后面 settlement 会被部分移动，借不到字段。
     let observed = observed_first_content(&settlement);
     let usage = accounting.usage_tokens();
@@ -401,10 +460,21 @@ fn settle_one(settlement: StreamSettlement, ending: Ending, accounting: &StreamA
     record.input_tokens = accounting.input_tokens().map(|value| value as i64);
     record.output_tokens = accounting.output_tokens().map(|value| value as i64);
     // Token 细分同样只有流结束才拿得到（§11.6）。
-    let usage = accounting.usage_breakdown();
-    record.cache_read_tokens = usage.cache_read.map(|value| value as i64);
-    record.cache_write_tokens = usage.cache_write.map(|value| value as i64);
-    record.reasoning_tokens = usage.reasoning.map(|value| value as i64);
+    let breakdown = accounting.usage_breakdown();
+    record.cache_read_tokens = breakdown.cache_read.map(|value| value as i64);
+    record.cache_write_tokens = breakdown.cache_write.map(|value| value as i64);
+    record.reasoning_tokens = breakdown.reasoning.map(|value| value as i64);
+    // 异常结束且上游没报用量时，记录页显示的是**下发给下游计费的那一份**估算：
+    // 否则控制台永远是「未知 / 未知」，与下游实际扣费的用量对不上。正常结束或
+    // 上游报了量时保持原样（绝不拿估算覆盖真实观测）。
+    if matches!(ending, Ending::Failed(_))
+        && record.input_tokens.is_none()
+        && let Some(input_estimate) = input_estimate
+    {
+        let billed = crate::gateway::stream::billing_usage(breakdown, input_estimate);
+        record.input_tokens = billed.input.map(|value| value as i64);
+        record.output_tokens = billed.output.map(|value| value as i64);
+    }
     // 结局写进 `error_code`：客户端断开记 `client_gone`，不再伪装成 200 成功
     // （§18.1、§24.1）。这是"这次为什么没有输入/输出"的第一手答案。
     if let Some(code) = ending.error_code() {

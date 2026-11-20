@@ -687,7 +687,7 @@ fn emit_stop(stop: StopReason) -> &'static str {
     }
 }
 
-fn emit_usage(usage: &Usage) -> Value {
+pub(crate) fn emit_usage(usage: &Usage) -> Value {
     let mut object = Map::new();
     // 缺失的项不写 0：伪造数字比留空更糟（§14.6）。
     if let Some(input) = usage.uncached_input() {

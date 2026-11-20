@@ -745,11 +745,178 @@ async fn an_upstream_eof_bills_with_a_merged_cache_usage_frame() {
         ),
         "EOF 必须留下异常结束标识：{record:?}"
     );
-    // 记录页保持诚实：上游没报用量就不写（§6.8 绝不估算）。计费所需的估算输入
-    // 只放进补发给下游的终止帧（上面已断言 prompt_tokens 存在），不污染观测记录。
+    // 记录页显示的是**下发给下游计费的那一份**估算：否则控制台永远是
+    // 「未知 / 未知」，与下游实际扣费的用量对不上。
     assert!(
-        record.input_tokens.is_none(),
-        "上游没报用量，记录不得估算：{record:?}"
+        record.input_tokens.unwrap_or(0) > 0,
+        "异常结束的记录必须显示计费用量：{record:?}"
+    );
+}
+
+/// **现场回归**：上游流内错误帧（cyber-policy 拒绝）时，用量帧必须排在错误帧之前。
+///
+/// sub2api / newapi 读到错误事件就停止解析后续帧。修复前 akhub 把用量帧排在错误帧
+/// 之后（甚至根本不发），下游的用量统计永远是 0——现场表现是「记录在、没有错误、
+/// 输入输出 0、计费 0」。这条用例从真实入口打进去，断言的是**下发字节的顺序**。
+#[tokio::test]
+async fn an_upstream_error_event_bills_usage_before_the_error_frame() {
+    // 假上游：Responses 协议，先送 created + 一个语义增量，再送 error 帧，然后结束。
+    async fn handler(body: String) -> axum::response::Response {
+        let _ = body;
+        let frames = [
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"cyber_policy\",\"message\":\"Request blocked by cyber policy.\"}}\n\n",
+        ].concat();
+        ([("content-type", "text/event-stream")], frames).into_response()
+    }
+    let app = Router::new().route("/v1/responses", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let upstream = format!("http://{addr}");
+
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiResponses,
+            "gpt-6-sol",
+            "gpt-6-sol",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-6-sol", "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 400, "messages": [{"role": "user", "content": "你好"}]}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    // 用量帧必须排在错误帧之前：sub2api / newapi 读到错误就停止解析，排在后面的
+    // 用量帧永远到不了它们的计费统计（现场就是这个顺序问题：记录在、用量 0、计费 0）。
+    let usage_at = text.find(r#""usage":"#);
+    let error_at = text.find(r#""error":"#);
+    assert!(
+        usage_at.is_some() && error_at.is_some() && usage_at < error_at,
+        "用量帧必须排在错误帧之前：{text}"
+    );
+    // 错误之后照上游 newapi 的做法补协议终止帧：sub2api 的 raw 路径靠它清掉
+    // "非计费错误"标记，从而按真实用量计费；错误本身已经先送达，客户端看得到中断。
+    let finish_at = text.find(r#""finish_reason":"stop""#);
+    assert!(
+        finish_at.is_some() && error_at < finish_at,
+        "错误之后必须补收尾帧（下游据此清掉非计费标记）：{text}"
+    );
+    assert!(text.contains("[DONE]"), "下游需要 [DONE] 才收尾：{text}");
+    assert!(text.contains("cyber policy"), "错误原因必须保留：{text}");
+
+    // 补出的用量帧必须是非零输入：上游没报量时要退回请求体估算，报 0 等于没报
+    // （跨协议转换的开场占位常带 input_tokens:0，不能拿它当"已知用量"）。
+    let usage_line = text
+        .lines()
+        .find(|line| line.contains("\"usage\":"))
+        .expect("必须有用量帧");
+    assert!(
+        !usage_line.contains("\"prompt_tokens\":0"),
+        "用量帧的输入不能是 0，否则下游仍按 0 计费：{usage_line}"
+    );
+
+    // akhub 自己的记录也要能看到这次计费的用量，控制台不再显示「未知 / 未知」。
+    let record = wait_for_record(&akhub, 1).await;
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("upstream_protocol_error")
+    );
+    assert!(
+        record.input_tokens.unwrap_or(0) > 0,
+        "记录必须显示计费用量：{record:?}"
+    );
+}
+
+/// **碎片回归**：上游按 TCP 分片、一帧被切成多块到达时，错误帧之前的用量帧
+/// 必须正常补出、且原字节一个不丢。修复按帧边界切块转发，跨块半帧靠 FrameReader
+/// 内部缓冲拼回；这条用例把同一段字节按 1 字节一块喂进去，钉住切块与缓冲的对齐。
+#[tokio::test]
+async fn a_fragmented_error_stream_still_emits_billing_usage_before_the_error() {
+    async fn handler() -> axum::response::Response {
+        // 一次只给 1 字节：最强的分片压力，任何按块对齐的假设都会暴露。
+        let frames = [
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"cyber_policy\",\"message\":\"Request blocked by cyber policy.\"}}\n\n",
+        ]
+        .concat();
+        let bytes = frames.into_bytes();
+        let stream = futures::stream::unfold(0usize, move |offset| {
+            let bytes = bytes.clone();
+            async move {
+                if offset >= bytes.len() {
+                    return None;
+                }
+                let end = (offset + 1).min(bytes.len());
+                Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(
+                        &bytes[offset..end],
+                    )),
+                    end,
+                ))
+            }
+        });
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &format!("http://{addr}"),
+            Protocol::OpenAiChat,
+            "gpt-5",
+            "gpt-5",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "gpt-5",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": "你好"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    // 原字节不丢：语义增量必须原样到达。
+    assert!(text.contains("你好"), "分片不得丢字节：{text}");
+    // 用量帧仍在错误帧之前。
+    let usage_at = text.find(r#""usage":"#);
+    let error_at = text.find(r#""error":"#);
+    assert!(
+        usage_at.is_some() && error_at.is_some() && usage_at < error_at,
+        "分片下用量帧仍必须排在错误帧之前：{text}"
     );
 }
 /// 等请求记录真正落库（写入是攒批的，最多 1 秒刷一次）。

@@ -779,20 +779,24 @@ async fn the_switch_boundary_still_holds_across_protocols() {
     assert!(!text.contains("Overloaded"), "错误不该泄漏给客户端：{text}");
     assert_eq!((a.requests(), b.requests()), (1, 1));
 
-    // 已经送出语义增量后中断：禁止拼接第二个上游。中断仍要按上游 newapi 口径
-    // 补一帧带用量的终止事件，让下游 sub2api 记上这次调用并计费（而不是整条丢弃）；
-    // 错误事件保留，客户端仍看得到这次流是中断的，不是正常写完。
+    // 已经送出语义增量后中断：禁止拼接第二个上游。中断要在错误事件**之前**补一帧
+    // 带用量的帧：下游 sub2api / newapi 读到错误就停止解析，排在后面的用量帧永远
+    // 进不了计费统计。补帧不带终止信号（不补 message_stop）：那会与错误自相矛盾。
     a.script([Behavior::StreamThenAbort]);
     let response = messages(&akhub, body).await;
     assert_eq!(response.status(), 200);
     let text = response.text().await.unwrap_or_default();
+    let usage_at = text.find(r#""usage":"#);
+    let error_at = text.find(r#""type":"error""#);
     assert!(
-        text.contains("message_stop"),
-        "中断也要补终止帧供下游计费：{text}"
+        usage_at.is_some() && error_at.is_some() && usage_at < error_at,
+        "用量帧必须排在错误事件之前：{text}"
     );
+    // 错误之后照上游 newapi 的做法补协议终止帧，下游靠它清掉"非计费错误"标记。
+    let stop_at = text.find("message_stop");
     assert!(
-        text.contains(r#""type":"error""#),
-        "中断的错误事件必须保留：{text}"
+        stop_at.is_some() && error_at < stop_at,
+        "错误之后必须补 message_stop：{text}"
     );
     assert_eq!(b.requests(), 1, "第一个语义事件之后不得切换");
 }

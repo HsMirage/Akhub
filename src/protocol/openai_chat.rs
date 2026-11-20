@@ -791,7 +791,7 @@ fn emit_finish(stop: StopReason) -> &'static str {
     }
 }
 
-fn emit_usage(usage: &Usage) -> Value {
+pub(crate) fn emit_usage(usage: &Usage) -> Value {
     let mut object = Map::new();
     if let Some(input) = usage.input {
         object.insert("prompt_tokens".into(), json!(input));

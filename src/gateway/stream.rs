@@ -627,7 +627,13 @@ pub fn cache_hit_rate(usage: UsageBreakdown) -> Option<f64> {
 /// 下游留下记录并计费，而不是被当成"没有用量"整条丢弃。
 pub fn billing_usage(usage: UsageBreakdown, input_estimate: u64) -> UsageBreakdown {
     UsageBreakdown {
-        input: usage.input.or(Some(input_estimate).filter(|n| *n > 0)),
+        // 上游报 0 等于没报：请求体确实发出去了，一定消耗了输入。跨协议转换出来的
+        // 开场占位（Anthropic 的 message_start 常带 input_tokens:0）若被当成"已知 0"，
+        // 兜底估算永远不触发，下游照旧按 0 计费——正是要修的那个现象。
+        input: usage
+            .input
+            .filter(|tokens| *tokens > 0)
+            .or(Some(input_estimate).filter(|tokens| *tokens > 0)),
         output: usage.output,
         cache_read: None,
         cache_write: None,
@@ -1538,6 +1544,12 @@ mod tests {
         assert_eq!(billed.cache_read, None);
         // 估算为 0（空请求体）时不伪造输入。
         assert_eq!(billing_usage(UsageBreakdown::default(), 0).input, None);
+        // 上游报 0 等于没报：必须退回估算，否则下游按 0 计费。
+        let zero = UsageBreakdown {
+            input: Some(0),
+            ..UsageBreakdown::default()
+        };
+        assert_eq!(billing_usage(zero, 5000).input, Some(5000));
     }
 
     /// `response.incomplete` 是"没写完就收尾"，不是失败：上游确实把这次回答
