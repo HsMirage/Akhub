@@ -2194,8 +2194,10 @@ impl Walk<'_> {
                 let hop_started = Instant::now();
                 self.telemetry.endpoint = Some(prepared.endpoint);
                 self.telemetry.degraded = prepared.degraded.clone();
+                // `sent_effort` 只喂"这一档在这个账号上可用"的证据，那是
+                // Anthropic 自适应契约的判定依据；另两个协议的档位只进尝试明细。
                 self.telemetry.sent_effort = adaptive_shape(&prepared.body).effort;
-                self.telemetry.attempt_effort = self.telemetry.sent_effort;
+                self.telemetry.attempt_effort = body_effort(&prepared.body);
 
                 match attempt(
                     self.forward,
@@ -2260,8 +2262,7 @@ impl Walk<'_> {
                             account = candidate.target.account.name,
                             model = candidate.target.target.upstream_model,
                             rejected_effort = rejected.as_str(),
-                            sent_effort = adaptive_shape(&prepared.body)
-                                .effort
+                            sent_effort = body_effort(&prepared.body)
                                 .map(Effort::as_str)
                                 .unwrap_or("默认"),
                             "上游不接受这个思考档位，改按可用档位重发"
@@ -2493,8 +2494,10 @@ impl Walk<'_> {
         // 所以脱离共享：独占时 `make_mut` 原地改，只有仍被别人持有时才复制。
         let body = std::sync::Arc::make_mut(&mut body);
         // 同协议透传不经过转换器，别的渠道留下的不可重放状态要在这里摘掉。
+        // 摘的是**历史**思考块，不是思考档位：记成 `thinking_history`，免得和
+        // `effort`（档位被折/被换）在记录页上混成同一个"降级"（§14.8）。
         if downstream == target_protocol && strip_foreign_replay_state(body, downstream) {
-            let capability = "thinking".to_string();
+            let capability = "thinking_history".to_string();
             if !degraded.contains(&capability) {
                 degraded.push(capability);
             }
@@ -4495,6 +4498,9 @@ fn is_foreign_replayed_state(status: StatusCode, message: &str) -> bool {
 /// * Anthropic：没有签名的 thinking 块，来自外部上游或转换；
 /// * Responses：没有 `encrypted_content` 的 reasoning 项，以及网关合成的
 ///   `rs_resp_akh_` 项。
+///
+/// 调用方按 `thinking_history` 记这一笔：丢的是**历史**块，本次要的思考档位
+/// 照发，不该和 `effort` 那种真降档共用一个名字。
 fn strip_foreign_replay_state(body: &mut serde_json::Value, protocol: Protocol) -> bool {
     match protocol {
         Protocol::AnthropicMessages => {
@@ -4674,12 +4680,27 @@ fn adaptive_shape(body: &serde_json::Value) -> AdaptiveShape {
         .and_then(|thinking| thinking.get("type"))
         .and_then(serde_json::Value::as_str)
         == Some("adaptive");
-    let effort = body
+    AdaptiveShape {
+        adaptive,
+        effort: body_effort(body),
+    }
+}
+
+/// 这次真正发出去的思考档位。
+///
+/// Anthropic 用 `output_config.effort`，OpenAI 两个协议用 `reasoning.effort`
+/// 或 `reasoning_effort`。只认第一种时，Chat/Responses 的尝试明细在记录页上
+/// 永远是"默认"——档位明明发出去了，人却看不见（§24.1）。
+fn body_effort(body: &serde_json::Value) -> Option<crate::protocol::canonical::Effort> {
+    let raw = body
         .get("output_config")
         .and_then(|config| config.get("effort"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(crate::protocol::canonical::Effort::parse);
-    AdaptiveShape { adaptive, effort }
+        .or_else(|| {
+            body.get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+        })
+        .or_else(|| body.get("reasoning_effort"))?;
+    crate::protocol::canonical::Effort::parse(raw.as_str()?)
 }
 
 /// 该上游状态码是否意味着"换个目标可能就成了"（§13.2）。
@@ -5516,6 +5537,20 @@ mod tests {
         assert!(!adaptive_shape(&manual).adaptive);
         assert_eq!(adaptive_shape(&manual).effort, None);
         assert_eq!(adaptive_shape(&json!({})).effort, None);
+
+        // OpenAI 两个协议把档位放在别处，记录页的"发出的档位"同样要看得见。
+        assert_eq!(
+            adaptive_shape(&json!({"reasoning": {"effort": "max"}})).effort,
+            Some(Effort::Max)
+        );
+        assert_eq!(
+            adaptive_shape(&json!({"reasoning_effort": "high"})).effort,
+            Some(Effort::High)
+        );
+        assert_eq!(
+            adaptive_shape(&json!({"reasoning_effort": "none"})).effort,
+            None
+        );
     }
 
     #[test]

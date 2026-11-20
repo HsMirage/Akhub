@@ -328,6 +328,12 @@ async fn unreplayable_reasoning_items_are_stripped_before_responses() {
     )
     .await;
     assert_eq!(response.status(), 200);
+    // 摘的是历史思考块，不是这次要的档位：标记要与 `effort` 区分开。
+    assert_eq!(
+        response.headers()["x-akhub-degraded"],
+        "thinking_history",
+        "历史思考块摘除必须显式标记（§14.8）"
+    );
     let sent = upstream.seen.lock().unwrap()[0].body.clone();
     let items = sent["input"].as_array().unwrap();
     assert_eq!(items.len(), 2, "{sent}");

@@ -39,6 +39,9 @@ impl Unsupported {
 pub struct Emitted {
     pub body: Value,
     /// 被降级的能力名，按 `X-Akhub-Degraded` 头的口径：`thinking`、`top_k`……
+    ///
+    /// 历史思考块不可重放而摘除时记的是 `thinking_history`：丢的是**过往**的
+    /// 块，本次要的档位照发，不能和 `effort` 那种真降档同名。
     pub degraded: Vec<String>,
 }
 
