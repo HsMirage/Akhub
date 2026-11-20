@@ -77,12 +77,14 @@ esac
 
 case "$uname_m" in
     x86_64|amd64)  arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) die "不支持的架构：$uname_m（当前只发布 x86_64 与 aarch64）" 2 ;;
+    # 2026-11-21 起不再构建 arm64：与其让用户下到一个 404，不如在这里说清楚。
+    aarch64|arm64) die "自 v1.1.48 起不再发布 linux-arm64 资产。
+  需要的话请从源码构建（cargo build --release）。" 2 ;;
+    *) die "不支持的架构：$uname_m（当前只发布 x86_64）" 2 ;;
 esac
 
 # 资产命名与 .github/workflows/release.yml 的 matrix.name 一一对应：
-#   linux-x86_64 / linux-aarch64
+#   linux-x86_64
 #
 # Linux 现在只有 glibc 版（静态链接的 musl 版已停发）。--libc 保留是为了不让
 # 旧脚本直接报参数错误，但选了 musl 也只能拿到 glibc 资产，所以明确警告一句。
