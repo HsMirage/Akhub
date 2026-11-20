@@ -70,6 +70,23 @@ pub struct StreamSettlement {
     /// 响应头在流开始前就发出去了，中途才知道的降级只能落到请求记录里——
     /// 记录页照样能标红，这是"不静默丢失"的实际落点。
     pub degraded: crate::gateway::translate::DegradationSink,
+    /// 异常结束（EOF / 客户端断开）时补发终止帧所需的请求上下文。
+    ///
+    /// 上游 newapi 流没正常收尾也会补一帧 usage 再结束，下游据此记账；akhub
+    /// 此前只发错误事件就断流，sub2api 拿不到用量整条丢弃。这里带上请求体与
+    /// 端点，结算时按上游口径（缓存并入输入）补出终止帧，让下游正常计费。
+    pub billing: Option<BillingContext>,
+}
+
+/// 异常结束时补发计费终止帧所需的请求上下文。
+pub struct BillingContext {
+    pub endpoint: crate::upstream::Endpoint,
+    pub request_bytes: usize,
+    pub body: std::sync::Arc<Value>,
+    pub raw: Option<crate::gateway::passthrough::RawBody>,
+    /// Responses 入口的网关 ID：补发的 `response.completed` 必须用它，
+    /// 客户端引用的地址从第一个事件起就固定是网关 ID（§15.1）。
+    pub responses_id: Option<String>,
 }
 
 /// Responses 流完成后的状态链补写计划（§15.2）。
@@ -151,28 +168,50 @@ pub fn settle_stream(
     let protocol = settlement.protocol;
     let idle_timeout = settlement.idle_timeout;
     let request_id = settlement.record.request_id.clone();
+    let billing = settlement.billing.as_ref().map(|ctx| {
+        let input_estimate = crate::gateway::passthrough::estimate_tokens(
+            ctx.endpoint,
+            ctx.request_bytes,
+            &ctx.body,
+            ctx.raw.as_ref(),
+        );
+        (ctx.responses_id.clone(), input_estimate)
+    });
     let guard = SettlementGuard {
         settlement: Some(settlement),
         accounting: StreamAccounting::new(protocol),
+        billing,
     };
 
     let stream = async_stream::stream! {
         let mut guard = guard;
         let mut filter = crate::gateway::translate::UnrequestedUsageFilter::new(strip_unrequested_usage);
         let mut upstream = body.into_data_stream();
+        // 内层转发（private_stream / translate）会把上游断流改写成错误帧再正常收尾，
+        //  accounting 不一定看得到错误。这里自己探一遍错误帧，收尾时据此补计费终止帧。
+        let mut error_probe = crate::protocol::sse::FrameReader::new();
+        let mut saw_error_frame = false;
         loop {
             let next = if let Some(timeout) = idle_timeout {
                 match tokio::time::timeout(timeout, upstream.next()).await {
                     Ok(next) => next,
                     Err(_) => {
                         tracing::warn!(%request_id, idle_secs = timeout.as_secs(), "流式响应连续无数据，结束等待");
-                        guard.settle(Ending::Failed("upstream_timeout"));
-                        yield Ok::<_, axum::Error>(crate::protocol::stream_error(
-                            protocol,
-                            crate::gateway::error::ErrorCode::UpstreamTimeout,
-                            "上游流式响应长时间未返回数据，请重试",
-                            Some(&request_id),
-                        ));
+                        let frames = guard.settle(Ending::Failed("upstream_timeout"));
+                        // 按上游口径补出带用量的终止帧，让下游正常计费；拿不到用量
+                        // 时退回原来的超时错误事件，至少把失败如实告诉客户端。
+                        if frames.is_empty() {
+                            yield Ok::<_, axum::Error>(crate::protocol::stream_error(
+                                protocol,
+                                crate::gateway::error::ErrorCode::UpstreamTimeout,
+                                "上游流式响应长时间未返回数据，请重试",
+                                Some(&request_id),
+                            ));
+                        } else {
+                            for frame in frames {
+                                yield Ok::<_, axum::Error>(frame);
+                            }
+                        }
                         return;
                     }
                 }
@@ -182,6 +221,11 @@ pub fn settle_stream(
             match next {
                 Some(Ok(chunk)) => {
                     guard.accounting.push(&chunk);
+                    for frame in error_probe.push(&chunk) {
+                        if crate::protocol::frame_error(&frame).is_some() {
+                            saw_error_frame = true;
+                        }
+                    }
                     if strip_unrequested_usage {
                         let bytes = filter.push(&chunk);
                         if !bytes.is_empty() {
@@ -192,8 +236,16 @@ pub fn settle_stream(
                     }
                 }
                 Some(Err(error)) => {
-                    guard.settle(Ending::Failed("upstream_exhausted"));
-                    yield Err::<axum::body::Bytes, _>(error);
+                    let frames = guard.settle(Ending::Failed("upstream_exhausted"));
+                    // 上游断流（EOF）：补出带用量的终止帧让下游计费，而不是把传输
+                    // 错误直接抛给下游——那会让 sub2api 当成可重放失败整条丢弃。
+                    if frames.is_empty() {
+                        yield Err::<axum::body::Bytes, _>(error);
+                    } else {
+                        for frame in frames {
+                            yield Ok::<_, axum::Error>(frame);
+                        }
+                    }
                     return;
                 }
                 None => break,
@@ -203,7 +255,21 @@ pub fn settle_stream(
         if let Some(tail) = filter.finish() {
             yield Ok::<_, axum::Error>(tail);
         }
-        guard.settle(Ending::Completed);
+        if let Some(frame) = error_probe.finish()
+            && crate::protocol::frame_error(&frame).is_some()
+        {
+            saw_error_frame = true;
+        }
+        // 流里出现过错误帧（上游断流被内层改写成错误事件）：按失败结算并补计费
+        // 终止帧；否则才是正常收尾。
+        let ending = if saw_error_frame {
+            Ending::Failed("upstream_protocol_error")
+        } else {
+            Ending::Completed
+        };
+        for frame in guard.settle(ending) {
+            yield Ok::<_, axum::Error>(frame);
+        }
     };
 
     Response::from_parts(parts, Body::from_stream(stream))
@@ -213,12 +279,21 @@ pub fn settle_stream(
 struct SettlementGuard {
     settlement: Option<StreamSettlement>,
     accounting: StreamAccounting,
+    /// 异常结束时补发终止帧用的（Responses 网关 ID、输入估算）。
+    billing: Option<(Option<String>, u64)>,
 }
 
 impl SettlementGuard {
-    fn settle(&mut self, ending: Ending) {
+    /// 结算并返回异常结束时要补发给下游的计费终止帧（正常结束返回空）。
+    ///
+    /// 上游 newapi 流没正常收尾也会补一帧 usage 再结束，下游据此记账；akhub 此前
+    /// 只发错误事件就断流，sub2api 把它当成"可重放失败"整条丢弃或按 95% 缓存读估算。
+    /// 这里按上游口径（缓存并入输入、不带缓存细分）补出协议自己的终止帧，让下游
+    /// 无论 sub2api / newapi 都按真实用量正常计费。拿不到输入用量时不补帧——没有
+    /// 可计费的量，补一帧 0 用量反而是伪造。
+    fn settle(&mut self, ending: Ending) -> Vec<axum::body::Bytes> {
         let Some(settlement) = self.settlement.take() else {
-            return;
+            return Vec::new();
         };
         self.accounting.finish();
         // 上游把错误写进流里时，生成器是"正常结束"的；语义上必须算失败。
@@ -235,14 +310,43 @@ impl SettlementGuard {
             }
             other => other,
         };
+        // 协议先取出来：settlement 马上要被 move 进 settle_one。
+        let protocol = settlement.protocol;
+        let frames = match ending {
+            // 正常收尾的流上游已经发过 usage，再补一帧会重复计费。
+            Ending::Completed => Vec::new(),
+            Ending::Failed(_) | Ending::Aborted => self
+                .billing
+                .as_ref()
+                .map(|(responses_id, input_estimate)| {
+                    let breakdown = crate::gateway::stream::billing_usage(
+                        self.accounting.usage_breakdown(),
+                        *input_estimate,
+                    );
+                    crate::protocol::terminal_usage_frames(
+                        protocol,
+                        crate::protocol::canonical::Usage {
+                            input: breakdown.input,
+                            output: breakdown.output,
+                            cache_read: None,
+                            cache_write: None,
+                            reasoning: breakdown.reasoning,
+                        },
+                        responses_id.clone(),
+                    )
+                })
+                .unwrap_or_default(),
+        };
         settle_one(settlement, ending, &self.accounting);
+        frames
     }
 }
 
 impl Drop for SettlementGuard {
     fn drop(&mut self) {
         // 客户端断开或任务被取消：不是上游的错，但状态链必须处理。
-        self.settle(Ending::Aborted);
+        // 连接已经没了，补发的终止帧无处可送，丢弃即可（结算照常落库）。
+        let _ = self.settle(Ending::Aborted);
     }
 }
 

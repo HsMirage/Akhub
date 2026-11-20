@@ -676,6 +676,82 @@ async fn a_non_stream_responses_records_cache_and_reasoning_tokens() {
     );
 }
 
+/// **现场回归**：上游断流（EOF）时，akhub 必须按上游 newapi 口径补发带用量的终止帧，
+/// 让下游 sub2api 正常记账计费，而不是把这次调用整条丢弃或按 95% 缓存读估算。
+///
+/// 修复前：上游 EOF 后 akhub 只发一个错误事件就断流，sub2api 拿不到终止帧与用量，
+/// 把它当成"可重放失败"丢弃（少扣费），或按请求体估算并把 95% 当缓存读折扣计价。
+/// 修复后：补出 Chat 的 finish_reason + usage + [DONE]，缓存并入输入、不带缓存细分。
+#[tokio::test]
+async fn an_upstream_eof_bills_with_a_merged_cache_usage_frame() {
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamThenAbort);
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "gpt-5",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": "你好"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+
+    // 下游必须拿到一个完整的协议终止：finish_reason + usage 收尾块 + [DONE]。
+    assert!(
+        body.contains("[DONE]"),
+        "EOF 后必须补出 [DONE] 终止帧：{body}"
+    );
+    assert!(
+        body.contains(r#""finish_reason":"stop""#),
+        "EOF 后必须补出 finish_reason 终止信号：{body}"
+    );
+    assert!(
+        body.contains(r#""prompt_tokens""#),
+        "EOF 后必须补出带输入用量的收尾块，下游才计得了费：{body}"
+    );
+    assert!(
+        !body.contains("cached_tokens"),
+        "缓存必须并入输入、不再单独计价（与上游 newapi 口径一致）：{body}"
+    );
+
+    // 这次调用必须留下记录（而不是被当成"没有用量"丢弃）。EOF 被内层转发
+    // 改写成错误帧再收尾，记 upstream_protocol_error；直接透传传输错误时记
+    // upstream_exhausted——两者都是异常结束的稳定标识。
+    let record = wait_for_record(&akhub, 1).await;
+    assert!(
+        matches!(
+            record.error_code.as_deref(),
+            Some("upstream_protocol_error" | "upstream_exhausted")
+        ),
+        "EOF 必须留下异常结束标识：{record:?}"
+    );
+    // 记录页保持诚实：上游没报用量就不写（§6.8 绝不估算）。计费所需的估算输入
+    // 只放进补发给下游的终止帧（上面已断言 prompt_tokens 存在），不污染观测记录。
+    assert!(
+        record.input_tokens.is_none(),
+        "上游没报用量，记录不得估算：{record:?}"
+    );
+}
 /// 等请求记录真正落库（写入是攒批的，最多 1 秒刷一次）。
 async fn wait_for_record(
     akhub: &common::Akhub,

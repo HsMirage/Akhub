@@ -1303,14 +1303,20 @@ async fn an_error_event_before_content_switches_but_a_delta_does_not() {
     assert_eq!(a.requests(), 1);
     assert_eq!(b.requests(), 1);
 
-    // 已经送出语义增量后中断：禁止拼接第二个上游，客户端看到的是截断的流。
+    // 已经送出语义增量后中断：禁止拼接第二个上游。中断仍要按上游 newapi 口径
+    // 补一帧带用量的终止事件，让下游 sub2api 记上这次调用并计费（而不是整条丢弃）；
+    // 错误事件保留，客户端仍看得到这次流是中断的，不是正常写完。
     a.script([Behavior::StreamThenAbort]);
     let response = messages(&akhub, body).await;
     assert_eq!(response.status(), 200);
     let text = response.text().await.unwrap_or_default();
     assert!(
-        !text.contains("message_stop"),
-        "不得伪造正常完成事件：{text}"
+        text.contains("message_stop"),
+        "中断也要补终止帧供下游计费：{text}"
+    );
+    assert!(
+        text.contains(r#""type":"error""#),
+        "中断的错误事件必须保留：{text}"
     );
     assert_eq!(a.requests(), 2);
     assert_eq!(b.requests(), 1, "第一个语义事件之后不得切换");

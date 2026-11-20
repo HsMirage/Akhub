@@ -1716,6 +1716,12 @@ impl Walk<'_> {
                         None,
                         Some(success.status),
                     );
+                    // 异常结束补发的 Responses 终止帧必须用网关 ID（§15.1）；
+                    // stream_state 马上要被 move 进 responses，先取出来。
+                    let responses_id = success
+                        .stream_state
+                        .as_ref()
+                        .map(|seed| seed.gateway_id.clone());
                     let responses = success
                         .stream_state
                         .map(|seed| settle::ResponsesCompletion {
@@ -1764,6 +1770,14 @@ impl Walk<'_> {
                             admission: Some(admission),
                             responses,
                             degraded: success.degraded.unwrap_or_else(translate::degradation_sink),
+                            // 异常结束（EOF / 客户端断开）时按上游口径补发计费终止帧。
+                            billing: Some(settle::BillingContext {
+                                endpoint: self.forward.endpoint,
+                                request_bytes: self.forward.request_bytes,
+                                body: std::sync::Arc::clone(&self.forward.body),
+                                raw: self.forward.raw.clone(),
+                                responses_id,
+                            }),
                         },
                         strip,
                     )))
@@ -4779,7 +4793,7 @@ fn rewrite_model(body: &mut serde_json::Value, upstream_model: &str) {
 /// 图生图就会被判成"超出 TPM 限额"，而且永远等不到窗口释放（单条请求就超过
 /// 整个窗口）。图片请求只按**文本字段**估算：JSON 入口数 prompt 一类的短字符串，
 /// multipart 入口只数非文件 part。
-fn estimate_tokens(
+pub(crate) fn estimate_tokens(
     endpoint: Endpoint,
     request_bytes: usize,
     body: &serde_json::Value,

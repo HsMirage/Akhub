@@ -616,6 +616,25 @@ pub fn cache_hit_rate(usage: UsageBreakdown) -> Option<f64> {
     (input > 0).then(|| (read as f64 / input as f64).clamp(0.0, 1.0))
 }
 
+/// 异常结束（EOF / 客户端断开）时下发给下游计费的用量。
+///
+/// 上游 newapi 在流没有正常收尾时不把缓存单独计价：整段输入（含缓存）都按普通
+/// 输入价结算（它的 usage 回退到 `ResponseText2Usage`，不带缓存细分）。下游若仍按
+/// 缓存读折扣价计费就会少扣（现场 sub2api 甚至按 95% 缓存读估算）。这里把缓存读写
+/// 并进输入、清空缓存细分，让下游无论 sub2api / newapi 都按上游口径计费。
+///
+/// 输入/输出都拿不到时退回请求体估算（与 TPM 预留同一口径），至少让这次调用在
+/// 下游留下记录并计费，而不是被当成"没有用量"整条丢弃。
+pub fn billing_usage(usage: UsageBreakdown, input_estimate: u64) -> UsageBreakdown {
+    UsageBreakdown {
+        input: usage.input.or(Some(input_estimate).filter(|n| *n > 0)),
+        output: usage.output,
+        cache_read: None,
+        cache_write: None,
+        reasoning: usage.reasoning,
+    }
+}
+
 impl StreamAccounting {
     pub fn new(protocol: Protocol) -> Self {
         Self {
@@ -1490,6 +1509,35 @@ mod tests {
         assert!(accounting.answer_completed());
         assert!(accounting.finished_response().is_some());
         assert_eq!(accounting.usage_tokens(), Some(7));
+    }
+
+    /// 异常结束的计费用量：缓存读写并进输入、清空缓存细分，与上游 newapi 口径一致。
+    #[test]
+    fn billing_usage_merges_cache_into_input() {
+        let reported = UsageBreakdown {
+            input: Some(1000),
+            output: Some(50),
+            cache_read: Some(768),
+            cache_write: Some(100),
+            reasoning: Some(32),
+        };
+        let billed = billing_usage(reported, 999);
+        assert_eq!(billed.input, Some(1000), "输入总量不变（本就含缓存）");
+        assert_eq!(billed.output, Some(50));
+        assert_eq!(billed.cache_read, None, "缓存读不再单独计价");
+        assert_eq!(billed.cache_write, None);
+        assert_eq!(billed.reasoning, Some(32), "思考 Token 保留");
+    }
+
+    /// 上游一个用量字段都没报时，退回请求体估算，至少让下游留下记录并计费。
+    #[test]
+    fn billing_usage_falls_back_to_estimate_when_upstream_silent() {
+        let billed = billing_usage(UsageBreakdown::default(), 5000);
+        assert_eq!(billed.input, Some(5000));
+        assert_eq!(billed.output, None, "输出未知绝不编造");
+        assert_eq!(billed.cache_read, None);
+        // 估算为 0（空请求体）时不伪造输入。
+        assert_eq!(billing_usage(UsageBreakdown::default(), 0).input, None);
     }
 
     /// `response.incomplete` 是"没写完就收尾"，不是失败：上游确实把这次回答

@@ -401,6 +401,33 @@ impl StreamEmitter {
     }
 }
 
+/// 流异常结束（EOF / 客户端断开）时补发的协议终止帧，携带结算用量。
+///
+/// 上游 newapi 在流没有正常收尾时仍会补一帧 usage 再 `[DONE]`（见
+/// `HandleFinalResponse`），下游据此记账。akhub 此前只发一个错误事件就断流，
+/// 下游（sub2api）拿不到终止帧与用量，整条调用被丢弃或按 95% 缓存读估算。这里
+/// 用与正常收尾相同的发射器补出终止帧：Chat 的 `finish_reason` + usage + `[DONE]`、
+/// Anthropic 的 `message_delta` + `message_stop`、Responses 的 `response.completed`。
+/// 用量为空时不补帧——没有可计费的量，补一帧 0 用量反而是伪造。
+pub fn terminal_usage_frames(
+    protocol: Protocol,
+    usage: canonical::Usage,
+    responses_id: Option<String>,
+) -> Vec<axum::body::Bytes> {
+    if usage.is_empty() {
+        return Vec::new();
+    }
+    let mut emitter = StreamEmitter::new(protocol, true, responses_id);
+    let mut frames = emitter.push(&Event::Usage(usage));
+    frames.extend(emitter.push(&Event::Finish {
+        stop: canonical::StopReason::EndTurn,
+        stop_sequence: None,
+    }));
+    frames.extend(emitter.push(&Event::Done));
+    frames.extend(emitter.done());
+    frames
+}
+
 /// 一帧是否是上游的错误事件；是则给出截断后的安全消息。
 ///
 /// 三个协议的错误帧形状不同，但都能由这三个信号之一识别：`event: error`、
@@ -1037,5 +1064,78 @@ mod tests {
             let _ = parser.push(&frame);
         }
         assert!(parser.take_degraded().is_empty(), "没有丢东西就不该报降级");
+    }
+
+    /// 异常结束补发的终止帧必须带用量、且是协议自己的终止信号——下游 sub2api /
+    /// newapi 正是靠它把这次调用记成"已完成"并计费，而不是当成可重放失败丢弃。
+    #[test]
+    fn terminal_usage_frames_carry_usage_and_a_stop_signal() {
+        let usage = canonical::Usage {
+            input: Some(1000),
+            output: Some(50),
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+        };
+        // Chat：finish_reason + usage 收尾块 + [DONE]。
+        let chat = terminal_usage_frames(Protocol::OpenAiChat, usage, None);
+        let chat_text: String = chat
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert!(
+            chat_text.contains(r#""finish_reason":"stop""#),
+            "{chat_text}"
+        );
+        assert!(chat_text.contains(r#""prompt_tokens":1000"#), "{chat_text}");
+        assert!(
+            chat_text.contains(r#""completion_tokens":50"#),
+            "{chat_text}"
+        );
+        assert!(chat_text.contains("[DONE]"), "{chat_text}");
+        assert!(
+            !chat_text.contains("cached_tokens"),
+            "缓存细分不得下发：{chat_text}"
+        );
+
+        // Anthropic：message_delta（带 stop_reason 与 usage）+ message_stop。
+        let anth = terminal_usage_frames(Protocol::AnthropicMessages, usage, None);
+        let anth_text: String = anth
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert!(anth_text.contains("message_delta"), "{anth_text}");
+        assert!(anth_text.contains("message_stop"), "{anth_text}");
+        assert!(anth_text.contains(r#""output_tokens":50"#), "{anth_text}");
+        // Anthropic 口径输入不含缓存：缓存已清空，input_tokens 就是全部输入。
+        assert!(anth_text.contains(r#""input_tokens":1000"#), "{anth_text}");
+        assert!(
+            !anth_text.contains("cache_read_input_tokens"),
+            "{anth_text}"
+        );
+
+        // Responses：response.completed 带网关 ID 与 usage。
+        let resp = terminal_usage_frames(
+            Protocol::OpenAiResponses,
+            usage,
+            Some("resp_akh_test".into()),
+        );
+        let resp_text: String = resp
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert!(resp_text.contains("response.completed"), "{resp_text}");
+        assert!(resp_text.contains("resp_akh_test"), "{resp_text}");
+        assert!(resp_text.contains(r#""input_tokens":1000"#), "{resp_text}");
+        assert!(!resp_text.contains("cached_tokens"), "{resp_text}");
+    }
+
+    /// 没有可计费的用量时不补帧——补一帧 0 用量是伪造，不如让下游按失败处理。
+    #[test]
+    fn terminal_usage_frames_skip_empty_usage() {
+        assert!(
+            terminal_usage_frames(Protocol::OpenAiChat, canonical::Usage::default(), None)
+                .is_empty()
+        );
     }
 }

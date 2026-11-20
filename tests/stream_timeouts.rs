@@ -215,7 +215,15 @@ async fn idle_stream_times_out_once_without_replay_or_placeholder_usage() {
             .await
             .unwrap()
             .unwrap();
-        assert!(text.contains("upstream_timeout"), "{text}");
+        // 空闲超时也要按上游 newapi 口径补一帧带用量的终止事件，让下游 sub2api
+        // 记上这次调用并计费（而不是整条丢弃）。记录页仍记 upstream_timeout、
+        // 输出用量仍为空（上游没报，绝不估算）——计费估算只进补发的终止帧。
+        let terminal = match downstream {
+            Protocol::AnthropicMessages => "message_stop",
+            Protocol::OpenAiChat => "[DONE]",
+            Protocol::OpenAiResponses => "response.completed",
+        };
+        assert!(text.contains(terminal), "超时要补终止帧供下游计费：{text}");
         let r = record(&akhub).await;
         assert_eq!(r.error_code.as_deref(), Some("upstream_timeout"), "{r:?}");
         assert_eq!(r.output_tokens, None, "{r:?}");
@@ -223,7 +231,7 @@ async fn idle_stream_times_out_once_without_replay_or_placeholder_usage() {
             assert_eq!(r.input_tokens, Some(120));
         }
         assert_eq!(r.output_tps, None);
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "超时不得重放上游");
         assert_eq!(
             akhub
                 .state
