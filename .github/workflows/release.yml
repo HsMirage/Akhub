@@ -1,10 +1,12 @@
-# 公开发版：推 v* tag 时产出桌面安装包 + Linux 单文件二进制 + 多架构 Docker 镜像。
+# 公开发版：推 v* tag 时产出桌面安装包 + Linux 单文件二进制 + Docker 镜像。
 #
-# 挂到 Release 上的只有这几个（2026-10-20 起的口径：只发 Linux 与 Windows）：
+# 挂到 Release 上的只有这几个（2026-11-21 起的口径：只发 linux-x86_64 与 windows-x86_64）：
 #   akhub-desktop-<tag>-windows-x86_64-setup.exe   Windows 桌面端（NSIS 安装器）
 #   akhub-v<tag>-linux-x86_64.tar.gz               Linux 服务端
-#   akhub-v<tag>-linux-aarch64.tar.gz              Linux 服务端（arm64）
 #   checksums.txt                                  上面这些文件的 sha256
+#
+# **linux-aarch64 不再构建**（2026-11-21 起）：线上与客户全是 x86_64，arm 产物
+# 只白占构建时间。历史 Release 上的 aarch64 资产不删，但新版本不再产出。
 #
 # **macOS 不再构建、不再发布**（2026-10-20 起）：本项目只保留 Linux 与 Windows
 # 两个平台。早于该日期的 Release 上仍有 macOS 的 .dmg 历史资产，它们不会被删除，
@@ -109,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- 二进制
-  # 三个平台都要编：Linux 的两份是发布资产，Windows 那份是桌面端 sidecar 的来源
+  # 两个平台都要编：Linux 那份是发布资产，Windows 那份是桌面端 sidecar 的来源
   # （见下面的 desktop job），编完只留在 workflow artifact 里，不上 Release。
   binaries:
     name: ${{ matrix.name }}
@@ -122,9 +124,6 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -287,7 +286,6 @@ jobs:
           shopt -s nullglob
           targets=(
             ./akhub-v*-linux-x86_64.tar.gz
-            ./akhub-v*-linux-aarch64.tar.gz
             ./akhub-desktop-*-windows-x86_64-setup.exe
           )
           shopt -u nullglob
@@ -351,14 +349,13 @@ jobs:
           body_path: ${{ runner.temp }}/notes.md
           files: |
             dist/akhub-v*-linux-x86_64.tar.gz
-            dist/akhub-v*-linux-aarch64.tar.gz
             dist/akhub-desktop-*-windows-x86_64-setup.exe
             dist/checksums.txt
   # ---------------------------------------------------------------- 容器镜像
-  # 每个架构在自己的原生 runner 上构建，再合成 manifest list。
-  # 用 QEMU 模拟 arm64 跑 Rust + aws-lc-sys 的 C 编译会慢一个数量级，还容易超时。
+  # 只发 amd64（2026-11-21 起不再编 arm64）。
   #
-  # 单架构阶段先推 <tag>-<arch>，两个架构互不覆盖；多架构 tag 由后面的
+  # 单架构阶段先推 <tag>-<arch>；不带后缀的 tag 由后面的 manifest 步骤指向它，
+  # 这样下游 compose 里的 image: <tag> 走的始终是 manifest。
   docker:
     name: 镜像 linux/${{ matrix.arch }}
     needs: [web]
@@ -369,14 +366,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `ubuntu-24.04-arm` 是 GitHub 的 arm64 托管 runner，公开仓库免费。
         include:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -452,9 +445,9 @@ jobs:
           cache-from: type=gha,scope=akhub-${{ matrix.arch }}
           cache-to: type=gha,scope=akhub-${{ matrix.arch }},mode=max
 
-  # 把两个架构的单架构镜像合成多架构 manifest。
+  # 把单架构镜像挂成不带后缀的 manifest（下游 compose 直接用这个 tag）。
   docker-manifest:
-    name: 合成多架构 manifest
+    name: 合成 manifest
     needs: [docker]
     runs-on: ubuntu-latest
     permissions:
@@ -510,7 +503,7 @@ jobs:
           while IFS= read -r tag; do
             [[ -z "$tag" ]] && continue
             echo "==> $tag"
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+            docker buildx imagetools create -t "$tag" "${tag}-amd64"
           done <<< "${{ steps.meta.outputs.tags }}"
 
       - name: 复核最终 manifest
