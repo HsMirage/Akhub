@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/release.sh                     # 全量：校验 + 全部平台 + 校验和
 #   ./scripts/release.sh --skip-tests        # 跳过 cargo test（仍然跑 fmt/clippy）
-#   ./scripts/release.sh --only linux-aarch64
+#   ./scripts/release.sh --only linux-x86_64
 #   ./scripts/release.sh --no-checksums
 #
 # 交叉编译依赖：
@@ -57,7 +57,6 @@ fi
 # 只保留 Linux 与 Windows：macOS 从 2026-10-20 起不再构建（见 docs/BUILD.md §1）。
 PLATFORMS=(
     "linux-x86_64:x86_64-unknown-linux-gnu"
-    "linux-aarch64:aarch64-unknown-linux-gnu"
     "windows-x86_64:x86_64-pc-windows-gnu"
 )
 

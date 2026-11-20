@@ -463,7 +463,7 @@ fn release_platforms_agree_across_workflow_script_and_installers() {
 
     // 只列真正发版的平台：macOS 自 2026-10-20 起不再构建（docs/BUILD.md §1），
     // 留在这里只会让这条用例一直红着，反而掩盖真正的漂移。
-    for platform in ["linux-x86_64", "linux-aarch64", "windows-x86_64"] {
+    for platform in ["linux-x86_64", "windows-x86_64"] {
         assert!(
             workflow.contains(&format!("name: {platform}")),
             "release.yml 的 matrix 缺少平台 {platform}"
@@ -511,8 +511,12 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
         .map(|name| name.trim().to_string())
         .collect();
     assert!(
-        declared.len() >= 3,
-        "release.yml 里应当解析出至少 3 个平台名（Linux x86_64/aarch64 + Windows），实际 {declared:?}"
+        declared.len() >= 2,
+        "release.yml 里应当解析出至少 2 个平台名（Linux x86_64 + Windows），实际 {declared:?}"
+    );
+    assert!(
+        !declared.iter().any(|name| name.contains("aarch64")),
+        "2026-11-21 起不再构建 linux-aarch64，release.yml 里不该再有它：{declared:?}"
     );
 
     // 伪造的 uname：只回答 -s 与 -m，值取自环境变量。
@@ -532,11 +536,9 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
     );
 
     // 覆盖安装脚本里每一个平台分支。
-    // macOS 分支已从 install.sh 删掉（现在会明确报错退出），只覆盖 Linux 两种架构。
-    let cases = [
-        ("Linux", "x86_64", "linux-x86_64"),
-        ("Linux", "aarch64", "linux-aarch64"),
-    ];
+    // macOS 明确报错退出；arm64 自 v1.1.48 起也不再有资产，同样应当明确报错，
+    // 而不是拼出一个必然 404 的 URL。只剩 Linux x86_64 一条可下载路径。
+    let cases = [("Linux", "x86_64", "linux-x86_64")];
 
     // 用 Cargo.toml 的版本构造 tag，避免测试里钉死一个会过期的版本号。
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -596,10 +598,11 @@ fn installer_resolves_to_platform_names_that_actually_exist() {
 /// Release 上只挂五个包：两个 Linux 服务端二进制 + 三个桌面安装包。
 ///
 /// 2026-10-01 起的口径：macOS / Windows 只以桌面应用发布（裸二进制仍会编出来，
-/// 但那是桌面端的 sidecar，不上 Release），Windows 的 .msi 也不再打。这条用例把
-/// 发布清单钉死——少一个用户装不上，多一个说明又回到了"每个平台发一堆东西"。
+/// 但那是桌面端的 sidecar，不上 Release），Windows 的 .msi 也不再打。
+/// 2026-11-21 起 linux-aarch64 停发：清单只剩 Linux x86_64 服务端、Windows 桌面
+/// 安装器与校验和三项。这条用例把发布清单钉死，多一个少一个都要红。
 #[test]
-fn the_release_publishes_exactly_the_five_assets() {
+fn the_release_publishes_exactly_the_three_assets() {
     let package = std::fs::read_to_string("scripts/package.sh").expect("package.sh");
     let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("release.yml");
 
@@ -628,10 +631,9 @@ fn the_release_publishes_exactly_the_five_assets() {
         .next()
         .expect("发布 job 之后应有容器镜像 job");
 
-    // 2026-10-20 起只发这四个：两个 Linux 服务端 + 一个 Windows 桌面安装器 + 校验和。
+    // 2026-11-21 起只发这三个：Linux x86_64 服务端 + Windows 桌面安装器 + 校验和。
     for pattern in [
         "dist/akhub-v*-linux-x86_64.tar.gz",
-        "dist/akhub-v*-linux-aarch64.tar.gz",
         "dist/akhub-desktop-*-windows-x86_64-setup.exe",
         "dist/checksums.txt",
     ] {
