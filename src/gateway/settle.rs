@@ -70,6 +70,8 @@ pub struct StreamSettlement {
     /// 响应头在流开始前就发出去了，中途才知道的降级只能落到请求记录里——
     /// 记录页照样能标红，这是"不静默丢失"的实际落点。
     pub degraded: crate::gateway::translate::DegradationSink,
+    /// 客户端断开后继续读完上游的时间上限；0 表示立刻放弃（§26.3 修订）。
+    pub drain_budget: Duration,
     /// 异常结束（EOF / 客户端断开）时补发终止帧所需的请求上下文。
     ///
     /// 上游 newapi 流没正常收尾也会补一帧 usage 再结束，下游据此记账；akhub
@@ -168,6 +170,11 @@ pub fn settle_stream(
     let protocol = settlement.protocol;
     let idle_timeout = settlement.idle_timeout;
     let request_id = settlement.record.request_id.clone();
+    let drain_budget = settlement.drain_budget;
+    let is_image_endpoint = settlement
+        .billing
+        .as_ref()
+        .is_some_and(|ctx| ctx.endpoint.is_image());
     let billing = settlement.billing.as_ref().map(|ctx| {
         let input_estimate = crate::gateway::passthrough::estimate_tokens(
             ctx.endpoint,
@@ -181,137 +188,352 @@ pub fn settle_stream(
         settlement: Some(settlement),
         accounting: StreamAccounting::new(protocol),
         billing,
+        unfinished_at_disconnect: false,
     };
 
-    let stream = async_stream::stream! {
-        let mut guard = guard;
-        let mut filter = crate::gateway::translate::UnrequestedUsageFilter::new(strip_unrequested_usage);
-        let mut upstream = body.into_data_stream();
-        // 内层转发（private_stream / translate）会把上游断流改写成错误帧再正常收尾，
-        //  accounting 不一定看得到错误。这里自己探一遍错误帧，收尾时据此补计费终止帧。
-        let mut error_probe = crate::protocol::sse::FrameReader::new();
-        let mut saw_error_frame = false;
-        let mut usage_injected = false;
-        loop {
-            let next = if let Some(timeout) = idle_timeout {
-                match tokio::time::timeout(timeout, upstream.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        tracing::warn!(%request_id, idle_secs = timeout.as_secs(), "流式响应连续无数据，结束等待");
-                        let frames = guard.settle(Ending::Failed("upstream_timeout"));
-                        // 按上游口径补出带用量的终止帧，让下游正常计费；拿不到用量
-                        // 时退回原来的超时错误事件，至少把失败如实告诉客户端。
+    // **读取、累计与结算都在独立任务里，响应体只转发字节。**
+    //
+    // 客户端断开时 axum 会直接丢弃响应体；若上游读取写在 body 里，它会跟着被丢掉，
+    // 而上游这时往往还在正常生成，那部分真实用量我们永远读不到（现场：New API 记
+    // 49,517/178，我们只记「未知 / 未知」）。放进独立任务后，断开只是不再往 channel
+    // 写，任务继续把上游读完再按 client_gone 结算落库（§26.3 修订）。
+    let (sender, receiver) = tokio::sync::mpsc::channel::<UpstreamChunk>(16);
+    // 下游是否已经走了。响应体被丢弃时由 Drop 置位，pump 用它区分「客户端断开」
+    // 与「上游正常写完」——两者都可能读到完整 usage，但记录页要给不同的结论。
+    let client_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // drain 阶段单次等待上限：客户端走了之后再等这么一小段时间还没新数据，就
+    // 认为上游也停下来了，按已读到的用量结算。用完整空闲超时（默认 180 秒）会把
+    // 记录拖到几分钟后才落库——记录页看不到这次调用，比少记一点用量更糟。
+    let drain_grace = drain_budget.min(CLIENT_GONE_DRAIN_GRACE);
+    tokio::spawn(pump_upstream(UpstreamPump {
+        guard,
+        upstream: Box::pin(body.into_data_stream()),
+        sender,
+        idle_timeout,
+        drain_budget,
+        drain_grace,
+        client_gone: std::sync::Arc::clone(&client_gone),
+        request_id: request_id.clone(),
+        is_image: is_image_endpoint,
+        protocol,
+    }));
+
+    let stream = downstream_stream(receiver, strip_unrequested_usage, client_gone);
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// 上游 → 下游之间传的一件东西。
+enum UpstreamChunk {
+    Data(axum::body::Bytes),
+    /// 上游把整条流发完了（字节已经全部转发完）。
+    End,
+}
+
+/// 读取上游、累计用量并负责结算的那一半。
+struct UpstreamPump {
+    guard: SettlementGuard,
+    upstream: TokioUpstream,
+    sender: tokio::sync::mpsc::Sender<UpstreamChunk>,
+    idle_timeout: Option<Duration>,
+    drain_budget: Duration,
+    /// drain 阶段单次等待上限（上游安静下来就收手）。
+    drain_grace: Duration,
+    /// 下游已经走了（响应体被丢弃）。
+    client_gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 请求 ID：断流时写进流内错误帧（§18.2）。
+    request_id: String,
+    /// 图片端点：它的 usage 就挂在 `image_generation.completed` 上，不补终止帧。
+    is_image: bool,
+    /// 下游协议：补发的终止帧/错误帧要长成它认的样子。
+    protocol: Protocol,
+}
+
+/// 跑完整条上游流：边读边转发、边累计用量，读完后按结局结算（§26.3）。
+async fn pump_upstream(pump: UpstreamPump) {
+    let UpstreamPump {
+        mut guard,
+        mut upstream,
+        sender,
+        idle_timeout,
+        drain_budget,
+        drain_grace,
+        client_gone,
+        request_id,
+        is_image,
+        protocol,
+    } = pump;
+    let mut bytes_read = 0usize;
+    let mut saw_error_frame = false;
+    let mut upstream_broken = false;
+    let mut usage_injected = false;
+    let mut error_probe = crate::protocol::sse::FrameReader::new();
+    // 下游走掉之后继续读的起点（None = 下游还在）。
+    let mut gone_at: Option<tokio::time::Instant> = None;
+    'pump: loop {
+        if gone_at.is_none() && client_gone.load(std::sync::atomic::Ordering::Relaxed) {
+            gone_at = Some(tokio::time::Instant::now());
+        }
+        if let Some(start) = gone_at
+            && (drain_budget.is_zero() || start.elapsed() >= drain_budget)
+        {
+            // 配置关闭了 drain，或已经读够久：按已读到的用量结算。
+            break;
+        }
+        // 同时等「上游下一块」和「下游断开」。两者都只等待、不消费数据，所以
+        // 断开分支胜出时不会吃掉任何字节（drain 之后照样从上游读得到）。
+        let next = tokio::select! {
+            // biased：断开检测优先。上游一直返回"还没数据"时，普通 select 每次都
+            // 随机挑分支，"断开"可能长时间轮不到——现场就是记录一直不落库。
+            biased;
+            _ = sender.closed(), if gone_at.is_none() => {
+                gone_at = Some(tokio::time::Instant::now());
+                // 断开这一刻上游写完了没有？写完了就是"下游读完才走"（正常完成），
+                // 没写完才是真的 client_gone。
+                guard.unfinished_at_disconnect = !guard.accounting.answer_completed();
+                // 上游一个字节都没送出（纯心跳场景）：drain 也读不到任何用量，
+                // 立刻结算，别白等一段 grace（现场：首字百秒级的慢回答）。
+                //
+                // 判据只看字节数，不看 usage 有没有到：上游常常先把正文吐完、
+                // 最后才补 usage——那正是要 drain 的情形。
+                let nothing_coming = bytes_read == 0;
+                // 注意：这里是 select! 的分支体，`break` 只会跳出 select 内部块，
+                // 必须用显式标志退出外层循环。
+                if nothing_coming {
+                    break 'pump;
+                }
+                // 下游走了：剩下的只读不发，继续累计用量直到上游收尾或超时。
+                continue 'pump;
+            }
+            next = async {
+                // 等待上限按阶段取小的那个：
+                //  * 正常阶段——空闲超时（上游卡住就换）；
+                //  * drain 阶段——空闲超时与剩余预算取小。上游安静下来就立刻收手，
+                //    不能因为"预算还有 60 秒"就干等着，记录会被挂死的上游拖住。
+                let limit = match gone_at {
+                    // drain 阶段：总时长就按 grace 算，不因为上游还在吐字节而续命。
+                    // 上游真要发完，几秒内一定发得完；一直发不完的多半是空转
+                    // （hyper 会在等待时吐块），续命只会让记录永远落不了库。
+                    Some(start) => drain_grace.saturating_sub(start.elapsed()),
+                    None => idle_timeout.unwrap_or(drain_budget),
+                };
+                tokio::time::timeout(limit, upstream.next()).await
+            } => match next {
+                Ok(next) => next,
+                Err(_) => {
+                    // 等待超时：正常阶段是上游卡住（upstream_timeout）；drain 阶段
+                    // 是客户端早就走了、上游也安静了——那是 client_gone，不是超时。
+                    guard.accounting.finish();
+                    let ending = if gone_at.is_some() {
+                        Ending::Aborted
+                    } else {
+                        Ending::Failed("upstream_timeout")
+                    };
+                    let frames = guard.settle(ending);
+                    // 超时也要按上游口径补出带用量的终止帧，否则下游只看到流凭空
+                    // 断掉、无从计费（§26.3）。
+                    if gone_at.is_none() {
                         if frames.is_empty() {
-                            yield Ok::<_, axum::Error>(crate::protocol::stream_error(
-                                protocol,
-                                crate::gateway::error::ErrorCode::UpstreamTimeout,
-                                "上游流式响应长时间未返回数据，请重试",
-                                Some(&request_id),
-                            ));
+                            let _ = sender
+                                .send(UpstreamChunk::Data(crate::protocol::stream_error(
+                                    protocol,
+                                    crate::gateway::error::ErrorCode::UpstreamTimeout,
+                                    "上游流式响应长时间未返回数据，请重试",
+                                    Some(&request_id),
+                                )))
+                                .await;
                         } else {
                             for frame in frames {
-                                yield Ok::<_, axum::Error>(frame);
+                                let _ = sender.send(UpstreamChunk::Data(frame)).await;
                             }
                         }
-                        return;
                     }
-                }
-            } else {
-                upstream.next().await
-            };
-            match next {
-                Some(Ok(chunk)) => {
-                    guard.accounting.push(&chunk);
-                    // 错误帧之前先补一帧「只有 usage、没有终止信号」的用量帧。
-                    // sub2api / newapi 把错误事件当终止信号，读到它就停止解析后续帧，
-                    // 但对任何带 usage 的帧都会先累计用量。把用量帧排在错误帧前面，
-                    // 下游先记到用量、再看到错误（现场 cyber-policy 拒绝：记录在、
-                    // 用量 0、计费 0，就是因为用量帧排在了错误帧后面）。
-                    //
-                    // 按帧边界切块转发：error_probe 与游标同步消费同一份字节，跨块
-                    // 半帧由 error_probe 内部缓冲拼回，游标只在完整帧处推进。
-                    let frames = error_probe.push(&chunk);
-                    let mut cursor = 0usize;
-                    for frame in &frames {
-                        let Some(end) = crate::protocol::sse::find_frame_end(&chunk, cursor) else {
-                            break;
-                        };
-                        if crate::protocol::frame_error(frame).is_some() {
-                            saw_error_frame = true;
-                            // 客户端没索取 usage 时不额外塞用量帧（§26.3 的契约）；
-                            // 计费型下游（sub2api / newapi）都会强制打开 include_usage。
-                            if !usage_injected && !strip_unrequested_usage {
-                                if let Some(usage_frame) = guard.usage_only_frame() {
-                                    yield Ok::<_, axum::Error>(usage_frame);
-                                }
-                                usage_injected = true;
-                            }
-                        }
-                        let piece = &chunk[cursor..end];
-                        if strip_unrequested_usage {
-                            let bytes = filter.push(piece);
-                            if !bytes.is_empty() {
-                                yield Ok::<_, axum::Error>(bytes);
-                            }
-                        } else {
-                            yield Ok::<_, axum::Error>(axum::body::Bytes::copy_from_slice(piece));
-                        }
-                        cursor = end;
-                    }
-                    // 完整帧之外的残留字节（半帧）原样放行，留给下一块拼。
-                    if cursor < chunk.len() {
-                        let rest = &chunk[cursor..];
-                        if strip_unrequested_usage {
-                            let bytes = filter.push(rest);
-                            if !bytes.is_empty() {
-                                yield Ok::<_, axum::Error>(bytes);
-                            }
-                        } else {
-                            yield Ok::<_, axum::Error>(axum::body::Bytes::copy_from_slice(rest));
-                        }
-                    }
-                }
-                Some(Err(error)) => {
-                    let frames = guard.settle(Ending::Failed("upstream_exhausted"));
-                    // 上游断流（EOF）：补出带用量的终止帧让下游计费，而不是把传输
-                    // 错误直接抛给下游——那会让 sub2api 当成可重放失败整条丢弃。
-                    if frames.is_empty() {
-                        yield Err::<axum::body::Bytes, _>(error);
-                    } else {
-                        for frame in frames {
-                            yield Ok::<_, axum::Error>(frame);
-                        }
-                    }
+                    let _ = sender.send(UpstreamChunk::End).await;
                     return;
                 }
-                None => break,
+            },
+        };
+        match next {
+            Some(Ok(chunk)) => {
+                // 空块（hyper 在等待上游时会吐）不算进展：否则 drain 会被无限
+                // 续命，记录永远落不了库。
+                if chunk.is_empty() {
+                    continue 'pump;
+                }
+                bytes_read += chunk.len();
+                guard.accounting.push(&chunk);
+                // 下游走掉就转入 drain：剩下的字节照样读、照样累计，只是不再下发。
+                if gone_at.is_none() && client_gone.load(std::sync::atomic::Ordering::Relaxed) {
+                    gone_at = Some(tokio::time::Instant::now());
+                }
+                if gone_at.is_some() {
+                    continue;
+                }
+                // 错误帧之前先补一帧「只有 usage、没有终止信号」的用量帧：下游读到
+                // 错误就停止解析后续帧，顺序反了用量永远进不了它的计费统计。
+                //
+                // 按帧边界切块转发：error_probe 与游标同步消费同一份字节，跨块半帧
+                // 由 error_probe 内部缓冲拼回，游标只在完整帧处推进。
+                let frames = error_probe.push(&chunk);
+                let mut cursor = 0usize;
+                for frame in &frames {
+                    let Some(end) = crate::protocol::sse::find_frame_end(&chunk, cursor) else {
+                        break;
+                    };
+                    if crate::protocol::frame_error(frame).is_some() {
+                        saw_error_frame = true;
+                        if !usage_injected && let Some(usage_frame) = guard.usage_only_frame() {
+                            push(&sender, UpstreamChunk::Data(usage_frame), &mut gone_at).await;
+                            usage_injected = true;
+                        }
+                    }
+                    push(
+                        &sender,
+                        UpstreamChunk::Data(axum::body::Bytes::copy_from_slice(
+                            &chunk[cursor..end],
+                        )),
+                        &mut gone_at,
+                    )
+                    .await;
+                    cursor = end;
+                }
+                if cursor < chunk.len() {
+                    push(
+                        &sender,
+                        UpstreamChunk::Data(axum::body::Bytes::copy_from_slice(&chunk[cursor..])),
+                        &mut gone_at,
+                    )
+                    .await;
+                }
+            }
+            // 上游断流与正常读完都走统一收尾：结算后先补计费/终止帧，最后才发
+            // End。在这里直接发 End 会让下游提前收尾，把后面那些帧全吞掉。
+            Some(Err(_)) => {
+                upstream_broken = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    if let Some(frame) = error_probe.finish()
+        && crate::protocol::frame_error(&frame).is_some()
+    {
+        saw_error_frame = true;
+    }
+    // 上游刚读完那一刻下游可能才断开：收尾前再看一眼，别把 client_gone 记成成功。
+    if gone_at.is_none() && client_gone.load(std::sync::atomic::Ordering::Relaxed) {
+        gone_at = Some(tokio::time::Instant::now());
+    }
+    guard.accounting.finish();
+
+    // 结局：错误帧 > 客户端断开 > 上游错误 > 完整写完 > 其余断流。
+    //
+    // 客户端断开必须排在"写完"之前：这次回答在上游那边确实写完了，但驱动它的
+    // 那个客户端已经走了，记录页要如实说这是一次 client_gone（§18.1），
+    // 而不是绿色成功——否则「断开后 drain 回来的用量」会被误读成正常完成。
+    let ending = if saw_error_frame {
+        Ending::Failed("upstream_protocol_error")
+    } else if gone_at.is_some() {
+        Ending::Aborted
+    } else if guard.accounting.error().is_some() {
+        Ending::Failed("upstream_protocol_error")
+    } else if guard.accounting.answer_completed() {
+        Ending::Completed
+    } else {
+        Ending::Failed("upstream_exhausted")
+    };
+    let frames = guard.settle(ending);
+    // 客户端还在：先告诉它这次断流了（否则它只看到流凭空结束），再补计费终止帧。
+    // 顺序照现场要求：用量帧在错误帧之前，收尾帧在错误之后。
+    //
+    // **图片端点不补**：图片流的 usage 就挂在 `image_generation.completed` 事件上，
+    // 那一帧是图片本体，再补一帧 Chat 形状的用量/收尾只会污染下游的事件序列。
+    if is_image {
+        let _ = sender.send(UpstreamChunk::End).await;
+        return;
+    }
+    if upstream_broken {
+        let _ = sender
+            .send(UpstreamChunk::Data(crate::protocol::stream_error(
+                Protocol::OpenAiChat,
+                crate::gateway::error::ErrorCode::UpstreamExhausted,
+                "上游流式响应中断",
+                Some(&request_id),
+            )))
+            .await;
+    }
+    for frame in frames {
+        let _ = sender.send(UpstreamChunk::Data(frame)).await;
+    }
+    let _ = sender.send(UpstreamChunk::End).await;
+}
+
+/// 把一帧交给下游；发送失败说明下游已经走了，记下这个时刻。
+///
+/// 用**发送失败**而不是 channel 的 `is_closed()`：后者要等发送端真去写才发现，
+/// 而上游还没吐新字节时我们根本不会写——断开就会被漏掉，结果 client_gone 被误记
+/// 成成功。
+async fn push(
+    sender: &tokio::sync::mpsc::Sender<UpstreamChunk>,
+    item: UpstreamChunk,
+    gone_at: &mut Option<tokio::time::Instant>,
+) {
+    if sender.send(item).await.is_err() && gone_at.is_none() {
+        *gone_at = Some(tokio::time::Instant::now());
+    }
+}
+
+/// 下游那一半：把 pump 送来的字节转出去，必要时剥掉没索取的 usage 帧。
+fn downstream_stream(
+    mut receiver: tokio::sync::mpsc::Receiver<UpstreamChunk>,
+    strip_unrequested_usage: bool,
+    client_gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> {
+    async_stream::stream! {
+        // 这个生成器被丢弃 = 客户端断开。置位后 pump 会继续读完上游（drain），
+        // 再把这次请求记成 client_gone。
+        let _gone = ClientGoneOnDrop(client_gone);
+        let mut filter = crate::gateway::translate::UnrequestedUsageFilter::new(strip_unrequested_usage);
+        while let Some(item) = receiver.recv().await {
+            match item {
+                UpstreamChunk::Data(chunk) => {
+                    if strip_unrequested_usage {
+                        let bytes = filter.push(&chunk);
+                        if !bytes.is_empty() {
+                            yield Ok::<_, axum::Error>(bytes);
+                        }
+                    } else {
+                        yield Ok::<_, axum::Error>(chunk);
+                    }
+                }
+                UpstreamChunk::End => break,
+
             }
         }
-        // 残留的半帧也要过一遍过滤，否则它会带着 usage 漏给下游。
         if let Some(tail) = filter.finish() {
             yield Ok::<_, axum::Error>(tail);
         }
-        if let Some(frame) = error_probe.finish()
-            && crate::protocol::frame_error(&frame).is_some()
-        {
-            saw_error_frame = true;
-        }
-        // 流里出现过错误帧（上游断流被内层改写成错误事件）：按失败结算，并照
-        // 上游 newapi 的做法在错误之后补协议终止帧。下游（sub2api 的 raw 路径）
-        // 正是靠错误之后的收尾帧把"这条流算非计费错误"的标记清掉、按真实用量计费；
-        // 错误本身已经先一步送达，客户端看得到这次是中断的。
-        let ending = if saw_error_frame {
-            Ending::Failed("upstream_protocol_error")
-        } else {
-            Ending::Completed
-        };
-        for frame in guard.settle(ending) {
-            yield Ok::<_, axum::Error>(frame);
-        }
-    };
-
-    Response::from_parts(parts, Body::from_stream(stream))
+    }
 }
+
+/// 响应体被丢弃时把「客户端已断开」置位。
+struct ClientGoneOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ClientGoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 客户端断开后，drain 阶段"上游安静多久就收手"。
+///
+/// 断开那一刻上游通常还在吐字节，读到收尾只要几秒；但如果上游也停了，再等下去
+/// 只会把这次请求的记录无限期推迟（记录页看不到，比少记一点用量更糟）。
+/// 1 秒足够覆盖上游正常吐字之间的间隔——真在生成时数据是连续的。
+const CLIENT_GONE_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// 上游响应体的数据流类型。
+type TokioUpstream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>;
 
 /// 结算守卫：正常结束显式结算，客户端断开由 `Drop` 兜底。
 struct SettlementGuard {
@@ -319,6 +541,11 @@ struct SettlementGuard {
     accounting: StreamAccounting,
     /// 异常结束时补发终止帧用的（Responses 网关 ID、输入估算）。
     billing: Option<(Option<String>, u64)>,
+    /// 下游断开时，上游的终止信号**还没**到（回答没写完）。
+    ///
+    /// 用来区分两种长得一样的流：上游写完、下游才走（正常完成，需求证）；
+    /// 下游先走、我们替它把上游读完（client_gone，不能记成绿色成功）。
+    unfinished_at_disconnect: bool,
 }
 
 impl SettlementGuard {
@@ -371,10 +598,16 @@ impl SettlementGuard {
             Ending::Completed if self.accounting.error().is_some() => {
                 Ending::Failed("upstream_protocol_error")
             }
-            // 终止信号已经转发、下游读到收尾就关连接（sub2api / New API 的常态）：
-            // 回答是完整送达的，不是掉线。现场 DeepSeek 流 93% 被记成 client_gone。
+            // 客户端断开，但上游确认整轮回答已经写完：这次不是"掉线"。
+            //
+            // 判据是**断开那一刻**就已经收到了终止信号（`answer_completed`）。
+            // 断开之后才由 drain 补收到的收尾不算——那种情况下驱动这次请求的客户端
+            // 早就走了，记录页必须如实说 client_gone，否则「drain 回来的用量」会被
+            // 误读成一次正常完成。
             Ending::Aborted
-                if self.accounting.error().is_none() && self.accounting.answer_completed() =>
+                if self.accounting.error().is_none()
+                    && self.accounting.answer_completed()
+                    && !self.unfinished_at_disconnect =>
             {
                 Ending::Completed
             }

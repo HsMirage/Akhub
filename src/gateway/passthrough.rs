@@ -1770,6 +1770,8 @@ impl Walk<'_> {
                             admission: Some(admission),
                             responses,
                             degraded: success.degraded.unwrap_or_else(translate::degradation_sink),
+                            // 客户端断开后继续读完上游的时限（§26.3 修订）。
+                            drain_budget: self.forward.state.settings.get().client_gone_drain,
                             // 异常结束（EOF / 客户端断开）时按上游口径补发计费终止帧。
                             billing: Some(settle::BillingContext {
                                 endpoint: self.forward.endpoint,

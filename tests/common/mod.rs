@@ -57,6 +57,12 @@ pub enum Behavior {
     /// 对应线上最常见的 `client_gone` 形态：上游其实已经跑完并上报了用量，
     /// 只是下游没等到最后就关了连接（§9.3 修订）。
     StreamUsageThenHang,
+    /// 流式：先只发语义增量，**usage 与收尾留到 release 之后**再发。
+    ///
+    /// 对应现场（req_01M7Y760MFGD5SMVHVYPBERDN4）：客户端断开那一刻上游还没写
+    /// 完，真实用量要等它继续生成才有。不 drain 的话我们永远读不到，记录页只能
+    /// 显示「未知 / 未知」，而上游已经按自己的账本扣了费。
+    StreamUsageAfterRelease,
     /// 流式：只送协议开始标记与一个错误事件，然后结束。
     StreamErrorEvent,
     /// 流式 Responses：只送协议开始标记与 `response.failed`，然后结束。
@@ -394,6 +400,28 @@ async fn inference(
                         return;
                     }
                 }
+            };
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Behavior::StreamUsageAfterRelease => {
+            // 断开前只给语义增量；usage 与收尾等 release 之后才发——这正是
+            // "断开时上游还在生成"的形状，drain 必须把它读回来。
+            let frames = usage_frames(&path);
+            let head = axum::body::Bytes::from(frames[..2].concat());
+            let tail = axum::body::Bytes::from(frames[2..].concat());
+            let mut released = upstream.release.subscribe();
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(head);
+                while !*released.borrow() {
+                    if released.changed().await.is_err() {
+                        return;
+                    }
+                }
+                yield Ok::<_, std::io::Error>(tail);
             };
             (
                 [("content-type", "text/event-stream")],

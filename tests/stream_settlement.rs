@@ -9,6 +9,7 @@
 
 mod common;
 
+use akhub::app::Settings;
 use akhub::domain::{Limits, Protocol};
 use axum::Router;
 use axum::response::IntoResponse;
@@ -16,6 +17,7 @@ use axum::routing::post;
 use common::{
     Behavior, FakeUpstream, TargetSpec, client, spawn_akhub, spawn_akhub_with, wire_target,
 };
+use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 /// 假上游返回的流式脚本。
@@ -919,6 +921,97 @@ async fn a_fragmented_error_stream_still_emits_billing_usage_before_the_error() 
         "分片下用量帧仍必须排在错误帧之前：{text}"
     );
 }
+
+/// **现场回归**：客户端断开后，akhub 仍要把上游流读完，拿到与上游一致的 usage。
+///
+/// 现场（req_01M7Y760MFGD5SMVHVYPBERDN4）：终端客户端断开 → sub2api 取消 → akhub。
+/// 修复前 akhub 立刻丢掉上游流，只留下「未知 / 未知」；而上游 New API 那边早就把
+/// 真实用量记进了自己的账本（49,517/178），sub2api 只能用 95% 缓存读估算。
+/// 修复后：断开只是不再往客户端写，上游流继续读完，usage 落进请求记录。
+#[tokio::test]
+async fn a_client_disconnect_still_drains_the_upstream_for_real_usage() {
+    // `StreamUsageAfterRelease`：断开前只给语义增量，usage 与收尾等 release
+    // 之后才发——这正是"断开时上游还在生成"的形状，drain 必须把它读回来。
+    let upstream = FakeUpstream::spawn().await;
+    upstream.fallback(Behavior::StreamUsageAfterRelease);
+    let akhub = spawn_akhub_with(
+        Settings {
+            client_gone_drain: std::time::Duration::from_secs(10),
+            ..Settings::default()
+        },
+        |_| {},
+    )
+    .await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream.base_url,
+            Protocol::OpenAiChat,
+            "gpt-5",
+            "gpt-5",
+            50,
+        ),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/chat/completions", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({
+            "model": "gpt-5",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": "你好"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // 先真的读掉第一块（现场：客户端已经在收流），再断开——这样下游 body
+    // 确实进过 poll 循环，连接断开才是"半路走人"而不是"从没开始读"。
+    let mut body = response.bytes_stream();
+    let _ = body.next().await;
+    drop(body);
+    // 等 akhub 真正感知到断开，再放行上游——顺序反了的话上游会先把用量发完并
+    // 正常结算，测到的就不是 drain 路径了。
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    upstream.release();
+
+    // drain 是后台任务：给它一点时间把上游读完再落库。
+    let mut record = None;
+    for _ in 0..100 {
+        if let Some(found) = akhub
+            .state
+            .store
+            .list_request_records(5, 0)
+            .await
+            .unwrap()
+            .first()
+        {
+            record = Some(found.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let record = record.expect("断开后必须仍然落一条记录");
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("client_gone"),
+        "{record:?}"
+    );
+    // 关键：上游在断开之后才发完，那些用量必须被 drain 读到。
+    assert!(
+        record.input_tokens.unwrap_or(0) > 0,
+        "断开后必须把上游的输入用量读回来，而不是记成未知：{record:?}"
+    );
+    assert!(
+        record.output_tokens.unwrap_or(0) > 0,
+        "断开后必须把上游的输出用量读回来：{record:?}"
+    );
+}
+
 /// 等请求记录真正落库（写入是攒批的，最多 1 秒刷一次）。
 async fn wait_for_record(
     akhub: &common::Akhub,

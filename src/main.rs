@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         first_content_grace: env_duration("AKHUB_FIRST_CONTENT_GRACE_SECS", 15)?,
         keep_alive_interval: env_duration("AKHUB_KEEP_ALIVE_INTERVAL_SECS", 5)?,
         max_request_bytes: env_usize("AKHUB_MAX_REQUEST_BYTES", 64 * 1024 * 1024)?,
+        client_gone_drain: env_duration("AKHUB_CLIENT_GONE_DRAIN_SECS", 60)?,
         shutdown_grace: env_duration("AKHUB_SHUTDOWN_GRACE_SECS", 180)?,
         multiplier_refresh: env_duration("AKHUB_MULTIPLIER_REFRESH_SECS", 300)?,
         response_state_days: env_u32("AKHUB_RESPONSE_STATE_DAYS", 30)?,

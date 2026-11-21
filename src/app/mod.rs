@@ -47,6 +47,12 @@ pub struct Settings {
     /// Responses 状态链保留天数（§15.2）。0 表示不保存可重放正文，
     /// 只保留完成原生生命周期所需的最小定位映射。
     pub response_state_days: u32,
+    /// 客户端断开后继续读完上游流的时间上限；0 表示立刻放弃（§26.3 修订）。
+    ///
+    /// 断开只是下游不要了，上游仍在生成并把真实用量记进它自己的账本。给一小段
+    /// 时间把剩余字节读完，我们才拿得到与上游一致的 usage；给 0 就退回"断开即
+    /// 结算"，记录页只能显示估算值。
+    pub client_gone_drain: Duration,
     /// 在途请求在关闭时的最长完成时间（§25.3）。
     pub shutdown_grace: Duration,
     /// 自动倍率刷新间隔（§11.3）。
@@ -65,6 +71,7 @@ impl Default for Settings {
             max_request_bytes: 64 * 1024 * 1024,
             retention_days: 30,
             response_state_days: 30,
+            client_gone_drain: Duration::from_secs(60),
             shutdown_grace: Duration::from_secs(180),
             multiplier_refresh: Duration::from_secs(300),
             model_sync: Duration::from_secs(1800),
@@ -85,6 +92,7 @@ pub struct PersistedSettings {
     pub max_request_bytes: Option<usize>,
     pub retention_days: Option<u32>,
     pub response_state_days: Option<u32>,
+    pub client_gone_drain_secs: Option<u64>,
     pub shutdown_grace_secs: Option<u64>,
     pub multiplier_refresh_secs: Option<u64>,
     pub model_sync_secs: Option<u64>,
@@ -113,6 +121,10 @@ impl PersistedSettings {
             max_request_bytes: self.max_request_bytes.unwrap_or(base.max_request_bytes),
             retention_days: self.retention_days.unwrap_or(base.retention_days),
             response_state_days: self.response_state_days.unwrap_or(base.response_state_days),
+            client_gone_drain: self
+                .client_gone_drain_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.client_gone_drain),
             shutdown_grace: self
                 .shutdown_grace_secs
                 .map(Duration::from_secs)
@@ -137,6 +149,7 @@ impl PersistedSettings {
             max_request_bytes: Some(settings.max_request_bytes),
             retention_days: Some(settings.retention_days),
             response_state_days: Some(settings.response_state_days),
+            client_gone_drain_secs: Some(settings.client_gone_drain.as_secs()),
             shutdown_grace_secs: Some(settings.shutdown_grace.as_secs()),
             multiplier_refresh_secs: Some(settings.multiplier_refresh.as_secs()),
             model_sync_secs: Some(settings.model_sync.as_secs()),
@@ -167,6 +180,12 @@ impl PersistedSettings {
             300,
         )?;
         range("首字前心跳间隔（秒）", self.keep_alive_interval_secs, 1, 60)?;
+        range(
+            "客户端断开后读完上游的时限（秒）",
+            self.client_gone_drain_secs,
+            0,
+            600,
+        )?;
         range("关闭宽限期（秒）", self.shutdown_grace_secs, 5, 3600)?;
         range(
             "自动倍率刷新间隔（秒）",
