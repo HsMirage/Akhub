@@ -201,17 +201,12 @@ pub fn settle_stream(
     // 下游是否已经走了。响应体被丢弃时由 Drop 置位，pump 用它区分「客户端断开」
     // 与「上游正常写完」——两者都可能读到完整 usage，但记录页要给不同的结论。
     let client_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // drain 阶段单次等待上限：客户端走了之后再等这么一小段时间还没新数据，就
-    // 认为上游也停下来了，按已读到的用量结算。用完整空闲超时（默认 180 秒）会把
-    // 记录拖到几分钟后才落库——记录页看不到这次调用，比少记一点用量更糟。
-    let drain_grace = drain_budget.min(CLIENT_GONE_DRAIN_GRACE);
     tokio::spawn(pump_upstream(UpstreamPump {
         guard,
         upstream: Box::pin(body.into_data_stream()),
         sender,
         idle_timeout,
         drain_budget,
-        drain_grace,
         client_gone: std::sync::Arc::clone(&client_gone),
         request_id: request_id.clone(),
         is_image: is_image_endpoint,
@@ -235,9 +230,8 @@ struct UpstreamPump {
     upstream: TokioUpstream,
     sender: tokio::sync::mpsc::Sender<UpstreamChunk>,
     idle_timeout: Option<Duration>,
+    /// 客户端断开后继续读上游的墙钟上限（`client_gone_drain`）。
     drain_budget: Duration,
-    /// drain 阶段单次等待上限（上游安静下来就收手）。
-    drain_grace: Duration,
     /// 下游已经走了（响应体被丢弃）。
     client_gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 请求 ID：断流时写进流内错误帧（§18.2）。
@@ -256,7 +250,6 @@ async fn pump_upstream(pump: UpstreamPump) {
         sender,
         idle_timeout,
         drain_budget,
-        drain_grace,
         client_gone,
         request_id,
         is_image,
@@ -290,15 +283,20 @@ async fn pump_upstream(pump: UpstreamPump) {
                 // 断开这一刻上游写完了没有？写完了就是"下游读完才走"（正常完成），
                 // 没写完才是真的 client_gone。
                 guard.unfinished_at_disconnect = !guard.accounting.answer_completed();
-                // 上游一个字节都没送出（纯心跳场景）：drain 也读不到任何用量，
-                // 立刻结算，别白等一段 grace（现场：首字百秒级的慢回答）。
+                // 上游还没送出任何语义内容（没字节，或只有网关自己的心跳）：drain
+                // 等不到用量，立刻结算（现场：首字百秒级的慢回答，客户端先放弃）。
                 //
-                // 判据只看字节数，不看 usage 有没有到：上游常常先把正文吐完、
-                // 最后才补 usage——那正是要 drain 的情形。
-                let nothing_coming = bytes_read == 0;
+                // 判据不看 usage 有没有到：上游常常先把正文吐完、最后才补 usage——
+                // 那正是要 drain 的情形。
+                let heartbeat_only = guard.settlement.as_ref().is_some_and(|s| {
+                    s.first_content
+                        .as_ref()
+                        .is_some_and(|clock| crate::gateway::stream::first_content(clock).is_none())
+                });
+                let nothing_coming = bytes_read == 0 || heartbeat_only;
                 // 注意：这里是 select! 的分支体，`break` 只会跳出 select 内部块，
                 // 必须用显式标志退出外层循环。
-                if nothing_coming {
+                if nothing_coming || settled_usage(&guard.accounting) {
                     break 'pump;
                 }
                 // 下游走了：剩下的只读不发，继续累计用量直到上游收尾或超时。
@@ -307,13 +305,14 @@ async fn pump_upstream(pump: UpstreamPump) {
             next = async {
                 // 等待上限按阶段取小的那个：
                 //  * 正常阶段——空闲超时（上游卡住就换）；
-                //  * drain 阶段——空闲超时与剩余预算取小。上游安静下来就立刻收手，
-                //    不能因为"预算还有 60 秒"就干等着，记录会被挂死的上游拖住。
+                //  * drain 阶段——断开后的剩余墙钟预算（默认 60 秒）。
+                //
+                // 不能再按"上游安静 1 秒就收手"：推理模型的用量只在最后一帧，断开时
+                // 往往还有几十秒没写完（现场 req_01M7ZBHJXEJ8XJFEHZZC54DQ5E：1 秒后
+                // 放弃，上游照常记 78,966 输入，我们只剩「未知 / 未知」）。预算按墙钟
+                // 从断开时刻算，hyper 空转吐的空块也续不了命。
                 let limit = match gone_at {
-                    // drain 阶段：总时长就按 grace 算，不因为上游还在吐字节而续命。
-                    // 上游真要发完，几秒内一定发得完；一直发不完的多半是空转
-                    // （hyper 会在等待时吐块），续命只会让记录永远落不了库。
-                    Some(start) => drain_grace.saturating_sub(start.elapsed()),
+                    Some(start) => drain_budget.saturating_sub(start.elapsed()),
                     None => idle_timeout.unwrap_or(drain_budget),
                 };
                 tokio::time::timeout(limit, upstream.next()).await
@@ -366,6 +365,10 @@ async fn pump_upstream(pump: UpstreamPump) {
                     gone_at = Some(tokio::time::Instant::now());
                 }
                 if gone_at.is_some() {
+                    // drain 只为拿用量：收尾与用量都到了就不再等上游关流。
+                    if settled_usage(&guard.accounting) {
+                        break;
+                    }
                     continue;
                 }
                 // 错误帧之前先补一帧「只有 usage、没有终止信号」的用量帧：下游读到
@@ -467,6 +470,15 @@ async fn pump_upstream(pump: UpstreamPump) {
     let _ = sender.send(UpstreamChunk::End).await;
 }
 
+/// 收尾信号与输出用量都已到手：drain 再读也不会多出可计费的东西。
+///
+/// 只看收尾不够：Chat 的 `finish_reason` 在 usage 块之前。三个协议的最终输出
+/// 用量都在收尾那一帧或其后（Anthropic 开场的 `output_tokens: 1` 早于收尾，
+/// 那时 `answer_completed` 还是假）。
+fn settled_usage(accounting: &StreamAccounting) -> bool {
+    accounting.answer_completed() && accounting.output_tokens().is_some()
+}
+
 /// 错误帧：裸 error 事件，或 Responses 的 `response.failed`（错误在 `response.error`
 /// 里，`frame_error` 认不出来）。后者漏判时用量帧就补不到错误之前，下游计 0。
 fn is_error_frame(frame: &crate::protocol::sse::Frame) -> bool {
@@ -538,13 +550,6 @@ impl Drop for ClientGoneOnDrop {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
-
-/// 客户端断开后，drain 阶段"上游安静多久就收手"。
-///
-/// 断开那一刻上游通常还在吐字节，读到收尾只要几秒；但如果上游也停了，再等下去
-/// 只会把这次请求的记录无限期推迟（记录页看不到，比少记一点用量更糟）。
-/// 1 秒足够覆盖上游正常吐字之间的间隔——真在生成时数据是连续的。
-const CLIENT_GONE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// 上游响应体的数据流类型。
 type TokioUpstream =

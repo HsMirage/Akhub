@@ -364,7 +364,15 @@ async fn a_client_that_disconnects_mid_stream_is_recorded_as_client_gone() {
     // 才会走到 `Ending::Aborted`；瞬间跑完的流在断开前就结算成 `Completed` 了。
     let upstream = FakeUpstream::spawn().await;
     upstream.fallback(Behavior::StreamThenHang);
-    let akhub = spawn_akhub().await;
+    // 上游挂住不收尾：drain 会读满整个预算，这里压短，只测记录结论。
+    let akhub = spawn_akhub_with(
+        Settings {
+            client_gone_drain: std::time::Duration::from_millis(300),
+            ..Settings::default()
+        },
+        |_| {},
+    )
+    .await;
     wire_target(
         &akhub,
         TargetSpec::new(
@@ -414,7 +422,15 @@ async fn a_client_that_disconnects_mid_stream_is_recorded_as_client_gone() {
 async fn a_disconnect_does_not_lower_the_targets_reliability() {
     let upstream = FakeUpstream::spawn().await;
     upstream.fallback(Behavior::StreamThenHang);
-    let akhub = spawn_akhub().await;
+    // 上游挂住不收尾：drain 会读满整个预算，这里压短，只测记录结论。
+    let akhub = spawn_akhub_with(
+        Settings {
+            client_gone_drain: std::time::Duration::from_millis(300),
+            ..Settings::default()
+        },
+        |_| {},
+    )
+    .await;
     let wired = wire_target(
         &akhub,
         TargetSpec::new(
@@ -537,7 +553,15 @@ async fn an_anthropic_truncation_before_output_is_not_evidence() {
     // （`output_tokens` 还是占位值 1），回答一个字都没写。
     let upstream = FakeUpstream::spawn().await;
     upstream.fallback(Behavior::StreamUsageStartThenHang);
-    let akhub = spawn_akhub().await;
+    // 上游挂住不收尾：drain 会读满整个预算，这里压短，只测记录结论。
+    let akhub = spawn_akhub_with(
+        Settings {
+            client_gone_drain: std::time::Duration::from_millis(300),
+            ..Settings::default()
+        },
+        |_| {},
+    )
+    .await;
     let wired = wire_target(
         &akhub,
         TargetSpec::new(
@@ -1040,7 +1064,10 @@ async fn a_client_disconnect_still_drains_the_upstream_for_real_usage() {
     drop(body);
     // 等 akhub 真正感知到断开，再放行上游——顺序反了的话上游会先把用量发完并
     // 正常结算，测到的就不是 drain 路径了。
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    //
+    // 停 1.5 秒再放行：断开后上游安静一阵（推理模型还在想）也必须等到用量。
+    // 现场 req_01M7ZBHJXEJ8XJFEHZZC54DQ5E 就是旧版"安静 1 秒就放弃"丢的用量。
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     upstream.release();
 
     // drain 是后台任务：给它一点时间把上游读完再落库。
