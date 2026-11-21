@@ -379,7 +379,7 @@ async fn pump_upstream(pump: UpstreamPump) {
                     let Some(end) = crate::protocol::sse::find_frame_end(&chunk, cursor) else {
                         break;
                     };
-                    if crate::protocol::frame_error(frame).is_some() {
+                    if is_error_frame(frame) {
                         saw_error_frame = true;
                         if !usage_injected && let Some(usage_frame) = guard.usage_only_frame() {
                             push(&sender, UpstreamChunk::Data(usage_frame), &mut gone_at).await;
@@ -415,7 +415,7 @@ async fn pump_upstream(pump: UpstreamPump) {
         }
     }
     if let Some(frame) = error_probe.finish()
-        && crate::protocol::frame_error(&frame).is_some()
+        && is_error_frame(&frame)
     {
         saw_error_frame = true;
     }
@@ -465,6 +465,21 @@ async fn pump_upstream(pump: UpstreamPump) {
         let _ = sender.send(UpstreamChunk::Data(frame)).await;
     }
     let _ = sender.send(UpstreamChunk::End).await;
+}
+
+/// 错误帧：裸 error 事件，或 Responses 的 `response.failed`（错误在 `response.error`
+/// 里，`frame_error` 认不出来）。后者漏判时用量帧就补不到错误之前，下游计 0。
+fn is_error_frame(frame: &crate::protocol::sse::Frame) -> bool {
+    crate::protocol::frame_error(frame).is_some()
+        || frame.event.as_deref() == Some("response.failed")
+        || serde_json::from_str::<serde_json::Value>(&frame.data)
+            .ok()
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "response.failed")
+            })
+            .unwrap_or(false)
 }
 
 /// 把一帧交给下游；发送失败说明下游已经走了，记下这个时刻。

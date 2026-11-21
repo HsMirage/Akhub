@@ -111,23 +111,64 @@ fn private_error_frame(
     let payload = serde_json::from_str::<serde_json::Value>(&frame.data).ok();
     let detail = redactor.payload(payload.as_ref().unwrap_or(&serde_json::Value::Null));
     tracing::warn!(request_id, detail = %detail.as_str(), "上游流式错误原因（已脱敏）");
+    // cyber_policy 是公开的 OpenAI 错误码，不含渠道信息：原样保留。sub2api 只认
+    // `error.code == "cyber_policy"` 才按上游已扣的 token 计费，改写成
+    // upstream_protocol_error 会让它当成免费失败，上游扣的钱就落在我们身上。
+    let cyber = payload.as_ref().is_some_and(|p| {
+        ["/error/code", "/response/error/code"]
+            .iter()
+            .any(|path| p.pointer(path).and_then(serde_json::Value::as_str) == Some(CYBER_POLICY))
+    });
     if protocol == Protocol::OpenAiResponses
         && let Some(mut response) =
             payload.and_then(|mut p| p.get_mut("response").map(serde_json::Value::take))
         && sanitize_failure(&mut response, redactor)
     {
+        if cyber {
+            response["error"]["code"] = json!(CYBER_POLICY);
+        }
         return crate::protocol::sse::format_frame(
             Some("response.failed"),
             &json!({"type":"response.failed", "response":response, "request_id":request_id})
                 .to_string(),
         );
     }
-    crate::protocol::stream_error_public(
+    let frame = crate::protocol::stream_error_public(
         protocol,
         ErrorCode::UpstreamProtocolError,
         &detail,
         Some(request_id),
-    )
+    );
+    if cyber {
+        with_cyber_code(&frame)
+    } else {
+        frame
+    }
+}
+
+const CYBER_POLICY: &str = "cyber_policy";
+
+/// 把网关错误帧的错误码换成 cyber_policy；没有 `error` 对象的形状（Responses 的
+/// 裸 error 事件）补一个，下游按 `error.code` 识别。
+fn with_cyber_code(frame: &axum::body::Bytes) -> axum::body::Bytes {
+    let frame = crate::protocol::sse::parse_frame(&String::from_utf8_lossy(frame));
+    let mut value: serde_json::Value = serde_json::from_str(&frame.data).unwrap_or_default();
+    if value.get("code").is_some() {
+        value["code"] = json!(CYBER_POLICY);
+    }
+    match value
+        .get_mut("error")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        Some(error) => {
+            error.insert("code".into(), json!(CYBER_POLICY));
+        }
+        None => {
+            let message = value.get("message").cloned().unwrap_or_default();
+            value["error"] = json!({"code": CYBER_POLICY, "message": message});
+        }
+    }
+    crate::protocol::sse::format_frame(frame.event.as_deref(), &value.to_string())
 }
 
 /// HTTP 200 的异步失败只保留安全任务字段和脱敏原因。
@@ -520,6 +561,40 @@ mod tests {
             assert!(!text.contains("private-channel"));
             assert!(!text.contains("secret"));
         }
+    }
+
+    #[test]
+    fn cyber_policy_code_survives_redaction() {
+        let redactor = ErrorRedactor::new("private-channel", "https://private.example", "tiny-key");
+        let failed = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"status\":\"failed\",\"error\":{\"code\":\"cyber_policy\",\"message\":\"Request blocked by cyber policy.\"},\"provider\":\"private-channel\"}}\n\n";
+        let bare = "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"cyber_policy\",\"message\":\"blocked\"}}\n\n";
+        for (raw, protocol) in [
+            (failed, Protocol::OpenAiResponses),
+            (bare, Protocol::OpenAiResponses),
+            (bare, Protocol::OpenAiChat),
+            (bare, Protocol::AnthropicMessages),
+        ] {
+            let text = String::from_utf8(
+                private_error_frame(raw.as_bytes(), protocol, "req_c", &redactor).to_vec(),
+            )
+            .unwrap();
+            let frame = crate::protocol::sse::parse_frame(&text);
+            let value: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+            let code = value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/response/error/code"));
+            assert_eq!(code, Some(&json!("cyber_policy")), "{protocol:?}: {text}");
+            assert!(!text.contains("private-channel"), "{text}");
+        }
+        // 其它错误码照旧改写，不放行供应商自己的码。
+        let other =
+            "event: error\ndata: {\"error\":{\"code\":\"private_code\",\"message\":\"x\"}}\n\n";
+        let text = String::from_utf8(
+            private_error_frame(other.as_bytes(), Protocol::OpenAiChat, "req_c", &redactor)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("upstream_protocol_error") && !text.contains("private_code"));
     }
 
     #[test]

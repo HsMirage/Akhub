@@ -841,6 +841,70 @@ async fn an_upstream_error_event_bills_usage_before_the_error_frame() {
     );
 }
 
+/// **现场回归（2026-11-21，吱吱鼠 / gpt-6.2-sol）**：上游以 `response.failed` +
+/// `cyber_policy` 拒绝时，下发给 sub2api 的流必须同时满足两点，否则它把这次当
+/// 免费失败（上游已经扣了输入 token，差价落在我们身上）：
+/// 1. 错误码保留 `cyber_policy`（sub2api 只认这个码走按量计费）；
+/// 2. 用量帧排在 `response.failed` 之前（它读到 failed 就停）。
+#[tokio::test]
+async fn a_responses_cyber_failure_keeps_its_code_and_bills_usage_first() {
+    async fn handler(body: String) -> axum::response::Response {
+        let _ = body;
+        let frames = [
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_up\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"好\"}\n\n",
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_up\",\"status\":\"failed\",\"error\":{\"code\":\"cyber_policy\",\"message\":\"Request blocked by cyber policy.\"}}}\n\n",
+        ].concat();
+        ([("content-type", "text/event-stream")], frames).into_response()
+    }
+    let app = Router::new().route("/v1/responses", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let upstream = format!("http://{addr}");
+
+    let akhub = spawn_akhub().await;
+    wire_target(
+        &akhub,
+        TargetSpec::new(
+            "账号A",
+            &upstream,
+            Protocol::OpenAiResponses,
+            "gpt-6-sol",
+            "gpt-6-sol",
+            50,
+        )
+        .pinned(),
+    )
+    .await;
+
+    let response = client()
+        .post(format!("{}/v1/responses", akhub.base_url))
+        .bearer_auth(&akhub.key)
+        .json(&json!({"model": "gpt-6-sol", "stream": true, "input": "你好"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let usage_at = text.find(r#""usage":"#);
+    let failed_at = text.find("event: response.failed");
+    assert!(
+        usage_at.is_some() && failed_at.is_some() && usage_at < failed_at,
+        "用量帧必须排在 response.failed 之前：{text}"
+    );
+    let failed = &text[failed_at.unwrap()..];
+    assert!(
+        failed.contains(r#""code":"cyber_policy""#),
+        "必须保留 cyber_policy 码：{text}"
+    );
+    assert!(
+        !text.contains(r#""input_tokens":0"#),
+        "用量帧的输入不能是 0：{text}"
+    );
+}
+
 /// **碎片回归**：上游按 TCP 分片、一帧被切成多块到达时，错误帧之前的用量帧
 /// 必须正常补出、且原字节一个不丢。修复按帧边界切块转发，跨块半帧靠 FrameReader
 /// 内部缓冲拼回；这条用例把同一段字节按 1 字节一块喂进去，钉住切块与缓冲的对齐。
