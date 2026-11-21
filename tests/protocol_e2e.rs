@@ -1507,6 +1507,50 @@ async fn upstream_content_moderation_fails_over_to_another_channel() {
 }
 
 #[tokio::test]
+async fn a_channel_that_lacks_the_model_fails_over_to_another_channel() {
+    // 现场（2026-11-21，可达鸭-cursor）：渠道自己没配这个模型，回
+    // "unknown provider for model ..."。与请求无关，必须换渠道而不是透给客户端。
+    let missing = FakeUpstream::spawn().await;
+    missing.fallback(Behavior::Json(
+        400,
+        json!({"error": {
+            "message": "unknown provider for model claude-opus-5.5",
+            "type": "invalid_request_error"
+        }}),
+    ));
+    let serving = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    for (name, upstream, priority) in [("没这个模型的", &missing, 60), ("正常的", &serving, 50)]
+    {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                priority,
+            ),
+        )
+        .await;
+    }
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "渠道缺模型要换渠道，而不是透出 400");
+    assert_eq!(missing.requests(), 1, "高优先级那台必须先被撞到");
+    assert_eq!(serving.requests(), 1, "换渠道：第二台真的接过这次请求");
+}
+
+#[tokio::test]
 async fn content_moderation_is_reported_as_such_when_every_channel_refuses() {
     // 全都拦：换一次渠道之后收手，错误码必须是 content_filtered（422）而不是
     // unsupported_parameter（400）——客户端据此知道"不是我的参数写错了"。

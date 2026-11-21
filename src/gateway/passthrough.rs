@@ -4292,6 +4292,31 @@ async fn classify_upstream_error(
             public: Some(public),
         });
     }
+    // 渠道自己没有这个模型（现场 2026-11-21，可达鸭-cursor：`unknown provider for
+    // model claude-opus-5.5`）：与请求无关，换渠道；按故障计，让这个目标冷却，
+    // 否则新会话会被反复分到它。必须先于可归因判定——那句话里有 "unknown"。
+    if is_channel_missing_model(status, &message) {
+        tracing::warn!(
+            request_id = forward.request_id,
+            account = target.account.name,
+            model = target.target.upstream_model,
+            upstream_status = status.as_u16(),
+            detail = %message,
+            "上游渠道没有这个模型，换渠道重试"
+        );
+        return Err(AttemptFailure::Switchable {
+            code: ErrorCode::UpstreamExhausted,
+            message: format!(
+                "账号「{}」返回 {}：{}",
+                target.account.name,
+                status.as_u16(),
+                message
+            ),
+            upstream_status: Some(status),
+            retry_after: None,
+            upstream_body: Some(bytes.to_vec()),
+        });
+    }
     // 会话被上游钉在别的渠道上（§13.3）：换账号可能就过，且不是账号故障。
     // 必须同样先于 `is_opaque_rejection`：这句话里没有可归因的参数名，
     // 落进 opaque 会被当成"上游抽了"，走不到"换渠道"这条正确路径。
@@ -4605,6 +4630,14 @@ fn is_content_filtered(status: StatusCode, message: &str) -> bool {
     ];
     !ATTRIBUTABLE.iter().any(|needle| lower.contains(needle))
 }
+/// 上游这句 400 是不是"这个渠道没有配这个模型"：换别的渠道就能过。
+fn is_channel_missing_model(status: StatusCode, message: &str) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && message
+            .to_ascii_lowercase()
+            .contains("unknown provider for model")
+}
+
 fn is_opaque_rejection(status: StatusCode, message: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
@@ -5309,6 +5342,17 @@ mod tests {
                 "应当判为可重试：{message}"
             );
         }
+    }
+
+    #[test]
+    fn a_channel_without_the_model_is_switched_away_from() {
+        let message = "unknown provider for model claude-opus-5.5";
+        assert!(is_channel_missing_model(StatusCode::BAD_REQUEST, message));
+        assert!(!is_channel_missing_model(StatusCode::NOT_FOUND, message));
+        assert!(!is_channel_missing_model(
+            StatusCode::BAD_REQUEST,
+            "unknown parameter: foo"
+        ));
     }
 
     #[test]
