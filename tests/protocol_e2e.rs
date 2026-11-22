@@ -1551,6 +1551,56 @@ async fn a_channel_that_lacks_the_model_fails_over_to_another_channel() {
 }
 
 #[tokio::test]
+async fn a_history_replay_400_gets_one_channel_switch() {
+    // 现场（2026-11-22 11:32，supeai.cc-cursor反代）：上游把"历史里带着别的渠道
+    // 的状态"说成"检查你的消息历史"。这句里的 message/tool/image 命中可归因词表，
+    // 以前直接透传 400；同一份请求体换一个账号就 200。
+    let strict = FakeUpstream::spawn().await;
+    strict.fallback(Behavior::Json(
+        400,
+        json!({"error": {
+            "message": "The request could not be processed. Please check the message history, \
+                        tool results, files, or images and try again. (request-id: req_0187TsgK)",
+            "type": "invalid_request_error"
+        }}),
+    ));
+    let accepting = FakeUpstream::spawn().await;
+    let akhub = spawn_akhub().await;
+    for (name, upstream, priority) in [("挑历史的", &strict, 60), ("正常的", &accepting, 50)]
+    {
+        wire_target(
+            &akhub,
+            TargetSpec::new(
+                name,
+                &upstream.base_url,
+                Protocol::AnthropicMessages,
+                MODEL,
+                "claude-opus-5-5",
+                priority,
+            ),
+        )
+        .await;
+    }
+
+    let response = messages(
+        &akhub,
+        json!({
+            "model": MODEL,
+            "max_tokens": 4_096,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "第一次这么说要换渠道，而不是透出 400"
+    );
+    assert_eq!(strict.requests(), 1, "高优先级那台必须先被撞到");
+    assert_eq!(accepting.requests(), 1, "换渠道：第二台真的接过这次请求");
+}
+
+#[tokio::test]
 async fn content_moderation_is_reported_as_such_when_every_channel_refuses() {
     // 全都拦：换一次渠道之后收手，错误码必须是 content_filtered（422）而不是
     // unsupported_parameter（400）——客户端据此知道"不是我的参数写错了"。

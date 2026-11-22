@@ -4395,7 +4395,13 @@ async fn classify_upstream_error(
     // 无法归因的 400：上游在开始生成之前就拒了，**没有消耗任何 token**。
     // 换一个渠道重试几乎免费，而直接透给客户端就把"上游此刻抽了"变成了用户可见
     // 的失败（§13.7）。归因得到请求本身的 400 不走这条路。
-    if is_opaque_rejection(status, &message) {
+    //
+    // 这句"检查你的消息历史"也要换：现场（2026-11-22，cursor 反代）它说的是历史里
+    // 带着别的渠道的状态，同一份请求体换一个账号就 200。与上面两句共用同一个
+    // 重试预算（首包 + 最多 2 次换渠道），不是无界重试。
+    let opaque =
+        is_opaque_rejection(status, &message) || is_foreign_history_replay(status, &message);
+    if opaque {
         tracing::warn!(
             request_id = forward.request_id,
             account = target.account.name,
@@ -4636,6 +4642,21 @@ fn is_channel_missing_model(status: StatusCode, message: &str) -> bool {
         && message
             .to_ascii_lowercase()
             .contains("unknown provider for model")
+}
+
+/// 上游把"历史里有别的渠道的状态"说成了笼统的"检查你的消息历史"。
+///
+/// 现场（2026-11-22 11:32，supeai.cc-cursor反代，465KB 历史）：
+/// `The request could not be processed. Please check the message history,
+/// tool results, files, or images and try again.` 这句里的 "message" 命中
+/// 可归因词表，会被当成客户端的参数错误直接透传；实际上同一份请求体换一个
+/// 账号就是 200（同类历史 72 小时里 3 组同字节数的请求体一败一成）。
+fn is_foreign_history_replay(status: StatusCode, message: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("message history") && lower.contains("could not be processed")
 }
 
 fn is_opaque_rejection(status: StatusCode, message: &str) -> bool {
@@ -5342,6 +5363,24 @@ mod tests {
                 "应当判为可重试：{message}"
             );
         }
+    }
+
+    #[test]
+    fn a_history_replay_400_is_worth_one_channel_switch() {
+        let message = "The request could not be processed. Please check the message \
+                       history, tool results, files, or images and try again.";
+        assert!(is_foreign_history_replay(StatusCode::BAD_REQUEST, message));
+        // 这句里的 "message" 命中可归因词表，单靠它会被当成客户端的参数错误。
+        assert!(
+            !is_opaque_rejection(StatusCode::BAD_REQUEST, message),
+            "可归因词表本来就把它挡在外面，正是这次的缺陷"
+        );
+        // 别的状态码各有处置；没有那句话的归因错误不受影响。
+        assert!(!is_foreign_history_replay(StatusCode::NOT_FOUND, message));
+        assert!(!is_foreign_history_replay(
+            StatusCode::BAD_REQUEST,
+            "prompt is too long"
+        ));
     }
 
     #[test]
