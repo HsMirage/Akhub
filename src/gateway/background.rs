@@ -339,11 +339,11 @@ impl TaskRunner {
             // Send 推断环，同时避免任务内部再进一次分流。
             let response = crate::gateway::passthrough::forward_no_managed(
                 crate::gateway::passthrough::Forward {
-                    state: &state,
-                    group: &request.group,
+                    state: std::sync::Arc::clone(&state),
+                    group: std::sync::Arc::clone(&request.group),
                     endpoint: crate::upstream::Endpoint::Responses,
-                    request_id: &request.request_id,
-                    downstream_headers: &request.downstream_headers,
+                    request_id: request.request_id.clone(),
+                    downstream_headers: request.downstream_headers.clone(),
                     body: std::sync::Arc::new(body),
                     raw: request.raw.clone(),
                     logical_model: request.logical_model.clone(),
@@ -594,7 +594,7 @@ pub struct ManagedRequest {
 ///
 /// 返回 `None` 表示照常走同步转发。
 pub async fn maybe_start_managed(
-    forward: &crate::gateway::passthrough::Forward<'_>,
+    forward: &crate::gateway::passthrough::Forward,
 ) -> Option<axum::response::Response> {
     if forward.endpoint != crate::upstream::Endpoint::Responses {
         return None;
@@ -622,7 +622,7 @@ pub async fn maybe_start_managed(
                 "托管后台任务已达并发上限，请稍后重试",
             )
             .with_protocol(forward.endpoint.protocol())
-            .with_request_id(forward.request_id),
+            .with_request_id(forward.request_id.as_str()),
         ));
     };
 
@@ -650,8 +650,8 @@ pub async fn maybe_start_managed(
 
     let request = ManagedRequest {
         task_id: task_id.clone(),
-        state: Arc::clone(forward.state),
-        group: Arc::clone(forward.group),
+        state: Arc::clone(&forward.state),
+        group: Arc::clone(&forward.group),
         request_id: forward.request_id.to_string(),
         downstream_headers: forward.downstream_headers.clone(),
         body: std::sync::Arc::clone(&forward.body),
@@ -664,7 +664,7 @@ pub async fn maybe_start_managed(
         chain: forward.chain.clone(),
     };
 
-    let runner_state = Arc::clone(forward.state);
+    let runner_state = Arc::clone(&forward.state);
     let runner = TaskRunner::new(Arc::clone(&runner_state));
     let spawned_task_id = task_id.clone();
     let job_state = Arc::clone(&runner_state);
@@ -689,7 +689,7 @@ pub async fn maybe_start_managed(
 ///
 /// 账号首选 Responses 协议时优先交由上游实际处理（计划 §29.1）。
 /// 历史请求的 404/405 不影响后续后台请求的协议选择。
-fn native_background_available(forward: &crate::gateway::passthrough::Forward<'_>) -> bool {
+fn native_background_available(forward: &crate::gateway::passthrough::Forward) -> bool {
     if forward.chain.pinned.is_some() {
         return true;
     }

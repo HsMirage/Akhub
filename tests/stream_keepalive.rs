@@ -514,3 +514,207 @@ async fn a_responses_stream_also_sends_heartbeats() {
     .await;
     assert_keepalive_before(response, "output_text.delta", "response.completed").await;
 }
+
+// ---------------------------------------------------------------------------
+// 2026-11-26：上游连**响应头**都不给时，源站也必须先开口
+//
+// 现场：claude-opus-5-5 经可达鸭渠道 122.7 秒才出第一个字节，这 122 秒全花在
+// "上游还没回响应头"上面。心跳原来只覆盖"响应头之后"那一段，于是 Cloudflare
+// 在 120 秒整判 524（源站 nginx 记 499 + 0 字节）。下面的用例把等待响应头的
+// 那一段单独拉长，验证宽限期一过就有字节出去。
+// ---------------------------------------------------------------------------
+
+/// 迟迟不回响应头、最后回一个 400 的上游。
+#[derive(Clone)]
+struct DelayedError {
+    delay: Duration,
+}
+
+async fn delayed_error_upstream(State(state): State<DelayedError>) -> impl IntoResponse {
+    tokio::time::sleep(state.delay).await;
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "prompt is too long"}
+        })
+        .to_string(),
+    )
+}
+
+/// 迟迟不回响应头、最后回普通 JSON 的上游（给非流式用例）。
+#[derive(Clone)]
+struct DelayedJson {
+    delay: Duration,
+}
+
+async fn delayed_json_upstream(State(state): State<DelayedJson>) -> impl IntoResponse {
+    tokio::time::sleep(state.delay).await;
+    axum::Json(json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 1}
+    }))
+}
+
+async fn spawn_router<S: Clone + Send + Sync + 'static>(routes: Router<S>, state: S) -> String {
+    let app = routes.with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{address}")
+}
+
+/// 上游 3 秒才交出响应头：宽限期（300ms）一过就必须有字节下来，
+/// 而且那一刻上游还没开始回应本身。
+#[tokio::test]
+async fn an_upstream_that_withholds_its_headers_still_produces_bytes_in_time() {
+    let url = spawn_headers_upstream(Duration::from_millis(3000), Duration::ZERO).await;
+    let akhub = spawn_akhub_with(keepalive_settings(), |_| {}).await;
+    wire(&akhub, &url, Protocol::AnthropicMessages).await;
+
+    let response = request(
+        &akhub,
+        Protocol::AnthropicMessages,
+        body(Protocol::AnthropicMessages),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "早提交必须按 SSE 交出去"
+    );
+
+    let mut stream = response.bytes_stream();
+    let started = tokio::time::Instant::now();
+    let mut seen = String::new();
+    while started.elapsed() < Duration::from_millis(2000) {
+        let remaining = Duration::from_millis(2000).saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if seen.contains("keep-alive") {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => panic!("流不应该报错：{error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        seen.contains("keep-alive"),
+        "上游不给响应头时，宽限期一过就必须发心跳：{seen:?}"
+    );
+    assert!(
+        !seen.contains("message_start") && !seen.contains("text_delta"),
+        "此刻上游连响应头都还没交出来，下游不该看到任何语义内容：{seen:?}"
+    );
+
+    // 上游响应头到达之后，真正的语义内容照常接上。
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        text.push_str(&String::from_utf8_lossy(&item.expect("流不应该报错")));
+        if text.contains("message_stop") {
+            break;
+        }
+    }
+    assert!(text.contains("hello"), "语义内容不能丢：{text:?}");
+    assert!(
+        !text.contains("event: error"),
+        "健康上游不该出现错误帧：{text:?}"
+    );
+}
+
+/// 早提交之后上游才失败：失败只能以流内错误帧收尾（状态码已经发出去了）。
+///
+/// 帧必须是下游协议认得的那一种，而且每个 data 行都得是完整 JSON。
+#[tokio::test]
+async fn a_failure_after_the_early_commit_arrives_as_an_error_frame() {
+    let url = spawn_router(
+        Router::new().route("/v1/messages", post(delayed_error_upstream)),
+        DelayedError {
+            delay: Duration::from_millis(1200),
+        },
+    )
+    .await;
+    let akhub = spawn_akhub_with(keepalive_settings(), |_| {}).await;
+    wire(&akhub, &url, Protocol::AnthropicMessages).await;
+
+    let response = request(
+        &akhub,
+        Protocol::AnthropicMessages,
+        body(Protocol::AnthropicMessages),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "响应头已经交出，状态码不能再改");
+    let text = tokio::time::timeout(Duration::from_secs(10), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        text.contains("keep-alive"),
+        "失败之前应当先有心跳：{text:?}"
+    );
+    assert!(
+        text.contains("event: error"),
+        "上游失败必须转成流内错误帧：{text:?}"
+    );
+    for line in text.lines() {
+        if let Some(payload) = line.trim_start().strip_prefix("data:") {
+            let payload = payload.trim();
+            assert!(
+                serde_json::from_str::<Value>(payload).is_ok(),
+                "错误帧的 data 必须是完整 JSON：{payload:?}"
+            );
+        }
+    }
+}
+
+/// 非流式请求不能被改成 SSE：它没有合法的保活形式，提前交 200 只会把
+/// 一个 JSON 响应变成客户端解析不了的东西。
+#[tokio::test]
+async fn a_non_streaming_request_keeps_its_own_content_type() {
+    let url = spawn_router(
+        Router::new().route("/v1/messages", post(delayed_json_upstream)),
+        DelayedJson {
+            delay: Duration::from_millis(800),
+        },
+    )
+    .await;
+    let akhub = spawn_akhub_with(keepalive_settings(), |_| {}).await;
+    wire(&akhub, &url, Protocol::AnthropicMessages).await;
+
+    let response = request(
+        &akhub,
+        Protocol::AnthropicMessages,
+        json!({"model":"claude-sonnet-4-5","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !content_type.starts_with("text/event-stream"),
+        "非流式请求不该被改成 SSE：{content_type}"
+    );
+    let text = tokio::time::timeout(Duration::from_secs(5), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(text.contains("hello"), "{text:?}");
+}

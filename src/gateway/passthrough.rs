@@ -191,12 +191,16 @@ pub struct RawBody {
 }
 
 /// 一次转发请求的全部输入。
-pub struct Forward<'a> {
-    pub state: &'a SharedState,
-    pub group: &'a Arc<GroupView>,
+///
+/// 每个字段都**自持**（Arc 或拥有所有权）：首个语义内容之前要尽早把响应头
+/// 交给下游，那段等待必须活在下游的响应体里，而响应体要求 'static——转发
+/// 输入不能借用处理函数栈帧上的任何东西（§13.4 修订）。
+pub struct Forward {
+    pub state: SharedState,
+    pub group: Arc<GroupView>,
     pub endpoint: Endpoint,
-    pub request_id: &'a str,
-    pub downstream_headers: &'a HeaderMap,
+    pub request_id: String,
+    pub downstream_headers: HeaderMap,
     /// 已解析的请求体。模型名会被逐目标改写。
     ///
     /// `Arc` 而不是裸 `Value`：流式请求的结算器要把它一直持有到流结束（可能
@@ -416,7 +420,7 @@ struct Telemetry {
 
 /// 一次请求在候选之间游走时的全部可变状态。
 struct Walk<'a> {
-    forward: &'a Forward<'a>,
+    forward: &'a Forward,
     /// 三个协议的转换缓存。同协议目标不碰它（§14.1）。
     translation: &'a Translation<'a>,
     telemetry: Telemetry,
@@ -520,7 +524,7 @@ struct Prepared {
 /// * 剩余冷却在这次请求的粘性等待预算之内；
 /// * 截止时间之前还等得起。
 fn sticky_busy_wait(
-    forward: &Forward<'_>,
+    forward: &Forward,
     plan: &routing::Plan,
     target_id: &str,
     budget: Duration,
@@ -598,7 +602,7 @@ enum Flow {
 }
 
 /// 按严格阶梯依次尝试候选目标，返回第一个成功的上游响应。
-pub async fn forward(forward: Forward<'_>) -> Response {
+pub async fn forward(forward: Forward) -> Response {
     // 网关托管后台任务：满足条件时登记任务并立刻返回任务对象，真正的执行在
     // 后台跑（计划 §29.1）。不满足条件就照常走同步转发。
     if let Some(response) = crate::gateway::background::maybe_start_managed(&forward).await {
@@ -612,7 +616,7 @@ pub async fn forward(forward: Forward<'_>) -> Response {
 /// 托管任务内部调用它：任务执行时已经去掉 `background`，再进一次分流既没有
 /// 意义，也会让 `Send` 推断形成环（`forward` → 托管 → spawn(`execute`) →
 /// `forward` → …）。类型上把这条回路切断，编译器才能证明 future 是 `Send`。
-pub async fn forward_no_managed(forward: Forward<'_>) -> Response {
+pub async fn forward_no_managed(forward: Forward) -> Response {
     let streaming = forward
         .body
         .get("stream")
@@ -620,18 +624,151 @@ pub async fn forward_no_managed(forward: Forward<'_>) -> Response {
         .unwrap_or(false);
     let now_unix = crate::storage::now_unix();
     let multipliers = forward.state.runtime.multipliers.view();
+    let settings = forward.state.settings.get();
+    let protocol = forward.endpoint.protocol();
+    let request_id = forward.request_id.clone();
+    // 早提交只在"下游要流式、端点真的产流"时成立：非流式没有合法的保活形式，
+    // 辅助端点（计数、状态链、图片）也根本不回 SSE。
+    let early = streaming && Endpoint::INFERENCE.contains(&forward.endpoint);
 
     // 状态链带可重放正文时，资格过滤与转换都按**合并体**算：引用不在里面，
     // 跨协议目标因此保持合格（§15.2）。合并体不存在时按原始请求体。
-    let multipliers_ref = &multipliers;
-    forward_inner(forward, streaming, now_unix, multipliers_ref).await
+    let walk = forward_inner(forward, streaming, now_unix, multipliers);
+    if !early {
+        return walk.await;
+    }
+
+    // 首个语义内容之前，源站本来一个字节都不发：这在 CDN 眼里就是"源站没响应"。
+    // 上游连**响应头**都憋着的时候（现场 opus-5-5 单次 122.7 秒），光靠"拿到
+    // 响应头之后再发心跳"救不了——CDN 早就在 120 秒那里判了 524（§13.4 修订）。
+    // 所以宽限期内等不到上游响应，就先把响应头交出去、用 SSE 注释帧保活，
+    // 由响应体继续等这一次转发的结果。
+    let mut walk = Box::pin(walk);
+    let budget = settings.first_content_grace.min(PRE_COMMIT_GRACE_CAP);
+    match tokio::time::timeout(budget, walk.as_mut()).await {
+        Ok(response) => response,
+        Err(_) => early_stream_response(protocol, &request_id, walk, settings.keep_alive_interval),
+    }
 }
 
-async fn forward_inner<'a>(
-    forward: Forward<'a>,
+/// 早提交宽限的上限。
+///
+/// 唯一的目的是**别越过最窄那层 CDN 的源站响应超时**：Cloudflare 是 120 秒
+/// （现场实测 129.9 秒回 524），EdgeOne 更耐等但长挂连接会放大 522。设置项
+/// `first_content_grace` 允许配到 300 秒（它对"上游响应头之后"那段等待也是
+/// 同一个旋钮），所以在这里夹一层，免得有人为了多留切换机会把 CDN 忘掉。
+const PRE_COMMIT_GRACE_CAP: Duration = Duration::from_secs(90);
+
+/// 单个网关错误体最多读多少字节来转成流内错误帧。
+const MAX_EARLY_ERROR_BODY: usize = 64 * 1024;
+
+/// 首个语义内容之前，把响应头提前交给下游，并持续发 SSE 注释帧保活。
+///
+/// 与 [`stream::keep_alive_until_ready`] 是同一套机制，区别只在接线位置：那里
+/// 接的是"上游响应头已到、还在等首个语义事件"的等待，这里接的是**连响应头
+/// 都还没到**的等待。上游在交出响应头之前沉默多久，源站就沉默多久。
+///
+/// 代价与 §13.4 的既有取舍一致：响应头一旦发出，这次请求的 HTTP 状态码就定了。
+/// 之后的失败只能按下游协议包成流内错误帧（客户端看到 200 + `event: error`），
+/// 成功则照常接上真正的响应体。多目标切换本身**不受影响**：它继续在响应体里跑。
+fn early_stream_response<F>(
+    protocol: Protocol,
+    request_id: &str,
+    mut walk: std::pin::Pin<Box<F>>,
+    interval: Duration,
+) -> Response
+where
+    F: std::future::Future<Output = Response> + Send + 'static,
+{
+    let owned_request_id = request_id.to_owned();
+    let clock = stream::first_content_clock();
+    let ready = async move {
+        let response = walk.as_mut().await;
+        if response.status().is_success() && is_event_stream(&response) {
+            return Ok(response.into_body());
+        }
+        Err(early_error_frame(response, protocol, &owned_request_id).await)
+    };
+    let body = stream::keep_alive_until_ready(ready, interval, clock, Duration::ZERO);
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        // 老 nginx 默认会缓冲这个响应；显式关掉，让注释帧立刻出去。
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    if let Ok(value) = axum::http::HeaderValue::try_from(request_id) {
+        response.headers_mut().insert("x-akhub-request-id", value);
+    }
+    response
+}
+
+/// 上游这一轮回的是不是 SSE。
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .get(.."text/event-stream".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+/// 已经把 200 交出去的失败：按下游协议包成流内错误帧。
+///
+/// 优先原样转发网关错误体的 JSON——它本来就按下游协议构造（§18.2），客户端
+/// 认得出里面的 `error.type` 与错误码；读不出合法 JSON 时按状态码退回一条
+/// 通用错误帧，绝不把空包或 HTML 塞进流里。
+async fn early_error_frame(
+    response: Response,
+    protocol: Protocol,
+    request_id: &str,
+) -> axum::body::Bytes {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), MAX_EARLY_ERROR_BODY)
+        .await
+        .unwrap_or_default();
+    let payload = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .filter(|value| value.get("error").is_some());
+    match payload {
+        Some(value) => sse_error_frame(protocol, &value.to_string()),
+        None => {
+            crate::protocol::stream_error(protocol, early_error_code(status), "", Some(request_id))
+        }
+    }
+}
+
+/// 错误帧的 SSE 外形：三个协议共用同一写法，只有事件名不同。
+///
+/// Anthropic 与 Responses 都用 event: error，Chat 没有事件名（§18.2）。
+fn sse_error_frame(protocol: Protocol, payload: &str) -> axum::body::Bytes {
+    let event = match protocol {
+        Protocol::AnthropicMessages | Protocol::OpenAiResponses => Some("error"),
+        Protocol::OpenAiChat => None,
+    };
+    crate::protocol::sse::format_frame(event, payload)
+}
+
+/// 没有可转发的错误体时按 HTTP 状态码归类，让客户端的重试行为正确（§18.3）。
+fn early_error_code(status: StatusCode) -> ErrorCode {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => ErrorCode::RateLimited,
+        StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => ErrorCode::UpstreamTimeout,
+        StatusCode::BAD_REQUEST => ErrorCode::UnsupportedParameter,
+        _ => ErrorCode::UpstreamProtocolError,
+    }
+}
+
+async fn forward_inner(
+    forward: Forward,
     streaming: bool,
     now_unix: i64,
-    multipliers: &'a multiplier::View,
+    multipliers: multiplier::View,
 ) -> Response {
     // 中间格式最多解析一次、每个目标协议最多发射一次（§19.4）。
     let translation = Translation::new(
@@ -644,7 +781,7 @@ async fn forward_inner<'a>(
     let context = routing::Context {
         health: &forward.state.runtime.health,
         perf: &forward.state.runtime.perf,
-        multipliers,
+        multipliers: &multipliers,
         credentials: &credentials,
         evidence: &forward.state.runtime.evidence,
         translation: &translation,
@@ -706,7 +843,7 @@ async fn forward_inner<'a>(
         &forward.state.key_digest,
         &forward.group.group.id,
         &forward.logical_model,
-        forward.downstream_headers,
+        &forward.downstream_headers,
         &forward.body,
     );
     // 绑定是"软"还是"硬"，取决于粘性键的来源：
@@ -799,7 +936,7 @@ async fn forward_inner<'a>(
     let plan = loop {
         let plan = loop {
             match routing::plan(
-                forward.group,
+                &forward.group,
                 &forward.logical_model,
                 &context,
                 // 只有弱绑定才做权重倾斜；硬绑定走下面的第一步，不经过抽签。
@@ -924,13 +1061,13 @@ async fn forward_inner<'a>(
         // 隔离的前缀缓存打碎。
         let pinned = binding.credential_digest.clone();
         let scoped = context.with_bound_credential(pinned.clone());
-        if routing::sticky_still_valid(forward.group, &candidate.target, &scoped) {
+        if routing::sticky_still_valid(&forward.group, &candidate.target, &scoped) {
             return Some((candidate, binding, pinned));
         }
         // 目标还合格、只是那把 Key 不再可用时，绑定仍然成立：请求照样打到这个
         // 目标，由发请求那一刻重新选一把 Key 并改写绑定。这比"整个绑定作废、
         // 重新抽签"温和得多——目标（也就省下了的连接与配额）没有变。
-        let target_ok = routing::sticky_still_valid(forward.group, &candidate.target, &context);
+        let target_ok = routing::sticky_still_valid(&forward.group, &candidate.target, &context);
         let key_gone = pinned.is_some()
             && binding.credential_digest.as_deref().is_some_and(|digest| {
                 credentials
@@ -2430,7 +2567,7 @@ impl Walk<'_> {
                             Box::new(
                                 GatewayError::new(ErrorCode::UnsupportedParameter, message)
                                     .with_protocol(self.forward.endpoint.protocol())
-                                    .with_request_id(self.forward.request_id)
+                                    .with_request_id(self.forward.request_id.as_str())
                                     .into_response(),
                             ),
                             None,
@@ -2483,7 +2620,7 @@ impl Walk<'_> {
                     Box::new(
                         GatewayError::new(ErrorCode::UnsupportedParameter, reason.to_string())
                             .with_protocol(self.forward.endpoint.protocol())
-                            .with_request_id(self.forward.request_id)
+                            .with_request_id(self.forward.request_id.as_str())
                             .into_response(),
                     ),
                     None,
@@ -2793,7 +2930,7 @@ impl Walk<'_> {
         ));
         let mut error = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
             .with_protocol(self.forward.endpoint.protocol())
-            .with_request_id(self.forward.request_id);
+            .with_request_id(self.forward.request_id.as_str());
         if let Some(public) = public {
             error = error.with_public_message(public);
         }
@@ -2817,7 +2954,7 @@ impl Walk<'_> {
         ));
         let mut error = GatewayError::new(ErrorCode::ContentFiltered, &message)
             .with_protocol(self.forward.endpoint.protocol())
-            .with_request_id(self.forward.request_id);
+            .with_request_id(self.forward.request_id.as_str());
         if let Some(public) = public {
             error = error.with_public_message(public);
         }
@@ -2827,7 +2964,7 @@ impl Walk<'_> {
     fn fail(&self, code: ErrorCode, message: String) -> Response {
         let mut error = GatewayError::new(code, message)
             .with_protocol(self.forward.endpoint.protocol())
-            .with_request_id(self.forward.request_id);
+            .with_request_id(self.forward.request_id.as_str());
         if self.last.as_ref().is_some_and(|(last, _)| *last == code)
             && let Some(detail) = self.last_public.clone()
         {
@@ -3118,7 +3255,7 @@ pub(crate) fn unavailable_code(reason: health::Unavailable) -> ErrorCode {
 /// 期间它不变。为 `None` 时退回账号的第一把 Key——这只可能发生在配置被外部
 /// 改动而快照还没重建的窗口里，属于兜底而不是常规路径。
 async fn attempt(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     credential: Option<&Arc<crate::credential::Credential>>,
     prepared: &Prepared,
@@ -3141,7 +3278,7 @@ async fn attempt(
 }
 
 async fn attempt_inner(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     credential: Option<&Arc<crate::credential::Credential>>,
     prepared: &Prepared,
@@ -3180,11 +3317,11 @@ async fn attempt_inner(
         upstream::build_headers_with_content_type(
             prepared.endpoint,
             &api_key,
-            forward.downstream_headers,
+            &forward.downstream_headers,
             raw.content_type.clone(),
         )
     } else {
-        upstream::build_headers(prepared.endpoint, &api_key, forward.downstream_headers)
+        upstream::build_headers(prepared.endpoint, &api_key, &forward.downstream_headers)
     }
     .map_err(|error| {
         AttemptFailure::switchable(
@@ -3280,12 +3417,12 @@ async fn attempt_inner(
         && !forward.endpoint.submits_image_task()
     {
         let parsed = crate::gateway::images::complete_job(
-            forward.state,
+            &forward.state,
             target,
             &api_key,
             response,
             timeout.saturating_sub(sent_at.elapsed()),
-            forward.request_id,
+            forward.request_id.as_str(),
         )
         .await
         .map_err(AttemptFailure::AcceptedJob)?;
@@ -3378,7 +3515,7 @@ fn upstream_streams(response: &reqwest::Response) -> bool {
 /// [`translate::commit_stream`]，判据从"上游的字节"换成"中间事件"。
 #[allow(clippy::too_many_arguments)]
 async fn commit_stream(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     response: reqwest::Response,
@@ -3491,7 +3628,7 @@ async fn commit_stream(
                 crate::gateway::error::private_stream(
                     body,
                     downstream,
-                    forward.request_id,
+                    forward.request_id.as_str(),
                     redactor.clone(),
                 ),
             ),
@@ -3551,7 +3688,7 @@ async fn commit_stream(
                         let body = crate::gateway::error::private_stream(
                             body,
                             downstream,
-                            forward.request_id,
+                            forward.request_id.as_str(),
                             redactor.clone(),
                         );
                         return Ok(Success {
@@ -3611,12 +3748,12 @@ async fn commit_stream(
                                 prefix,
                                 response,
                                 &gateway,
-                                forward.request_id,
+                                forward.request_id.as_str(),
                             );
                             let body = crate::gateway::error::private_stream(
                                 body,
                                 downstream,
-                                forward.request_id,
+                                forward.request_id.as_str(),
                                 redactor.clone(),
                             );
                             return Ok(Success {
@@ -3736,7 +3873,7 @@ async fn commit_stream(
                     carry,
                     response,
                     downstream,
-                    forward.request_id,
+                    forward.request_id.as_str(),
                     translate::KeepAlive {
                         clock: clock.clone(),
                         interval: forward.state.settings.get().keep_alive_interval,
@@ -3746,7 +3883,7 @@ async fn commit_stream(
                 let body = crate::gateway::error::private_stream(
                     body,
                     downstream,
-                    forward.request_id,
+                    forward.request_id.as_str(),
                     redactor.clone(),
                 );
                 return Ok(Success {
@@ -3771,12 +3908,16 @@ async fn commit_stream(
             stream::Verdict::Pending => continue,
             stream::Verdict::Semantic => {
                 let prefix = sniffer.take_buffer();
-                let body =
-                    translate::passthrough_stream(prefix, response, downstream, forward.request_id);
+                let body = translate::passthrough_stream(
+                    prefix,
+                    response,
+                    downstream,
+                    forward.request_id.as_str(),
+                );
                 let body = crate::gateway::error::private_stream(
                     body,
                     downstream,
-                    forward.request_id,
+                    forward.request_id.as_str(),
                     redactor.clone(),
                 );
                 return Ok(Success {
@@ -3853,7 +3994,7 @@ async fn responses_ready(
 /// "违反所选协议的损坏响应"（§13.2），并取出 `usage` 用于 TPM 归还与输出速度
 /// 统计。跨协议时在这里把响应体翻译回下游协议。
 async fn commit_body(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     response: reqwest::Response,
@@ -4010,7 +4151,7 @@ async fn commit_body(
 /// 完整记录落库或删除。写失败只记日志——状态链是增强能力，不能影响主流程。
 #[allow(clippy::too_many_arguments)]
 fn record_response_state(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     gateway_id: &str,
@@ -4073,7 +4214,7 @@ const IMAGE_TASK_TTL_SECS: i64 = 24 * 60 * 60;
 /// 只在成功下单时调用：失败响应里没有可轮询的任务 ID。写失败只记日志——
 /// 轮询是增强能力，不能反过来把已经成功的下单变成失败。
 async fn remember_image_task(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     key_digest: Option<&str>,
     body: &serde_json::Value,
@@ -4113,7 +4254,7 @@ async fn remember_image_task(
 
 /// 把上游的非 2xx 响应分成"可切换"与"必须直接返回下游"两类。
 async fn classify_upstream_error(
-    forward: &Forward<'_>,
+    forward: &Forward,
     target: &Arc<TargetView>,
     prepared: &Prepared,
     response: reqwest::Response,
@@ -4253,7 +4394,7 @@ async fn classify_upstream_error(
         let mut response = GatewayError::new(ErrorCode::UnsupportedParameter, &message)
             .with_public_message(public.clone())
             .with_protocol(forward.endpoint.protocol())
-            .with_request_id(forward.request_id)
+            .with_request_id(forward.request_id.as_str())
             .into_response();
         *response.status_mut() = status;
         return Err(AttemptFailure::EffortRejected {
@@ -4434,7 +4575,7 @@ async fn classify_upstream_error(
             .payload(&serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)),
         )
         .with_protocol(forward.endpoint.protocol())
-        .with_request_id(forward.request_id);
+        .with_request_id(forward.request_id.as_str());
     if let Some(seconds) = retry_after {
         error = error.with_retry_after(seconds);
     }
@@ -4773,7 +4914,7 @@ fn is_switchable_status(status: StatusCode) -> bool {
 }
 
 fn build_response(
-    forward: &Forward<'_>,
+    forward: &Forward,
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
     prepared: &Prepared,
@@ -4790,7 +4931,7 @@ fn build_response(
             .map(|headers| headers.insert("x-akhub-degraded", value));
     }
     builder
-        .header("x-akhub-request-id", forward.request_id)
+        .header("x-akhub-request-id", forward.request_id.as_str())
         .body(body)
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }

@@ -258,11 +258,11 @@ async fn handle(
     }
 
     let response = passthrough::forward(passthrough::Forward {
-        state: &state,
-        group: &group,
+        state: std::sync::Arc::clone(&state),
+        group: std::sync::Arc::clone(&group),
         endpoint,
-        request_id: &request_id,
-        downstream_headers: &headers,
+        request_id: request_id.clone(),
+        downstream_headers: headers.clone(),
         body: std::sync::Arc::new(body),
         raw,
         logical_model,
