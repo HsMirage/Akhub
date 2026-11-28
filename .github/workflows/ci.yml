@@ -4,7 +4,15 @@ name: CI
 
 on:
   push:
+    branches:
+      - master
   pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +57,41 @@ jobs:
       # 实现只在 scripts/check-platforms.sh 里，release.yml 也调用同一份。
       - name: 平台上限
         run: ./scripts/check-platforms.sh
+
+      # 版本一致性与发版预检：在 PR 阶段提前拦截 desktop 版本掉队或重复版本号，
+      # 并在升级版本号时于摘要中明确提示「合并后将自动发版」。
+      - name: 版本一致性与发版预检
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          desktop="$(grep -m1 '^version' desktop/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "crate=$crate desktop=$desktop"
+          if [[ ! "$crate" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Cargo.toml 的版本号不是合法 semver：$crate"
+            exit 1
+          fi
+          if [[ "$desktop" != "$crate" ]]; then
+            echo "::error::desktop/Cargo.toml 的 $desktop 与根 Cargo.toml 的 $crate 不一致"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_REF" ]]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            base_ver="$(git show "origin/${BASE_REF}:Cargo.toml" | grep -m1 '^version' | sed -E 's/.*"(.*)".*/\1/')"
+            echo "base_ver=$base_ver"
+            if [[ "$crate" != "$base_ver" ]]; then
+              tag="v${crate}"
+              if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+                echo "::error::目标发版 tag ${tag} 已存在，请调整版本号后再合并"
+                exit 1
+              fi
+              echo "🚀 检测到版本升级（\`${base_ver}\` → \`${crate}\`）：本 PR 合并到 \`${BASE_REF}\` 后将自动创建 tag \`${tag}\` 并触发完整 Release。" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "ℹ️ 版本号未变化（\`${crate}\`）：本 PR 合并后仅合入代码，不触发自动发版。" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
 
       # 发布脚本是运维唯一直接执行的东西，语法错误必须在这里拦下，
       # 而不是等用户在服务器上敲下去才发现。

@@ -25,12 +25,25 @@ on:
   push:
     tags:
       - "v*"
-  # 手动触发只跑构建，不发 Release（下面的 release job 判断了 ref 必须是 tag）。
+  # 手动触发只跑构建，不发 Release（下面的 release / docker job 判断了 is_release）。
   workflow_dispatch:
+  # 由 pr-release.yml 在 PR 合并且版本升级时自动创建 tag 后调用。
+  workflow_call:
+    inputs:
+      tag:
+        description: "本次发布的版本 tag（例如 v1.1.58）"
+        required: true
+        type: string
+      pr_number:
+        description: "触发本次发布的 PR 编号（可选，用于生成 Release 说明）"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
   packages: write
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,23 +55,43 @@ jobs:
   verify:
     name: 版本一致性
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      is_release: ${{ steps.meta.outputs.is_release }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: tag 必须与 Cargo.toml 的版本一致
+      - name: 确定发布 tag 并校验 Cargo.toml 版本一致性
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
-            echo "非 tag 触发（${GITHUB_REF}），跳过版本校验"
-            exit 0
-          fi
-          tag="${GITHUB_REF_NAME#v}"
           crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          echo "tag=$tag crate=$crate"
-          if [[ "$tag" != "$crate" ]]; then
-            echo "::error::tag v$tag 与 Cargo.toml 的 $crate 不一致；二进制里的 /admin 版本号和 --version 都会对不上"
-            exit 1
+          if [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+            is_release="true"
+          elif [[ "$EVENT_REF" == refs/tags/v* ]]; then
+            tag="$EVENT_REF_NAME"
+            is_release="true"
+          else
+            tag="v${crate}"
+            is_release="false"
           fi
+          echo "tag=$tag is_release=$is_release crate=$crate"
+          if [[ "$is_release" == "true" ]]; then
+            ver="${tag#v}"
+            if [[ "$ver" != "$crate" ]]; then
+              echo "::error::tag ${tag} 与 Cargo.toml 的 $crate 不一致；二进制里的 /admin 版本号和 --version 都会对不上"
+              exit 1
+            fi
+          else
+            echo "非正式发版触发（${EVENT_REF}），跳过 tag 校验并仅做构建演练"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
 
       # 平台上限：只发 Linux 与 Windows。ci.yml 里有同一道门禁，但 tag 发版
       # 不会经过 ci.yml，所以这里必须再卡一次——否则一条 darwin 目标就能悄悄
@@ -151,10 +184,12 @@ jobs:
       # Windows 上用 Git Bash 跑它；那边只产裸 exe，没有归档。
       - name: 打包
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          TAG="${GITHUB_REF_NAME:-v$VERSION}"
+          TAG="${RELEASE_TAG:-v$VERSION}"
           BINARY="target/${{ matrix.target }}/release/akhub"
           if [[ "${{ matrix.target }}" == *windows* ]]; then BINARY="$BINARY.exe"; fi
           AKHUB_TAG="$TAG" ./scripts/package.sh \
@@ -181,7 +216,7 @@ jobs:
   # 「仍要运行」。具体步骤写在 desktop/README.md。
   desktop:
     name: desktop-${{ matrix.name }}
-    needs: [binaries]
+    needs: [verify, binaries]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -241,10 +276,12 @@ jobs:
       # 一眼就能看出是哪个平台、什么版本。
       - name: 归集产物
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          TAG="${GITHUB_REF_NAME:-v$VERSION}"
+          TAG="${RELEASE_TAG:-v$VERSION}"
           BUNDLE="desktop/target/${{ matrix.target }}/release/bundle"
           # Tauri 在有 --target 时把产物放在 <target-dir>/<triple>/release/bundle；
           # 万一将来布局变了，退回到不带三元组的那层，避免整条发版卡在一个路径上。
@@ -264,11 +301,13 @@ jobs:
   release:
     name: 生成 Release
     # 桌面产物与 Linux 二进制进同一个 Release：checksums.txt 得把它们一起算上。
-    needs: [binaries, desktop]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, binaries, desktop]
+    if: needs.verify.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -297,47 +336,95 @@ jobs:
           sha256sum "${targets[@]}" > checksums.txt
           cat checksums.txt
 
-      # Release 说明取自**发布提交**的正文，而不是 GitHub 的自动生成。
-      #
-      # 自动生成只列 PR 与贡献者，而本仓库的发布是直接提交到 master 的：结果是
-      # 每个 Release 只剩一行 "Full Changelog" 链接，这一版改了什么、为什么改，
-      # 用户点进去一个字都看不到。发布提交的正文本来就是按"给用户看"写的
-      # （现场证据、判据、影响面），直接拿它当说明最省事也最不会掉队。
-      - name: 从发布提交生成 Release 说明
+      # Release 说明优先取关联 PR 的标题与正文（过滤模板注释与勾选段）；
+      # 若非 PR 合入（例如手动直接推 tag），回退到「发布 vX.Y.Z」提交正文或 HEAD 提交。
+      - name: 生成 Release 说明
         id: notes
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
           version="${tag#v}"
-          # 找形如「发布 v1.1.30：…」的那条提交。
-          #
-          # 版本号后面必须紧跟「：」或行尾：只写 `^发布 v${version}` 时，v1.1.3
-          # 会匹配到 "发布 v1.1.30：…"——Release 说明会张冠李戴成另一个版本。
-          # 找不到就退回被 tag 的提交，宁可说明短一点，也不能让 Release 空着。
-          commit="$(git log --format=%H \
-            --grep="^发布 v${version}：\|^发布 v${version}$" -1)"
-          if [[ -z "$commit" ]]; then
-            echo "::warning::没找到「发布 v${version}」提交，退回被 tag 的提交"
-            commit="$(git rev-parse HEAD)"
+          commit="$(git rev-parse HEAD)"
+
+          pr_number="${INPUT_PR_NUMBER}"
+          if [[ -z "$pr_number" ]]; then
+            pr_number="$(gh api "repos/${REPO}/commits/${commit}/pulls" \
+              --jq '[.[] | select(.merged_at != null and .base.ref == "master")] | sort_by(.merged_at) | last | .number // empty' 2>/dev/null || true)"
           fi
-          subject="$(git log --format=%s -1 "$commit")"
-          body="$(git log --format=%b -1 "$commit")"
+
+          title=""
+          body=""
+          if [[ -n "$pr_number" ]]; then
+            pr_json="$(gh api "repos/${REPO}/pulls/${pr_number}" 2>/dev/null || true)"
+            if [[ -n "$pr_json" ]]; then
+              pr_title="$(printf '%s' "$pr_json" | jq -r '.title // empty')"
+              pr_body="$(printf '%s' "$pr_json" | jq -r '.body // empty')"
+              # 清理 HTML 注释与 PR 模板末尾的「发版确认」勾选段，保留面向用户的说明。
+              cleaned_body="$(PR_BODY="$pr_body" python3 - <<'PY'
+          import os, re
+          text = os.environ.get("PR_BODY", "")
+          text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+          text = re.sub(r"\n##\s*发版确认[\s\S]*$", "", text)
+          lines = [line.rstrip() for line in text.splitlines()]
+          while lines and not lines[0].strip():
+              lines.pop(0)
+          while lines and not lines[-1].strip():
+              lines.pop()
+          print("\n".join(lines))
+          PY
+          )"
+              if [[ -n "$pr_title" ]]; then
+                clean_title="${pr_title#发布 }"
+                if [[ "$clean_title" == *"$tag"* || "$clean_title" == *"$version"* ]]; then
+                  title="$clean_title"
+                else
+                  title="${tag}：${clean_title}"
+                fi
+              fi
+              body="$cleaned_body"
+            fi
+          fi
+
+          if [[ -z "$title" ]]; then
+            # 回退：找形如「发布 v1.1.30：…」的那条提交。
+            release_commit="$(git log --format=%H \
+              --grep="^发布 v${version}：\|^发布 v${version}$" -1 || true)"
+            if [[ -n "$release_commit" ]]; then
+              commit="$release_commit"
+            fi
+            subject="$(git log --format=%s -1 "$commit")"
+            body="$(git log --format=%b -1 "$commit")"
+            title="${subject#发布 }"
+          fi
+
           echo "commit=$commit"
-          echo "subject=$subject"
-          # 标题去掉「发布 」前缀，版本号已经在 Release 名里了。
-          echo "title=${subject#发布 }" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${pr_number:-none}"
+          echo "title=$title"
+          {
+            echo "title<<AKHUB_TITLE_EOF"
+            printf '%s\n' "$title"
+            echo "AKHUB_TITLE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
           prev="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
           {
-            if [[ -n "${body// /}" ]]; then
+            if [[ -n "${body//[[:space:]]/}" ]]; then
               printf '%s\n' "$body"
             else
-              # 正文为空的旧式发布提交（如 v1.1.28）：至少给出标题，不留白板。
-              echo "$subject"
+              printf '%s\n' "$title"
             fi
             echo
             echo "---"
-            if [[ -n "$prev" ]]; then
-              echo "**完整改动**：https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            if [[ -n "$pr_number" ]]; then
+              echo "**发布 PR**：#${pr_number}"
+            fi
+            if [[ -n "$prev" && "$prev" != "$tag" ]]; then
+              echo "**完整改动**：https://github.com/${REPO}/compare/${prev}...${tag}"
             fi
           } > "$RUNNER_TEMP/notes.md"
           echo "--- 生成的 Release 说明 ---"
@@ -345,6 +432,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.verify.outputs.tag }}
           name: ${{ steps.notes.outputs.title }}
           body_path: ${{ runner.temp }}/notes.md
           files: |
@@ -358,7 +446,8 @@ jobs:
   # 这样下游 compose 里的 image: <tag> 走的始终是 manifest。
   docker:
     name: 镜像 linux/${{ matrix.arch }}
-    needs: [web]
+    needs: [verify, web]
+    if: needs.verify.outputs.is_release == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -426,9 +515,9 @@ jobs:
             latest=auto
             suffix=-${{ matrix.arch }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}},value=${{ needs.verify.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.verify.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.is_release == 'true' }}
 
       - name: 构建并推送单架构镜像
         uses: docker/build-push-action@v6
@@ -448,7 +537,8 @@ jobs:
   # 把单架构镜像挂成不带后缀的 manifest（下游 compose 直接用这个 tag）。
   docker-manifest:
     name: 合成 manifest
-    needs: [docker]
+    needs: [verify, docker]
+    if: needs.verify.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -493,9 +583,9 @@ jobs:
         with:
           images: ${{ steps.repos.outputs.list }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}},value=${{ needs.verify.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.verify.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.is_release == 'true' }}
 
       - name: 合成多架构 manifest
         run: |

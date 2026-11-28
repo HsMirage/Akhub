@@ -1,0 +1,121 @@
+# PR 合并自动发版：
+# 当 PR 合并到 master 且本次变更升级了 Cargo.toml 的 version 时，自动创建 annotated
+# tag v<version> 并直接调用 release.yml 构建与发布（Linux 二进制 + Windows 桌面端 +
+# Docker 镜像 + GitHub Release）。
+#
+# 为什么通过 workflow_call 直接调用 release.yml 而不是依赖 push tag 触发：
+# GitHub Actions 默认用 GITHUB_TOKEN 推送的 tag 不会再触发其他 on.push.tags workflow
+# （防循环保护）。用 workflow_call 既无需配置长期 PAT，又能与手动推 v* tag 共用同一份
+# release.yml 流水线。
+name: PR Auto Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: read
+
+concurrency:
+  group: pr-auto-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: 检测版本升级并打标
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查 Cargo.toml 版本变化并创建 tag
+        id: check
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          curr_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          desktop_ver="$(grep -m1 '^version' desktop/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "curr_ver=$curr_ver desktop_ver=$desktop_ver before=$BEFORE_SHA"
+
+          if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "无法确定变更前提交，跳过自动发版"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git cat-file -e "${BEFORE_SHA}:Cargo.toml" 2>/dev/null; then
+            echo "变更前提交中不存在 Cargo.toml，跳过自动发版"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_ver="$(git show "${BEFORE_SHA}:Cargo.toml" | grep -m1 '^version' | sed -E 's/.*"(.*)".*/\1/')"
+          echo "prev_ver=$prev_ver"
+
+          if [[ "$curr_ver" == "$prev_ver" ]]; then
+            echo "Cargo.toml 版本未变化（$curr_ver），跳过自动发版"
+            echo "ℹ️ 本次合入未修改 \`Cargo.toml\` 版本号（\`${curr_ver}\`），跳过自动发版。" >> "$GITHUB_STEP_SUMMARY"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ ! "$curr_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Cargo.toml 的版本号不是合法 semver：$curr_ver"
+            exit 1
+          fi
+
+          if [[ "$desktop_ver" != "$curr_ver" ]]; then
+            echo "::error::desktop/Cargo.toml 的 $desktop_ver 与根 Cargo.toml 的 $curr_ver 不一致，中止自动发版"
+            exit 1
+          fi
+
+          tag="v${curr_ver}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::warning::tag ${tag} 已存在，跳过重复发版"
+            echo "⚠️ tag \`${tag}\` 已存在，跳过重复发版。" >> "$GITHUB_STEP_SUMMARY"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pr_number="$(gh api "repos/${REPO}/commits/${CURRENT_SHA}/pulls" \
+            --jq '[.[] | select(.merged_at != null and .base.ref == "master")] | sort_by(.merged_at) | last | .number // empty' 2>/dev/null || true)"
+          echo "pr_number=${pr_number:-none}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          tag_msg="Release ${tag}"
+          if [[ -n "$pr_number" ]]; then
+            tag_msg="Release ${tag} (PR #${pr_number})"
+          fi
+
+          git tag -a "$tag" -m "$tag_msg" "$CURRENT_SHA"
+          git push origin "refs/tags/${tag}"
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "🚀 已自动创建并推送 tag \`${tag}\`（版本 \`${prev_ver}\` → \`${curr_ver}\`），开始执行 Release 流水线。" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 执行正式发布
+    needs: [detect]
+    if: needs.detect.outputs.should_release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.detect.outputs.tag }}
+      pr_number: ${{ needs.detect.outputs.pr_number }}
+    secrets: inherit

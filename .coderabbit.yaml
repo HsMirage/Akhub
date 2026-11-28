@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Akhub CodeRabbit 自动审查配置
+language: "zh-CN"
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: false
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "master"
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+  path_filters:
+    - "!**/Cargo.lock"
+    - "!**/package-lock.json"
+    - "!web/dist/**"
+    - "!dist/**"
+    - "!docs/images/**"
+    - "!assets/**"
+    - "!review/**"
+  path_instructions:
+    - path: "src/gateway/**"
+      instructions: >-
+        重点检查 SSE 流式透传、跨协议转换、首字前心跳与早提交边界、客户端断开
+        （client_gone）清理、多目标故障切换与超时控制，以及避免阻塞异步运行时。
+    - path: "src/upstream/**"
+      instructions: >-
+        重点检查上游 HTTP/SSE 请求构建、超时与重试条件、错误码映射、冷却策略以及
+        敏感请求头/凭据脱敏。
+    - path: "src/auth/**"
+      instructions: >-
+        重点检查鉴权与会话安全、时序攻击、密钥处理与权限边界，严禁在日志或错误中
+        泄露密钥或令牌。
+    - path: "src/storage/**"
+      instructions: >-
+        重点检查 SQLite schema 迁移兼容性、事务原子性、锁竞争（busy/WAL）、SQL 注入
+        与索引性能。
+    - path: "src/multiplier/**"
+      instructions: >-
+        重点检查计费倍率计算精度、浮点/整数溢出、缓存与后台刷新并发竞态。
+    - path: "web/src/**"
+      instructions: >-
+        重点检查 TypeScript 类型安全、管理后台状态同步、API 错误处理与 XSS 防护。
+    - path: ".github/workflows/**"
+      instructions: >-
+        重点检查 GitHub Actions 权限最小化、命令注入风险（避免直接插值不可信输入）、
+        版本号一致性与发版资产命名（仅发 Linux x86_64 与 Windows x86_64，不含 macOS/arm64）。
+    - path: "scripts/**"
+      instructions: >-
+        重点检查 POSIX sh / bash 语法兼容性（匹配 shebang）、错误处理（set -euo pipefail）、
+        变量引号保护与破坏性操作安全性。
+    - path: "Cargo.toml"
+      instructions: >-
+        如果修改了 package.version，请确认 desktop/Cargo.toml 已同步升级到同一版本号；
+        合并到 master 后将自动打 v<version> tag 并触发正式 Release。
+    - path: "desktop/Cargo.toml"
+      instructions: >-
+        请确认 package.version 与根 Cargo.toml 完全一致，避免桌面安装包与服务端版本脱节。
+
+chat:
+  auto_reply: true
